@@ -1,0 +1,17 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(pip install:*)",
+      "Bash(playwright install:*)",
+      "Bash(python:*)",
+      "Bash(PYTHONIOENCODING=utf-8 python:*)",
+      "Bash(PYTHONPATH=\"D:/zwj_project/OmniCore\" PYTHONIOENCODING=utf-8 python:*)",
+      "Bash(PYTHONPATH=\"D:/zwj_project/OmniCore\" PYTHONIOENCODING=utf-8 timeout 90 python:*)",
+      "Bash(PYTHONPATH=\"D:/zwj_project/OmniCore\" PYTHONIOENCODING=utf-8 timeout 120 python:*)",
+      "Bash(PYTHONPATH=\"D:/zwj_project/OmniCore\" PYTHONIOENCODING=utf-8 timeout 60 python:*)",
+      "Bash(PYTHONPATH=. python:*)",
+      "Bash(find D:\\\\zwj_project\\\\OmniCore:*)",
+      "Bash(git:*)"
+    ]
+  }
+}

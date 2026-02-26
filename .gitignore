@@ -1,0 +1,38 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+dist/
+build/
+*.egg
+
+# Virtual environment
+venv/
+.venv/
+
+# Environment variables (contains API keys!)
+.env
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# ChromaDB data
+data/chroma/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+
+# Playwright
+playwright-report/
+
+# Misc
+*.xlsx
+*.csv
+nul
