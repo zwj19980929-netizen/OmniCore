@@ -330,6 +330,9 @@ class FileWorker:
 
     def _collect_data_items(self, params: Dict[str, Any], shared_memory: Dict[str, Any], task: TaskItem) -> List[Dict[str, Any]]:
         """从 shared_memory 收集数据项，支持单源和多源"""
+        logger.debug(f"shared_memory keys: {list(shared_memory.keys())}")
+        logger.debug(f"params data_source: {params.get('data_source')}, data_sources: {params.get('data_sources')}")
+
         # 多数据源合并
         data_sources = params.get("data_sources")
         if isinstance(data_sources, list) and data_sources:
@@ -346,11 +349,22 @@ class FileWorker:
             elif isinstance(source_data, list) and source_data:
                 return [{"data": str(item)} for item in source_data]
 
+        # 模糊匹配：data_source 可能是 "task_1" 但实际 key 是 "task_1_scrape" 之类
+        if data_source:
+            for key in shared_memory:
+                if data_source in key or key in data_source:
+                    value = shared_memory[key]
+                    if isinstance(value, list) and value and isinstance(value[0], dict):
+                        logger.debug(f"模糊匹配到数据源: {key}")
+                        return value
+
         # fallback: 查找共享内存中的任何列表数据
         for key, value in shared_memory.items():
             if isinstance(value, list) and value and isinstance(value[0], dict):
+                logger.debug(f"fallback 使用数据源: {key}")
                 return value
 
+        logger.warning(f"未找到任何可用数据，shared_memory 内容: {list(shared_memory.keys())}")
         return []
 
     def execute(self, task: TaskItem, shared_memory: Dict[str, Any]) -> Dict[str, Any]:

@@ -196,6 +196,65 @@ class WebWorker:
 
         return None
 
+    async def explore_for_data_page(self, page: Page, task_description: str) -> Optional[str]:
+        """
+        当前页面没有目标数据时，分析页面上的导航链接，找到数据所在的子页面。
+        返回最可能包含数据的 URL，找不到则返回 None。
+        """
+        log_agent_action(self.name, "探索页面导航，寻找数据页面")
+
+        # 提取页面上所有链接
+        links = await page.evaluate("""() => {
+            const anchors = document.querySelectorAll('a[href]');
+            const results = [];
+            for (const a of anchors) {
+                const href = a.href;
+                const text = a.innerText.trim();
+                if (href && text && text.length < 50 && !href.startsWith('javascript:')) {
+                    results.push({text, href});
+                }
+            }
+            return results.slice(0, 50);
+        }""")
+
+        if not links:
+            return None
+
+        links_text = "\n".join([f"- [{l['text']}]({l['href']})" for l in links])
+
+        response = self.llm.chat_with_system(
+            system_prompt=f"""你是一个网页导航专家。用户想要获取特定数据，但当前页面是网站首页或非数据页。
+请从下面的链接列表中，找出最可能包含目标数据的链接。
+
+## 用户任务
+{task_description}
+
+## 当前页面 URL
+{page.url}
+
+## 页面上的链接
+{links_text}
+
+返回 JSON：
+```json
+{{"target_url": "最可能包含数据的链接URL", "reasoning": "为什么选这个链接"}}
+```
+
+如果没有合适的链接，target_url 设为空字符串。""",
+            user_message="请分析哪个链接最可能包含目标数据",
+            temperature=0.2,
+            json_mode=True,
+        )
+
+        try:
+            result = self.llm.parse_json_response(response)
+            target = result.get("target_url", "")
+            if target:
+                log_agent_action(self.name, "找到数据页面", target[:80])
+            return target or None
+        except:
+            return None
+
     async def analyze_page_structure(
         self,
         page: Page,
@@ -214,8 +273,8 @@ class WebWorker:
         html = re.sub(r'\s+', ' ', html)
 
         # 截取
-        if len(html) > 8000:
-            html = html[:8000] + "\n... (truncated)"
+        if len(html) > 15000:
+            html = html[:15000] + "\n... (truncated)"
 
         response = self.llm.chat_with_system(
             system_prompt=PAGE_ANALYSIS_PROMPT.format(
@@ -331,6 +390,28 @@ class WebWorker:
 
         page = await self._create_stealth_page()
 
+        # 用于捕获 SPA 页面的 API 响应数据
+        api_responses = []
+
+        async def _capture_api_response(response):
+            """拦截 XHR/Fetch API 响应，捕获 JSON 数据"""
+            try:
+                content_type = response.headers.get("content-type", "")
+                if "json" in content_type and response.status == 200:
+                    body = await response.json()
+                    # 只保留包含列表数据的响应（通常是数组或包含数组的对象）
+                    if isinstance(body, list) and len(body) > 0:
+                        api_responses.append({"url": response.url, "data": body})
+                    elif isinstance(body, dict):
+                        # 查找响应中的列表字段
+                        for key, val in body.items():
+                            if isinstance(val, list) and len(val) >= 3 and isinstance(val[0], dict):
+                                api_responses.append({"url": response.url, "data": val, "key": key})
+            except:
+                pass
+
+        page.on("response", _capture_api_response)
+
         try:
             # Step 2: 访问页面
             log_agent_action(self.name, "访问页面", url)
@@ -339,9 +420,16 @@ class WebWorker:
 
             # 等待页面稳定
             try:
-                await page.wait_for_load_state("networkidle", timeout=10000)
+                await page.wait_for_load_state("networkidle", timeout=15000)
             except:
                 pass  # 超时也继续
+
+            # 等待动态内容渲染（SPA 页面需要额外等待）
+            try:
+                await page.wait_for_selector("table, .list, ul li, [class*='list'], [class*='item'], .el-table", timeout=10000)
+            except:
+                # 没找到常见列表元素，多等一会儿让 JS 执行完
+                await self._human_like_delay(3000, 5000)
 
             # Step 2.5: 检测并处理验证码
             try:
@@ -375,31 +463,66 @@ class WebWorker:
             # 模拟人类行为
             await self._scroll_page(page)
 
-            # Step 3: 分析页面结构
-            config = await self.analyze_page_structure(page, task_description)
+            # Step 3-5: 提取数据（带自主探索重试）
+            max_attempts = 3
+            data = []
 
-            if not config.get("item_selector"):
-                # 尝试常见的选择器
-                log_warning("LLM 未返回有效选择器，尝试通用选择器")
-                common_selectors = [
-                    "table tbody tr",
-                    "table tr:not(:first-child)",
-                    ".list-item",
-                    ".item",
-                    "ul.list li",
-                    ".vulnerability-list tr",
-                    ".data-list tr",
-                ]
-                for sel in common_selectors:
-                    items = await page.query_selector_all(sel)
-                    if len(items) >= 3:
-                        config["item_selector"] = sel
-                        config["fields"] = {"title": "td:nth-child(2)", "link": "a"}
-                        log_agent_action(self.name, f"使用通用选择器", sel)
-                        break
+            for attempt in range(max_attempts):
+                if attempt > 0:
+                    log_agent_action(self.name, f"第 {attempt + 1} 次尝试提取数据", page.url[:60])
 
-            # Step 4: 提取数据
-            data = await self.extract_data_with_selectors(page, config, limit)
+                # Step 3: 分析页面结构
+                config = await self.analyze_page_structure(page, task_description)
+
+                if config.get("item_selector"):
+                    # Step 4: 用选择器提取数据
+                    data = await self.extract_data_with_selectors(page, config, limit)
+
+                if not data:
+                    # 尝试通用选择器
+                    common_selectors = [
+                        "table tbody tr", "table tr:not(:first-child)",
+                        ".list-item", ".item", "ul.list li",
+                        ".el-table__row", "[class*='vuln'] tr", "[class*='list'] li",
+                    ]
+                    for sel in common_selectors:
+                        items = await page.query_selector_all(sel)
+                        if len(items) >= 3:
+                            config["item_selector"] = sel
+                            config["fields"] = {"title": "td:nth-child(2)", "link": "a"}
+                            data = await self.extract_data_with_selectors(page, config, limit)
+                            if data:
+                                break
+
+                if not data and api_responses:
+                    # 尝试使用拦截到的 API 数据
+                    best_api = max(api_responses, key=lambda x: len(x["data"]))
+                    data = best_api["data"][:limit]
+                    log_success(f"从 API 响应中提取到 {len(data)} 条数据")
+
+                if data:
+                    break
+
+                # 数据为空，尝试探索页面导航找到正确的数据页
+                if attempt < max_attempts - 1:
+                    log_agent_action(self.name, "当前页面无数据，尝试探索导航链接")
+                    next_url = await self.explore_for_data_page(page, task_description)
+                    if next_url and next_url != page.url:
+                        api_responses.clear()
+                        await page.goto(next_url, wait_until="domcontentloaded", timeout=30000)
+                        await self._human_like_delay(2000, 4000)
+                        try:
+                            await page.wait_for_load_state("networkidle", timeout=15000)
+                        except:
+                            pass
+                        # 等待动态内容
+                        try:
+                            await page.wait_for_selector("table, .list, ul li, [class*='list'], [class*='item'], .el-table", timeout=10000)
+                        except:
+                            await self._human_like_delay(3000, 5000)
+                        await self._scroll_page(page)
+                    else:
+                        break  # 没有新页面可探索了
 
             # 处理相对链接
             base_url = "/".join(url.split("/")[:3])
@@ -412,9 +535,9 @@ class WebWorker:
                             item[key] = url.rsplit("/", 1)[0] + "/" + item[key]
 
             if data:
-                log_success(f"成功提取 {len(data)} 条数据")
+                log_success(f"最终成功提取 {len(data)} 条数据")
             else:
-                log_warning("未能提取到数据")
+                log_warning("所有尝试均未能提取到数据")
 
             return {
                 "success": len(data) > 0,

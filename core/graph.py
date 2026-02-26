@@ -108,16 +108,29 @@ def human_confirm_node(state: OmniCoreState) -> OmniCoreState:
 
 def finalize_node(state: OmniCoreState) -> OmniCoreState:
     """最终输出节点"""
-    # 如果没有任务（information_query），从 Router 的 reasoning 中提取回答
+    # 如果没有任务（information_query / 聊天 / 追问），用 LLM 生成面向用户的回复
     if not state["task_queue"]:
-        # 从 messages 中提取 Router 的分析结果
+        # 提取 Router 的分析
+        router_reasoning = ""
         for msg in reversed(state.get("messages", [])):
             content = getattr(msg, "content", "")
             if "Router 分析完成" in content:
-                state["final_output"] = content.replace("Router 分析完成: ", "")
+                router_reasoning = content.replace("Router 分析完成: ", "")
                 break
-        if not state.get("final_output"):
-            state["final_output"] = "没有需要执行的任务。"
+
+        # 用 LLM 基于 Router 的分析和用户原始输入，生成面向用户的回复
+        from core.llm import LLMClient
+        try:
+            llm = LLMClient()
+            response = llm.chat_with_system(
+                system_prompt="你是 OmniCore 智能助手。请根据分析结果，用简洁友好的语言直接回答用户的问题。不要提及内部系统、Router、Worker 等技术细节。",
+                user_message=f"用户问题：{state['user_input']}\n\n分析结果：{router_reasoning}",
+                temperature=0.7,
+            )
+            state["final_output"] = response.content
+        except:
+            state["final_output"] = router_reasoning or "抱歉，我没有理解你的意思，请再说一次。"
+
         state["execution_status"] = "completed"
         state["critic_approved"] = True
         return state
