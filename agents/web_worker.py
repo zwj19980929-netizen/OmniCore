@@ -13,6 +13,14 @@ from core.llm import LLMClient
 from utils.logger import log_agent_action, logger, log_success, log_error, log_warning
 from utils.captcha_solver import CaptchaSolver
 
+# 延迟导入避免循环引用（agents/__init__.py → web_worker → core → graph → agents）
+def _import_paod():
+    from agents.paod import (
+        classify_failure, make_trace_step, evaluate_success_criteria,
+        execute_fallback, MAX_FALLBACK_ATTEMPTS,
+    )
+    return classify_failure, make_trace_step, evaluate_success_criteria, execute_fallback, MAX_FALLBACK_ATTEMPTS
+
 
 # URL 和导航分析提示词
 URL_ANALYSIS_PROMPT = """你是一个智能网站导航专家。根据用户任务，推理出最佳的目标 URL。
@@ -641,26 +649,92 @@ class WebWorker:
         task: TaskItem,
         shared_memory: Dict[str, Any],
     ) -> Dict[str, Any]:
-        """异步执行 Web 任务"""
+        """异步执行 Web 任务（PAOD 微反思包装）"""
+        classify_failure, make_trace_step, evaluate_success_criteria, execute_fallback, MAX_FALLBACK_ATTEMPTS = _import_paod()
+
         params = task["params"]
         url = params.get("url", "")
         limit = params.get("limit", 10)
         task_description = task["description"]
+        trace: List[Dict[str, Any]] = task.get("execution_trace", [])
+        step_no = len(trace) + 1
 
-        return await self.smart_scrape(url, task_description, limit)
+        # --- 主执行 ---
+        trace.append(make_trace_step(step_no, "执行 smart_scrape", f"url={url}, limit={limit}", "", ""))
+        result = await self.smart_scrape(url, task_description, limit)
+        trace[-1]["observation"] = f"success={result.get('success')}, count={result.get('count', 0)}"
+
+        # --- 评估 success_criteria ---
+        criteria = task.get("success_criteria", [])
+        if result.get("success") and evaluate_success_criteria(criteria, result):
+            trace[-1]["decision"] = "criteria_met → done"
+            task["execution_trace"] = trace
+            return result
+
+        # --- 不满足 → 尝试 fallback ---
+        trace[-1]["decision"] = "criteria_not_met → try fallback"
+        fb_index = 0
+        while fb_index < MAX_FALLBACK_ATTEMPTS:
+            fb = execute_fallback(task, fb_index, shared_memory)
+            if fb is None:
+                break
+            fb_index += 1
+            step_no += 1
+
+            if fb["action"] == "switch_worker":
+                # 返回特殊信号，让 process() 处理 worker 切换
+                trace.append(make_trace_step(step_no, f"switch_worker → {fb['target']}", "signal", "", "escalate"))
+                task["execution_trace"] = trace
+                result["_switch_worker"] = fb["target"]
+                result["_switch_params"] = fb.get("param_patch", {})
+                return result
+
+            # retry with param_patch
+            patch = fb.get("param_patch", {})
+            patched_params = {**params, **patch}
+            retry_url = patched_params.get("url", url)
+            retry_limit = patched_params.get("limit", limit)
+            trace.append(make_trace_step(step_no, f"retry #{fb_index}", f"url={retry_url}, patch={patch}", "", ""))
+
+            result = await self.smart_scrape(retry_url, task_description, retry_limit)
+            trace[-1]["observation"] = f"success={result.get('success')}, count={result.get('count', 0)}"
+
+            if result.get("success") and evaluate_success_criteria(criteria, result):
+                trace[-1]["decision"] = "criteria_met → done"
+                task["execution_trace"] = trace
+                return result
+            trace[-1]["decision"] = "still_failing → next fallback"
+
+        # --- 所有 fallback 耗尽 ---
+        if not result.get("success"):
+            task["failure_type"] = classify_failure(result.get("error", ""))
+        task["execution_trace"] = trace
+        return result
 
     def execute(self, task: TaskItem, shared_memory: Dict[str, Any]) -> Dict[str, Any]:
         """同步执行入口"""
         return asyncio.run(self.execute_async(task, shared_memory))
 
     def process(self, state: OmniCoreState) -> OmniCoreState:
-        """LangGraph 节点函数"""
+        """LangGraph 节点函数（PAOD 增强）"""
+        classify_failure = _import_paod()[0]
+
         async def _process_all():
             for idx, task in enumerate(state["task_queue"]):
                 if task["task_type"] == "web_worker" and task["status"] == "pending":
                     state["task_queue"][idx]["status"] = "running"
 
                     result = await self.execute_async(task, state["shared_memory"])
+
+                    # 检测 switch_worker 信号
+                    if isinstance(result, dict) and result.get("_switch_worker"):
+                        target = result.pop("_switch_worker")
+                        patch = result.pop("_switch_params", {})
+                        log_warning(f"WebWorker 触发 switch_worker → {target}")
+                        state["task_queue"][idx]["task_type"] = target
+                        state["task_queue"][idx]["params"].update(patch)
+                        state["task_queue"][idx]["status"] = "pending"
+                        continue
 
                     state["task_queue"][idx]["status"] = (
                         "completed" if result.get("success") else "failed"
@@ -671,6 +745,9 @@ class WebWorker:
                         state["shared_memory"][task["task_id"]] = result["data"]
 
                     if not result.get("success"):
+                        state["task_queue"][idx]["failure_type"] = classify_failure(
+                            result.get("error", "")
+                        )
                         state["error_trace"] = result.get("error", "未知错误")
 
             await self._close_browser()

@@ -3,9 +3,9 @@ OmniCore File Worker Agent
 负责本地文件的读取、写入、创建操作
 """
 import os
-from pathlib import Path
 from typing import Dict, Any, Optional, List
 from datetime import datetime
+from pathlib import Path
 
 import pandas as pd
 
@@ -13,6 +13,10 @@ from core.state import OmniCoreState, TaskItem
 from utils.logger import log_agent_action, logger, log_success, log_error
 from utils.human_confirm import HumanConfirm
 from config.settings import settings
+
+def _import_paod():
+    from agents.paod import classify_failure, make_trace_step
+    return classify_failure, make_trace_step
 
 
 class FileWorker:
@@ -388,7 +392,7 @@ class FileWorker:
 
     def execute(self, task: TaskItem, shared_memory: Dict[str, Any]) -> Dict[str, Any]:
         """
-        执行文件操作任务
+        执行文件操作任务（PAOD 增强：写入后硬验证）
 
         Args:
             task: 任务项
@@ -397,8 +401,12 @@ class FileWorker:
         Returns:
             执行结果
         """
+        classify_failure, make_trace_step = _import_paod()
+
         params = task["params"]
         action = params.get("action", "")
+        trace: List[Dict[str, Any]] = task.get("execution_trace", [])
+        step_no = len(trace) + 1
 
         # 智能判断操作类型：如果有 data_source 或描述中包含"保存/写入/save/write"，则为写入操作
         if not action:
@@ -425,33 +433,62 @@ class FileWorker:
             data_items = self._collect_data_items(params, shared_memory, task)
             report_title = self._generate_report_title(task["description"])
 
+            # Step 1: 写入
+            trace.append(make_trace_step(step_no, f"write file ({fmt})", file_path, "", ""))
+
             # 按格式分发到对应写入方法
             if data_items and fmt in ("xlsx", "csv", "markdown", "html"):
                 if fmt == "xlsx":
-                    return self._write_excel(file_path, data_items, report_title)
+                    result = self._write_excel(file_path, data_items, report_title)
                 elif fmt == "csv":
-                    return self._write_csv(file_path, data_items)
+                    result = self._write_csv(file_path, data_items)
                 elif fmt == "markdown":
-                    return self._write_markdown(file_path, data_items, report_title)
+                    result = self._write_markdown(file_path, data_items, report_title)
                 elif fmt == "html":
-                    return self._write_html(file_path, data_items, report_title)
-
-            # fallback: txt 格式（向后兼容）
-            if data_items:
-                content = self.format_data_to_text(data_items, report_title)
+                    result = self._write_html(file_path, data_items, report_title)
             else:
-                content = params.get("content", "No data to write")
-            return self.write_file(file_path, content, require_confirm=False)
+                # fallback: txt 格式（向后兼容）
+                if data_items:
+                    content = self.format_data_to_text(data_items, report_title)
+                else:
+                    content = params.get("content", "No data to write")
+                result = self.write_file(file_path, content, require_confirm=False)
+
+            trace[-1]["observation"] = f"success={result.get('success')}, path={result.get('file_path', '')}"
+
+            # Step 2: 硬验证 — 文件存在且非空
+            step_no += 1
+            trace.append(make_trace_step(step_no, "verify file", result.get("file_path", ""), "", ""))
+            actual_path = Path(result.get("file_path", ""))
+            if result.get("success") and actual_path.exists() and actual_path.stat().st_size > 0:
+                trace[-1]["observation"] = f"exists=True, size={actual_path.stat().st_size}"
+                trace[-1]["decision"] = "verified → done"
+            else:
+                trace[-1]["observation"] = f"exists={actual_path.exists()}, size={actual_path.stat().st_size if actual_path.exists() else 0}"
+                trace[-1]["decision"] = "verification_failed"
+                result["success"] = False
+                result["error"] = result.get("error", "文件验证失败：文件不存在或为空")
+                task["failure_type"] = classify_failure(result.get("error", ""))
+
+            task["execution_trace"] = trace
+            return result
 
         elif action == "read":
             file_path = params.get("file_path", "")
-            return self.read_file(file_path)
+            trace.append(make_trace_step(step_no, "read file", file_path, "", ""))
+            result = self.read_file(file_path)
+            trace[-1]["observation"] = f"success={result.get('success')}"
+            trace[-1]["decision"] = "done" if result.get("success") else "failed"
+            if not result.get("success"):
+                task["failure_type"] = classify_failure(result.get("error", ""))
+            task["execution_trace"] = trace
+            return result
 
         else:
-            return {
-                "success": False,
-                "error": f"未知操作类型: {action}",
-            }
+            result = {"success": False, "error": f"未知操作类型: {action}"}
+            task["failure_type"] = "invalid_input"
+            task["execution_trace"] = trace
+            return result
 
     def process(self, state: OmniCoreState) -> OmniCoreState:
         """

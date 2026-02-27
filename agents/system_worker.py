@@ -12,6 +12,10 @@ from utils.logger import log_agent_action, logger, log_success, log_error, log_w
 from utils.human_confirm import HumanConfirm
 from config.settings import settings
 
+def _import_paod():
+    from agents.paod import classify_failure, make_trace_step, execute_fallback, MAX_FALLBACK_ATTEMPTS
+    return classify_failure, make_trace_step, execute_fallback, MAX_FALLBACK_ATTEMPTS
+
 
 class SystemWorker:
     """
@@ -215,7 +219,7 @@ class SystemWorker:
 
     def execute(self, task: TaskItem, shared_memory: Dict[str, Any]) -> Dict[str, Any]:
         """
-        执行系统任务
+        执行系统任务（PAOD 增强：fallback + trace）
 
         Args:
             task: 任务项
@@ -224,24 +228,67 @@ class SystemWorker:
         Returns:
             执行结果
         """
+        classify_failure, make_trace_step, execute_fallback, MAX_FALLBACK_ATTEMPTS = _import_paod()
+
         params = task["params"]
         action = params.get("action", "")
+        trace = task.get("execution_trace", [])
+        step_no = len(trace) + 1
 
         log_agent_action(self.name, f"执行任务: {action}", task["description"])
 
+        # --- 主执行 ---
+        trace.append(make_trace_step(step_no, f"execute {action}", str(params)[:100], "", ""))
+        result = self._dispatch_action(action, params)
+        trace[-1]["observation"] = f"success={result.get('success')}, rc={result.get('return_code', 'N/A')}"
+
+        if result.get("success"):
+            trace[-1]["decision"] = "done"
+            task["execution_trace"] = trace
+            return result
+
+        # --- 失败 → 尝试 fallback ---
+        trace[-1]["decision"] = "failed → try fallback"
+        fb_index = 0
+        while fb_index < MAX_FALLBACK_ATTEMPTS:
+            fb = execute_fallback(task, fb_index, shared_memory)
+            if fb is None or fb["action"] != "retry":
+                break
+            fb_index += 1
+            step_no += 1
+
+            patch = fb.get("param_patch", {})
+            patched_params = {**params, **patch}
+            patched_action = patched_params.get("action", action)
+            trace.append(make_trace_step(step_no, f"retry #{fb_index}", f"patch={patch}", "", ""))
+
+            result = self._dispatch_action(patched_action, patched_params)
+            trace[-1]["observation"] = f"success={result.get('success')}"
+
+            if result.get("success"):
+                trace[-1]["decision"] = "done"
+                task["execution_trace"] = trace
+                return result
+            trace[-1]["decision"] = "still_failing"
+
+        # --- 所有 fallback 耗尽 ---
+        task["failure_type"] = classify_failure(result.get("error", ""))
+        task["execution_trace"] = trace
+        return result
+
+    def _dispatch_action(self, action: str, params: Dict[str, Any]) -> Dict[str, Any]:
+        """根据 action 分发到具体执行方法"""
         if action == "execute_command":
             return self.execute_command(
                 command=params.get("command", ""),
                 working_dir=params.get("working_dir"),
                 timeout=params.get("timeout", 30),
             )
-
         elif action == "keyboard":
             return self.simulate_keyboard(
                 text=params.get("text", ""),
                 interval=params.get("interval", 0.05),
             )
-
         elif action == "mouse_click":
             return self.simulate_mouse_click(
                 x=params.get("x", 0),
@@ -249,23 +296,20 @@ class SystemWorker:
                 button=params.get("button", "left"),
                 clicks=params.get("clicks", 1),
             )
-
         elif action == "screenshot":
             return self.take_screenshot(
                 save_path=params.get("save_path"),
                 region=params.get("region"),
             )
-
         else:
-            return {
-                "success": False,
-                "error": f"未知操作类型: {action}",
-            }
+            return {"success": False, "error": f"未知操作类型: {action}"}
 
     def process(self, state: OmniCoreState) -> OmniCoreState:
         """
         LangGraph 节点函数：处理系统相关任务
         """
+        classify_failure = _import_paod()[0]
+
         for idx, task in enumerate(state["task_queue"]):
             if task["task_type"] == "system_worker" and task["status"] == "pending":
                 state["task_queue"][idx]["status"] = "running"
@@ -280,6 +324,7 @@ class SystemWorker:
                 state["shared_memory"][task["task_id"]] = result
 
                 if not result.get("success"):
+                    state["task_queue"][idx]["failure_type"] = task.get("failure_type") or classify_failure(result.get("error", ""))
                     state["error_trace"] = result.get("error", "未知错误")
 
         return state
