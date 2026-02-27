@@ -36,3 +36,8 @@ playwright-report/
 *.xlsx
 *.csv
 nul
+
+# Runtime artifacts
+error.txt
+outputs/
+reports/
