@@ -64,6 +64,9 @@ class OmniCoreState(TypedDict):
     # 执行状态: idle, routing, executing, reviewing, completed, error
     execution_status: str
 
+    # 重规划计数（防止无限循环）
+    replan_count: int
+
 
 def create_initial_state(user_input: str) -> OmniCoreState:
     """创建初始状态"""
@@ -82,4 +85,5 @@ def create_initial_state(user_input: str) -> OmniCoreState:
         error_trace="",
         final_output="",
         execution_status="idle",
+        replan_count=0,
     )

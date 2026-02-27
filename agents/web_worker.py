@@ -97,19 +97,29 @@ class WebWorker:
         self._browser: Optional[Browser] = None
         self.captcha_solver = CaptchaSolver()
 
-    async def _ensure_browser(self) -> Browser:
+    async def _ensure_browser(self, headless: bool = True) -> Browser:
         """启动浏览器，配置反检测参数"""
-        if self._browser is None or not self._browser.is_connected():
-            self._playwright = await async_playwright().start()
-            self._browser = await self._playwright.chromium.launch(
-                headless=True,
-                args=[
-                    '--disable-blink-features=AutomationControlled',
-                    '--disable-dev-shm-usage',
-                    '--no-sandbox',
-                ]
-            )
+        if self._browser is not None and self._browser.is_connected():
+            return self._browser
+        # 关闭旧实例
+        await self._close_browser()
+        self._playwright = await async_playwright().start()
+        self._browser = await self._playwright.chromium.launch(
+            headless=headless,
+            args=[
+                '--disable-blink-features=AutomationControlled',
+                '--disable-dev-shm-usage',
+                '--no-sandbox',
+            ]
+        )
+        self._headless = headless
         return self._browser
+
+    async def _restart_browser_visible(self):
+        """反爬触发时，切换到有头模式重启浏览器"""
+        log_agent_action(self.name, "检测到反爬，切换到有头浏览器模式")
+        await self._close_browser()
+        await self._ensure_browser(headless=False)
 
     async def _create_stealth_page(self) -> Page:
         """创建具有反检测能力的页面"""
@@ -254,6 +264,43 @@ class WebWorker:
             return target or None
         except:
             return None
+
+    def validate_data_quality(self, data: List[Dict], task_description: str, limit: int) -> Dict[str, Any]:
+        """
+        让 LLM 判断抓到的数据是否符合任务要求。
+        返回 {"valid": bool, "reason": str, "suggestion": str}
+        """
+        if not data:
+            return {"valid": False, "reason": "数据为空", "suggestion": "换页面或换选择器"}
+
+        sample = data[:3]
+        sample_str = json.dumps(sample, ensure_ascii=False, default=str)[:1500]
+
+        response = self.llm.chat_with_system(
+            system_prompt="""你是一个数据质量审查专家。判断抓取到的数据是否符合用户的任务要求。
+
+请根据用户的任务描述，自主判断：
+1. 抓到的数据和用户想要的是同一类东西吗？
+2. 数据的关键信息是否足够？
+3. 如果数据不对，你觉得应该去哪里找才对？
+
+返回 JSON：
+```json
+{
+    "valid": true,
+    "reason": "判断理由",
+    "suggestion": "如果数据不对，建议下一步怎么做"
+}
+```""",
+            user_message=f"任务：{task_description}\n\n抓到的数据样本（前3条）：\n{sample_str}\n\n共抓到 {len(data)} 条，要求 {limit} 条",
+            temperature=0.2,
+            json_mode=True,
+        )
+
+        try:
+            return self.llm.parse_json_response(response)
+        except:
+            return {"valid": True, "reason": "审查失败，默认通过", "suggestion": ""}
 
     async def analyze_page_structure(
         self,
@@ -413,9 +460,31 @@ class WebWorker:
         page.on("response", _capture_api_response)
 
         try:
-            # Step 2: 访问页面
+            # Step 2: 访问页面（带重试 + 反爬自适应）
             log_agent_action(self.name, "访问页面", url)
-            await page.goto(url, wait_until="domcontentloaded", timeout=30000)
+            page_loaded = False
+            for goto_attempt in range(3):
+                try:
+                    wait_strategy = "domcontentloaded" if goto_attempt < 2 else "commit"
+                    await page.goto(url, wait_until=wait_strategy, timeout=45000)
+                    page_loaded = True
+                    break
+                except Exception as goto_err:
+                    if goto_attempt == 0:
+                        # 第一次失败：切换到有头浏览器模式绕过反爬
+                        log_warning(f"页面加载失败，切换到有头浏览器模式重试...")
+                        await page.close()
+                        await self._restart_browser_visible()
+                        page = await self._create_stealth_page()
+                        page.on("response", _capture_api_response)
+                    elif goto_attempt == 1:
+                        log_warning(f"第 3 次尝试，降低等待要求...")
+                    else:
+                        raise goto_err
+
+            if not page_loaded:
+                return {"success": False, "error": "页面加载失败（可能被反爬拦截）", "data": [], "url": url}
+
             await self._human_like_delay(1500, 3000)
 
             # 等待页面稳定
@@ -501,9 +570,17 @@ class WebWorker:
                     log_success(f"从 API 响应中提取到 {len(data)} 条数据")
 
                 if data:
-                    break
+                    # 数据自检：验证抓到的数据是否符合任务要求
+                    quality = self.validate_data_quality(data, task_description, limit)
+                    if quality.get("valid"):
+                        log_success(f"数据质量验证通过: {quality.get('reason', '')[:50]}")
+                        break
+                    else:
+                        log_warning(f"数据不符合要求: {quality.get('reason', '')[:80]}")
+                        log_agent_action(self.name, "建议", quality.get("suggestion", "")[:80])
+                        data = []  # 清空，继续尝试
 
-                # 数据为空，尝试探索页面导航找到正确的数据页
+                # 数据为空或不合格，尝试探索页面导航找到正确的数据页
                 if attempt < max_attempts - 1:
                     log_agent_action(self.name, "当前页面无数据，尝试探索导航链接")
                     next_url = await self.explore_for_data_page(page, task_description)

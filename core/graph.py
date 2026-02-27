@@ -1,6 +1,7 @@
 """
 OmniCore LangGraph DAG 编排
 将所有 Agent 串联成完整的执行图
+支持 Worker 失败后反思重规划
 """
 from typing import Literal
 from langgraph.graph import StateGraph, END
@@ -12,7 +13,8 @@ from agents.file_worker import FileWorker
 from agents.system_worker import SystemWorker
 from agents.critic import CriticAgent
 from agents.browser_agent import BrowserAgent
-from utils.logger import log_agent_action, log_success, log_error
+from core.llm import LLMClient
+from utils.logger import log_agent_action, log_success, log_error, log_warning
 from utils.human_confirm import HumanConfirm
 from config.settings import settings
 
@@ -24,6 +26,8 @@ file_worker = FileWorker()
 system_worker = SystemWorker()
 critic_agent = CriticAgent()
 browser_agent = BrowserAgent()
+
+MAX_REPLAN = 2  # 最多重规划 2 次
 
 
 def route_node(state: OmniCoreState) -> OmniCoreState:
@@ -84,6 +88,95 @@ def browser_agent_node(state: OmniCoreState) -> OmniCoreState:
     return state
 
 
+def replanner_node(state: OmniCoreState) -> OmniCoreState:
+    """反思重规划节点：分析失败原因，制定新策略"""
+    state["replan_count"] = state.get("replan_count", 0) + 1
+    log_agent_action("Replanner", f"开始反思重规划（第 {state['replan_count']} 次）")
+
+    # 收集失败信息
+    failures = []
+    for task in state["task_queue"]:
+        if task["status"] == "failed":
+            error = task.get("result", {}).get("error", "未知错误") if isinstance(task.get("result"), dict) else "未知错误"
+            failures.append(f"- 任务: {task['description']}\n  失败原因: {error}")
+
+    failure_summary = "\n".join(failures) if failures else "无明确失败信息，但任务结果不符合预期"
+
+    # 让 LLM 分析失败原因并重新规划
+    llm = LLMClient()
+    response = llm.chat_with_system(
+        system_prompt="""你是 OmniCore 的重规划专家。之前的任务执行失败了，你需要分析原因并制定新的执行策略。
+
+你要像一个有经验的人一样思考：
+1. 为什么失败了？是 URL 不对？页面结构变了？被反爬了？数据不在这个页面？
+2. 新的策略是什么？换个 URL？换个方法？用搜索引擎找？用 browser_agent 代替 web_worker？
+3. 给出具体可执行的新任务列表
+
+返回 JSON：
+```json
+{
+    "analysis": "失败原因分析",
+    "new_strategy": "新策略描述",
+    "tasks": [
+        {
+            "task_id": "replan_task_1",
+            "task_type": "worker类型",
+            "description": "新任务描述",
+            "params": {},
+            "priority": 10,
+            "depends_on": []
+        }
+    ]
+}
+```
+
+可用的 worker 类型：web_worker, browser_agent, file_worker, system_worker
+""",
+        user_message=f"用户原始需求：{state['user_input']}\n\n失败的任务：\n{failure_summary}\n\n请分析原因并重新规划。",
+        temperature=0.3,
+        json_mode=True,
+    )
+
+    try:
+        result = llm.parse_json_response(response)
+        log_agent_action("Replanner", f"分析: {result.get('analysis', '')[:80]}")
+        log_agent_action("Replanner", f"新策略: {result.get('new_strategy', '')[:80]}")
+
+        # 用新任务替换失败的任务
+        import uuid
+        new_tasks = []
+        for task_data in result.get("tasks", []):
+            from core.state import TaskItem
+            new_tasks.append(TaskItem(
+                task_id=task_data.get("task_id", f"replan_{uuid.uuid4().hex[:8]}"),
+                task_type=task_data.get("task_type", "web_worker"),
+                description=task_data.get("description", ""),
+                params=task_data.get("params", {}),
+                status="pending",
+                result=None,
+                priority=task_data.get("priority", 10),
+            ))
+
+        if new_tasks:
+            # 保留已完成的任务，替换失败的
+            completed = [t for t in state["task_queue"] if t["status"] == "completed"]
+            state["task_queue"] = completed + new_tasks
+            state["error_trace"] = ""
+            log_success(f"重规划完成，新增 {len(new_tasks)} 个任务")
+        else:
+            log_warning("重规划未产生新任务")
+
+    except Exception as e:
+        log_error(f"重规划失败: {e}")
+
+    from langchain_core.messages import SystemMessage
+    state["messages"].append(
+        SystemMessage(content=f"Replanner 重规划完成（第 {state['replan_count']} 次）")
+    )
+
+    return state
+
+
 def critic_node(state: OmniCoreState) -> OmniCoreState:
     """Critic 审查节点"""
     return critic_agent.review(state)
@@ -108,18 +201,13 @@ def human_confirm_node(state: OmniCoreState) -> OmniCoreState:
 
 def finalize_node(state: OmniCoreState) -> OmniCoreState:
     """最终输出节点"""
-    # 如果没有任务（information_query / 聊天 / 追问），用 LLM 生成面向用户的回复
     if not state["task_queue"]:
-        # 提取 Router 的分析
         router_reasoning = ""
         for msg in reversed(state.get("messages", [])):
             content = getattr(msg, "content", "")
             if "Router 分析完成" in content:
                 router_reasoning = content.replace("Router 分析完成: ", "")
                 break
-
-        # 用 LLM 基于 Router 的分析和用户原始输入，生成面向用户的回复
-        from core.llm import LLMClient
         try:
             llm = LLMClient()
             response = llm.chat_with_system(
@@ -130,12 +218,10 @@ def finalize_node(state: OmniCoreState) -> OmniCoreState:
             state["final_output"] = response.content
         except:
             state["final_output"] = router_reasoning or "抱歉，我没有理解你的意思，请再说一次。"
-
         state["execution_status"] = "completed"
         state["critic_approved"] = True
         return state
 
-    # 汇总所有任务结果
     results = []
     for task in state["task_queue"]:
         if task["status"] == "completed":
@@ -158,58 +244,56 @@ def finalize_node(state: OmniCoreState) -> OmniCoreState:
 # === 条件路由函数 ===
 
 def should_continue_after_route(state: OmniCoreState) -> Literal["human_confirm", "finalize"]:
-    """路由后决定下一步"""
     if not state["task_queue"]:
         return "finalize"
     return "human_confirm"
 
 
-def should_continue_after_confirm(state: OmniCoreState) -> Literal["execute_workers", "end"]:
-    """人类确认后决定下一步"""
-    if state["human_approved"]:
-        return "execute_workers"
-    return "end"
-
-
 def get_next_worker(state: OmniCoreState) -> Literal["web_worker", "file_worker", "system_worker", "browser_agent", "critic"]:
-    """决定下一个要执行的 Worker"""
     for task in state["task_queue"]:
         if task["status"] == "pending":
             task_type = task["task_type"]
-            if task_type == "web_worker":
-                return "web_worker"
-            elif task_type == "file_worker":
-                return "file_worker"
-            elif task_type == "system_worker":
-                return "system_worker"
-            elif task_type == "browser_agent":
-                return "browser_agent"
-
-    # 所有任务完成，进入审查
+            if task_type in ["web_worker", "file_worker", "system_worker", "browser_agent"]:
+                return task_type
     return "critic"
 
 
-def should_continue_after_worker(state: OmniCoreState) -> Literal["next_worker", "critic"]:
-    """Worker 执行后决定下一步"""
-    # 检查是否还有待执行的任务
-    pending_tasks = [t for t in state["task_queue"] if t["status"] == "pending"]
-    if pending_tasks:
-        return "next_worker"
+def should_replan_or_critic(state: OmniCoreState) -> Literal["replanner", "critic"]:
+    """Worker 全部执行完后，检查是否有失败任务需要重规划"""
+    # 还有 pending 任务，继续执行
+    pending = [t for t in state["task_queue"] if t["status"] == "pending"]
+    if pending:
+        return "critic"  # 不应该到这里，但安全起见
+
+    failed = [t for t in state["task_queue"] if t["status"] == "failed"]
+    if failed and state.get("replan_count", 0) < MAX_REPLAN:
+        return "replanner"
     return "critic"
 
 
-def should_retry_or_finish(state: OmniCoreState) -> Literal["execute_workers", "finalize"]:
-    """审查后决定是否重试"""
+def should_retry_or_finish(state: OmniCoreState) -> Literal["finalize", "replanner"]:
+    """Critic 审查后决定是否重试"""
     if state["critic_approved"]:
         return "finalize"
-    # 可以在这里添加重试逻辑
+    if state.get("replan_count", 0) < MAX_REPLAN:
+        return "replanner"
     return "finalize"
 
 
-def build_graph() -> StateGraph:
-    """构建 OmniCore 执行图"""
+def get_first_worker(state: OmniCoreState) -> str:
+    if not state["human_approved"]:
+        return "end"
+    for task in state["task_queue"]:
+        if task["status"] == "pending":
+            task_type = task["task_type"]
+            if task_type in ["web_worker", "file_worker", "system_worker", "browser_agent"]:
+                return task_type
+    return "critic"
 
-    # 创建图
+
+def build_graph() -> StateGraph:
+    """构建 OmniCore 执行图（含反思重规划循环）"""
+
     graph = StateGraph(OmniCoreState)
 
     # 添加节点
@@ -219,104 +303,69 @@ def build_graph() -> StateGraph:
     graph.add_node("file_worker", file_worker_node)
     graph.add_node("system_worker", system_worker_node)
     graph.add_node("browser_agent", browser_agent_node)
+    graph.add_node("replanner", replanner_node)
     graph.add_node("critic", critic_node)
     graph.add_node("finalize", finalize_node)
 
-    # 设置入口
+    # 入口
     graph.set_entry_point("router")
 
-    # 添加边
-    graph.add_conditional_edges(
-        "router",
-        should_continue_after_route,
-        {
-            "human_confirm": "human_confirm",
-            "finalize": "finalize",
-        }
-    )
+    # Router → human_confirm 或 finalize
+    graph.add_conditional_edges("router", should_continue_after_route, {
+        "human_confirm": "human_confirm",
+        "finalize": "finalize",
+    })
 
-    # 人类确认后，根据第一个任务类型决定去哪个 worker
-    def get_first_worker(state: OmniCoreState) -> str:
-        if not state["human_approved"]:
-            return "end"
+    # human_confirm → 第一个 worker 或 end
+    graph.add_conditional_edges("human_confirm", get_first_worker, {
+        "web_worker": "web_worker",
+        "file_worker": "file_worker",
+        "system_worker": "system_worker",
+        "browser_agent": "browser_agent",
+        "critic": "critic",
+        "end": END,
+    })
+
+    # 每个 Worker 执行后 → 下一个 worker 或检查是否需要重规划
+    worker_edges = {
+        "web_worker": "web_worker",
+        "file_worker": "file_worker",
+        "system_worker": "system_worker",
+        "browser_agent": "browser_agent",
+        "replanner": "replanner",
+        "critic": "critic",
+    }
+
+    def after_worker(state: OmniCoreState) -> str:
+        """Worker 执行后：还有 pending 就继续，有 failed 就重规划，否则审查"""
         for task in state["task_queue"]:
             if task["status"] == "pending":
-                task_type = task["task_type"]
-                if task_type in ["web_worker", "file_worker", "system_worker", "browser_agent"]:
-                    return task_type
+                t = task["task_type"]
+                if t in ["web_worker", "file_worker", "system_worker", "browser_agent"]:
+                    return t
+        failed = [t for t in state["task_queue"] if t["status"] == "failed"]
+        if failed and state.get("replan_count", 0) < MAX_REPLAN:
+            return "replanner"
         return "critic"
 
-    graph.add_conditional_edges(
-        "human_confirm",
-        get_first_worker,
-        {
-            "web_worker": "web_worker",
-            "file_worker": "file_worker",
-            "system_worker": "system_worker",
-            "browser_agent": "browser_agent",
-            "critic": "critic",
-            "end": END,
-        }
-    )
+    for worker in ["web_worker", "file_worker", "system_worker", "browser_agent"]:
+        graph.add_conditional_edges(worker, after_worker, worker_edges)
 
-    # Worker 之间的流转 - 使用统一的 get_next_worker 函数
-    graph.add_conditional_edges(
-        "web_worker",
-        get_next_worker,
-        {
-            "web_worker": "web_worker",
-            "file_worker": "file_worker",
-            "system_worker": "system_worker",
-            "browser_agent": "browser_agent",
-            "critic": "critic",
-        }
-    )
+    # Replanner → 第一个 pending worker 或 critic
+    graph.add_conditional_edges("replanner", get_first_worker, {
+        "web_worker": "web_worker",
+        "file_worker": "file_worker",
+        "system_worker": "system_worker",
+        "browser_agent": "browser_agent",
+        "critic": "critic",
+        "end": END,
+    })
 
-    graph.add_conditional_edges(
-        "file_worker",
-        get_next_worker,
-        {
-            "web_worker": "web_worker",
-            "file_worker": "file_worker",
-            "system_worker": "system_worker",
-            "browser_agent": "browser_agent",
-            "critic": "critic",
-        }
-    )
-
-    graph.add_conditional_edges(
-        "system_worker",
-        get_next_worker,
-        {
-            "web_worker": "web_worker",
-            "file_worker": "file_worker",
-            "system_worker": "system_worker",
-            "browser_agent": "browser_agent",
-            "critic": "critic",
-        }
-    )
-
-    graph.add_conditional_edges(
-        "browser_agent",
-        get_next_worker,
-        {
-            "web_worker": "web_worker",
-            "file_worker": "file_worker",
-            "system_worker": "system_worker",
-            "browser_agent": "browser_agent",
-            "critic": "critic",
-        }
-    )
-
-    # Critic 审查后
-    graph.add_conditional_edges(
-        "critic",
-        should_retry_or_finish,
-        {
-            "execute_workers": "web_worker",
-            "finalize": "finalize",
-        }
-    )
+    # Critic → finalize 或 replanner
+    graph.add_conditional_edges("critic", should_retry_or_finish, {
+        "finalize": "finalize",
+        "replanner": "replanner",
+    })
 
     # 最终节点
     graph.add_edge("finalize", END)

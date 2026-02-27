@@ -86,8 +86,19 @@ class FileWorker:
             # 确保父目录存在
             path.parent.mkdir(parents=True, exist_ok=True)
 
-            # 写入文件
-            path.write_text(content, encoding=encoding)
+            # 写入文件（如果被占用则自动重命名）
+            try:
+                path.write_text(content, encoding=encoding)
+            except PermissionError:
+                # 文件可能被其他程序打开，尝试加时间戳重命名
+                from datetime import datetime
+                stem = path.stem
+                suffix = path.suffix
+                timestamp = datetime.now().strftime("%H%M%S")
+                new_path = path.parent / f"{stem}_{timestamp}{suffix}"
+                new_path.write_text(content, encoding=encoding)
+                path = new_path
+                log_warning(f"原文件被占用，已保存到: {path}")
 
             log_success(f"文件写入成功: {path}")
             return {
@@ -217,8 +228,16 @@ class FileWorker:
         try:
             path.parent.mkdir(parents=True, exist_ok=True)
             df = pd.DataFrame(data_items)
-            with pd.ExcelWriter(str(path), engine="openpyxl") as writer:
-                df.to_excel(writer, sheet_name=title[:31], index=False)
+            try:
+                with pd.ExcelWriter(str(path), engine="openpyxl") as writer:
+                    df.to_excel(writer, sheet_name=title[:31], index=False)
+            except PermissionError:
+                timestamp = datetime.now().strftime("%H%M%S")
+                new_path = path.parent / f"{path.stem}_{timestamp}{path.suffix}"
+                with pd.ExcelWriter(str(new_path), engine="openpyxl") as writer:
+                    df.to_excel(writer, sheet_name=title[:31], index=False)
+                path = new_path
+                log_warning(f"原文件被占用，已保存到: {path}")
             log_success(f"Excel 写入成功: {path}")
             return {"success": True, "file_path": str(path), "format": "xlsx", "rows": len(data_items)}
         except Exception as e:
