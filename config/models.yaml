@@ -1,0 +1,117 @@
+# OmniCore 模型能力配置
+# 模型列表从各厂家 API 动态获取，这里补充 API 无法返回的能力标签和元数据
+
+capability_overrides:
+  gemini:
+    gemini-2.5-pro:
+      capabilities: [text_chat, text_long, vision, code, reasoning]
+      cost_tier: high
+    gemini-2.5-flash:
+      capabilities: [text_chat, text_long, vision, code]
+      cost_tier: low
+    gemini-2.0-flash:
+      capabilities: [text_chat, text_long, vision]
+      cost_tier: low
+    gemini-2.0-flash-lite:
+      capabilities: [text_chat]
+      cost_tier: low
+    gemini-1.5-pro:
+      capabilities: [text_chat, text_long, vision, code]
+      cost_tier: medium
+    gemini-1.5-flash:
+      capabilities: [text_chat, text_long]
+      cost_tier: low
+    imagen-3.0-generate:
+      capabilities: [image_gen]
+      cost_tier: medium
+
+  kimi:
+    moonshot-v1-8k:
+      capabilities: [text_chat]
+      max_tokens: 8000
+      cost_tier: low
+    moonshot-v1-32k:
+      capabilities: [text_chat]
+      max_tokens: 32000
+      cost_tier: low
+    moonshot-v1-128k:
+      capabilities: [text_chat, text_long]
+      max_tokens: 128000
+      cost_tier: medium
+    kimi-latest:
+      capabilities: [text_chat, text_long, vision]
+      max_tokens: 128000
+      cost_tier: medium
+
+  openai:
+    gpt-4o:
+      capabilities: [text_chat, vision, code]
+      max_tokens: 128000
+      cost_tier: high
+    gpt-4o-mini:
+      capabilities: [text_chat, vision]
+      max_tokens: 128000
+      cost_tier: low
+    gpt-4-turbo:
+      capabilities: [text_chat, vision, code]
+      max_tokens: 128000
+      cost_tier: high
+    o1:
+      capabilities: [text_chat, code, reasoning]
+      max_tokens: 200000
+      cost_tier: high
+    o1-mini:
+      capabilities: [text_chat, code, reasoning]
+      max_tokens: 128000
+      cost_tier: medium
+    dall-e-3:
+      capabilities: [image_gen]
+      cost_tier: high
+    whisper-1:
+      capabilities: [stt]
+      cost_tier: low
+    tts-1:
+      capabilities: [tts]
+      cost_tier: low
+    tts-1-hd:
+      capabilities: [tts]
+      cost_tier: medium
+
+  deepseek:
+    deepseek-chat:
+      capabilities: [text_chat, text_long, code]
+      max_tokens: 64000
+      cost_tier: low
+    deepseek-coder:
+      capabilities: [code]
+      max_tokens: 64000
+      cost_tier: low
+    deepseek-reasoner:
+      capabilities: [text_chat, code, reasoning]
+      max_tokens: 64000
+      cost_tier: medium
+
+# 能力到模型的全局优先级（用户未指定厂家时的默认选择）
+capability_defaults:
+  text_chat: ["deepseek/deepseek-chat", "kimi/moonshot-v1-32k", "gemini/gemini-2.0-flash"]
+  text_long: ["gemini/gemini-2.5-pro", "kimi/moonshot-v1-128k", "deepseek/deepseek-chat"]
+  vision: ["gemini/gemini-2.5-pro", "openai/gpt-4o", "kimi/kimi-latest"]
+  image_gen: ["openai/dall-e-3", "gemini/imagen-3.0-generate"]
+  stt: ["openai/whisper-1"]
+  tts: ["openai/tts-1", "openai/tts-1-hd"]
+  code: ["deepseek/deepseek-coder", "openai/o1-mini", "gemini/gemini-2.5-pro"]
+  reasoning: ["openai/o1", "openai/o1-mini", "deepseek/deepseek-reasoner"]
+
+# 厂家 API 配置
+provider_config:
+  gemini:
+    api_key_env: "GEMINI_API_KEY"
+    list_endpoint: "https://generativelanguage.googleapis.com/v1beta/models"
+  kimi:
+    api_key_env: "KIMI_API_KEY"
+    api_base: "https://api.moonshot.cn/v1"
+  openai:
+    api_key_env: "OPENAI_API_KEY"
+  deepseek:
+    api_key_env: "DEEPSEEK_API_KEY"
+    api_base: "https://api.deepseek.com"

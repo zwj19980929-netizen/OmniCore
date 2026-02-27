@@ -6,15 +6,38 @@ from typing import TypedDict, Annotated, List, Dict, Any, Optional
 from langgraph.graph.message import add_messages
 
 
-class TaskItem(TypedDict):
-    """单个子任务结构"""
+class _TaskItemRequired(TypedDict):
+    """TaskItem 必填字段（v0.1 兼容）"""
     task_id: str
-    task_type: str          # web_scraping, file_operation, system_control
+    task_type: str          # web_worker, file_worker, system_worker, browser_agent
     description: str
     params: Dict[str, Any]
     status: str             # pending, running, completed, failed
     result: Optional[Any]
     priority: int           # 优先级 1-10，数字越大优先级越高
+
+
+class TaskItem(_TaskItemRequired, total=False):
+    """单个子任务结构（v0.2 扩展）"""
+    success_criteria: List[str]           # ["len(result.data) >= 5"]
+    fallbacks: List[Dict[str, Any]]       # [{"type":"retry","param_patch":{}}]
+    abort_conditions: List[str]           # ["manual_cancelled"]
+    depends_on: List[str]                 # 依赖的 task_id 列表
+    failure_type: Optional[str]           # timeout/selector_not_found/blocked_or_captcha/permission_denied/invalid_input/unknown
+    execution_trace: List[Dict[str, Any]] # [{step_no, plan, action, observation, decision}]
+    required_capabilities: List[str]      # 所需模型能力 ["text_chat", "vision", "image_gen", ...]
+
+
+def ensure_task_defaults(task: TaskItem) -> TaskItem:
+    """为缺失的 v0.2 可选字段填充默认值（就地修改并返回）"""
+    task.setdefault("success_criteria", [])
+    task.setdefault("fallbacks", [])
+    task.setdefault("abort_conditions", [])
+    task.setdefault("depends_on", [])
+    task.setdefault("failure_type", None)
+    task.setdefault("execution_trace", [])
+    task.setdefault("required_capabilities", [])
+    return task
 
 
 class OmniCoreState(TypedDict):
@@ -67,6 +90,9 @@ class OmniCoreState(TypedDict):
     # 重规划计数（防止无限循环）
     replan_count: int
 
+    # Validator 硬规则校验是否通过
+    validator_passed: bool
+
 
 def create_initial_state(user_input: str) -> OmniCoreState:
     """创建初始状态"""
@@ -86,4 +112,5 @@ def create_initial_state(user_input: str) -> OmniCoreState:
         final_output="",
         execution_status="idle",
         replan_count=0,
+        validator_passed=True,
     )

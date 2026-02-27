@@ -23,6 +23,12 @@ class Settings:
     ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY", "")
     GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
     DEEPSEEK_API_KEY = os.getenv("DEEPSEEK_API_KEY", "")
+    KIMI_API_KEY = os.getenv("KIMI_API_KEY", "")
+
+    # === 模型智能路由 ===
+    PREFERRED_PROVIDER = os.getenv("PREFERRED_PROVIDER", "")  # gemini/kimi/openai/deepseek
+    COST_PREFERENCE = os.getenv("COST_PREFERENCE", "low")  # low/medium/high
+    MODELS_CONFIG_PATH = os.getenv("MODELS_CONFIG_PATH", "config/models.yaml")
 
     # === 本地路径 ===
     USER_DESKTOP_PATH = Path(

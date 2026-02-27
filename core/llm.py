@@ -1,9 +1,12 @@
 """
 OmniCore LiteLLM 统一接口封装
-支持无缝切换 OpenAI, Anthropic, Gemini 等模型
+支持无缝切换 OpenAI, Anthropic, Gemini, DeepSeek, Kimi 等模型
+支持按能力自动选择子模型 + 多模态调用
 """
 import json
-from typing import Optional, List, Dict, Any
+import base64
+from typing import Optional, List, Dict, Any, Union
+from pathlib import Path
 from litellm import completion, acompletion
 import litellm
 from pydantic import BaseModel
@@ -27,17 +30,60 @@ class LLMClient:
     """
     LiteLLM 统一客户端
     封装多模型调用，提供一致的接口
+    支持按能力自动选择子模型、Kimi/Gemini 接入、多模态调用
     """
 
-    def __init__(self, model: Optional[str] = None):
+    # 厂家到 API Base 的映射
+    PROVIDER_API_BASE = {
+        "kimi": "https://api.moonshot.cn/v1",
+        "moonshot": "https://api.moonshot.cn/v1",
+    }
+
+    def __init__(
+        self,
+        model: Optional[str] = None,
+        capability: Optional[str] = None,
+        provider: Optional[str] = None,
+    ):
         """
         初始化 LLM 客户端
 
         Args:
-            model: 模型名称，默认使用配置中的 DEFAULT_MODEL
+            model: 模型名称，如 "gemini/gemini-2.5-pro" 或 "gpt-4o"
+            capability: 按能力自动选择模型，如 "vision", "image_gen", "stt"
+            provider: 限定厂家，如 "gemini", "kimi"
         """
-        self.model = model or settings.DEFAULT_MODEL
+        if model:
+            self.model = model
+        elif capability:
+            from core.model_registry import get_registry, ModelCapability
+            registry = get_registry()
+            if provider:
+                registry.set_provider(provider)
+            cap_enum = ModelCapability(capability)
+            resolved = registry.get_model_for_capability(cap_enum)
+            if not resolved:
+                raise ValueError(f"没有找到支持 {capability} 的模型")
+            self.model = resolved
+        else:
+            self.model = settings.DEFAULT_MODEL
+
         self._setup_api_keys()
+
+    @classmethod
+    def for_capability(cls, capability: str, provider: str = None) -> "LLMClient":
+        """工厂方法：根据能力创建客户端"""
+        return cls(capability=capability, provider=provider)
+
+    @classmethod
+    def for_vision(cls, provider: str = None) -> "LLMClient":
+        """快捷方法：创建视觉模型客户端"""
+        return cls(capability="vision", provider=provider)
+
+    @classmethod
+    def for_image_gen(cls, provider: str = None) -> "LLMClient":
+        """快捷方法：创建图片生成客户端"""
+        return cls(capability="image_gen", provider=provider)
 
     def _setup_api_keys(self):
         """设置 API Keys（LiteLLM 会自动从环境变量读取）"""
@@ -50,6 +96,49 @@ class LLMClient:
             os.environ["GEMINI_API_KEY"] = settings.GEMINI_API_KEY
         if settings.DEEPSEEK_API_KEY:
             os.environ["DEEPSEEK_API_KEY"] = settings.DEEPSEEK_API_KEY
+        kimi_key = getattr(settings, "KIMI_API_KEY", "")
+        if kimi_key:
+            os.environ["KIMI_API_KEY"] = kimi_key
+
+    def _get_provider_from_model(self) -> str:
+        """从模型名解析厂家"""
+        if "/" in self.model:
+            return self.model.split("/")[0]
+        model_lower = self.model.lower()
+        if "gemini" in model_lower or "imagen" in model_lower:
+            return "gemini"
+        if "moonshot" in model_lower or "kimi" in model_lower:
+            return "kimi"
+        if "deepseek" in model_lower:
+            return "deepseek"
+        return "openai"
+
+    def _get_litellm_model(self) -> str:
+        """转换为 LiteLLM 识别的模型格式"""
+        provider = self._get_provider_from_model()
+        model_id = self.model.split("/")[-1] if "/" in self.model else self.model
+
+        if provider in ("kimi", "moonshot"):
+            return f"openai/{model_id}"
+        if provider == "gemini":
+            return f"gemini/{model_id}"
+        if provider == "deepseek":
+            return f"deepseek/{model_id}"
+        return model_id
+
+    def _get_extra_kwargs(self) -> Dict[str, Any]:
+        """获取额外的 LiteLLM 参数（如 api_base, api_key）"""
+        provider = self._get_provider_from_model()
+        kwargs: Dict[str, Any] = {}
+
+        if provider in self.PROVIDER_API_BASE:
+            kwargs["api_base"] = self.PROVIDER_API_BASE[provider]
+            # Kimi 需要显式传 api_key
+            kimi_key = getattr(settings, "KIMI_API_KEY", "")
+            if kimi_key:
+                kwargs["api_key"] = kimi_key
+
+        return kwargs
 
     def _safe_max_tokens(self, requested: int) -> int:
         """根据模型限制返回安全的 max_tokens 值"""
@@ -57,6 +146,8 @@ class LLMClient:
         if "deepseek" in model_lower:
             return min(requested, 8192)
         if "claude" in model_lower:
+            return min(requested, 8192)
+        if "moonshot" in model_lower or "kimi" in model_lower:
             return min(requested, 8192)
         return requested
 
@@ -68,26 +159,17 @@ class LLMClient:
         json_mode: bool = False,
     ) -> LLMResponse:
         """
-        同步聊天接口
-
-        Args:
-            messages: 消息列表 [{"role": "user", "content": "..."}]
-            temperature: 温度参数
-            max_tokens: 最大 token 数
-            json_mode: 是否强制 JSON 输出
-
-        Returns:
-            LLMResponse: 统一响应结构
+        同步聊天接口（支持所有厂家）
         """
         try:
             kwargs = {
-                "model": self.model,
+                "model": self._get_litellm_model(),
                 "messages": messages,
                 "temperature": temperature,
                 "max_tokens": self._safe_max_tokens(max_tokens),
+                "timeout": 120,
+                **self._get_extra_kwargs(),
             }
-
-            # JSON 模式（部分模型支持）
             if json_mode:
                 kwargs["response_format"] = {"type": "json_object"}
 
@@ -126,14 +208,16 @@ class LLMClient:
         json_mode: bool = False,
     ) -> LLMResponse:
         """
-        异步聊天接口
+        异步聊天接口（支持所有厂家）
         """
         try:
             kwargs = {
-                "model": self.model,
+                "model": self._get_litellm_model(),
                 "messages": messages,
                 "temperature": temperature,
                 "max_tokens": self._safe_max_tokens(max_tokens),
+                "timeout": 120,
+                **self._get_extra_kwargs(),
             }
 
             if json_mode:
@@ -231,3 +315,145 @@ class LLMClient:
         logger.error(f"JSON 解析失败")
         logger.error(f"原始内容: {content[:500]}")
         raise ValueError(f"无法解析 JSON: {content[:200]}")
+
+    # ========== 多模态扩展方法 ==========
+
+    def _prepare_image_content(self, image: Union[str, Path, bytes]) -> Dict:
+        """准备图片内容（URL 或 base64）"""
+        if isinstance(image, bytes):
+            b64 = base64.b64encode(image).decode()
+            return {
+                "type": "image_url",
+                "image_url": {"url": f"data:image/png;base64,{b64}"}
+            }
+        elif isinstance(image, Path) or (isinstance(image, str) and not image.startswith("http")):
+            path = Path(image)
+            with open(path, "rb") as f:
+                b64 = base64.b64encode(f.read()).decode()
+            suffix = path.suffix.lower().lstrip(".")
+            mime_map = {"png": "png", "jpg": "jpeg", "jpeg": "jpeg", "gif": "gif", "webp": "webp", "bmp": "bmp"}
+            mime = mime_map.get(suffix, "png")
+            return {
+                "type": "image_url",
+                "image_url": {"url": f"data:image/{mime};base64,{b64}"}
+            }
+        else:
+            return {
+                "type": "image_url",
+                "image_url": {"url": image}
+            }
+
+    def chat_with_image(
+        self,
+        text: str,
+        image: Union[str, Path, bytes],
+        temperature: float = 0.7,
+        max_tokens: int = 4096,
+    ) -> LLMResponse:
+        """
+        带图片的对话（视觉理解）
+
+        Args:
+            text: 文本提示
+            image: 图片路径、URL 或 bytes
+        """
+        image_content = self._prepare_image_content(image)
+        messages = [{
+            "role": "user",
+            "content": [
+                {"type": "text", "text": text},
+                image_content,
+            ]
+        }]
+        return self.chat(messages, temperature, max_tokens)
+
+    def generate_image(
+        self,
+        prompt: str,
+        size: str = "1024x1024",
+        quality: str = "standard",
+        n: int = 1,
+    ) -> List[str]:
+        """
+        图片生成
+
+        Returns:
+            生成的图片 URL 列表
+        """
+        from openai import OpenAI
+
+        provider = self._get_provider_from_model()
+        model_id = self.model.split("/")[-1] if "/" in self.model else self.model
+
+        if provider == "openai":
+            client = OpenAI(api_key=settings.OPENAI_API_KEY)
+            response = client.images.generate(
+                model=model_id,
+                prompt=prompt,
+                size=size,
+                quality=quality,
+                n=n,
+            )
+            return [img.url for img in response.data]
+
+        raise ValueError(f"{provider} 暂不支持图片生成，请使用 openai/dall-e-3")
+
+    def transcribe(
+        self,
+        audio_path: Union[str, Path],
+        language: str = None,
+    ) -> str:
+        """
+        语音识别（STT）
+
+        Args:
+            audio_path: 音频文件路径
+            language: 语言代码（如 "zh", "en"）
+
+        Returns:
+            识别的文本
+        """
+        from openai import OpenAI
+
+        client = OpenAI(api_key=settings.OPENAI_API_KEY)
+        kwargs: Dict[str, Any] = {"model": "whisper-1"}
+        if language:
+            kwargs["language"] = language
+
+        with open(audio_path, "rb") as f:
+            kwargs["file"] = f
+            response = client.audio.transcriptions.create(**kwargs)
+
+        return response.text
+
+    def speak(
+        self,
+        text: str,
+        output_path: Union[str, Path],
+        voice: str = "alloy",
+        model: str = "tts-1",
+    ) -> Path:
+        """
+        语音合成（TTS）
+
+        Args:
+            text: 要转换的文本
+            output_path: 输出音频路径
+            voice: 声音类型 (alloy, echo, fable, onyx, nova, shimmer)
+            model: tts-1 或 tts-1-hd
+
+        Returns:
+            输出文件路径
+        """
+        from openai import OpenAI
+
+        client = OpenAI(api_key=settings.OPENAI_API_KEY)
+        response = client.audio.speech.create(
+            model=model,
+            voice=voice,
+            input=text,
+        )
+
+        output_path = Path(output_path)
+        response.stream_to_file(output_path)
+        return output_path

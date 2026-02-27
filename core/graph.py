@@ -6,17 +6,23 @@ OmniCore LangGraph DAG 编排
 from typing import Literal
 from langgraph.graph import StateGraph, END
 
-from core.state import OmniCoreState, create_initial_state
+from core.state import OmniCoreState, create_initial_state, ensure_task_defaults
 from core.router import RouterAgent
 from agents.web_worker import WebWorker
 from agents.file_worker import FileWorker
 from agents.system_worker import SystemWorker
 from agents.critic import CriticAgent
+from agents.validator import Validator
 from agents.browser_agent import BrowserAgent
 from core.llm import LLMClient
+from core.capability_detector import CapabilityDetector
+from core.model_registry import get_registry, ModelCapability
 from utils.logger import log_agent_action, log_success, log_error, log_warning
 from utils.human_confirm import HumanConfirm
 from config.settings import settings
+
+# 能力检测器实例
+_capability_detector = CapabilityDetector()
 
 
 # 初始化所有 Agent
@@ -25,9 +31,55 @@ web_worker = WebWorker()
 file_worker = FileWorker()
 system_worker = SystemWorker()
 critic_agent = CriticAgent()
+validator_agent = Validator()
 browser_agent = BrowserAgent()
 
 MAX_REPLAN = 2  # 最多重规划 2 次
+
+
+def _resolve_model_for_task(task: dict) -> str:
+    """
+    根据任务的 required_capabilities 选择最合适的模型
+
+    Returns:
+        模型全名（如 "gemini/gemini-2.5-pro"）或 None（使用默认）
+    """
+    try:
+        registry = get_registry()
+
+        # 1. 优先使用任务声明的能力
+        required_caps = task.get("required_capabilities", [])
+
+        # 2. 如果没有声明，自动检测
+        if not required_caps:
+            detected = _capability_detector.detect(
+                task.get("description", ""),
+                task.get("params"),
+            )
+            required_caps = [c.value for c in detected]
+
+        # 3. 选择主要能力
+        cap_set = set()
+        for c in required_caps:
+            try:
+                cap_set.add(ModelCapability(c))
+            except ValueError:
+                pass
+
+        if not cap_set:
+            return None
+
+        primary = _capability_detector.get_primary_capability(cap_set)
+
+        # 4. 获取最合适的模型
+        model = registry.get_model_for_capability(primary)
+        if model:
+            log_agent_action("ModelRouter", f"任务 [{task.get('task_id')}] 能力 {primary.value} → 模型 {model}")
+        return model
+
+    except Exception as e:
+        log_warning(f"模型自动选择失败: {e}，将使用默认模型")
+        return None
 
 
 def route_node(state: OmniCoreState) -> OmniCoreState:
@@ -51,8 +103,9 @@ def system_worker_node(state: OmniCoreState) -> OmniCoreState:
 
 
 def browser_agent_node(state: OmniCoreState) -> OmniCoreState:
-    """Browser Agent 节点 - 处理浏览器交互任务"""
+    """Browser Agent 节点 - 处理浏览器交互任务（PAOD trace 增强）"""
     import asyncio
+    from agents.paod import classify_failure, make_trace_step
 
     for idx, task in enumerate(state["task_queue"]):
         if task["task_type"] == "browser_agent" and task["status"] == "pending":
@@ -73,16 +126,36 @@ def browser_agent_node(state: OmniCoreState) -> OmniCoreState:
 
             try:
                 result = asyncio.run(_run_browser())
+
+                # 将 BrowserAgent 返回的 steps 转换为 execution_trace
+                trace = []
+                for i, step in enumerate(result.get("steps", []), 1):
+                    trace.append(make_trace_step(
+                        step_no=i,
+                        plan=step.get("plan", step.get("action_type", "")),
+                        action=step.get("action", step.get("selector", "")),
+                        observation=step.get("observation", step.get("result", "")),
+                        decision=step.get("decision", "continue"),
+                    ))
+                state["task_queue"][idx]["execution_trace"] = trace
+
                 state["task_queue"][idx]["status"] = "completed" if result.get("success") else "failed"
                 state["task_queue"][idx]["result"] = result
                 state["shared_memory"][task["task_id"]] = result
 
                 if not result.get("success"):
+                    state["task_queue"][idx]["failure_type"] = classify_failure(
+                        result.get("message", result.get("error", ""))
+                    )
                     state["error_trace"] = result.get("message", "浏览器任务失败")
             except Exception as e:
                 log_error(f"Browser Agent 执行失败: {e}")
                 state["task_queue"][idx]["status"] = "failed"
                 state["task_queue"][idx]["result"] = {"success": False, "error": str(e)}
+                state["task_queue"][idx]["failure_type"] = classify_failure(str(e))
+                state["task_queue"][idx]["execution_trace"] = [
+                    make_trace_step(1, "run browser_agent", task_desc[:80], str(e), "exception")
+                ]
                 state["error_trace"] = str(e)
 
     return state
@@ -147,7 +220,7 @@ def replanner_node(state: OmniCoreState) -> OmniCoreState:
         new_tasks = []
         for task_data in result.get("tasks", []):
             from core.state import TaskItem
-            new_tasks.append(TaskItem(
+            t = TaskItem(
                 task_id=task_data.get("task_id", f"replan_{uuid.uuid4().hex[:8]}"),
                 task_type=task_data.get("task_type", "web_worker"),
                 description=task_data.get("description", ""),
@@ -155,7 +228,9 @@ def replanner_node(state: OmniCoreState) -> OmniCoreState:
                 status="pending",
                 result=None,
                 priority=task_data.get("priority", 10),
-            ))
+            )
+            ensure_task_defaults(t)
+            new_tasks.append(t)
 
         if new_tasks:
             # 保留已完成的任务，替换失败的
@@ -180,6 +255,11 @@ def replanner_node(state: OmniCoreState) -> OmniCoreState:
 def critic_node(state: OmniCoreState) -> OmniCoreState:
     """Critic 审查节点"""
     return critic_agent.review(state)
+
+
+def validator_node(state: OmniCoreState) -> OmniCoreState:
+    """Validator 硬规则验证节点"""
+    return validator_agent.validate(state)
 
 
 def human_confirm_node(state: OmniCoreState) -> OmniCoreState:
@@ -241,6 +321,17 @@ def finalize_node(state: OmniCoreState) -> OmniCoreState:
     return state
 
 
+# === 辅助函数 ===
+
+def _is_task_ready(task: dict, task_queue: list) -> bool:
+    """检查任务的 depends_on 是否全部完成（为 Phase 2 并发做准备）"""
+    depends = task.get("depends_on", [])
+    if not depends:
+        return True
+    completed_ids = {t["task_id"] for t in task_queue if t["status"] == "completed"}
+    return all(dep in completed_ids for dep in depends)
+
+
 # === 条件路由函数 ===
 
 def should_continue_after_route(state: OmniCoreState) -> Literal["human_confirm", "finalize"]:
@@ -249,26 +340,22 @@ def should_continue_after_route(state: OmniCoreState) -> Literal["human_confirm"
     return "human_confirm"
 
 
-def get_next_worker(state: OmniCoreState) -> Literal["web_worker", "file_worker", "system_worker", "browser_agent", "critic"]:
+def get_next_worker(state: OmniCoreState) -> Literal["web_worker", "file_worker", "system_worker", "browser_agent", "validator"]:
     for task in state["task_queue"]:
-        if task["status"] == "pending":
+        if task["status"] == "pending" and _is_task_ready(task, state["task_queue"]):
             task_type = task["task_type"]
             if task_type in ["web_worker", "file_worker", "system_worker", "browser_agent"]:
                 return task_type
-    return "critic"
+    return "validator"
 
 
-def should_replan_or_critic(state: OmniCoreState) -> Literal["replanner", "critic"]:
-    """Worker 全部执行完后，检查是否有失败任务需要重规划"""
-    # 还有 pending 任务，继续执行
-    pending = [t for t in state["task_queue"] if t["status"] == "pending"]
-    if pending:
-        return "critic"  # 不应该到这里，但安全起见
-
-    failed = [t for t in state["task_queue"] if t["status"] == "failed"]
-    if failed and state.get("replan_count", 0) < MAX_REPLAN:
+def after_validator(state: OmniCoreState) -> Literal["critic", "replanner", "finalize"]:
+    """Validator 之后：passed → critic，failed + replan_count < MAX → replanner，否则 finalize"""
+    if state.get("validator_passed", True):
+        return "critic"
+    if state.get("replan_count", 0) < MAX_REPLAN:
         return "replanner"
-    return "critic"
+    return "finalize"
 
 
 def should_retry_or_finish(state: OmniCoreState) -> Literal["finalize", "replanner"]:
@@ -284,25 +371,31 @@ def get_first_worker(state: OmniCoreState) -> str:
     if not state["human_approved"]:
         return "end"
     for task in state["task_queue"]:
-        if task["status"] == "pending":
+        if task["status"] == "pending" and _is_task_ready(task, state["task_queue"]):
             task_type = task["task_type"]
             if task_type in ["web_worker", "file_worker", "system_worker", "browser_agent"]:
                 return task_type
-    return "critic"
+    return "validator"
 
 
 def build_graph() -> StateGraph:
-    """构建 OmniCore 执行图（含反思重规划循环）"""
+    """
+    构建 OmniCore 执行图 v0.2
+    新流程: Router → human_confirm → Worker(s) → Validator → Critic → finalize
+                                                    ↓ fail      ↓ fail
+                                                 replanner    replanner
+    """
 
     graph = StateGraph(OmniCoreState)
 
-    # 添加节点
+    # 添加节点（10 个）
     graph.add_node("router", route_node)
     graph.add_node("human_confirm", human_confirm_node)
     graph.add_node("web_worker", web_worker_node)
     graph.add_node("file_worker", file_worker_node)
     graph.add_node("system_worker", system_worker_node)
     graph.add_node("browser_agent", browser_agent_node)
+    graph.add_node("validator", validator_node)
     graph.add_node("replanner", replanner_node)
     graph.add_node("critic", critic_node)
     graph.add_node("finalize", finalize_node)
@@ -316,48 +409,51 @@ def build_graph() -> StateGraph:
         "finalize": "finalize",
     })
 
-    # human_confirm → 第一个 worker 或 end
+    # human_confirm → 第一个 worker 或 validator（无 pending 时）或 end
     graph.add_conditional_edges("human_confirm", get_first_worker, {
         "web_worker": "web_worker",
         "file_worker": "file_worker",
         "system_worker": "system_worker",
         "browser_agent": "browser_agent",
-        "critic": "critic",
+        "validator": "validator",
         "end": END,
     })
 
-    # 每个 Worker 执行后 → 下一个 worker 或检查是否需要重规划
+    # 每个 Worker 执行后 → 下一个 ready worker 或 validator
     worker_edges = {
         "web_worker": "web_worker",
         "file_worker": "file_worker",
         "system_worker": "system_worker",
         "browser_agent": "browser_agent",
-        "replanner": "replanner",
-        "critic": "critic",
+        "validator": "validator",
     }
 
     def after_worker(state: OmniCoreState) -> str:
-        """Worker 执行后：还有 pending 就继续，有 failed 就重规划，否则审查"""
+        """Worker 执行后：还有 ready pending 就继续，否则进 validator"""
         for task in state["task_queue"]:
-            if task["status"] == "pending":
+            if task["status"] == "pending" and _is_task_ready(task, state["task_queue"]):
                 t = task["task_type"]
                 if t in ["web_worker", "file_worker", "system_worker", "browser_agent"]:
                     return t
-        failed = [t for t in state["task_queue"] if t["status"] == "failed"]
-        if failed and state.get("replan_count", 0) < MAX_REPLAN:
-            return "replanner"
-        return "critic"
+        return "validator"
 
     for worker in ["web_worker", "file_worker", "system_worker", "browser_agent"]:
         graph.add_conditional_edges(worker, after_worker, worker_edges)
 
-    # Replanner → 第一个 pending worker 或 critic
+    # Validator → critic / replanner / finalize
+    graph.add_conditional_edges("validator", after_validator, {
+        "critic": "critic",
+        "replanner": "replanner",
+        "finalize": "finalize",
+    })
+
+    # Replanner → 第一个 pending worker 或 validator
     graph.add_conditional_edges("replanner", get_first_worker, {
         "web_worker": "web_worker",
         "file_worker": "file_worker",
         "system_worker": "system_worker",
         "browser_agent": "browser_agent",
-        "critic": "critic",
+        "validator": "validator",
         "end": END,
     })
 
