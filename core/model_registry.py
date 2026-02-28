@@ -7,6 +7,7 @@ OmniCore 模型注册表
 from typing import Dict, List, Optional, Set
 from enum import Enum
 from pathlib import Path
+import os
 import yaml
 import litellm
 
@@ -45,12 +46,10 @@ class ModelRegistry:
         self.cost_preference: str = getattr(settings, "COST_PREFERENCE", "low")
 
         # 初始化动态发现服务
-        self.discovery = ModelDiscovery({
-            "gemini": settings.GEMINI_API_KEY,
-            "kimi": getattr(settings, "KIMI_API_KEY", ""),
-            "openai": settings.OPENAI_API_KEY,
-            "deepseek": settings.DEEPSEEK_API_KEY,
-        })
+        self.discovery = ModelDiscovery(
+            self._resolve_api_keys(),
+            provider_config=self.config.get("provider_config", {}),
+        )
 
         # 合并后的模型信息缓存 {provider: {model_id: ModelInfo}}
         self._merged_models: Dict[str, Dict[str, ModelInfo]] = {}
@@ -67,6 +66,30 @@ class ModelRegistry:
                 return yaml.safe_load(f) or {}
         logger.warning(f"模型配置文件不存在: {self.config_path}")
         return {}
+
+    def _resolve_api_keys(self) -> Dict[str, str]:
+        """
+        解析各 provider 的 API key：
+        1) 优先使用 settings 中已加载的常规变量
+        2) 若为空，回退到 provider_config.api_key_env 指定的环境变量名
+        """
+        keys = {
+            "gemini": settings.GEMINI_API_KEY,
+            "kimi": getattr(settings, "KIMI_API_KEY", ""),
+            "openai": settings.OPENAI_API_KEY,
+            "deepseek": settings.DEEPSEEK_API_KEY,
+        }
+
+        provider_cfg = self.config.get("provider_config", {})
+        for provider in self.SUPPORTED_PROVIDERS:
+            if keys.get(provider):
+                continue
+            cfg = provider_cfg.get(provider, {})
+            env_name = cfg.get("api_key_env", "")
+            if isinstance(env_name, str) and env_name and env_name.isupper() and "_" in env_name:
+                keys[provider] = os.getenv(env_name, "")
+
+        return keys
 
     def _enrich_with_litellm(self, model_id: str, provider: str) -> dict:
         """从 LiteLLM model_cost 补充 token 限制"""

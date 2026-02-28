@@ -3,26 +3,38 @@
 
 capability_overrides:
   gemini:
+    # === 主力 LLM 模型 ===
+    gemini-3-pro-preview:
+      type: llm
+      channel: "稳定1"
+      capabilities: [text_chat, text_long, vision, code, reasoning]
+      cost_tier: high
+    gemini-3-pro-preview-y:
+      type: llm
+      channel: "渠道二"
+      capabilities: [text_chat, text_long, vision, code, reasoning]
+      cost_tier: high
+    gemini-3-pro-preview-an:
+      type: llm
+      channel: "渠道二"
+      capabilities: [text_chat, text_long, vision, code, reasoning]
+      cost_tier: high
+    # === 其他模型 ===
     gemini-2.5-pro:
+      type: llm
       capabilities: [text_chat, text_long, vision, code, reasoning]
       cost_tier: high
     gemini-2.5-flash:
+      type: llm
       capabilities: [text_chat, text_long, vision, code]
       cost_tier: low
     gemini-2.0-flash:
+      type: llm
       capabilities: [text_chat, text_long, vision]
       cost_tier: low
-    gemini-2.0-flash-lite:
-      capabilities: [text_chat]
-      cost_tier: low
-    gemini-1.5-pro:
-      capabilities: [text_chat, text_long, vision, code]
-      cost_tier: medium
-    gemini-1.5-flash:
-      capabilities: [text_chat, text_long]
-      cost_tier: low
-    imagen-3.0-generate:
-      capabilities: [image_gen]
+    gemini-2.5-flash-image-preview:
+      type: image_gen
+      capabilities: [image_gen, vision]
       cost_tier: medium
 
   kimi:
@@ -106,12 +118,18 @@ capability_defaults:
 provider_config:
   gemini:
     api_key_env: "GEMINI_API_KEY"
-    list_endpoint: "https://generativelanguage.googleapis.com/v1beta/models"
+    auth_mode: "query_key"
+    api_base: "https://llmxapi.com/v1beta"
+    list_endpoint: "https://llmxapi.com/v1beta/models"
   kimi:
     api_key_env: "KIMI_API_KEY"
+    auth_mode: "bearer"
     api_base: "https://api.moonshot.cn/v1"
   openai:
     api_key_env: "OPENAI_API_KEY"
+    auth_mode: "bearer"
+    api_base: "https://api.openai.com/v1"
   deepseek:
     api_key_env: "DEEPSEEK_API_KEY"
+    auth_mode: "bearer"
     api_base: "https://api.deepseek.com"

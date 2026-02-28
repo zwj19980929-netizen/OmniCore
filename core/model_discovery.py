@@ -2,11 +2,12 @@
 OmniCore 动态模型发现模块
 - 调用各厂家 API 获取实时可用模型列表
 - 缓存结果避免频繁请求
-- Gemini 返回完整信息（token限制+能力），其他厂家返回基础信息
+- 发现接口、鉴权方式由 config/models.yaml 的 provider_config 驱动
 """
-from typing import Dict, List, Any, Optional
+from typing import Dict, List, Any, Optional, Tuple
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
+import os
 import requests
 
 from utils.logger import logger
@@ -34,8 +35,9 @@ class ModelDiscovery:
 
     CACHE_TTL = timedelta(hours=1)
 
-    def __init__(self, api_keys: Dict[str, str]):
+    def __init__(self, api_keys: Dict[str, str], provider_config: Optional[Dict[str, Any]] = None):
         self.api_keys = api_keys
+        self.provider_config = provider_config or {}
         self._cache: Dict[str, List[ModelInfo]] = {}
         self._cache_time: Dict[str, datetime] = {}
 
@@ -48,160 +50,202 @@ class ModelDiscovery:
         self._cache[provider] = models
         self._cache_time[provider] = datetime.now()
 
+    def _get_provider_cfg(self, provider: str) -> Dict[str, Any]:
+        cfg = self.provider_config.get(provider, {})
+        return cfg if isinstance(cfg, dict) else {}
+
+    def _get_api_key(self, provider: str) -> str:
+        key = self.api_keys.get(provider, "")
+        if key:
+            return key
+
+        cfg = self._get_provider_cfg(provider)
+        env_name = cfg.get("api_key_env", "")
+        if isinstance(env_name, str) and env_name and env_name.isupper() and "_" in env_name:
+            return os.getenv(env_name, "")
+        return ""
+
+    def _get_list_endpoint(self, provider: str, default_endpoint: str) -> str:
+        cfg = self._get_provider_cfg(provider)
+        endpoint = cfg.get("list_endpoint")
+        if endpoint:
+            return endpoint
+
+        api_base = cfg.get("api_base")
+        if api_base:
+            return f"{str(api_base).rstrip('/')}/models"
+
+        return default_endpoint
+
+    def _build_auth(self, provider: str, api_key: str) -> Tuple[Dict[str, str], Dict[str, str]]:
+        cfg = self._get_provider_cfg(provider)
+        auth_mode = str(cfg.get("auth_mode", "bearer")).lower()
+
+        headers: Dict[str, str] = {}
+        params: Dict[str, str] = {}
+
+        if not api_key:
+            return headers, params
+
+        if auth_mode == "query_key":
+            params["key"] = api_key
+        else:
+            headers["Authorization"] = f"Bearer {api_key}"
+
+        return headers, params
+
+    def _request_models(self, provider: str, default_endpoint: str) -> Optional[Dict[str, Any]]:
+        api_key = self._get_api_key(provider)
+        if not api_key:
+            logger.warning(f"未配置 {provider.upper()} API key，跳过 {provider} 模型发现")
+            return None
+
+        endpoint = self._get_list_endpoint(provider, default_endpoint)
+        headers, params = self._build_auth(provider, api_key)
+
+        try:
+            resp = requests.get(endpoint, headers=headers, params=params, timeout=15)
+            resp.raise_for_status()
+            return resp.json()
+        except Exception as e:
+            logger.error(f"{provider} 模型发现失败: {e}")
+            return None
+
+    def _iter_model_records(self, data: Dict[str, Any]) -> List[Dict[str, Any]]:
+        if not isinstance(data, dict):
+            return []
+        if isinstance(data.get("models"), list):
+            return data["models"]
+        if isinstance(data.get("data"), list):
+            return data["data"]
+        return []
+
     def list_gemini_models(self) -> List[ModelInfo]:
         """
-        Gemini - 返回完整信息（token限制 + supportedGenerationMethods）
-        GET https://generativelanguage.googleapis.com/v1beta/models?key=KEY
+        Gemini/代理兼容模式：
+        - 官方返回: {"models": [...]}，字段含 name/displayName/inputTokenLimit
+        - 代理可能返回: {"data": [...]}，字段含 id/name
         """
         if self._is_cache_valid("gemini"):
             return self._cache["gemini"]
 
-        key = self.api_keys.get("gemini", "")
-        if not key:
-            logger.warning("未配置 GEMINI_API_KEY，跳过 Gemini 模型发现")
-            return []
-
-        try:
-            url = "https://generativelanguage.googleapis.com/v1beta/models"
-            resp = requests.get(url, params={"key": key}, timeout=15)
-            resp.raise_for_status()
-            data = resp.json()
-
-            models = []
-            for m in data.get("models", []):
-                model_id = m.get("name", "").replace("models/", "")
-                if not model_id:
-                    continue
-                models.append(ModelInfo(
-                    id=model_id,
-                    provider="gemini",
-                    display_name=m.get("displayName"),
-                    input_token_limit=m.get("inputTokenLimit"),
-                    output_token_limit=m.get("outputTokenLimit"),
-                    supported_methods=m.get("supportedGenerationMethods", []),
-                ))
-
-            self._set_cache("gemini", models)
-            logger.info(f"Gemini 模型发现完成，共 {len(models)} 个模型")
-            return models
-
-        except Exception as e:
-            logger.error(f"Gemini 模型发现失败: {e}")
+        data = self._request_models(
+            provider="gemini",
+            default_endpoint="https://generativelanguage.googleapis.com/v1beta/models",
+        )
+        if data is None:
             return self._cache.get("gemini", [])
+
+        models: List[ModelInfo] = []
+        for m in self._iter_model_records(data):
+            model_id = (
+                m.get("id")
+                or m.get("name", "").replace("models/", "")
+            )
+            if not model_id:
+                continue
+
+            models.append(ModelInfo(
+                id=model_id,
+                provider="gemini",
+                display_name=m.get("displayName") or m.get("display_name") or m.get("id"),
+                input_token_limit=m.get("inputTokenLimit") or m.get("input_token_limit"),
+                output_token_limit=m.get("outputTokenLimit") or m.get("output_token_limit"),
+                supported_methods=m.get("supportedGenerationMethods") or m.get("supported_generation_methods") or [],
+            ))
+
+        self._set_cache("gemini", models)
+        logger.info(f"Gemini 模型发现完成，共 {len(models)} 个模型")
+        return models
 
     def list_kimi_models(self) -> List[ModelInfo]:
         """
         Kimi/Moonshot - OpenAI 兼容格式
-        GET https://api.moonshot.cn/v1/models
         """
         if self._is_cache_valid("kimi"):
             return self._cache["kimi"]
 
-        key = self.api_keys.get("kimi", "")
-        if not key:
-            logger.warning("未配置 KIMI_API_KEY，跳过 Kimi 模型发现")
-            return []
-
-        try:
-            resp = requests.get(
-                "https://api.moonshot.cn/v1/models",
-                headers={"Authorization": f"Bearer {key}"},
-                timeout=15,
-            )
-            resp.raise_for_status()
-            data = resp.json()
-
-            models = []
-            for m in data.get("data", []):
-                models.append(ModelInfo(
-                    id=m["id"],
-                    provider="kimi",
-                    display_name=m.get("id"),
-                ))
-
-            self._set_cache("kimi", models)
-            logger.info(f"Kimi 模型发现完成，共 {len(models)} 个模型")
-            return models
-
-        except Exception as e:
-            logger.error(f"Kimi 模型发现失败: {e}")
+        data = self._request_models(
+            provider="kimi",
+            default_endpoint="https://api.moonshot.cn/v1/models",
+        )
+        if data is None:
             return self._cache.get("kimi", [])
+
+        models: List[ModelInfo] = []
+        for m in self._iter_model_records(data):
+            model_id = m.get("id") or m.get("name")
+            if not model_id:
+                continue
+            models.append(ModelInfo(
+                id=model_id,
+                provider="kimi",
+                display_name=model_id,
+            ))
+
+        self._set_cache("kimi", models)
+        logger.info(f"Kimi 模型发现完成，共 {len(models)} 个模型")
+        return models
 
     def list_openai_models(self) -> List[ModelInfo]:
         """
-        OpenAI - GET https://api.openai.com/v1/models
+        OpenAI - GET /models
         只返回 id/owned_by，token 限制需要静态配置补充
         """
         if self._is_cache_valid("openai"):
             return self._cache["openai"]
 
-        key = self.api_keys.get("openai", "")
-        if not key:
-            logger.warning("未配置 OPENAI_API_KEY，跳过 OpenAI 模型发现")
-            return []
-
-        try:
-            resp = requests.get(
-                "https://api.openai.com/v1/models",
-                headers={"Authorization": f"Bearer {key}"},
-                timeout=15,
-            )
-            resp.raise_for_status()
-            data = resp.json()
-
-            models = []
-            for m in data.get("data", []):
-                models.append(ModelInfo(
-                    id=m["id"],
-                    provider="openai",
-                    display_name=m.get("id"),
-                ))
-
-            self._set_cache("openai", models)
-            logger.info(f"OpenAI 模型发现完成，共 {len(models)} 个模型")
-            return models
-
-        except Exception as e:
-            logger.error(f"OpenAI 模型发现失败: {e}")
+        data = self._request_models(
+            provider="openai",
+            default_endpoint="https://api.openai.com/v1/models",
+        )
+        if data is None:
             return self._cache.get("openai", [])
+
+        models: List[ModelInfo] = []
+        for m in self._iter_model_records(data):
+            model_id = m.get("id") or m.get("name")
+            if not model_id:
+                continue
+            models.append(ModelInfo(
+                id=model_id,
+                provider="openai",
+                display_name=model_id,
+            ))
+
+        self._set_cache("openai", models)
+        logger.info(f"OpenAI 模型发现完成，共 {len(models)} 个模型")
+        return models
 
     def list_deepseek_models(self) -> List[ModelInfo]:
         """
-        DeepSeek - GET https://api.deepseek.com/models
+        DeepSeek - GET /models
         OpenAI 兼容格式
         """
         if self._is_cache_valid("deepseek"):
             return self._cache["deepseek"]
 
-        key = self.api_keys.get("deepseek", "")
-        if not key:
-            logger.warning("未配置 DEEPSEEK_API_KEY，跳过 DeepSeek 模型发现")
-            return []
-
-        try:
-            resp = requests.get(
-                "https://api.deepseek.com/models",
-                headers={"Authorization": f"Bearer {key}"},
-                timeout=15,
-            )
-            resp.raise_for_status()
-            data = resp.json()
-
-            models = []
-            for m in data.get("data", []):
-                models.append(ModelInfo(
-                    id=m["id"],
-                    provider="deepseek",
-                    display_name=m.get("id"),
-                ))
-
-            self._set_cache("deepseek", models)
-            logger.info(f"DeepSeek 模型发现完成，共 {len(models)} 个模型")
-            return models
-
-        except Exception as e:
-            logger.error(f"DeepSeek 模型发现失败: {e}")
+        data = self._request_models(
+            provider="deepseek",
+            default_endpoint="https://api.deepseek.com/models",
+        )
+        if data is None:
             return self._cache.get("deepseek", [])
+
+        models: List[ModelInfo] = []
+        for m in self._iter_model_records(data):
+            model_id = m.get("id") or m.get("name")
+            if not model_id:
+                continue
+            models.append(ModelInfo(
+                id=model_id,
+                provider="deepseek",
+                display_name=model_id,
+            ))
+
+        self._set_cache("deepseek", models)
+        logger.info(f"DeepSeek 模型发现完成，共 {len(models)} 个模型")
+        return models
 
     def list_models(self, provider: str) -> List[ModelInfo]:
         """按厂家名获取模型列表"""

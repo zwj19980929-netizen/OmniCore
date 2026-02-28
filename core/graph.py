@@ -115,7 +115,7 @@ def browser_agent_node(state: OmniCoreState) -> OmniCoreState:
             params = task["params"]
             task_desc = params.get("task", task["description"])
             start_url = params.get("start_url", "")
-            headless = params.get("headless", False)
+            headless = params.get("headless", settings.BROWSER_FAST_MODE)
 
             async def _run_browser():
                 agent = BrowserAgent(headless=headless)

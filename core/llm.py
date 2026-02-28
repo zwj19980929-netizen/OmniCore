@@ -5,10 +5,14 @@ OmniCore LiteLLM 统一接口封装
 """
 import json
 import base64
+import asyncio
 from typing import Optional, List, Dict, Any, Union
 from pathlib import Path
+import os
 from litellm import completion, acompletion
 import litellm
+import yaml
+import requests
 from pydantic import BaseModel
 
 from config.settings import settings
@@ -37,6 +41,8 @@ class LLMClient:
     PROVIDER_API_BASE = {
         "kimi": "https://api.moonshot.cn/v1",
         "moonshot": "https://api.moonshot.cn/v1",
+        "openai": "https://api.openai.com/v1",
+        "deepseek": "https://api.deepseek.com",
     }
 
     def __init__(
@@ -68,6 +74,7 @@ class LLMClient:
         else:
             self.model = settings.DEFAULT_MODEL
 
+        self.provider_config = self._load_provider_config()
         self._setup_api_keys()
 
     @classmethod
@@ -87,7 +94,6 @@ class LLMClient:
 
     def _setup_api_keys(self):
         """设置 API Keys（LiteLLM 会自动从环境变量读取）"""
-        import os
         if settings.OPENAI_API_KEY:
             os.environ["OPENAI_API_KEY"] = settings.OPENAI_API_KEY
         if settings.ANTHROPIC_API_KEY:
@@ -99,6 +105,42 @@ class LLMClient:
         kimi_key = getattr(settings, "KIMI_API_KEY", "")
         if kimi_key:
             os.environ["KIMI_API_KEY"] = kimi_key
+
+    def _load_provider_config(self) -> Dict[str, Any]:
+        """从 models.yaml 加载 provider_config"""
+        config_path = Path(settings.MODELS_CONFIG_PATH)
+        if not config_path.exists():
+            return {}
+        try:
+            data = yaml.safe_load(config_path.read_text(encoding="utf-8")) or {}
+            provider_cfg = data.get("provider_config", {})
+            return provider_cfg if isinstance(provider_cfg, dict) else {}
+        except Exception as e:
+            logger.warning(f"读取模型配置失败: {e}")
+            return {}
+
+    def _get_provider_api_key(self, provider: str) -> str:
+        """按 provider 获取 API key（优先 settings，其次 provider_config 指定 env）"""
+        provider = provider.lower()
+        if provider == "gemini":
+            if settings.GEMINI_API_KEY:
+                return settings.GEMINI_API_KEY
+        elif provider in ("kimi", "moonshot"):
+            kimi_key = getattr(settings, "KIMI_API_KEY", "")
+            if kimi_key:
+                return kimi_key
+        elif provider == "openai":
+            if settings.OPENAI_API_KEY:
+                return settings.OPENAI_API_KEY
+        elif provider == "deepseek":
+            if settings.DEEPSEEK_API_KEY:
+                return settings.DEEPSEEK_API_KEY
+
+        cfg = self.provider_config.get(provider, {})
+        env_name = cfg.get("api_key_env", "")
+        if isinstance(env_name, str) and env_name and env_name.isupper() and "_" in env_name:
+            return os.getenv(env_name, "")
+        return ""
 
     def _get_provider_from_model(self) -> str:
         """从模型名解析厂家"""
@@ -131,14 +173,135 @@ class LLMClient:
         provider = self._get_provider_from_model()
         kwargs: Dict[str, Any] = {}
 
-        if provider in self.PROVIDER_API_BASE:
+        cfg = self.provider_config.get(provider, {})
+        api_base = cfg.get("api_base")
+        if api_base:
+            kwargs["api_base"] = api_base
+        elif provider in self.PROVIDER_API_BASE:
             kwargs["api_base"] = self.PROVIDER_API_BASE[provider]
-            # Kimi 需要显式传 api_key
-            kimi_key = getattr(settings, "KIMI_API_KEY", "")
-            if kimi_key:
-                kwargs["api_key"] = kimi_key
+
+        api_key = self._get_provider_api_key(provider)
+        if api_key:
+            # 对代理或 OpenAI 兼容接口显式传 key，减少环境变量依赖问题
+            kwargs["api_key"] = api_key
 
         return kwargs
+
+    def _should_use_gemini_query_mode(self) -> bool:
+        """
+        对于需要 query key 鉴权的 Gemini 代理，绕开 LiteLLM 的 custom api_base 认证差异。
+        """
+        provider = self._get_provider_from_model()
+        if provider != "gemini":
+            return False
+        cfg = self.provider_config.get("gemini", {})
+        return str(cfg.get("auth_mode", "")).lower() == "query_key" and bool(cfg.get("api_base"))
+
+    def _gemini_message_to_contents(self, messages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        """
+        OpenAI-style messages -> Gemini contents.
+        支持文本和 data URL 图片（inline_data）。
+        """
+        contents: List[Dict[str, Any]] = []
+        for msg in messages:
+            role = msg.get("role", "user")
+            gemini_role = "model" if role == "assistant" else "user"
+            content = msg.get("content", "")
+
+            parts: List[Dict[str, Any]] = []
+            if isinstance(content, str):
+                parts.append({"text": content})
+            elif isinstance(content, list):
+                for item in content:
+                    if not isinstance(item, dict):
+                        continue
+                    item_type = item.get("type")
+                    if item_type == "text":
+                        parts.append({"text": item.get("text", "")})
+                    elif item_type == "image_url":
+                        image_url = (item.get("image_url") or {}).get("url", "")
+                        if image_url.startswith("data:") and ";base64," in image_url:
+                            try:
+                                prefix, b64 = image_url.split(";base64,", 1)
+                                mime = prefix.replace("data:", "")
+                                parts.append({
+                                    "inline_data": {
+                                        "mime_type": mime,
+                                        "data": b64,
+                                    }
+                                })
+                            except Exception:
+                                continue
+
+            if parts:
+                contents.append({"role": gemini_role, "parts": parts})
+
+        if not contents:
+            contents = [{"role": "user", "parts": [{"text": ""}]}]
+        return contents
+
+    def _chat_gemini_query_mode(
+        self,
+        messages: List[Dict[str, Any]],
+        temperature: float,
+        max_tokens: int,
+        json_mode: bool,
+    ) -> LLMResponse:
+        cfg = self.provider_config.get("gemini", {})
+        api_base = str(cfg.get("api_base", "")).rstrip("/")
+        api_key = self._get_provider_api_key("gemini")
+        if not api_base or not api_key:
+            raise ValueError("Gemini query mode 缺少 api_base 或 api_key")
+
+        model_id = self.model.split("/")[-1] if "/" in self.model else self.model
+        url = f"{api_base}/models/{model_id}:generateContent"
+        params = {"key": api_key}
+
+        generation_config: Dict[str, Any] = {
+            "temperature": temperature,
+            "maxOutputTokens": self._safe_max_tokens(max_tokens),
+        }
+        if json_mode:
+            generation_config["responseMimeType"] = "application/json"
+
+        payload: Dict[str, Any] = {
+            "contents": self._gemini_message_to_contents(messages),
+            "generationConfig": generation_config,
+        }
+
+        resp = requests.post(
+            url,
+            params=params,
+            headers={"Content-Type": "application/json"},
+            json=payload,
+            timeout=120,
+        )
+        resp.raise_for_status()
+        data = resp.json()
+
+        candidates = data.get("candidates", [])
+        content = ""
+        if candidates:
+            parts = ((candidates[0].get("content") or {}).get("parts") or [])
+            texts = [p.get("text", "") for p in parts if isinstance(p, dict)]
+            content = "".join(texts).strip()
+
+        if not content:
+            content = '{"intent":"unknown","confidence":0,"reasoning":"Gemini 返回空内容","tasks":[],"is_high_risk":false}'
+
+        usage_meta = data.get("usageMetadata", {})
+        usage = {
+            "prompt_tokens": usage_meta.get("promptTokenCount", 0),
+            "completion_tokens": usage_meta.get("candidatesTokenCount", 0),
+            "total_tokens": usage_meta.get("totalTokenCount", 0),
+        }
+
+        return LLMResponse(
+            content=content,
+            model=data.get("modelVersion", self.model),
+            usage=usage,
+            raw_response=data,
+        )
 
     def _safe_max_tokens(self, requested: int) -> int:
         """根据模型限制返回安全的 max_tokens 值"""
@@ -162,6 +325,14 @@ class LLMClient:
         同步聊天接口（支持所有厂家）
         """
         try:
+            if self._should_use_gemini_query_mode():
+                return self._chat_gemini_query_mode(
+                    messages=messages,  # type: ignore[arg-type]
+                    temperature=temperature,
+                    max_tokens=max_tokens,
+                    json_mode=json_mode,
+                )
+
             kwargs = {
                 "model": self._get_litellm_model(),
                 "messages": messages,
@@ -211,6 +382,15 @@ class LLMClient:
         异步聊天接口（支持所有厂家）
         """
         try:
+            if self._should_use_gemini_query_mode():
+                return await asyncio.to_thread(
+                    self._chat_gemini_query_mode,
+                    messages,  # type: ignore[arg-type]
+                    temperature,
+                    max_tokens,
+                    json_mode,
+                )
+
             kwargs = {
                 "model": self._get_litellm_model(),
                 "messages": messages,

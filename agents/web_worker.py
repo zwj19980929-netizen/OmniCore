@@ -3,15 +3,19 @@ OmniCore 智能 Web Worker Agent
 自适应网页爬取：自主搜索、页面理解、反爬应对、自动导航、验证码处理
 """
 import asyncio
+import json
 import random
 import re
 from typing import Dict, Any, List, Optional
+from urllib.parse import urljoin
+import requests
 from playwright.async_api import async_playwright, Browser, Page, Playwright
 
 from core.state import OmniCoreState, TaskItem
 from core.llm import LLMClient
 from utils.logger import log_agent_action, logger, log_success, log_error, log_warning
 from utils.captcha_solver import CaptchaSolver
+from config.settings import settings
 
 # 延迟导入避免循环引用（agents/__init__.py → web_worker → core → graph → agents）
 def _import_paod():
@@ -104,6 +108,9 @@ class WebWorker:
         self._playwright: Optional[Playwright] = None
         self._browser: Optional[Browser] = None
         self.captcha_solver = CaptchaSolver()
+        self.fast_mode = settings.BROWSER_FAST_MODE
+        self.block_heavy_resources = settings.BLOCK_HEAVY_RESOURCES
+        self.static_fetch_enabled = settings.STATIC_FETCH_ENABLED
 
     async def _ensure_browser(self, headless: bool = True) -> Browser:
         """启动浏览器，配置反检测参数"""
@@ -139,6 +146,18 @@ class WebWorker:
             timezone_id='Asia/Shanghai',
         )
 
+        if self.block_heavy_resources:
+            async def _route_handler(route):
+                try:
+                    if route.request.resource_type in {"image", "font", "media"}:
+                        await route.abort()
+                    else:
+                        await route.continue_()
+                except Exception:
+                    await route.continue_()
+
+            await context.route("**/*", _route_handler)
+
         page = await context.new_page()
 
         # 注入反检测脚本
@@ -153,14 +172,20 @@ class WebWorker:
 
     async def _human_like_delay(self, min_ms: int = 500, max_ms: int = 2000):
         """模拟人类操作延迟"""
+        if self.fast_mode:
+            min_ms, max_ms = 80, 220
         delay = random.randint(min_ms, max_ms) / 1000
         await asyncio.sleep(delay)
 
     async def _scroll_page(self, page: Page):
         """模拟人类滚动页面"""
-        for _ in range(random.randint(2, 4)):
+        loops = random.randint(1, 2) if self.fast_mode else random.randint(2, 4)
+        for _ in range(loops):
             await page.mouse.wheel(0, random.randint(200, 500))
-            await self._human_like_delay(300, 800)
+            if self.fast_mode:
+                await self._human_like_delay(120, 260)
+            else:
+                await self._human_like_delay(300, 800)
 
     async def _close_browser(self):
         """关闭浏览器"""
@@ -191,6 +216,168 @@ class WebWorker:
         except Exception as e:
             log_error(f"URL 分析失败: {e}")
             return {"url": "", "need_search": True, "search_query": task_description}
+
+    def _can_use_static_fetch(self, task_description: str, url: Optional[str]) -> bool:
+        """判断是否适合优先用静态抓取（纯读场景）"""
+        if not self.static_fetch_enabled or not url:
+            return False
+        desc = (task_description or "").lower()
+        interactive_keywords = [
+            "登录", "注册", "填写", "点击", "提交", "支付", "购买",
+            "login", "sign in", "register", "click", "submit", "checkout", "buy",
+        ]
+        return not any(k in desc for k in interactive_keywords)
+
+    def _clean_html_text(self, raw_html: str) -> str:
+        html = re.sub(r"<script[^>]*>.*?</script>", "", raw_html, flags=re.DOTALL | re.IGNORECASE)
+        html = re.sub(r"<style[^>]*>.*?</style>", "", html, flags=re.DOTALL | re.IGNORECASE)
+        html = re.sub(r"<!--.*?-->", "", html, flags=re.DOTALL)
+        return html
+
+    def _strip_tags(self, text: str) -> str:
+        text = re.sub(r"<[^>]+>", " ", text)
+        text = re.sub(r"\s+", " ", text)
+        return text.strip()
+
+    def _is_noise_link(self, text: str, href: str) -> bool:
+        t = (text or "").strip().lower()
+        h = (href or "").strip().lower()
+        if not t or len(t) < 4:
+            return True
+        if h.startswith("javascript:") or h.startswith("mailto:") or h == "#" or not h:
+            return True
+        noise_keywords = [
+            "login", "register", "privacy", "terms", "cookie", "help", "about",
+            "登录", "注册", "隐私", "条款", "帮助", "关于", "更多",
+        ]
+        return any(k in t for k in noise_keywords)
+
+    def _score_static_link(self, text: str, href: str, task_description: str) -> int:
+        score = 0
+        t = text.lower()
+        task = (task_description or "").lower()
+        if len(text) >= 12:
+            score += 2
+        if href.startswith("http"):
+            score += 1
+        for token in re.split(r"[\s,.;:|/\\]+", task):
+            token = token.strip()
+            if len(token) >= 3 and token in t:
+                score += 2
+        return score
+
+    def _prefers_static_text(self, task_description: str) -> bool:
+        desc = (task_description or "").lower()
+        text_keywords = [
+            "read", "summary", "summarize", "extract text", "article", "content",
+            "读取", "总结", "概述", "正文", "文章", "内容",
+        ]
+        return any(k in desc for k in text_keywords)
+
+    def _extract_static_links(self, html: str, base_url: str, task_description: str, limit: int) -> List[Dict[str, Any]]:
+        """从静态 HTML 中提取标题链接，优先标题标签中的链接。"""
+        cleaned = self._clean_html_text(html)
+        candidates: List[Dict[str, Any]] = []
+        seen = set()
+
+        heading_pattern = re.compile(
+            r"<(h1|h2|h3)[^>]*>.*?<a[^>]*href=[\"']([^\"']+)[\"'][^>]*>(.*?)</a>.*?</\1>",
+            re.DOTALL | re.IGNORECASE,
+        )
+        anchor_pattern = re.compile(
+            r"<a[^>]*href=[\"']([^\"']+)[\"'][^>]*>(.*?)</a>",
+            re.DOTALL | re.IGNORECASE,
+        )
+
+        def _append(href: str, raw_text: str):
+            text = self._strip_tags(raw_text)
+            full_href = urljoin(base_url, href.strip())
+            if self._is_noise_link(text, full_href):
+                return
+            key = (text[:80], full_href)
+            if key in seen:
+                return
+            seen.add(key)
+            candidates.append({
+                "title": text[:160],
+                "link": full_href,
+                "_score": self._score_static_link(text, full_href, task_description),
+                "_order": len(candidates),
+            })
+
+        for match in heading_pattern.finditer(cleaned):
+            _append(match.group(2), match.group(3))
+        if len(candidates) < limit:
+            for match in anchor_pattern.finditer(cleaned):
+                _append(match.group(1), match.group(2))
+                if len(candidates) >= max(limit * 4, 20):
+                    break
+
+        candidates.sort(key=lambda x: (-x["_score"], x["_order"]))
+        results = candidates[:limit]
+        for item in results:
+            item.pop("_score", None)
+            item.pop("_order", None)
+        return results
+
+    def _extract_static_text_blocks(self, html: str, limit: int) -> List[Dict[str, Any]]:
+        cleaned = self._clean_html_text(html)
+        blocks: List[Dict[str, Any]] = []
+        seen = set()
+        patterns = [
+            re.compile(r"<(p|li)[^>]*>(.*?)</\1>", re.DOTALL | re.IGNORECASE),
+            re.compile(r"<(main|article|section|div)[^>]*>(.*?)</\1>", re.DOTALL | re.IGNORECASE),
+        ]
+
+        for pattern in patterns:
+            for match in pattern.finditer(cleaned):
+                text = self._strip_tags(match.group(2))
+                if len(text) < 40:
+                    continue
+                key = re.sub(r"\s+", " ", text).strip().lower()[:120]
+                if key in seen:
+                    continue
+                seen.add(key)
+                blocks.append({"text": text[:400]})
+                if len(blocks) >= limit:
+                    return blocks
+        return blocks
+
+    def _static_fetch(self, url: str, task_description: str, limit: int) -> Dict[str, Any]:
+        """静态抓取：不启浏览器，直接拉取 HTML。"""
+        try:
+            resp = requests.get(
+                url,
+                headers={
+                    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
+                    "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
+                },
+                timeout=15,
+            )
+            resp.raise_for_status()
+            content_type = resp.headers.get("content-type", "").lower()
+            if "html" not in content_type:
+                return {"success": False, "error": f"非HTML响应: {content_type}", "data": [], "url": url}
+
+            html = resp.text
+            text_data = self._extract_static_text_blocks(html, max(3, min(limit, 6)))
+            link_data = self._extract_static_links(html, url, task_description, limit)
+            if self._prefers_static_text(task_description):
+                data = text_data or link_data
+            else:
+                data = link_data or text_data
+            if not data:
+                return {"success": False, "error": "静态抓取未提取到有效内容", "data": [], "url": url}
+
+            return {
+                "success": True,
+                "data": data,
+                "count": len(data),
+                "source": url,
+                "mode": "static_fetch_text" if "text" in data[0] else "static_fetch",
+            }
+        except Exception as e:
+            return {"success": False, "error": str(e), "data": [], "url": url}
 
     async def search_for_url(self, query: str) -> Optional[str]:
         """通过搜索引擎查找目标网站"""
@@ -443,6 +630,14 @@ class WebWorker:
                 "data": [],
             }
 
+        # Step 1.5: 纯读场景优先静态抓取，减少浏览器启动成本
+        if self._can_use_static_fetch(task_description, url):
+            static_result = self._static_fetch(url, task_description, limit)
+            if static_result.get("success"):
+                log_success(f"静态抓取成功，获取 {static_result.get('count', 0)} 条数据")
+                return static_result
+            log_warning(f"静态抓取失败，回退浏览器模式: {static_result.get('error', '')[:80]}")
+
         page = await self._create_stealth_page()
 
         # 用于捕获 SPA 页面的 API 响应数据
@@ -493,20 +688,35 @@ class WebWorker:
             if not page_loaded:
                 return {"success": False, "error": "页面加载失败（可能被反爬拦截）", "data": [], "url": url}
 
-            await self._human_like_delay(1500, 3000)
+            if self.fast_mode:
+                await self._human_like_delay(180, 450)
+            else:
+                await self._human_like_delay(1500, 3000)
 
             # 等待页面稳定
-            try:
-                await page.wait_for_load_state("networkidle", timeout=15000)
-            except:
-                pass  # 超时也继续
+            if self.fast_mode:
+                try:
+                    await page.wait_for_load_state("domcontentloaded", timeout=3000)
+                except:
+                    pass
+            else:
+                try:
+                    await page.wait_for_load_state("networkidle", timeout=15000)
+                except:
+                    pass  # 超时也继续
 
             # 等待动态内容渲染（SPA 页面需要额外等待）
             try:
-                await page.wait_for_selector("table, .list, ul li, [class*='list'], [class*='item'], .el-table", timeout=10000)
+                await page.wait_for_selector(
+                    "table, .list, ul li, [class*='list'], [class*='item'], .el-table",
+                    timeout=4000 if self.fast_mode else 10000,
+                )
             except:
                 # 没找到常见列表元素，多等一会儿让 JS 执行完
-                await self._human_like_delay(3000, 5000)
+                if self.fast_mode:
+                    await self._human_like_delay(300, 700)
+                else:
+                    await self._human_like_delay(3000, 5000)
 
             # Step 2.5: 检测并处理验证码
             try:
@@ -520,13 +730,16 @@ class WebWorker:
                 captcha_solved = await self.captcha_solver.solve(page, max_retries=5)
                 if captcha_solved:
                     # 验证码通过后，等待页面完全加载
-                    await self._human_like_delay(2000, 3000)
+                    if self.fast_mode:
+                        await self._human_like_delay(250, 600)
+                    else:
+                        await self._human_like_delay(2000, 3000)
                     try:
-                        await page.wait_for_load_state("domcontentloaded", timeout=10000)
+                        await page.wait_for_load_state("domcontentloaded", timeout=3000 if self.fast_mode else 10000)
                     except:
                         pass
                     try:
-                        await page.wait_for_load_state("networkidle", timeout=10000)
+                        await page.wait_for_load_state("networkidle", timeout=3000 if self.fast_mode else 10000)
                     except:
                         pass
                 else:
@@ -595,16 +808,25 @@ class WebWorker:
                     if next_url and next_url != page.url:
                         api_responses.clear()
                         await page.goto(next_url, wait_until="domcontentloaded", timeout=30000)
-                        await self._human_like_delay(2000, 4000)
+                        if self.fast_mode:
+                            await self._human_like_delay(200, 500)
+                        else:
+                            await self._human_like_delay(2000, 4000)
                         try:
-                            await page.wait_for_load_state("networkidle", timeout=15000)
+                            await page.wait_for_load_state("networkidle", timeout=3000 if self.fast_mode else 15000)
                         except:
                             pass
                         # 等待动态内容
                         try:
-                            await page.wait_for_selector("table, .list, ul li, [class*='list'], [class*='item'], .el-table", timeout=10000)
+                            await page.wait_for_selector(
+                                "table, .list, ul li, [class*='list'], [class*='item'], .el-table",
+                                timeout=4000 if self.fast_mode else 10000,
+                            )
                         except:
-                            await self._human_like_delay(3000, 5000)
+                            if self.fast_mode:
+                                await self._human_like_delay(300, 700)
+                            else:
+                                await self._human_like_delay(3000, 5000)
                         await self._scroll_page(page)
                     else:
                         break  # 没有新页面可探索了

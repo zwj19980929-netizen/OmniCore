@@ -45,6 +45,14 @@ class Settings:
     DEBUG_MODE = os.getenv("DEBUG_MODE", "false").lower() == "true"
     LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO")
 
+    # === 浏览器执行配置 ===
+    # 快速模式：减少随机延迟与不必要等待，优先吞吐
+    BROWSER_FAST_MODE = os.getenv("BROWSER_FAST_MODE", "true").lower() == "true"
+    # 阻断重资源：图片/字体/媒体，减少页面负载
+    BLOCK_HEAVY_RESOURCES = os.getenv("BLOCK_HEAVY_RESOURCES", "true").lower() == "true"
+    # 静态抓取优先：纯读取页面时先尝试 requests，不启动浏览器
+    STATIC_FETCH_ENABLED = os.getenv("STATIC_FETCH_ENABLED", "true").lower() == "true"
+
     # === 意图分类 ===
     INTENT_TYPES = [
         "web_scraping",      # 网页抓取
