@@ -17,6 +17,7 @@ from pydantic import BaseModel
 
 from config.settings import settings
 from utils.logger import logger, log_agent_action
+from utils.text import sanitize_text, sanitize_value
 
 # 自动丢弃模型不支持的参数（如 GPT-5 不支持 temperature）
 litellm.drop_params = True
@@ -177,6 +178,8 @@ class LLMClient:
         api_base = cfg.get("api_base")
         if api_base:
             kwargs["api_base"] = api_base
+        elif provider == "openai" and settings.OPENAI_API_BASE:
+            kwargs["api_base"] = settings.OPENAI_API_BASE
         elif provider in self.PROVIDER_API_BASE:
             kwargs["api_base"] = self.PROVIDER_API_BASE[provider]
 
@@ -325,9 +328,11 @@ class LLMClient:
         同步聊天接口（支持所有厂家）
         """
         try:
+            clean_messages = sanitize_value(messages)
+
             if self._should_use_gemini_query_mode():
                 return self._chat_gemini_query_mode(
-                    messages=messages,  # type: ignore[arg-type]
+                    messages=clean_messages,  # type: ignore[arg-type]
                     temperature=temperature,
                     max_tokens=max_tokens,
                     json_mode=json_mode,
@@ -335,7 +340,7 @@ class LLMClient:
 
             kwargs = {
                 "model": self._get_litellm_model(),
-                "messages": messages,
+                "messages": clean_messages,
                 "temperature": temperature,
                 "max_tokens": self._safe_max_tokens(max_tokens),
                 "timeout": 120,
@@ -346,7 +351,7 @@ class LLMClient:
 
             response = completion(**kwargs)
 
-            content = response.choices[0].message.content
+            content = sanitize_text(response.choices[0].message.content or "")
             if not content:
                 refusal = getattr(response.choices[0].message, 'refusal', None)
                 if refusal:
@@ -382,10 +387,12 @@ class LLMClient:
         异步聊天接口（支持所有厂家）
         """
         try:
+            clean_messages = sanitize_value(messages)
+
             if self._should_use_gemini_query_mode():
                 return await asyncio.to_thread(
                     self._chat_gemini_query_mode,
-                    messages,  # type: ignore[arg-type]
+                    clean_messages,  # type: ignore[arg-type]
                     temperature,
                     max_tokens,
                     json_mode,
@@ -393,7 +400,7 @@ class LLMClient:
 
             kwargs = {
                 "model": self._get_litellm_model(),
-                "messages": messages,
+                "messages": clean_messages,
                 "temperature": temperature,
                 "max_tokens": self._safe_max_tokens(max_tokens),
                 "timeout": 120,
@@ -406,7 +413,7 @@ class LLMClient:
             response = await acompletion(**kwargs)
 
             return LLMResponse(
-                content=response.choices[0].message.content,
+                content=sanitize_text(response.choices[0].message.content or ""),
                 model=response.model,
                 usage={
                     "prompt_tokens": response.usage.prompt_tokens,
@@ -432,8 +439,8 @@ class LLMClient:
         带系统提示的聊天（便捷方法）
         """
         messages = [
-            {"role": "system", "content": system_prompt},
-            {"role": "user", "content": user_message},
+            {"role": "system", "content": sanitize_text(system_prompt or "")},
+            {"role": "user", "content": sanitize_text(user_message or "")},
         ]
         return self.chat(messages, temperature, max_tokens, json_mode)
 

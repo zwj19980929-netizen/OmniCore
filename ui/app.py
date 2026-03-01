@@ -3,7 +3,6 @@ OmniCore Streamlit 前端界面
 简洁的 Web UI，支持任务输入和结果展示
 """
 import streamlit as st
-import asyncio
 from datetime import datetime
 
 # 页面配置
@@ -26,6 +25,8 @@ def init_session_state():
         st.session_state.messages = []
     if "task_history" not in st.session_state:
         st.session_state.task_history = []
+    if "conversation_history" not in st.session_state:
+        st.session_state.conversation_history = []
     if "memory_initialized" not in st.session_state:
         st.session_state.memory_initialized = False
 
@@ -93,30 +94,26 @@ def render_chat_message(role: str, content: str, timestamp: str = None):
 
 def execute_task(user_input: str) -> dict:
     """执行任务"""
-    from core.state import create_initial_state
-    from core.graph import get_graph
+    from core.runtime import run_task
 
-    initial_state = create_initial_state(user_input)
+    memory = st.session_state.memory if st.session_state.memory_initialized else None
+    result = run_task(
+        user_input,
+        memory=memory,
+        conversation_history=st.session_state.conversation_history,
+    )
 
-    # 查询相关记忆
-    if st.session_state.memory_initialized:
-        try:
-            related = st.session_state.memory.search_memory(user_input, n_results=3)
-            if related:
-                initial_state["shared_memory"]["related_history"] = related
-        except:
-            pass
+    if not result.get("is_special_command"):
+        turn_record = {
+            "user_input": user_input,
+            "success": result.get("success", False),
+            "output": (result.get("output") or result.get("error") or "")[:300],
+        }
+        st.session_state.conversation_history.append(turn_record)
+        if len(st.session_state.conversation_history) > 5:
+            st.session_state.conversation_history.pop(0)
 
-    graph = get_graph()
-    final_state = graph.invoke(initial_state)
-
-    return {
-        "success": final_state.get("execution_status") == "completed",
-        "output": final_state.get("final_output", ""),
-        "status": final_state.get("execution_status"),
-        "intent": final_state.get("current_intent", ""),
-        "tasks": final_state.get("task_queue", []),
-    }
+    return result
 
 
 def main():
@@ -163,10 +160,11 @@ def main():
                     result = execute_task(user_input)
 
                     if result["success"]:
-                        response = f"✅ 任务完成\n\n{result['output']}"
+                        response = f"✅ {result.get('output', '任务完成')}"
                         st.success("任务执行成功")
                     else:
-                        response = f"❌ 任务失败\n\n状态: {result['status']}"
+                        detail = result.get("error") or result.get("output") or f"状态: {result['status']}"
+                        response = f"❌ {detail}"
                         st.error("任务执行失败")
 
                     st.markdown(response)

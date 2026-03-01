@@ -9,6 +9,14 @@ from dotenv import load_dotenv
 load_dotenv()
 
 
+def _env_int(name: str, default: int) -> int:
+    """读取整型环境变量，异常时回退默认值。"""
+    try:
+        return int(os.getenv(name, str(default)))
+    except (TypeError, ValueError):
+        return default
+
+
 class Settings:
     """全局配置类"""
 
@@ -20,6 +28,7 @@ class Settings:
     DEFAULT_MODEL = os.getenv("DEFAULT_MODEL", "deepseek/deepseek-chat")
     VISION_MODEL = os.getenv("VISION_MODEL", "gpt-4o")  # 多模态模型
     OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
+    OPENAI_API_BASE = os.getenv("OPENAI_API_BASE", "")  # OpenAI 代理地址
     ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY", "")
     GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
     DEEPSEEK_API_KEY = os.getenv("DEEPSEEK_API_KEY", "")
@@ -52,6 +61,14 @@ class Settings:
     BLOCK_HEAVY_RESOURCES = os.getenv("BLOCK_HEAVY_RESOURCES", "true").lower() == "true"
     # 静态抓取优先：纯读取页面时先尝试 requests，不启动浏览器
     STATIC_FETCH_ENABLED = os.getenv("STATIC_FETCH_ENABLED", "true").lower() == "true"
+    # DAG 调度是否允许同批次并行执行互不依赖的任务
+    ENABLE_PARALLEL_EXECUTION = os.getenv("ENABLE_PARALLEL_EXECUTION", "true").lower() == "true"
+    # 单批次最大并行任务数
+    MAX_PARALLEL_TASKS = max(_env_int("MAX_PARALLEL_TASKS", 4), 1)
+    # 浏览器任务单批次并行上限，避免 Playwright 资源争抢过重
+    MAX_PARALLEL_BROWSER_TASKS = max(_env_int("MAX_PARALLEL_BROWSER_TASKS", 2), 1)
+    # 系统任务默认串行，避免命令执行/桌面控制互相干扰
+    MAX_PARALLEL_SYSTEM_TASKS = max(_env_int("MAX_PARALLEL_SYSTEM_TASKS", 1), 1)
 
     # === 意图分类 ===
     INTENT_TYPES = [

@@ -12,6 +12,7 @@ from chromadb.config import Settings as ChromaSettings
 
 from config.settings import settings
 from utils.logger import log_agent_action, logger, log_success
+from utils.text import sanitize_text, sanitize_value
 
 
 class ChromaMemory:
@@ -63,19 +64,20 @@ class ChromaMemory:
         Returns:
             记忆 ID
         """
+        clean_content = sanitize_text(content or "")
         memory_id = f"mem_{uuid.uuid4().hex[:12]}"
 
         meta = {
             "type": memory_type,
             "timestamp": datetime.now().isoformat(),
-            "content_length": len(content),
+            "content_length": len(clean_content),
         }
         if metadata:
-            meta.update(metadata)
+            meta.update(sanitize_value(metadata))
 
         self._collection.add(
             ids=[memory_id],
-            documents=[content],
+            documents=[clean_content],
             metadatas=[meta],
         )
 
@@ -99,14 +101,15 @@ class ChromaMemory:
         Returns:
             相关记忆列表
         """
-        log_agent_action(self.name, "搜索记忆", query[:30])
+        clean_query = sanitize_text(query or "")
+        log_agent_action(self.name, "搜索记忆", clean_query[:30])
 
         where_filter = None
         if memory_type:
             where_filter = {"type": memory_type}
 
         results = self._collection.query(
-            query_texts=[query],
+            query_texts=[clean_query],
             n_results=n_results,
             where=where_filter,
         )
@@ -116,8 +119,10 @@ class ChromaMemory:
             for i, doc in enumerate(results["documents"][0]):
                 memories.append({
                     "id": results["ids"][0][i],
-                    "content": doc,
-                    "metadata": results["metadatas"][0][i] if results["metadatas"] else {},
+                    "content": sanitize_text(doc or ""),
+                    "metadata": sanitize_value(
+                        results["metadatas"][0][i] if results["metadatas"] else {}
+                    ),
                     "distance": results["distances"][0][i] if results["distances"] else None,
                 })
 

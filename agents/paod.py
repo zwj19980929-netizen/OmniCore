@@ -8,7 +8,7 @@ from utils.logger import log_agent_action, log_warning
 
 # === 常量 ===
 MAX_STEPS_PER_TASK = 6
-MAX_FALLBACK_ATTEMPTS = 2
+MAX_FALLBACK_ATTEMPTS = 3
 
 FAILURE_TYPES: Dict[str, List[str]] = {
     "timeout": ["timeout", "timed out", "超时", "TimeoutError"],
