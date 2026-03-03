@@ -31,7 +31,7 @@ class SystemWorker:
         self,
         command: str,
         working_dir: Optional[str] = None,
-        timeout: int = 30,
+        timeout: int = None,
         require_confirm: bool = True,
     ) -> Dict[str, Any]:
         """
@@ -40,12 +40,13 @@ class SystemWorker:
         Args:
             command: 要执行的命令
             working_dir: 工作目录
-            timeout: 超时时间（秒）
+            timeout: 超时时间（秒），None 则使用默认配置
             require_confirm: 是否需要人类确认
 
         Returns:
             执行结果
         """
+        timeout_sec = timeout if timeout is not None else settings.SYSTEM_COMMAND_TIMEOUT
         log_agent_action(self.name, "准备执行命令", command[:50])
 
         # 高危操作确认
@@ -67,7 +68,7 @@ class SystemWorker:
                 shell=True,
                 capture_output=True,
                 text=True,
-                timeout=timeout,
+                timeout=timeout_sec,
                 cwd=working_dir,
             )
 
@@ -89,10 +90,10 @@ class SystemWorker:
                 }
 
         except subprocess.TimeoutExpired:
-            log_error(f"命令执行超时: {timeout}秒")
+            log_error(f"命令执行超时: {timeout_sec}秒")
             return {
                 "success": False,
-                "error": f"执行超时 ({timeout}秒)",
+                "error": f"执行超时 ({timeout_sec}秒)",
                 "command": command,
             }
         except Exception as e:

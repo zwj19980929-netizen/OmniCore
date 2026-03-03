@@ -42,6 +42,9 @@ def replanner_node(state: OmniCoreState) -> OmniCoreState:
     state["replan_count"] = state.get("replan_count", 0) + 1
     log_agent_action("Replanner", f"开始反思重规划（第 {state['replan_count']} 次）")
 
+    # 如果已经是最后一次重规划，标记为"必须给出答案"模式
+    is_final_attempt = state["replan_count"] >= MAX_REPLAN
+
     # 记录本轮失败策略到历史（防止 Replanner 兜圈子）
     replan_history = state.get("shared_memory", {}).get("_replan_history", [])
 
@@ -105,13 +108,18 @@ def replanner_node(state: OmniCoreState) -> OmniCoreState:
 - 想想一个真实的人遇到同样的障碍会怎么做——他会打开搜索引擎，找一条能走通的路。
 - 新策略必须和之前失败的方案有本质区别，不能只是"换个参数再来一次"。
 - 如果不确定该去哪，就先安排一个搜索任务，让 Worker 通过搜索引擎找到可行的信息来源。
+- **重要**：不要基于你自己的知识判断"某个产品是否存在"。你的知识可能过时。应该让 Worker 去实际搜索，基于搜索结果判断。
+- **保持用户的原始意图**：如果用户要"价格对比"，就应该一直尝试找价格对比，而不是改成找"爆料"或"预测"。只有在确认产品完全不存在时才考虑替代方案。
 
 返回 JSON：
 ```json
 {
     "analysis": "失败原因分析（属于哪个层次的失败）",
     "failed_approach": "之前走的路为什么本质上走不通",
-    "new_strategy": "新策略描述（必须和之前有本质区别）",
+    "new_strategy": "新策略描述（必须和之前有本质区别，但要保持用户的原始意图）",
+    "should_give_up": false,
+    "give_up_reason": "如果 should_give_up 为 true，说明为什么应该放弃并直接回答用户",
+    "direct_answer": "如果 should_give_up 为 true，这里填写给用户的直接回答",
     "tasks": [
         {
             "task_id": "replan_task_1",
@@ -127,7 +135,7 @@ def replanner_node(state: OmniCoreState) -> OmniCoreState:
 
 可用的 worker 类型：web_worker, browser_agent, file_worker, system_worker
 """,
-        user_message=f"用户原始需求：{state['user_input']}\n\n失败的任务：\n{failure_summary}{history_summary}\n\n这是第 {state['replan_count']} 次重规划，请提出和之前所有尝试都不同的新策略。",
+        user_message=f"用户原始需求：{state['user_input']}\n\n失败的任务：\n{failure_summary}{history_summary}\n\n这是第 {state['replan_count']} 次重规划（{'最后一次，必须给出明确答案' if is_final_attempt else '请提出和之前所有尝试都不同的新策略'}）。",
         temperature=0.3,
         json_mode=True,
     )
@@ -135,6 +143,16 @@ def replanner_node(state: OmniCoreState) -> OmniCoreState:
     try:
         result = llm.parse_json_response(response)
         log_agent_action("Replanner", f"分析: {result.get('analysis', '')[:80]}")
+
+        # 检查是否应该放弃并直接回答用户
+        if result.get("should_give_up", False):
+            log_warning(f"Replanner 决定放弃: {result.get('give_up_reason', '')}")
+            state["final_output"] = result.get("direct_answer", "抱歉，无法完成您的请求。")
+            state["execution_status"] = "completed"
+            state["critic_approved"] = True
+            state["task_queue"] = []  # 清空任务队列，直接结束
+            return state
+
         log_agent_action("Replanner", f"新策略: {result.get('new_strategy', '')[:80]}")
 
         # 用新任务替换失败的任务
@@ -155,11 +173,11 @@ def replanner_node(state: OmniCoreState) -> OmniCoreState:
             new_tasks.append(t)
 
         if new_tasks:
-            # 保留已完成的任务，替换失败的
-            completed = [t for t in state["task_queue"] if t["status"] == "completed"]
-            state["task_queue"] = completed + new_tasks
+            # 不保留之前的任务，因为既然触发了 Replanner，说明之前的任务都不满足要求
+            # 保留它们只会导致 Critic 重复审查并持续失败
+            state["task_queue"] = new_tasks
             state["error_trace"] = ""
-            log_success(f"重规划完成，新增 {len(new_tasks)} 个任务")
+            log_success(f"重规划完成，新增 {len(new_tasks)} 个任务（已清空旧任务）")
         else:
             log_warning("重规划未产生新任务")
 

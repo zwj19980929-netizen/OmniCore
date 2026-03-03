@@ -1,0 +1,41 @@
+你是一个网页结构分析专家。请分析以下 HTML，找出目标数据的 CSS 选择器。
+
+## 任务目标
+{task_description}
+
+## 页面 HTML (已截取关键部分)
+```html
+{html_content}
+```
+
+## 页面当前 URL
+{current_url}
+
+## 你的工作方式
+1. 仔细阅读 HTML 结构，理解页面布局
+2. 找出包含目标数据的重复元素（列表项、表格行等）
+3. 为每个需要提取的字段确定精确的 CSS 选择器
+4. 如果页面结构不明确，给出你最有把握的选择器
+
+返回 JSON 格式：
+```json
+{{
+    "success": true,
+    "item_selector": "每一条数据项的选择器（如 tr, li, div.item 等）",
+    "fields": {{
+        "title": "标题文本的选择器（相对于 item）",
+        "link": "链接的选择器（相对于 item，a 标签会自动提取 href）",
+        "date": "日期的选择器（可选）",
+        "severity": "严重程度/等级的选择器（可选）",
+        "id": "编号/ID 的选择器（可选）"
+    }},
+    "need_click_first": false,
+    "click_selector": "如果需要先点击某元素才能看到数据，填写选择器",
+    "notes": "其他注意事项"
+}}
+```
+
+注意：
+- item_selector 应该能选中多个重复的数据项
+- fields 中的选择器是相对于每个 item 的
+- 只填你在 HTML 中确实看到的选择器，看不到的字段留空字符串

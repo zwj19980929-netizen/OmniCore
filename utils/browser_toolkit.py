@@ -33,6 +33,7 @@ class BrowserToolkit:
     """
     原子浏览器操作工具箱。
     合并 browser_agent + web_worker 的反检测逻辑，统一管理生命周期和 iframe 状态。
+    支持 async with 上下文管理器，确保资源正确释放。
     """
 
     def __init__(
@@ -57,6 +58,19 @@ class BrowserToolkit:
         )
         self.user_data_dir = user_data_dir
         self._captcha_solver = None  # lazy
+
+    # ── context manager support ──────────────────────────────
+
+    async def __aenter__(self):
+        """异步上下文管理器入口"""
+        await self.launch()
+        await self.create_page()
+        return self
+
+    async def __aexit__(self, exc_type, exc_val, exc_tb):
+        """异步上下文管理器退出，确保资源释放"""
+        await self.close()
+        return False  # 不抑制异常
 
     # ── helpers ──────────────────────────────────────────────
 
@@ -208,146 +222,161 @@ class BrowserToolkit:
 
     # ── navigation ────────────────────────────────────────────
 
-    async def goto(self, url: str, wait_until: str = "domcontentloaded", timeout: int = 30000) -> ToolkitResult:
+    async def goto(self, url: str, wait_until: str = "domcontentloaded", timeout: int = None) -> ToolkitResult:
         try:
-            await self._page.goto(url, wait_until=wait_until, timeout=self._timeout(timeout))
+            timeout_ms = timeout if timeout is not None else settings.BROWSER_NAVIGATION_TIMEOUT
+            await self._page.goto(url, wait_until=wait_until, timeout=self._timeout(timeout_ms))
             return ToolkitResult(success=True, data=self._page.url)
         except Exception as e:
             return ToolkitResult(success=False, error=str(e))
 
     async def go_back(self) -> ToolkitResult:
         try:
-            await self._page.go_back(timeout=self._timeout(10000))
+            await self._page.go_back(timeout=self._timeout(settings.BROWSER_NAVIGATION_TIMEOUT))
             return ToolkitResult(success=True)
         except Exception as e:
             return ToolkitResult(success=False, error=str(e))
 
     async def go_forward(self) -> ToolkitResult:
         try:
-            await self._page.go_forward(timeout=self._timeout(10000))
+            await self._page.go_forward(timeout=self._timeout(settings.BROWSER_NAVIGATION_TIMEOUT))
             return ToolkitResult(success=True)
         except Exception as e:
             return ToolkitResult(success=False, error=str(e))
 
     async def refresh(self) -> ToolkitResult:
         try:
-            await self._page.reload(timeout=self._timeout(15000))
+            await self._page.reload(timeout=self._timeout(settings.BROWSER_NAVIGATION_TIMEOUT))
             return ToolkitResult(success=True)
         except Exception as e:
             return ToolkitResult(success=False, error=str(e))
 
-    async def wait_for_load(self, state: str = "domcontentloaded", timeout: int = 10000) -> ToolkitResult:
+    async def wait_for_load(self, state: str = "domcontentloaded", timeout: int = None) -> ToolkitResult:
         try:
+            timeout_ms = timeout if timeout is not None else settings.BROWSER_LOAD_TIMEOUT
             target = self.active_surface or self._page
-            await target.wait_for_load_state(state, timeout=self._timeout(timeout))
+            await target.wait_for_load_state(state, timeout=self._timeout(timeout_ms))
             return ToolkitResult(success=True)
         except Exception as e:
             return ToolkitResult(success=False, error=str(e))
 
-    async def wait_for_selector(self, selector: str, timeout: int = 8000) -> ToolkitResult:
+    async def wait_for_selector(self, selector: str, timeout: int = None) -> ToolkitResult:
         try:
+            timeout_ms = timeout if timeout is not None else settings.BROWSER_SELECTOR_TIMEOUT
             target = self.active_surface or self._page
-            elem = await target.wait_for_selector(selector, timeout=self._timeout(timeout))
+            elem = await target.wait_for_selector(selector, timeout=self._timeout(timeout_ms))
             return ToolkitResult(success=True, data=elem)
         except Exception as e:
             return ToolkitResult(success=False, error=str(e))
 
     # ── interaction ──────────────────────────────────────────
 
-    async def click(self, selector: str, timeout: int = 5000) -> ToolkitResult:
+    async def click(self, selector: str, timeout: int = None) -> ToolkitResult:
         try:
+            timeout_ms = timeout if timeout is not None else settings.BROWSER_ACTION_TIMEOUT
             surface = self.active_surface
-            await surface.click(selector, timeout=self._timeout(timeout))
+            await surface.click(selector, timeout=self._timeout(timeout_ms))
             return ToolkitResult(success=True)
         except Exception as e:
             return ToolkitResult(success=False, error=str(e))
 
-    async def double_click(self, selector: str, timeout: int = 5000) -> ToolkitResult:
+    async def double_click(self, selector: str, timeout: int = None) -> ToolkitResult:
         try:
+            timeout_ms = timeout if timeout is not None else settings.BROWSER_ACTION_TIMEOUT
             surface = self.active_surface
-            await surface.dblclick(selector, timeout=self._timeout(timeout))
+            await surface.dblclick(selector, timeout=self._timeout(timeout_ms))
             return ToolkitResult(success=True)
         except Exception as e:
             return ToolkitResult(success=False, error=str(e))
 
-    async def right_click(self, selector: str, timeout: int = 5000) -> ToolkitResult:
+    async def right_click(self, selector: str, timeout: int = None) -> ToolkitResult:
         try:
+            timeout_ms = timeout if timeout is not None else settings.BROWSER_ACTION_TIMEOUT
             surface = self.active_surface
-            await surface.click(selector, button="right", timeout=self._timeout(timeout))
+            await surface.click(selector, button="right", timeout=self._timeout(timeout_ms))
             return ToolkitResult(success=True)
         except Exception as e:
             return ToolkitResult(success=False, error=str(e))
 
-    async def hover(self, selector: str, timeout: int = 5000) -> ToolkitResult:
+    async def hover(self, selector: str, timeout: int = None) -> ToolkitResult:
         try:
+            timeout_ms = timeout if timeout is not None else settings.BROWSER_ACTION_TIMEOUT
             surface = self.active_surface
-            await surface.hover(selector, timeout=self._timeout(timeout))
+            await surface.hover(selector, timeout=self._timeout(timeout_ms))
             return ToolkitResult(success=True)
         except Exception as e:
             return ToolkitResult(success=False, error=str(e))
 
-    async def input_text(self, selector: str, text: str, timeout: int = 5000) -> ToolkitResult:
+    async def input_text(self, selector: str, text: str, timeout: int = None) -> ToolkitResult:
         """fill — 直接设置值（快速）"""
         try:
+            timeout_ms = timeout if timeout is not None else settings.BROWSER_ACTION_TIMEOUT
             surface = self.active_surface
-            await surface.locator(selector).first.fill(text, timeout=self._timeout(timeout))
+            await surface.locator(selector).first.fill(text, timeout=self._timeout(timeout_ms))
             return ToolkitResult(success=True)
         except Exception as e:
             return ToolkitResult(success=False, error=str(e))
 
-    async def type_text(self, selector: str, text: str, delay: int = 20, timeout: int = 5000) -> ToolkitResult:
+    async def type_text(self, selector: str, text: str, delay: int = 20, timeout: int = None) -> ToolkitResult:
         """type — 逐字符输入（模拟人类）"""
         try:
+            timeout_ms = timeout if timeout is not None else settings.BROWSER_ACTION_TIMEOUT
             surface = self.active_surface
-            await surface.locator(selector).first.type(text, delay=delay, timeout=self._timeout(timeout))
+            await surface.locator(selector).first.type(text, delay=delay, timeout=self._timeout(timeout_ms))
             return ToolkitResult(success=True)
         except Exception as e:
             return ToolkitResult(success=False, error=str(e))
 
-    async def clear_input(self, selector: str, timeout: int = 5000) -> ToolkitResult:
+    async def clear_input(self, selector: str, timeout: int = None) -> ToolkitResult:
         try:
+            timeout_ms = timeout if timeout is not None else settings.BROWSER_ACTION_TIMEOUT
             surface = self.active_surface
-            await surface.locator(selector).first.fill("", timeout=self._timeout(timeout))
+            await surface.locator(selector).first.fill("", timeout=self._timeout(timeout_ms))
             return ToolkitResult(success=True)
         except Exception as e:
             return ToolkitResult(success=False, error=str(e))
 
-    async def select_option(self, selector: str, value: str, timeout: int = 5000) -> ToolkitResult:
+    async def select_option(self, selector: str, value: str, timeout: int = None) -> ToolkitResult:
         try:
+            timeout_ms = timeout if timeout is not None else settings.BROWSER_ACTION_TIMEOUT
             surface = self.active_surface
-            await surface.locator(selector).first.select_option(value=value, timeout=self._timeout(timeout))
+            await surface.locator(selector).first.select_option(value=value, timeout=self._timeout(timeout_ms))
             return ToolkitResult(success=True)
         except Exception as e:
             return ToolkitResult(success=False, error=str(e))
 
-    async def check_checkbox(self, selector: str, timeout: int = 5000) -> ToolkitResult:
+    async def check_checkbox(self, selector: str, timeout: int = None) -> ToolkitResult:
         try:
+            timeout_ms = timeout if timeout is not None else settings.BROWSER_ACTION_TIMEOUT
             surface = self.active_surface
-            await surface.locator(selector).first.check(timeout=self._timeout(timeout))
+            await surface.locator(selector).first.check(timeout=self._timeout(timeout_ms))
             return ToolkitResult(success=True)
         except Exception as e:
             return ToolkitResult(success=False, error=str(e))
 
-    async def upload_file(self, selector: str, path: str, timeout: int = 5000) -> ToolkitResult:
+    async def upload_file(self, selector: str, path: str, timeout: int = None) -> ToolkitResult:
         try:
+            timeout_ms = timeout if timeout is not None else settings.BROWSER_ACTION_TIMEOUT
             surface = self.active_surface
-            await surface.locator(selector).first.set_input_files(path, timeout=self._timeout(timeout))
+            await surface.locator(selector).first.set_input_files(path, timeout=self._timeout(timeout_ms))
             return ToolkitResult(success=True)
         except Exception as e:
             return ToolkitResult(success=False, error=str(e))
 
-    async def force_click(self, selector: str, timeout: int = 5000) -> ToolkitResult:
+    async def force_click(self, selector: str, timeout: int = None) -> ToolkitResult:
         try:
+            timeout_ms = timeout if timeout is not None else settings.BROWSER_ACTION_TIMEOUT
             surface = self.active_surface
-            await surface.locator(selector).first.click(timeout=self._timeout(timeout), force=True)
+            await surface.locator(selector).first.click(timeout=self._timeout(timeout_ms), force=True)
             return ToolkitResult(success=True)
         except Exception as e:
             return ToolkitResult(success=False, error=str(e))
 
-    async def locator_click(self, selector: str, timeout: int = 5000) -> ToolkitResult:
+    async def locator_click(self, selector: str, timeout: int = None) -> ToolkitResult:
         try:
+            timeout_ms = timeout if timeout is not None else settings.BROWSER_ACTION_TIMEOUT
             surface = self.active_surface
-            await surface.locator(selector).first.click(timeout=self._timeout(timeout))
+            await surface.locator(selector).first.click(timeout=self._timeout(timeout_ms))
             return ToolkitResult(success=True)
         except Exception as e:
             return ToolkitResult(success=False, error=str(e))
@@ -784,12 +813,13 @@ class BrowserToolkit:
 
     # ── download ─────────────────────────────────────────────
 
-    async def expect_download(self, selector: str, save_path: str = "", timeout: int = 10000) -> ToolkitResult:
+    async def expect_download(self, selector: str, save_path: str = "", timeout: int = None) -> ToolkitResult:
         """点击触发下载并可选保存"""
         try:
+            timeout_ms = timeout if timeout is not None else settings.BROWSER_DOWNLOAD_TIMEOUT
             surface = self.active_surface
-            async with self._page.expect_download(timeout=self._timeout(timeout)) as dl_info:
-                await surface.click(selector, timeout=self._timeout(5000))
+            async with self._page.expect_download(timeout=self._timeout(timeout_ms)) as dl_info:
+                await surface.click(selector, timeout=self._timeout(settings.BROWSER_ACTION_TIMEOUT))
             download = await dl_info.value
             if save_path:
                 await download.save_as(save_path)
@@ -799,34 +829,38 @@ class BrowserToolkit:
 
     # ── semantic locators (for fallback strategies) ──────────
 
-    async def click_by_role(self, role: str, name: str, timeout: int = 5000) -> ToolkitResult:
+    async def click_by_role(self, role: str, name: str, timeout: int = None) -> ToolkitResult:
         try:
+            timeout_ms = timeout if timeout is not None else settings.BROWSER_ACTION_TIMEOUT
             surface = self.active_surface
-            await surface.get_by_role(role, name=name, exact=False).first.click(timeout=self._timeout(timeout))
+            await surface.get_by_role(role, name=name, exact=False).first.click(timeout=self._timeout(timeout_ms))
             return ToolkitResult(success=True)
         except Exception as e:
             return ToolkitResult(success=False, error=str(e))
 
-    async def click_by_label(self, label: str, timeout: int = 5000) -> ToolkitResult:
+    async def click_by_label(self, label: str, timeout: int = None) -> ToolkitResult:
         try:
+            timeout_ms = timeout if timeout is not None else settings.BROWSER_ACTION_TIMEOUT
             surface = self.active_surface
-            await surface.get_by_label(label, exact=False).first.click(timeout=self._timeout(timeout))
+            await surface.get_by_label(label, exact=False).first.click(timeout=self._timeout(timeout_ms))
             return ToolkitResult(success=True)
         except Exception as e:
             return ToolkitResult(success=False, error=str(e))
 
-    async def fill_by_placeholder(self, placeholder: str, value: str, timeout: int = 5000) -> ToolkitResult:
+    async def fill_by_placeholder(self, placeholder: str, value: str, timeout: int = None) -> ToolkitResult:
         try:
+            timeout_ms = timeout if timeout is not None else settings.BROWSER_ACTION_TIMEOUT
             surface = self.active_surface
-            await surface.get_by_placeholder(placeholder, exact=False).first.fill(value, timeout=self._timeout(timeout))
+            await surface.get_by_placeholder(placeholder, exact=False).first.fill(value, timeout=self._timeout(timeout_ms))
             return ToolkitResult(success=True)
         except Exception as e:
             return ToolkitResult(success=False, error=str(e))
 
-    async def fill_by_label(self, label: str, value: str, timeout: int = 5000) -> ToolkitResult:
+    async def fill_by_label(self, label: str, value: str, timeout: int = None) -> ToolkitResult:
         try:
+            timeout_ms = timeout if timeout is not None else settings.BROWSER_ACTION_TIMEOUT
             surface = self.active_surface
-            await surface.get_by_label(label, exact=False).first.fill(value, timeout=self._timeout(timeout))
+            await surface.get_by_label(label, exact=False).first.fill(value, timeout=self._timeout(timeout_ms))
             return ToolkitResult(success=True)
         except Exception as e:
             return ToolkitResult(success=False, error=str(e))

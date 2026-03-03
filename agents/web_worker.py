@@ -18,7 +18,34 @@ from utils.browser_toolkit import BrowserToolkit, ToolkitResult
 from utils.retry import async_retry, is_retryable
 from config.settings import settings
 
-# 延迟导入避免循环引用
+# ==================== 预编译正则表达式 ====================
+# HTML 清理相关
+RE_SCRIPT_TAG = re.compile(r"<script[^>]*>.*?</script>", re.DOTALL | re.IGNORECASE)
+RE_STYLE_TAG = re.compile(r"<style[^>]*>.*?</style>", re.DOTALL | re.IGNORECASE)
+RE_HTML_COMMENT = re.compile(r"<!--.*?-->", re.DOTALL)
+RE_HTML_TAG = re.compile(r"<[^>]+>")
+RE_WHITESPACE = re.compile(r"\s+")
+
+# 链接提取相关
+RE_HEADING_WITH_LINK = re.compile(
+    r"<(h1|h2|h3)[^>]*>.*?<a[^>]*href=[\"']([^\"']+)[\"'][^>]*>(.*?)</a>.*?</\1>",
+    re.DOTALL | re.IGNORECASE,
+)
+RE_ANCHOR_TAG = re.compile(
+    r"<a[^>]*href=[\"']([^\"']+)[\"'][^>]*>(.*?)</a>",
+    re.DOTALL | re.IGNORECASE,
+)
+
+# 文本块提取相关
+RE_PARAGRAPH_BLOCK = re.compile(r"<(p|li)[^>]*>(.*?)</\1>", re.DOTALL | re.IGNORECASE)
+RE_CONTENT_BLOCK = re.compile(
+    r"<(main|article|section|div)[^>]*>(.*?)</\1>", re.DOTALL | re.IGNORECASE
+)
+
+# 分词相关
+RE_TOKEN_SPLIT = re.compile(r"[\s,.;:|/\\]+")
+
+# ==================== 延迟导入 ====================
 def _import_paod():
     from agents.paod import (
         classify_failure, make_trace_step, evaluate_success_criteria,
@@ -148,14 +175,14 @@ class WebWorker:
         return not any(k in desc for k in interactive_keywords)
 
     def _clean_html_text(self, raw_html: str) -> str:
-        html = re.sub(r"<script[^>]*>.*?</script>", "", raw_html, flags=re.DOTALL | re.IGNORECASE)
-        html = re.sub(r"<style[^>]*>.*?</style>", "", html, flags=re.DOTALL | re.IGNORECASE)
-        html = re.sub(r"<!--.*?-->", "", html, flags=re.DOTALL)
+        html = RE_SCRIPT_TAG.sub("", raw_html)
+        html = RE_STYLE_TAG.sub("", html)
+        html = RE_HTML_COMMENT.sub("", html)
         return html
 
     def _strip_tags(self, text: str) -> str:
-        text = re.sub(r"<[^>]+>", " ", text)
-        text = re.sub(r"\s+", " ", text)
+        text = RE_HTML_TAG.sub(" ", text)
+        text = RE_WHITESPACE.sub(" ", text)
         return text.strip()
 
     def _is_noise_link(self, text: str, href: str) -> bool:
@@ -179,7 +206,7 @@ class WebWorker:
             score += 2
         if href.startswith("http"):
             score += 1
-        for token in re.split(r"[\s,.;:|/\\]+", task):
+        for token in RE_TOKEN_SPLIT.split(task):
             token = token.strip()
             if len(token) >= 3 and token in t:
                 score += 2
@@ -197,14 +224,6 @@ class WebWorker:
         cleaned = self._clean_html_text(html)
         candidates: List[Dict[str, Any]] = []
         seen = set()
-        heading_pattern = re.compile(
-            r"<(h1|h2|h3)[^>]*>.*?<a[^>]*href=[\"']([^\"']+)[\"'][^>]*>(.*?)</a>.*?</\1>",
-            re.DOTALL | re.IGNORECASE,
-        )
-        anchor_pattern = re.compile(
-            r"<a[^>]*href=[\"']([^\"']+)[\"'][^>]*>(.*?)</a>",
-            re.DOTALL | re.IGNORECASE,
-        )
 
         def _append(href: str, raw_text: str):
             text = self._strip_tags(raw_text)
@@ -221,10 +240,10 @@ class WebWorker:
                 "_order": len(candidates),
             })
 
-        for match in heading_pattern.finditer(cleaned):
+        for match in RE_HEADING_WITH_LINK.finditer(cleaned):
             _append(match.group(2), match.group(3))
         if len(candidates) < limit:
-            for match in anchor_pattern.finditer(cleaned):
+            for match in RE_ANCHOR_TAG.finditer(cleaned):
                 _append(match.group(1), match.group(2))
                 if len(candidates) >= max(limit * 4, 20):
                     break
@@ -239,16 +258,13 @@ class WebWorker:
         cleaned = self._clean_html_text(html)
         blocks: List[Dict[str, Any]] = []
         seen = set()
-        patterns = [
-            re.compile(r"<(p|li)[^>]*>(.*?)</\1>", re.DOTALL | re.IGNORECASE),
-            re.compile(r"<(main|article|section|div)[^>]*>(.*?)</\1>", re.DOTALL | re.IGNORECASE),
-        ]
+        patterns = [RE_PARAGRAPH_BLOCK, RE_CONTENT_BLOCK]
         for pattern in patterns:
             for match in pattern.finditer(cleaned):
                 text = self._strip_tags(match.group(2))
                 if len(text) < 40:
                     continue
-                key = re.sub(r"\s+", " ", text).strip().lower()[:120]
+                key = RE_WHITESPACE.sub(" ", text).strip().lower()[:120]
                 if key in seen:
                     continue
                 seen.add(key)
@@ -427,10 +443,10 @@ class WebWorker:
         html_r = await tk.get_page_html()
         html = html_r.data or ""
 
-        html = re.sub(r'<script[^>]*>.*?</script>', '', html, flags=re.DOTALL | re.IGNORECASE)
-        html = re.sub(r'<style[^>]*>.*?</style>', '', html, flags=re.DOTALL | re.IGNORECASE)
-        html = re.sub(r'<!--.*?-->', '', html, flags=re.DOTALL)
-        html = re.sub(r'\s+', ' ', html)
+        html = RE_SCRIPT_TAG.sub('', html)
+        html = RE_STYLE_TAG.sub('', html)
+        html = RE_HTML_COMMENT.sub('', html)
+        html = RE_WHITESPACE.sub(' ', html)
         if len(html) > 15000:
             html = html[:15000] + "\n... (truncated)"
 
@@ -717,14 +733,14 @@ class WebWorker:
             if data:
                 log_success(f"最终成功提取 {len(data)} 条数据")
             else:
-                # 换源搜索
+                # 换源搜索（最多尝试 2 个替代来源，防止无限循环）
                 log_agent_action(self.name, "当前来源失败，尝试通过搜索引擎寻找替代来源")
                 alt_urls = await self.search_for_urls(task_description, max_results=3, tk=tk)
                 original_domain = "/".join(url.split("/")[:3]) if url else ""
                 alt_urls = [u for u in alt_urls if original_domain not in u]
 
-                for alt_url in alt_urls[:2]:
-                    log_agent_action(self.name, "尝试替代来源", alt_url[:80])
+                for idx, alt_url in enumerate(alt_urls[:2], 1):
+                    log_agent_action(self.name, f"尝试替代来源 ({idx}/2)", alt_url[:80])
                     try:
                         await tk.goto(alt_url, timeout=30000)
                         await tk.human_delay(500, 1500)
@@ -742,12 +758,15 @@ class WebWorker:
                                 log_success(f"替代来源成功，从 {alt_url[:60]} 提取到 {len(data)} 条数据")
                                 break
                             else:
+                                log_warning(f"替代来源 {idx} 数据质量不符合要求")
                                 data = []
+                        else:
+                            log_warning(f"替代来源 {idx} 未能提取到数据")
                     except Exception as alt_err:
-                        log_warning(f"替代来源访问失败: {str(alt_err)[:80]}")
+                        log_warning(f"替代来源 {idx} 访问失败: {str(alt_err)[:80]}")
                         continue
                 if not data:
-                    log_warning("所有来源均未能提取到数据")
+                    log_warning("所有来源（包括 2 个替代来源）均未能提取到数据")
 
             return {
                 "success": len(data) > 0, "data": data, "count": len(data),

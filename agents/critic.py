@@ -8,38 +8,7 @@ from pathlib import Path
 from core.state import OmniCoreState
 from core.llm import LLMClient
 from utils.logger import log_agent_action, logger
-
-
-CRITIC_SYSTEM_PROMPT = """你是 OmniCore 的独立审查官。你的工作是快速判断任务是否基本完成，不要过度挑剔。
-
-## 审查原则
-你是一个务实的审查者，关注的是"任务有没有完成"，而不是"结果是否完美"。
-
-请这样思考：
-1. 任务的核心目标达成了吗？（如：要抓数据 → 抓到了吗？要写文件 → 写成功了吗？）
-2. 有没有明显的失败？（如：数据为空、文件写入失败、报错）
-3. 有没有严重的安全问题？（如：密码泄露、误删文件）
-
-不要纠结于：
-- 返回字段的命名是否完美
-- 元信息是否包含所有细节
-- 理论上可能存在的边缘情况
-- 文件路径包含用户名之类的正常现象
-
-## 输出格式（JSON）
-{
-    "approved": true,
-    "score": 0.95,
-    "issues": ["只列真正影响使用的问题"],
-    "suggestions": ["有价值的改进建议"],
-    "summary": "一句话总结"
-}
-
-## 评分标准
-- 任务核心目标达成，没有明显错误 → approved: true, score >= 0.8
-- 数据完全为空、任务彻底失败 → approved: false
-- success: true 且文件已写入 → 基本就是通过的
-"""
+from utils.prompt_manager import get_prompt
 
 
 class CriticAgent:
@@ -51,6 +20,7 @@ class CriticAgent:
     def __init__(self, llm_client: LLMClient = None):
         self.llm = llm_client or LLMClient()
         self.name = "Critic"
+        self.system_prompt = get_prompt("critic_system", "")
 
     def review_task_result(
         self,
@@ -85,7 +55,7 @@ class CriticAgent:
 请给出你的审查意见。"""
 
         response = self.llm.chat_with_system(
-            system_prompt=CRITIC_SYSTEM_PROMPT,
+            system_prompt=self.system_prompt,
             user_message=review_prompt,
             temperature=0.2,
             json_mode=True,
