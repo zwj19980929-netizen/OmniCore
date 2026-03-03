@@ -3,7 +3,15 @@ OmniCore 独立 Playwright 测试脚本
 直接测试 Web 自动化功能，无需 LLM 调用
 """
 import asyncio
+import os
+import pytest
 from playwright.async_api import async_playwright
+
+
+pytestmark = pytest.mark.skipif(
+    os.getenv("RUN_EXTERNAL_INTEGRATION_TESTS", "").lower() != "true",
+    reason="external browser tests require Playwright and network access",
+)
 
 
 async def scrape_hackernews_standalone():
@@ -73,7 +81,7 @@ async def scrape_hackernews_standalone():
         return news_items
 
 
-async def test_page_screenshot():
+async def _test_page_screenshot():
     """测试截图功能"""
     print("\n测试截图功能...")
 
@@ -91,7 +99,7 @@ async def test_page_screenshot():
         await browser.close()
 
 
-async def test_form_interaction():
+async def _test_form_interaction():
     """测试表单交互（以 Hacker News 搜索为例）"""
     print("\n测试页面交互...")
 
@@ -129,6 +137,16 @@ def main():
 
     # 运行测试
     asyncio.run(scrape_hackernews_standalone())
+
+
+def test_page_screenshot_external():
+    """Optional pytest entrypoint for the screenshot flow."""
+    asyncio.run(_test_page_screenshot())
+
+
+def test_form_interaction_external():
+    """Optional pytest entrypoint for the form interaction flow."""
+    asyncio.run(_test_form_interaction())
 
 
 if __name__ == "__main__":

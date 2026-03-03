@@ -3,8 +3,10 @@ OmniCore 测试用例 - Hacker News 抓取
 测试完整的任务执行流程：网页抓取 + 文件写入
 """
 import asyncio
+import os
 import sys
 from pathlib import Path
+import pytest
 
 # 添加项目根目录到 path
 sys.path.insert(0, str(Path(__file__).parent.parent))
@@ -19,7 +21,13 @@ from rich.panel import Panel
 from rich.table import Table
 
 
-async def test_hackernews_scrape():
+pytestmark = pytest.mark.skipif(
+    os.getenv("RUN_EXTERNAL_INTEGRATION_TESTS", "").lower() != "true",
+    reason="external integration tests require network access and local side effects",
+)
+
+
+async def _test_hackernews_scrape():
     """测试 Hacker News 抓取功能"""
     console.print(Panel("测试 1: Hacker News 网页抓取", style="cyan"))
 
@@ -51,7 +59,7 @@ async def test_hackernews_scrape():
         return None
 
 
-def test_file_write(news_data: list):
+def _test_file_write(news_data: list):
     """测试文件写入功能"""
     console.print(Panel("测试 2: 文件写入", style="cyan"))
 
@@ -78,7 +86,7 @@ def test_file_write(news_data: list):
         return None
 
 
-def test_critic_verify(file_path: str):
+def _test_critic_verify(file_path: str):
     """测试 Critic 验证功能"""
     console.print(Panel("测试 3: Critic 文件验证", style="cyan"))
 
@@ -114,7 +122,7 @@ async def run_full_test():
     console.print()
 
     # Step 1: 网页抓取
-    news_data = await test_hackernews_scrape()
+    news_data = await _test_hackernews_scrape()
     if not news_data:
         log_error("测试中止: 网页抓取失败")
         return False
@@ -122,7 +130,7 @@ async def run_full_test():
     console.print()
 
     # Step 2: 文件写入
-    file_path = test_file_write(news_data)
+    file_path = _test_file_write(news_data)
     if not file_path:
         log_error("测试中止: 文件写入失败")
         return False
@@ -130,7 +138,7 @@ async def run_full_test():
     console.print()
 
     # Step 3: Critic 验证
-    verified = test_critic_verify(file_path)
+    verified = _test_critic_verify(file_path)
 
     console.print()
 
@@ -167,6 +175,11 @@ def main():
         import traceback
         traceback.print_exc()
         sys.exit(1)
+
+
+def test_hackernews_pipeline_external():
+    """Optional pytest entrypoint for the external integration flow."""
+    assert asyncio.run(run_full_test()) is True
 
 
 if __name__ == "__main__":

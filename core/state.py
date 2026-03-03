@@ -26,6 +26,25 @@ class TaskItem(_TaskItemRequired, total=False):
     failure_type: Optional[str]           # timeout/selector_not_found/blocked_or_captcha/permission_denied/invalid_input/unknown
     execution_trace: List[Dict[str, Any]] # [{step_no, plan, action, observation, decision}]
     required_capabilities: List[str]      # 所需模型能力 ["text_chat", "vision", "image_gen", ...]
+    tool_name: str
+    risk_level: str
+    requires_confirmation: bool
+    policy_reason: str
+    affected_resources: List[str]
+
+
+class ArtifactItem(TypedDict, total=False):
+    artifact_id: str
+    session_id: str
+    job_id: str
+    task_id: str
+    created_at: str
+    artifact_type: str
+    source_key: str
+    path: str
+    name: str
+    task_type: str
+    tool_name: str
 
 
 def ensure_task_defaults(task: TaskItem) -> TaskItem:
@@ -37,6 +56,11 @@ def ensure_task_defaults(task: TaskItem) -> TaskItem:
     task.setdefault("failure_type", None)
     task.setdefault("execution_trace", [])
     task.setdefault("required_capabilities", [])
+    task.setdefault("tool_name", "")
+    task.setdefault("risk_level", "medium")
+    task.setdefault("requires_confirmation", False)
+    task.setdefault("policy_reason", "")
+    task.setdefault("affected_resources", [])
     return task
 
 
@@ -50,6 +74,8 @@ class OmniCoreState(TypedDict):
 
     # 用户原始输入
     user_input: str
+    session_id: str
+    job_id: str
 
     # 路由器的当前意图解析
     current_intent: str
@@ -65,6 +91,7 @@ class OmniCoreState(TypedDict):
 
     # 各个 Worker 抓取或处理后的中间数据暂存区
     shared_memory: Dict[str, Any]
+    artifacts: List[ArtifactItem]
 
     # 独立审查官 (Critic) 的反馈
     critic_feedback: str
@@ -94,16 +121,23 @@ class OmniCoreState(TypedDict):
     validator_passed: bool
 
 
-def create_initial_state(user_input: str) -> OmniCoreState:
+def create_initial_state(
+    user_input: str,
+    session_id: str = "",
+    job_id: str = "",
+) -> OmniCoreState:
     """创建初始状态"""
     return OmniCoreState(
         messages=[],
         user_input=user_input,
+        session_id=session_id,
+        job_id=job_id,
         current_intent="",
         intent_confidence=0.0,
         task_queue=[],
         current_task_index=0,
         shared_memory={},
+        artifacts=[],
         critic_feedback="",
         critic_approved=False,
         human_approved=False,

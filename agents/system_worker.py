@@ -27,6 +27,15 @@ class SystemWorker:
         self.name = "SystemWorker"
         self.platform = platform.system()  # Windows, Darwin, Linux
 
+    def _validate_command_safety(self, command: str) -> Optional[str]:
+        normalized = str(command or "").strip()
+        if not normalized:
+            return "命令不能为空"
+        for token in ["&&", "||", ";", "|", ">", "<", "`", "$("]:
+            if token in normalized:
+                return f"不允许的命令控制符: {token}"
+        return None
+
     def execute_command(
         self,
         command: str,
@@ -47,6 +56,13 @@ class SystemWorker:
             执行结果
         """
         timeout_sec = timeout if timeout is not None else settings.SYSTEM_COMMAND_TIMEOUT
+        validation_error = self._validate_command_safety(command)
+        if validation_error:
+            return {
+                "success": False,
+                "error": validation_error,
+                "command": command,
+            }
         log_agent_action(self.name, "准备执行命令", command[:50])
 
         # 高危操作确认
@@ -240,7 +256,26 @@ class SystemWorker:
 
         # --- 主执行 ---
         trace.append(make_trace_step(step_no, f"execute {action}", str(params)[:100], "", ""))
-        result = self._dispatch_action(action, params)
+        dispatch_params = dict(params)
+        if action == "execute_command" and task.get("requires_confirmation", False):
+            confirmed = HumanConfirm.request_system_command_confirmation(
+                command=dispatch_params.get("command", ""),
+                working_dir=dispatch_params.get("working_dir", "当前目录"),
+            )
+            if not confirmed:
+                result = {
+                    "success": False,
+                    "error": "用户取消系统命令执行",
+                    "command": dispatch_params.get("command", ""),
+                }
+                trace[-1]["observation"] = "success=False, cancelled_by_user"
+                trace[-1]["decision"] = "cancelled"
+                task["failure_type"] = classify_failure(result.get("error", ""))
+                task["execution_trace"] = trace
+                return result
+            dispatch_params["_policy_preconfirmed"] = True
+
+        result = self._dispatch_action(action, dispatch_params)
         trace[-1]["observation"] = f"success={result.get('success')}, rc={result.get('return_code', 'N/A')}"
 
         if result.get("success"):
@@ -284,6 +319,7 @@ class SystemWorker:
                 command=params.get("command", ""),
                 working_dir=params.get("working_dir"),
                 timeout=params.get("timeout", 30),
+                require_confirm=not params.get("_policy_preconfirmed", False),
             )
         elif action == "keyboard":
             return self.simulate_keyboard(

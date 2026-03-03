@@ -6,8 +6,9 @@ OmniCore LangGraph DAG 编排
 from typing import Literal
 from langgraph.graph import StateGraph, END
 
-from core.state import OmniCoreState, ensure_task_defaults
+from core.state import OmniCoreState
 from core.router import RouterAgent
+from core.task_planner import build_task_item_from_plan
 from agents.critic import CriticAgent
 from agents.validator import Validator
 from core.llm import LLMClient
@@ -156,26 +157,24 @@ def replanner_node(state: OmniCoreState) -> OmniCoreState:
         log_agent_action("Replanner", f"新策略: {result.get('new_strategy', '')[:80]}")
 
         # 用新任务替换失败的任务
-        import uuid
         new_tasks = []
         for task_data in result.get("tasks", []):
-            from core.state import TaskItem
-            t = TaskItem(
-                task_id=task_data.get("task_id", f"replan_{uuid.uuid4().hex[:8]}"),
-                task_type=task_data.get("task_type", "web_worker"),
-                description=task_data.get("description", ""),
-                params=task_data.get("params", {}),
-                status="pending",
-                result=None,
-                priority=task_data.get("priority", 10),
+            new_tasks.append(
+                build_task_item_from_plan(
+                    task_data,
+                    task_id_prefix="replan",
+                    default_priority=10,
+                )
             )
-            ensure_task_defaults(t)
-            new_tasks.append(t)
 
         if new_tasks:
             # 不保留之前的任务，因为既然触发了 Replanner，说明之前的任务都不满足要求
             # 保留它们只会导致 Critic 重复审查并持续失败
             state["task_queue"] = new_tasks
+            state["needs_human_confirm"] = any(
+                task.get("requires_confirmation", False) for task in new_tasks
+            )
+            state["human_approved"] = not state["needs_human_confirm"]
             state["error_trace"] = ""
             log_success(f"重规划完成，新增 {len(new_tasks)} 个任务（已清空旧任务）")
         else:
@@ -214,6 +213,45 @@ def human_confirm_node(state: OmniCoreState) -> OmniCoreState:
         if not confirmed:
             state["execution_status"] = "cancelled"
             state["error_trace"] = "用户取消执行"
+    else:
+        state["human_approved"] = True
+    return state
+
+
+def human_confirm_node_v2(state: OmniCoreState) -> OmniCoreState:
+    """Deterministic-policy aware human confirmation node."""
+    if state["needs_human_confirm"] and not state["human_approved"]:
+        flagged_tasks = [
+            task for task in state["task_queue"] if task.get("requires_confirmation", False)
+        ]
+        tasks_for_review = flagged_tasks or state["task_queue"]
+        affected_items = []
+        for task in tasks_for_review:
+            reason = str(task.get("policy_reason", "") or "").strip()
+            if reason:
+                affected_items.append(f"{task['description']} [{reason}]")
+            else:
+                affected_items.append(task["description"])
+
+        details = f"About to execute {len(state['task_queue'])} task(s)."
+        if flagged_tasks:
+            details += f" {len(flagged_tasks)} task(s) were flagged by deterministic policy."
+
+        router_risk_reason = str(
+            state.get("shared_memory", {}).get("router_high_risk_reason", "") or ""
+        ).strip()
+        if router_risk_reason:
+            details += f" Router risk signal: {router_risk_reason}"
+
+        confirmed = HumanConfirm.request_confirmation(
+            operation="Execute planned task queue",
+            details=details,
+            affected_items=affected_items,
+        )
+        state["human_approved"] = confirmed
+        if not confirmed:
+            state["execution_status"] = "cancelled"
+            state["error_trace"] = "User cancelled execution"
     else:
         state["human_approved"] = True
     return state
@@ -313,7 +351,7 @@ def build_graph() -> StateGraph:
 
     # 添加节点（7 个）
     graph.add_node("router", route_node)
-    graph.add_node("human_confirm", human_confirm_node)
+    graph.add_node("human_confirm", human_confirm_node_v2)
     graph.add_node("parallel_executor", parallel_executor_node)
     graph.add_node("validator", validator_node)
     graph.add_node("replanner", replanner_node)

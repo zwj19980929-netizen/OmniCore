@@ -18,7 +18,13 @@ from playwright.async_api import (
 )
 
 from config.settings import settings
-from utils.logger import log_agent_action, log_error, log_warning
+from utils.browser_runtime_pool import (
+    BrowserLease,
+    BrowserPoolCircuitOpenError,
+    BrowserPoolLaunchError,
+    get_browser_runtime_pool,
+)
+from utils.logger import log_agent_action, log_debug_metrics, log_error, log_warning
 
 
 @dataclass
@@ -45,6 +51,7 @@ class BrowserToolkit:
     ):
         self._playwright: Optional[Playwright] = None
         self._browser: Optional[Browser] = None
+        self._browser_lease: Optional[BrowserLease] = None
         self._context: Optional[BrowserContext] = None
         self._page: Optional[Page] = None
         self._current_frame: Optional[Frame] = None
@@ -92,6 +99,20 @@ class BrowserToolkit:
             if self._browser and self._browser.is_connected():
                 return ToolkitResult(success=True)
             await self.close()
+            if settings.BROWSER_POOL_ENABLED:
+                pool = get_browser_runtime_pool()
+                try:
+                    lease = await pool.acquire_browser(
+                        headless=self.headless,
+                    )
+                except (BrowserPoolCircuitOpenError, BrowserPoolLaunchError) as exc:
+                    log_warning(f"Browser pool bypassed, falling back to direct launch: {exc}")
+                else:
+                    self._browser_lease = lease
+                    self._browser = lease.browser
+                    self._playwright = None
+                    log_debug_metrics("browser_pool.acquire", pool.snapshot_stats())
+                    return ToolkitResult(success=True)
             self._playwright = await async_playwright().start()
             self._browser = await self._playwright.chromium.launch(
                 headless=self.headless,
@@ -168,6 +189,8 @@ class BrowserToolkit:
     async def close(self) -> ToolkitResult:
         """关闭所有资源，保存 storage state"""
         try:
+            lease = self._browser_lease
+            self._browser_lease = None
             if self._context:
                 storage_path = self._get_storage_state_path()
                 if storage_path:
@@ -185,6 +208,15 @@ class BrowserToolkit:
             self._context = None
             self._current_frame = None
             self._in_iframe = False
+            if lease is not None:
+                await lease.release()
+                log_debug_metrics(
+                    "browser_pool.release",
+                    get_browser_runtime_pool().snapshot_stats(),
+                )
+                self._browser = None
+                self._playwright = None
+                return ToolkitResult(success=True)
             if self._browser:
                 await self._browser.close()
             self._browser = None
@@ -193,6 +225,12 @@ class BrowserToolkit:
             self._playwright = None
             return ToolkitResult(success=True)
         except Exception as e:
+            if 'lease' in locals() and lease is not None:
+                try:
+                    await lease.release()
+                except Exception:
+                    pass
+            self._browser_lease = None
             self._page = None
             self._context = None
             self._browser = None

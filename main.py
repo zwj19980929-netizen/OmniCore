@@ -45,6 +45,7 @@ def interactive_mode():
     # 对话上下文：保留最近 5 轮的交互记录
     conversation_history: List[Dict] = []
     MAX_HISTORY = 5
+    session_id = None
 
     while True:
         try:
@@ -58,7 +59,13 @@ def interactive_mode():
                 continue
 
             # 执行任务，传入对话历史
-            result = run_task(user_input, memory, conversation_history)
+            result = run_task(
+                user_input,
+                memory,
+                conversation_history,
+                session_id=session_id,
+            )
+            session_id = result.get("session_id") or session_id
 
             # 非内置命令才加入对话历史，避免污染 Router 上下文
             if not result.get("is_special_command"):

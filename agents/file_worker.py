@@ -394,6 +394,36 @@ class FileWorker:
         logger.warning(f"未找到任何可用数据，shared_memory 内容: {list(shared_memory.keys())}")
         return []
 
+    def _confirm_write_if_needed(
+        self,
+        task: TaskItem,
+        file_path: str,
+        data_items: List[Dict[str, Any]],
+        preview_content: str = "",
+    ) -> Optional[Dict[str, Any]]:
+        if not task.get("requires_confirmation", False):
+            return None
+
+        preview = preview_content
+        if not preview and data_items:
+            preview = self.format_data_to_text(data_items[:3], "Preview")
+        if not preview:
+            preview = "Generated file content"
+
+        resolved_path = str(self._resolve_path(file_path))
+        confirmed = HumanConfirm.request_file_write_confirmation(
+            file_path=resolved_path,
+            content_preview=preview[:300],
+            is_overwrite=Path(resolved_path).exists(),
+        )
+        if confirmed:
+            return None
+        return {
+            "success": False,
+            "error": "用户取消文件写入",
+            "file_path": resolved_path,
+        }
+
     def execute(self, task: TaskItem, shared_memory: Dict[str, Any]) -> Dict[str, Any]:
         """
         执行文件操作任务（PAOD 增强：写入后硬验证）
@@ -436,6 +466,21 @@ class FileWorker:
             # 收集数据项
             data_items = self._collect_data_items(params, shared_memory, task)
             report_title = self._generate_report_title(task["description"])
+            preview_content = ""
+            if not data_items:
+                preview_content = params.get("content", "No data to write")
+
+            cancel_result = self._confirm_write_if_needed(
+                task,
+                file_path,
+                data_items,
+                preview_content=preview_content,
+            )
+            if cancel_result is not None:
+                trace.append(make_trace_step(step_no, "confirm file write", file_path, "cancelled", "stop"))
+                task["failure_type"] = classify_failure(cancel_result.get("error", ""))
+                task["execution_trace"] = trace
+                return cancel_result
 
             # Step 1: 写入
             trace.append(make_trace_step(step_no, f"write file ({fmt})", file_path, "", ""))

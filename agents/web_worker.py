@@ -13,7 +13,15 @@ import requests
 
 from core.state import OmniCoreState, TaskItem
 from core.llm import LLMClient
-from utils.logger import log_agent_action, logger, log_success, log_error, log_warning
+from core.llm_cache import get_llm_cache
+from utils.logger import (
+    log_agent_action,
+    log_debug_metrics,
+    logger,
+    log_success,
+    log_error,
+    log_warning,
+)
 from utils.browser_toolkit import BrowserToolkit, ToolkitResult
 from utils.retry import async_retry, is_retryable
 from config.settings import settings
@@ -134,6 +142,7 @@ class WebWorker:
     def __init__(self, llm_client: LLMClient = None):
         self.name = "WebWorker"
         self.llm = llm_client or LLMClient()
+        self.cache = get_llm_cache()
         self.fast_mode = settings.BROWSER_FAST_MODE
         self.block_heavy_resources = settings.BLOCK_HEAVY_RESOURCES
         self.static_fetch_enabled = settings.STATIC_FETCH_ENABLED
@@ -149,6 +158,18 @@ class WebWorker:
 
     async def determine_target_url(self, task_description: str) -> Dict[str, Any]:
         log_agent_action(self.name, "分析目标 URL", task_description[:50])
+        task_signature = self.cache.build_task_signature(task_description)
+        cache_key = self.cache.build_key(
+            "url_analysis",
+            task_signature=task_signature,
+            prompt_version="url_analysis_prompt_v1",
+            model_name=getattr(self.llm, "model", ""),
+        )
+        cached = self.cache.get(cache_key)
+        if isinstance(cached, dict):
+            log_agent_action(self.name, "鍛戒腑 URL 鍒嗘瀽缂撳瓨", task_description[:50])
+            log_debug_metrics("llm_cache.url_analysis", self.cache.snapshot_stats())
+            return cached
         response = self.llm.chat_with_system(
             system_prompt=URL_ANALYSIS_PROMPT.format(task_description=task_description),
             user_message="请分析应该访问哪个 URL",
@@ -156,6 +177,13 @@ class WebWorker:
         )
         try:
             result = self.llm.parse_json_response(response)
+            if result.get("url") or result.get("need_search"):
+                self.cache.set(
+                    cache_key,
+                    result,
+                    settings.URL_ANALYSIS_CACHE_TTL_SECONDS,
+                )
+                log_debug_metrics("llm_cache.url_analysis", self.cache.snapshot_stats())
             log_agent_action(self.name, "目标 URL", result.get("url", "未知"))
             return result
         except Exception as e:
@@ -447,6 +475,22 @@ class WebWorker:
         html = RE_STYLE_TAG.sub('', html)
         html = RE_HTML_COMMENT.sub('', html)
         html = RE_WHITESPACE.sub(' ', html)
+        normalized_url = self.cache.normalize_url(url_r.data or "")
+        task_signature = self.cache.build_task_signature(task_description)
+        page_fingerprint = self.cache.build_page_fingerprint(html)
+        cache_key = self.cache.build_key(
+            "page_structure_analysis",
+            normalized_url=normalized_url,
+            task_signature=task_signature,
+            page_fingerprint=page_fingerprint,
+            prompt_version="page_analysis_prompt_v1",
+            model_name=getattr(self.llm, "model", ""),
+        )
+        cached = self.cache.get(cache_key)
+        if isinstance(cached, dict):
+            log_agent_action(self.name, "鍛戒腑椤甸潰缁撴瀯鍒嗘瀽缂撳瓨", normalized_url[:80])
+            log_debug_metrics("llm_cache.page_analysis", self.cache.snapshot_stats())
+            return cached
         if len(html) > 15000:
             html = html[:15000] + "\n... (truncated)"
 
@@ -461,6 +505,13 @@ class WebWorker:
         )
         try:
             config = self.llm.parse_json_response(response)
+            if config.get("item_selector"):
+                self.cache.set(
+                    cache_key,
+                    config,
+                    settings.PAGE_ANALYSIS_CACHE_TTL_SECONDS,
+                )
+                log_debug_metrics("llm_cache.page_analysis", self.cache.snapshot_stats())
             log_agent_action(self.name, "页面分析完成", f"item_selector: {config.get('item_selector', 'N/A')}")
             return config
         except Exception as e:
@@ -934,3 +985,13 @@ class WebWorker:
 
         asyncio.run(_process_all())
         return state
+
+
+from agents.web_worker_singleflight import (
+    analyze_page_structure_with_singleflight,
+    determine_target_url_with_singleflight,
+)
+
+
+WebWorker.determine_target_url = determine_target_url_with_singleflight
+WebWorker.analyze_page_structure = analyze_page_structure_with_singleflight

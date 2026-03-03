@@ -8,6 +8,43 @@ from dotenv import load_dotenv
 # 加载环境变量
 load_dotenv()
 
+PROJECT_ROOT = Path(__file__).parent.parent
+DATA_DIR = PROJECT_ROOT / "data"
+RUNTIME_METRICS_OVERRIDE_PATH = Path(
+    os.getenv("RUNTIME_METRICS_OVERRIDE_PATH", DATA_DIR / "runtime_metrics_overrides.env")
+)
+RUNTIME_METRICS_TUNING_KEYS = {
+    "BROWSER_POOL_ACQUIRE_TIMEOUT_SECONDS",
+    "BROWSER_POOL_IDLE_TTL_SECONDS",
+    "BROWSER_POOL_MAX_BROWSERS_PER_KEY",
+    "BROWSER_POOL_MAX_CONTEXTS_PER_BROWSER",
+    "LLM_CACHE_INFLIGHT_WAIT_SECONDS",
+    "LLM_CACHE_PAGE_ANALYSIS_MAX_ENTRIES",
+    "LLM_CACHE_URL_ANALYSIS_MAX_ENTRIES",
+    "PAGE_ANALYSIS_CACHE_TTL_SECONDS",
+    "URL_ANALYSIS_CACHE_TTL_SECONDS",
+}
+
+
+def _load_runtime_metrics_overrides() -> None:
+    if not RUNTIME_METRICS_OVERRIDE_PATH.exists():
+        return
+    try:
+        with RUNTIME_METRICS_OVERRIDE_PATH.open("r", encoding="utf-8") as handle:
+            for raw_line in handle:
+                line = raw_line.strip()
+                if not line or line.startswith("#") or "=" not in line:
+                    continue
+                key, value = line.split("=", 1)
+                key = key.strip()
+                if key in RUNTIME_METRICS_TUNING_KEYS:
+                    os.environ[key] = value.strip()
+    except OSError:
+        return
+
+
+_load_runtime_metrics_overrides()
+
 
 def _env_int(name: str, default: int) -> int:
     """读取整型环境变量，异常时回退默认值。"""
@@ -21,8 +58,9 @@ class Settings:
     """全局配置类"""
 
     # === 项目路径 ===
-    PROJECT_ROOT = Path(__file__).parent.parent
-    DATA_DIR = PROJECT_ROOT / "data"
+    PROJECT_ROOT = PROJECT_ROOT
+    DATA_DIR = DATA_DIR
+    RUNTIME_METRICS_OVERRIDE_PATH = RUNTIME_METRICS_OVERRIDE_PATH
 
     # === 大模型配置 ===
     DEFAULT_MODEL = os.getenv("DEFAULT_MODEL", "deepseek/deepseek-chat")
@@ -61,6 +99,30 @@ class Settings:
     BLOCK_HEAVY_RESOURCES = os.getenv("BLOCK_HEAVY_RESOURCES", "true").lower() == "true"
     # 静态抓取优先：纯读取页面时先尝试 requests，不启动浏览器
     STATIC_FETCH_ENABLED = os.getenv("STATIC_FETCH_ENABLED", "true").lower() == "true"
+    BROWSER_POOL_ENABLED = os.getenv("BROWSER_POOL_ENABLED", "true").lower() == "true"
+    BROWSER_POOL_IDLE_TTL_SECONDS = max(_env_int("BROWSER_POOL_IDLE_TTL_SECONDS", 120), 1)
+    BROWSER_POOL_MAX_BROWSERS_PER_KEY = max(
+        _env_int("BROWSER_POOL_MAX_BROWSERS_PER_KEY", 1), 1
+    )
+    BROWSER_POOL_MAX_ACTIVE_LEASES_PER_KEY = max(
+        _env_int("BROWSER_POOL_MAX_ACTIVE_LEASES_PER_KEY", 4), 1
+    )
+    BROWSER_POOL_MAX_CONTEXTS_PER_BROWSER = max(
+        _env_int(
+            "BROWSER_POOL_MAX_CONTEXTS_PER_BROWSER",
+            _env_int("BROWSER_POOL_MAX_ACTIVE_LEASES_PER_KEY", 4),
+        ),
+        1,
+    )
+    BROWSER_POOL_ACQUIRE_TIMEOUT_SECONDS = max(
+        _env_int("BROWSER_POOL_ACQUIRE_TIMEOUT_SECONDS", 10), 1
+    )
+    BROWSER_POOL_CIRCUIT_BREAK_THRESHOLD = max(
+        _env_int("BROWSER_POOL_CIRCUIT_BREAK_THRESHOLD", 3), 1
+    )
+    BROWSER_POOL_CIRCUIT_BREAK_SECONDS = max(
+        _env_int("BROWSER_POOL_CIRCUIT_BREAK_SECONDS", 30), 1
+    )
     # DAG 调度是否允许同批次并行执行互不依赖的任务
     ENABLE_PARALLEL_EXECUTION = os.getenv("ENABLE_PARALLEL_EXECUTION", "true").lower() == "true"
     # 单批次最大并行任务数
@@ -84,6 +146,22 @@ class Settings:
 
     # 系统命令超时（单位：秒）
     SYSTEM_COMMAND_TIMEOUT = _env_int("SYSTEM_COMMAND_TIMEOUT", 30)  # 系统命令执行
+
+    # LLM analysis cache
+    LLM_CACHE_ENABLED = os.getenv("LLM_CACHE_ENABLED", "true").lower() == "true"
+    LLM_CACHE_MAX_ENTRIES = max(_env_int("LLM_CACHE_MAX_ENTRIES", 512), 1)
+    LLM_CACHE_URL_ANALYSIS_MAX_ENTRIES = max(
+        _env_int("LLM_CACHE_URL_ANALYSIS_MAX_ENTRIES", 128), 1
+    )
+    LLM_CACHE_PAGE_ANALYSIS_MAX_ENTRIES = max(
+        _env_int("LLM_CACHE_PAGE_ANALYSIS_MAX_ENTRIES", 256), 1
+    )
+    LLM_CACHE_INFLIGHT_WAIT_SECONDS = max(
+        _env_int("LLM_CACHE_INFLIGHT_WAIT_SECONDS", 15), 1
+    )
+    URL_ANALYSIS_CACHE_TTL_SECONDS = max(_env_int("URL_ANALYSIS_CACHE_TTL_SECONDS", 1800), 1)
+    PAGE_ANALYSIS_CACHE_TTL_SECONDS = max(_env_int("PAGE_ANALYSIS_CACHE_TTL_SECONDS", 1800), 1)
+    RUNTIME_METRICS_HISTORY_LIMIT = max(_env_int("RUNTIME_METRICS_HISTORY_LIMIT", 200), 1)
 
     # === 意图分类 ===
     INTENT_TYPES = [

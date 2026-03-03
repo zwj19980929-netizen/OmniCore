@@ -81,3 +81,14 @@ def log_error(message: str):
 def log_warning(message: str):
     """警告日志"""
     console.print(f"[warning][WARN] {message}[/warning]")
+
+
+def log_debug_metrics(scope: str, metrics: dict):
+    """Only emit lightweight metrics when debug mode is enabled."""
+    if not settings.DEBUG_MODE:
+        return
+    if not metrics:
+        console.print(f"[dim][debug] {scope}: no metrics[/dim]")
+        return
+    parts = [f"{key}={metrics[key]}" for key in sorted(metrics)]
+    console.print(f"[dim][debug] {scope}: {', '.join(parts)}[/dim]", highlight=False)
