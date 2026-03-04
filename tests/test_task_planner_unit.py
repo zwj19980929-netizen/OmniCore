@@ -1,4 +1,4 @@
-from core.task_planner import build_task_item_from_plan
+from core.task_planner import build_policy_decision_from_task, build_task_item_from_plan
 
 
 def test_build_task_item_from_legacy_task_type_adds_tool_metadata():
@@ -29,3 +29,20 @@ def test_build_task_item_from_tool_name_accepts_tool_args():
     assert task["tool_name"] == "web.fetch_and_extract"
     assert task["params"]["url"] == "https://example.com"
     assert task["requires_confirmation"] is False
+
+
+def test_build_policy_decision_from_task_reflects_confirmation_state():
+    task = build_task_item_from_plan(
+        {
+            "task_type": "system_worker",
+            "description": "Run a system command",
+            "params": {"action": "execute_command", "command": "python --version"},
+        }
+    )
+
+    decision = build_policy_decision_from_task(task)
+
+    assert decision["task_id"] == task["task_id"]
+    assert decision["tool_name"] == "system.control"
+    assert decision["decision"] == "pending_confirmation"
+    assert decision["requires_human_confirm"] is True

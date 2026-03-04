@@ -3,10 +3,17 @@ OmniCore - 全栈智能体操作系统核心
 主程序入口
 """
 import sys
+import time
 import traceback
 from typing import List, Dict
 
-from core.runtime import run_task
+from core.runtime import (
+    get_background_worker_status,
+    run_background_worker_forever,
+    run_task,
+    start_background_worker,
+    stop_background_worker,
+)
 from memory.chroma_store import ChromaMemory
 from utils.logger import console, log_error
 
@@ -103,7 +110,34 @@ def interactive_mode():
             continue
 
 
+def worker_mode():
+    """Run the queue worker as a dedicated foreground process."""
+    print_banner()
+    started = start_background_worker()
+    status = get_background_worker_status()
+    console.print(f"[green]Queue worker {'started' if started else 'already running'}[/green]")
+    if status.get("persisted"):
+        console.print(f"[dim]{status['persisted']}[/dim]")
+    console.print("[green]Press Ctrl+C to stop the worker.[/green]")
+
+    try:
+        while True:
+            time.sleep(1.0)
+    except KeyboardInterrupt:
+        stopped = stop_background_worker()
+        if stopped:
+            console.print("[yellow]Queue worker stopped[/yellow]")
+        else:
+            console.print("[yellow]Queue worker was not running[/yellow]")
+
+
 def main():
+    if len(sys.argv) >= 3 and sys.argv[1].lower() == "worker" and sys.argv[2] == "--process-loop":
+        run_background_worker_forever()
+        return
+    if len(sys.argv) == 2 and sys.argv[1].lower() == "worker":
+        worker_mode()
+        return
     """主函数"""
     if len(sys.argv) > 1:
         # 命令行参数模式

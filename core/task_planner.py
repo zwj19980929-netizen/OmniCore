@@ -7,10 +7,11 @@ runtime shape.
 from __future__ import annotations
 
 import uuid
+from datetime import datetime
 from typing import Any, Dict
 
 from core.policy_engine import evaluate_task_policy
-from core.state import TaskItem, ensure_task_defaults
+from core.state import PolicyDecisionItem, TaskItem, ensure_task_defaults
 from core.tool_registry import get_builtin_tool_registry
 
 
@@ -63,3 +64,37 @@ def build_task_item_from_plan(
     task_item["affected_resources"] = decision.affected_resources
     task_item["risk_level"] = decision.risk_level
     return task_item
+
+
+def build_policy_decision_from_task(
+    task: TaskItem,
+    *,
+    decision_override: str | None = None,
+    approved_by: str = "",
+    approved_at: str = "",
+) -> PolicyDecisionItem:
+    """Project task-level policy metadata into an auditable decision record."""
+    affected_resources = task.get("affected_resources") or []
+    primary_target = str(affected_resources[0]).strip() if affected_resources else ""
+    action = str(task.get("tool_name") or task.get("task_type") or "").strip()
+    requires_confirmation = bool(task.get("requires_confirmation", False))
+
+    decision = decision_override
+    if not decision:
+        decision = "pending_confirmation" if requires_confirmation else "auto_allow"
+
+    if approved_by and not approved_at:
+        approved_at = datetime.now().isoformat(timespec="seconds")
+
+    return PolicyDecisionItem(
+        task_id=str(task.get("task_id", "") or ""),
+        tool_name=str(task.get("tool_name", "") or ""),
+        action=action,
+        target_resource=primary_target,
+        risk_level=str(task.get("risk_level", "medium") or "medium"),
+        decision=decision,
+        reason=str(task.get("policy_reason", "") or ""),
+        requires_human_confirm=requires_confirmation,
+        approved_by=approved_by,
+        approved_at=approved_at,
+    )

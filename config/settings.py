@@ -8,6 +8,46 @@ from dotenv import load_dotenv
 # 加载环境变量
 load_dotenv()
 
+
+def _set_env_pair(name: str, value: str) -> None:
+    if value:
+        os.environ[name] = value
+        os.environ[name.lower()] = value
+    else:
+        os.environ.pop(name, None)
+        os.environ.pop(name.lower(), None)
+
+
+def _apply_managed_proxy_env(
+    *,
+    allow_system_proxy: bool,
+    http_proxy: str = "",
+    https_proxy: str = "",
+    all_proxy: str = "",
+    no_proxy: str = "",
+) -> None:
+    if not allow_system_proxy:
+        for key in ("HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "NO_PROXY"):
+            _set_env_pair(key, "")
+
+    if http_proxy:
+        _set_env_pair("HTTP_PROXY", http_proxy)
+    if https_proxy:
+        _set_env_pair("HTTPS_PROXY", https_proxy)
+    if all_proxy:
+        _set_env_pair("ALL_PROXY", all_proxy)
+    if no_proxy:
+        _set_env_pair("NO_PROXY", no_proxy)
+
+
+_apply_managed_proxy_env(
+    allow_system_proxy=os.getenv("ALLOW_SYSTEM_PROXY", "false").lower() == "true",
+    http_proxy=os.getenv("OMNICORE_HTTP_PROXY", "").strip(),
+    https_proxy=os.getenv("OMNICORE_HTTPS_PROXY", "").strip(),
+    all_proxy=os.getenv("OMNICORE_ALL_PROXY", "").strip(),
+    no_proxy=os.getenv("OMNICORE_NO_PROXY", "").strip(),
+)
+
 PROJECT_ROOT = Path(__file__).parent.parent
 DATA_DIR = PROJECT_ROOT / "data"
 RUNTIME_METRICS_OVERRIDE_PATH = Path(
@@ -54,6 +94,20 @@ def _env_int(name: str, default: int) -> int:
         return default
 
 
+def _env_csv(name: str) -> tuple[str, ...]:
+    """Parse a delimited environment variable into a normalized tuple."""
+    raw = os.getenv(name, "")
+    if not raw:
+        return ()
+
+    values = []
+    for part in raw.replace(";", ",").split(","):
+        item = part.strip()
+        if item:
+            values.append(item)
+    return tuple(values)
+
+
 class Settings:
     """全局配置类"""
 
@@ -71,6 +125,11 @@ class Settings:
     GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
     DEEPSEEK_API_KEY = os.getenv("DEEPSEEK_API_KEY", "")
     KIMI_API_KEY = os.getenv("KIMI_API_KEY", "")
+    ALLOW_SYSTEM_PROXY = os.getenv("ALLOW_SYSTEM_PROXY", "false").lower() == "true"
+    OMNICORE_HTTP_PROXY = os.getenv("OMNICORE_HTTP_PROXY", "").strip()
+    OMNICORE_HTTPS_PROXY = os.getenv("OMNICORE_HTTPS_PROXY", "").strip()
+    OMNICORE_ALL_PROXY = os.getenv("OMNICORE_ALL_PROXY", "").strip()
+    OMNICORE_NO_PROXY = os.getenv("OMNICORE_NO_PROXY", "").strip()
 
     # === 模型智能路由 ===
     PREFERRED_PROVIDER = os.getenv("PREFERRED_PROVIDER", "")  # gemini/kimi/openai/deepseek
@@ -161,7 +220,21 @@ class Settings:
     )
     URL_ANALYSIS_CACHE_TTL_SECONDS = max(_env_int("URL_ANALYSIS_CACHE_TTL_SECONDS", 1800), 1)
     PAGE_ANALYSIS_CACHE_TTL_SECONDS = max(_env_int("PAGE_ANALYSIS_CACHE_TTL_SECONDS", 1800), 1)
+    TOOL_ADAPTER_PLUGIN_MODULES = _env_csv("TOOL_ADAPTER_PLUGIN_MODULES")
+    TOOL_ADAPTER_PLUGIN_DIRS = _env_csv("TOOL_ADAPTER_PLUGIN_DIRS")
+    ENABLED_TOOL_PLUGIN_IDS = _env_csv("ENABLED_TOOL_PLUGIN_IDS")
+    DISABLED_TOOL_PLUGIN_IDS = _env_csv("DISABLED_TOOL_PLUGIN_IDS")
     RUNTIME_METRICS_HISTORY_LIMIT = max(_env_int("RUNTIME_METRICS_HISTORY_LIMIT", 200), 1)
+    QUEUE_WORKER_MODE = os.getenv("QUEUE_WORKER_MODE", "process").strip().lower() or "process"
+    QUEUE_WORKER_POLL_INTERVAL_SECONDS = max(_env_int("QUEUE_WORKER_POLL_INTERVAL_SECONDS", 1), 1)
+    QUEUE_STALE_AFTER_SECONDS = max(_env_int("QUEUE_STALE_AFTER_SECONDS", 120), 5)
+    SCHEDULER_RELEASE_LIMIT = max(_env_int("SCHEDULER_RELEASE_LIMIT", 5), 1)
+    SCHEDULE_DEFAULT_LOOKAHEAD_SECONDS = max(_env_int("SCHEDULE_DEFAULT_LOOKAHEAD_SECONDS", 60), 1)
+    NOTIFICATION_HISTORY_LIMIT = max(_env_int("NOTIFICATION_HISTORY_LIMIT", 300), 20)
+    DEFAULT_OUTPUT_DIRECTORY = os.getenv("DEFAULT_OUTPUT_DIRECTORY", "")
+    DEFAULT_PREFERRED_TOOLS = _env_csv("DEFAULT_PREFERRED_TOOLS")
+    DEFAULT_PREFERRED_SITES = _env_csv("DEFAULT_PREFERRED_SITES")
+    DEFAULT_AUTO_QUEUE_CONFIRMATIONS = os.getenv("DEFAULT_AUTO_QUEUE_CONFIRMATIONS", "false").lower() == "true"
 
     # === 意图分类 ===
     INTENT_TYPES = [

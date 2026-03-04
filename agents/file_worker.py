@@ -53,6 +53,7 @@ class FileWorker:
         content: str,
         encoding: str = "utf-8",
         require_confirm: bool = True,
+        policy_preconfirmed: bool = False,
     ) -> Dict[str, Any]:
         """
         写入文件
@@ -73,7 +74,7 @@ class FileWorker:
         is_overwrite = path.exists()
 
         # 高危操作确认
-        if require_confirm and settings.REQUIRE_HUMAN_CONFIRM:
+        if settings.REQUIRE_HUMAN_CONFIRM and (require_confirm or not policy_preconfirmed):
             confirmed = HumanConfirm.request_file_write_confirmation(
                 file_path=str(path),
                 content_preview=content[:300],
@@ -454,8 +455,19 @@ class FileWorker:
 
         if action == "write":
             file_path = params.get("file_path", "")
+            user_preferences = shared_memory.get("user_preferences", {}) if isinstance(shared_memory, dict) else {}
+            preferred_output_dir = ""
+            if isinstance(user_preferences, dict):
+                preferred_output_dir = str(user_preferences.get("default_output_directory", "") or "").strip()
             if not file_path:
-                file_path = "~/Desktop/output.txt"
+                if preferred_output_dir:
+                    file_path = str(Path(preferred_output_dir) / "output.txt")
+                else:
+                    file_path = "~/Desktop/output.txt"
+            elif preferred_output_dir:
+                candidate = Path(file_path)
+                if not candidate.is_absolute() and str(candidate.parent) == ".":
+                    file_path = str(Path(preferred_output_dir) / candidate.name)
 
             # 确定输出格式：params["format"] > 文件扩展名推断 > 默认 txt
             fmt = params.get("format", "")
@@ -501,7 +513,12 @@ class FileWorker:
                     content = self.format_data_to_text(data_items, report_title)
                 else:
                     content = params.get("content", "No data to write")
-                result = self.write_file(file_path, content, require_confirm=False)
+                result = self.write_file(
+                    file_path,
+                    content,
+                    require_confirm=False,
+                    policy_preconfirmed=True,
+                )
 
             trace[-1]["observation"] = f"success={result.get('success')}, path={result.get('file_path', '')}"
 

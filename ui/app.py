@@ -19,6 +19,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from config.settings import settings
+from core.statuses import WAITING_JOB_STATUSES
 from utils.runtime_metrics_store import get_runtime_metrics_store
 
 
@@ -53,6 +54,12 @@ def init_session_state():
         st.session_state.conversation_history = []
     if "agent_session_id" not in st.session_state:
         st.session_state.agent_session_id = ""
+    if "current_goal_id" not in st.session_state:
+        st.session_state.current_goal_id = ""
+    if "current_project_id" not in st.session_state:
+        st.session_state.current_project_id = ""
+    if "current_todo_id" not in st.session_state:
+        st.session_state.current_todo_id = ""
     if "memory_initialized" not in st.session_state:
         st.session_state.memory_initialized = False
     if "last_runtime_metrics" not in st.session_state:
@@ -92,6 +99,41 @@ def render_sidebar():
         )
 
         require_confirm = st.checkbox("高危操作需确认", value=True)
+
+        if st.session_state.agent_session_id:
+            st.divider()
+            st.subheader("🧭 Work Context")
+            try:
+                from core.runtime import get_work_dashboard
+
+                dashboard = get_work_dashboard(st.session_state.agent_session_id)
+                goals = dashboard.get("goals", []) or []
+                projects = dashboard.get("projects", []) or []
+                todos = dashboard.get("todos", []) or []
+                goal_map = {item.get("goal_id", ""): item for item in goals if isinstance(item, dict)}
+                project_map = {item.get("project_id", ""): item for item in projects if isinstance(item, dict)}
+                todo_map = {item.get("todo_id", ""): item for item in todos if isinstance(item, dict)}
+
+                st.session_state.current_goal_id = st.selectbox(
+                    "Goal",
+                    options=[""] + list(goal_map.keys())[::-1],
+                    index=0 if st.session_state.current_goal_id not in goal_map else ([""] + list(goal_map.keys())[::-1]).index(st.session_state.current_goal_id),
+                    format_func=lambda key: goal_map.get(key, {}).get("title", "") if key else "(none)",
+                )
+                st.session_state.current_project_id = st.selectbox(
+                    "Project",
+                    options=[""] + list(project_map.keys())[::-1],
+                    index=0 if st.session_state.current_project_id not in project_map else ([""] + list(project_map.keys())[::-1]).index(st.session_state.current_project_id),
+                    format_func=lambda key: project_map.get(key, {}).get("title", "") if key else "(none)",
+                )
+                st.session_state.current_todo_id = st.selectbox(
+                    "Todo",
+                    options=[""] + list(todo_map.keys())[::-1],
+                    index=0 if st.session_state.current_todo_id not in todo_map else ([""] + list(todo_map.keys())[::-1]).index(st.session_state.current_todo_id),
+                    format_func=lambda key: todo_map.get(key, {}).get("title", "") if key else "(none)",
+                )
+            except Exception as e:
+                st.caption(f"工作上下文加载失败: {e}")
 
         if settings.DEBUG_MODE and st.session_state.last_runtime_metrics:
             st.divider()
@@ -151,6 +193,28 @@ def render_sidebar():
         except Exception as e:
             st.warning(f"记忆系统未就绪: {e}")
 
+        if st.session_state.agent_session_id:
+            st.divider()
+            st.subheader("🔔 通知")
+            try:
+                from core.runtime import get_notification_feed
+
+                notifications = get_notification_feed(
+                    session_id=st.session_state.agent_session_id,
+                    unread_only=True,
+                    limit=5,
+                )
+                if notifications:
+                    for item in notifications[::-1]:
+                        prefix = "⚠️" if item.get("requires_action") else "ℹ️"
+                        st.caption(
+                            f"{prefix} {item.get('title', '')}: {item.get('message', '')}"
+                        )
+                else:
+                    st.caption("暂无未读通知")
+            except Exception as e:
+                st.caption(f"通知加载失败: {e}")
+
     return None
 
 
@@ -173,6 +237,9 @@ def execute_task(user_input: str) -> dict:
         memory=memory,
         conversation_history=st.session_state.conversation_history,
         session_id=st.session_state.agent_session_id or None,
+        goal_id=st.session_state.current_goal_id or None,
+        project_id=st.session_state.current_project_id or None,
+        todo_id=st.session_state.current_todo_id or None,
     )
     current_metrics = result.get("runtime_metrics", {}) or {}
     if result.get("session_id"):
@@ -237,12 +304,17 @@ def main():
             with st.spinner("🔄 正在处理..."):
                 try:
                     result = execute_task(user_input)
+                    status = str(result.get("status", "") or "")
 
                     if result["success"]:
                         response = f"✅ {result.get('output', '任务完成')}"
                         st.success("任务执行成功")
+                    elif status in WAITING_JOB_STATUSES:
+                        detail = result.get("output") or result.get("error") or f"状态: {status}"
+                        response = f"⏸️ {detail}"
+                        st.warning(f"任务进入等待状态: {status}")
                     else:
-                        detail = result.get("error") or result.get("output") or f"状态: {result['status']}"
+                        detail = result.get("error") or result.get("output") or f"状态: {status}"
                         response = f"❌ {detail}"
                         st.error("任务执行失败")
 
@@ -252,8 +324,87 @@ def main():
                     if result.get("tasks"):
                         with st.expander("📋 任务详情"):
                             for task in result["tasks"]:
-                                status_icon = "✅" if task["status"] == "completed" else "❌"
+                                task_status = str(task.get("status", "") or "")
+                                if task_status == "completed":
+                                    status_icon = "✅"
+                                elif task_status in WAITING_JOB_STATUSES:
+                                    status_icon = "⏸️"
+                                elif task_status in {"pending", "running"}:
+                                    status_icon = "…"
+                                else:
+                                    status_icon = "❌"
                                 st.write(f"{status_icon} {task['description']}")
+
+                    if result.get("delivery_package"):
+                        with st.expander("Delivery Package"):
+                            delivery = result.get("delivery_package", {}) or {}
+                            st.write(delivery.get("headline", ""))
+                            goal = delivery.get("goal", {}) or {}
+                            project = delivery.get("project", {}) or {}
+                            todo = delivery.get("todo", {}) or {}
+                            if goal.get("title") or project.get("title") or todo.get("title"):
+                                st.caption(
+                                    "Work Context: "
+                                    f"{goal.get('title', '')} / "
+                                    f"{project.get('title', '')} / "
+                                    f"{todo.get('title', '')}"
+                                )
+                            summary_cols = st.columns(3)
+                            summary_cols[0].metric("Completed", delivery.get("completed_task_count", 0))
+                            summary_cols[1].metric("Planned", delivery.get("total_task_count", 0))
+                            summary_cols[2].metric("Review", str(delivery.get("review_status", "")))
+                            if delivery.get("completed_tasks"):
+                                st.caption("Completed Work")
+                                st.dataframe(
+                                    [{"task": item} for item in delivery.get("completed_tasks", [])],
+                                    use_container_width=True,
+                                    hide_index=True,
+                                )
+                            if delivery.get("deliverables"):
+                                st.caption("Deliverables")
+                                st.dataframe(
+                                    [
+                                        {
+                                            "type": item.get("artifact_type", ""),
+                                            "name": item.get("name", ""),
+                                            "location": item.get("location", ""),
+                                        }
+                                        for item in delivery.get("deliverables", [])
+                                        if isinstance(item, dict)
+                                    ],
+                                    use_container_width=True,
+                                    hide_index=True,
+                                )
+                            if delivery.get("issues"):
+                                st.caption("Open Issues")
+                                st.dataframe(
+                                    [
+                                        {
+                                            "task": item.get("description", ""),
+                                            "issue": item.get("error", ""),
+                                        }
+                                        for item in delivery.get("issues", [])
+                                        if isinstance(item, dict)
+                                    ],
+                                    use_container_width=True,
+                                    hide_index=True,
+                                )
+                            if delivery.get("recommended_next_step"):
+                                st.caption(f"Next: {delivery.get('recommended_next_step', '')}")
+                            if delivery.get("open_todos"):
+                                st.caption("Pending Work")
+                                st.dataframe(
+                                    [
+                                        {
+                                            "todo": item.get("title", ""),
+                                            "status": item.get("status", ""),
+                                        }
+                                        for item in delivery.get("open_todos", [])
+                                        if isinstance(item, dict)
+                                    ],
+                                    use_container_width=True,
+                                    hide_index=True,
+                                )
 
                     if result.get("artifacts"):
                         with st.expander("Artifacts"):
@@ -265,6 +416,25 @@ def main():
                                 else:
                                     preview = artifact.get("preview", "")
                                     st.write(f"- {label}: {preview}")
+
+                    if result.get("policy_decisions"):
+                        with st.expander("Policy Decisions"):
+                            st.dataframe(
+                                [
+                                    {
+                                        "task_id": item.get("task_id", ""),
+                                        "tool_name": item.get("tool_name", ""),
+                                        "decision": item.get("decision", ""),
+                                        "risk_level": item.get("risk_level", ""),
+                                        "target_resource": item.get("target_resource", ""),
+                                        "approved_by": item.get("approved_by", ""),
+                                    }
+                                    for item in result["policy_decisions"]
+                                    if isinstance(item, dict)
+                                ],
+                                use_container_width=True,
+                                hide_index=True,
+                            )
 
                     if settings.DEBUG_MODE and result.get("runtime_metrics"):
                         with st.expander("Debug Metrics"):

@@ -3,12 +3,15 @@ OmniCore LangGraph DAG 编排
 将所有 Agent 串联成完整的执行图
 支持 Worker 失败后反思重规划
 """
+from pathlib import Path
+from datetime import datetime
 from typing import Literal
 from langgraph.graph import StateGraph, END
 
+from core.statuses import BLOCKED, WAITING_FOR_APPROVAL, WAITING_FOR_EVENT
 from core.state import OmniCoreState
 from core.router import RouterAgent
-from core.task_planner import build_task_item_from_plan
+from core.task_planner import build_policy_decision_from_task, build_task_item_from_plan
 from agents.critic import CriticAgent
 from agents.validator import Validator
 from core.llm import LLMClient
@@ -24,22 +27,83 @@ validator_agent = Validator()
 
 MAX_REPLAN = 3  # 最多重规划 3 次（给 Replanner 足够空间做策略转换）
 
+_CHECKPOINT_STAGE_ORDER = {
+    "route": 1,
+    "human_confirm": 2,
+    "parallel_executor": 3,
+    "validator": 4,
+    "critic": 5,
+    "replanner": 6,
+    "finalize": 7,
+}
+
+
+def _save_runtime_checkpoint(state: OmniCoreState, stage: str, note: str = "") -> None:
+    session_id = str(state.get("session_id", "") or "").strip()
+    job_id = str(state.get("job_id", "") or "").strip()
+    if not session_id or not job_id:
+        return
+
+    try:
+        from utils.runtime_state_store import get_runtime_state_store
+
+        get_runtime_state_store().save_checkpoint(
+            session_id=session_id,
+            job_id=job_id,
+            stage=stage,
+            state=state,
+            note=note,
+        )
+    except Exception as exc:
+        log_warning(f"Runtime checkpoint persistence failed: {exc}")
+
+
+def _should_skip_for_resume(state: OmniCoreState, stage: str) -> bool:
+    shared_memory = state.get("shared_memory", {})
+    if not isinstance(shared_memory, dict):
+        return False
+
+    resume_after = str(shared_memory.get("_resume_after_stage", "") or "").strip()
+    if not resume_after:
+        return False
+
+    target_index = _CHECKPOINT_STAGE_ORDER.get(resume_after)
+    current_index = _CHECKPOINT_STAGE_ORDER.get(stage)
+    if target_index is None or current_index is None:
+        shared_memory.pop("_resume_after_stage", None)
+        return False
+
+    if current_index <= target_index:
+        return True
+
+    shared_memory.pop("_resume_after_stage", None)
+    return False
+
 
 def route_node(state: OmniCoreState) -> OmniCoreState:
     """路由节点：分析意图并拆解任务"""
-    return router_agent.route(state)
+    if _should_skip_for_resume(state, "route"):
+        return state
+    state = router_agent.route(state)
+    _save_runtime_checkpoint(state, "route", "Router completed")
+    return state
 
 
 def parallel_executor_node(state: OmniCoreState) -> OmniCoreState:
     """批次执行节点：执行当前批次所有 ready 任务。"""
+    if _should_skip_for_resume(state, "parallel_executor"):
+        return state
     if collect_ready_task_indexes(state):
         state["execution_status"] = "executing"
     state = run_ready_batch(state)
+    _save_runtime_checkpoint(state, "parallel_executor", "Executed ready task batch")
     return state
 
 
 def replanner_node(state: OmniCoreState) -> OmniCoreState:
     """反思重规划节点：分析失败原因，制定新策略"""
+    if _should_skip_for_resume(state, "replanner"):
+        return state
     state["replan_count"] = state.get("replan_count", 0) + 1
     log_agent_action("Replanner", f"开始反思重规划（第 {state['replan_count']} 次）")
 
@@ -171,6 +235,10 @@ def replanner_node(state: OmniCoreState) -> OmniCoreState:
             # 不保留之前的任务，因为既然触发了 Replanner，说明之前的任务都不满足要求
             # 保留它们只会导致 Critic 重复审查并持续失败
             state["task_queue"] = new_tasks
+            state["policy_decisions"] = [
+                build_policy_decision_from_task(task)
+                for task in new_tasks
+            ]
             state["needs_human_confirm"] = any(
                 task.get("requires_confirmation", False) for task in new_tasks
             )
@@ -187,18 +255,27 @@ def replanner_node(state: OmniCoreState) -> OmniCoreState:
     state["messages"].append(
         SystemMessage(content=f"Replanner 重规划完成（第 {state['replan_count']} 次）")
     )
+    _save_runtime_checkpoint(state, "replanner", "Replanner completed")
 
     return state
 
 
 def critic_node(state: OmniCoreState) -> OmniCoreState:
     """Critic 审查节点"""
-    return critic_agent.review(state)
+    if _should_skip_for_resume(state, "critic"):
+        return state
+    state = critic_agent.review(state)
+    _save_runtime_checkpoint(state, "critic", "Critic review completed")
+    return state
 
 
 def validator_node(state: OmniCoreState) -> OmniCoreState:
     """Validator 硬规则验证节点"""
-    return validator_agent.validate(state)
+    if _should_skip_for_resume(state, "validator"):
+        return state
+    state = validator_agent.validate(state)
+    _save_runtime_checkpoint(state, "validator", "Validator completed")
+    return state
 
 
 def human_confirm_node(state: OmniCoreState) -> OmniCoreState:
@@ -218,8 +295,46 @@ def human_confirm_node(state: OmniCoreState) -> OmniCoreState:
     return state
 
 
+def _sync_policy_decisions_after_confirmation(
+    state: OmniCoreState,
+    *,
+    approved: bool,
+) -> None:
+    timestamp = datetime.now().isoformat(timespec="seconds")
+    decisions = []
+    existing = {
+        str(item.get("task_id", "") or ""): dict(item)
+        for item in state.get("policy_decisions", []) or []
+        if isinstance(item, dict) and item.get("task_id")
+    }
+
+    for task in state.get("task_queue", []) or []:
+        if not isinstance(task, dict):
+            continue
+        task_id = str(task.get("task_id", "") or "")
+        current = existing.get(task_id) or dict(build_policy_decision_from_task(task))
+        if bool(current.get("requires_human_confirm", False)):
+            current["decision"] = "approved" if approved else "rejected"
+            current["approved_by"] = "user"
+            current["approved_at"] = timestamp
+        decisions.append(current)
+
+    state["policy_decisions"] = decisions
+
+
 def human_confirm_node_v2(state: OmniCoreState) -> OmniCoreState:
     """Deterministic-policy aware human confirmation node."""
+    if _should_skip_for_resume(state, "human_confirm"):
+        return state
+    user_preferences = state.get("shared_memory", {}).get("user_preferences", {})
+    auto_queue_confirmations = bool(
+        isinstance(user_preferences, dict) and user_preferences.get("auto_queue_confirmations", False)
+    )
+    if auto_queue_confirmations and state["needs_human_confirm"] and not state["human_approved"]:
+        state["human_approved"] = True
+        _sync_policy_decisions_after_confirmation(state, approved=True)
+        _save_runtime_checkpoint(state, "human_confirm", "Auto-approved by user preference")
+        return state
     if state["needs_human_confirm"] and not state["human_approved"]:
         flagged_tasks = [
             task for task in state["task_queue"] if task.get("requires_confirmation", False)
@@ -249,16 +364,291 @@ def human_confirm_node_v2(state: OmniCoreState) -> OmniCoreState:
             affected_items=affected_items,
         )
         state["human_approved"] = confirmed
+        _sync_policy_decisions_after_confirmation(state, approved=confirmed)
         if not confirmed:
             state["execution_status"] = "cancelled"
             state["error_trace"] = "User cancelled execution"
     else:
         state["human_approved"] = True
+    _save_runtime_checkpoint(state, "human_confirm", "Human confirmation handled")
     return state
+
+
+def _collect_delivery_artifacts(state: OmniCoreState):
+    artifacts = []
+    seen = set()
+    path_keys = ("file_path", "path", "output_path", "download_path", "screenshot_path")
+
+    for artifact in state.get("artifacts", []) or []:
+        if not isinstance(artifact, dict):
+            continue
+        fingerprint = (
+            str(artifact.get("path", "") or ""),
+            str(artifact.get("name", "") or ""),
+            str(artifact.get("artifact_type", "") or ""),
+        )
+        if fingerprint in seen:
+            continue
+        seen.add(fingerprint)
+        artifacts.append(dict(artifact))
+
+    for task in state.get("task_queue", []) or []:
+        result = task.get("result")
+        if not isinstance(result, dict):
+            continue
+
+        for source_key in path_keys:
+            raw_path = str(result.get(source_key, "") or "").strip()
+            if not raw_path:
+                continue
+            artifact_type = "file"
+            if source_key == "screenshot_path":
+                artifact_type = "image"
+            elif source_key == "download_path":
+                artifact_type = "download"
+            fingerprint = (raw_path, source_key, artifact_type)
+            if fingerprint in seen:
+                continue
+            seen.add(fingerprint)
+            artifacts.append(
+                {
+                    "task_id": task.get("task_id", ""),
+                    "task_type": task.get("task_type", ""),
+                    "tool_name": task.get("tool_name", ""),
+                    "artifact_type": artifact_type,
+                    "source_key": source_key,
+                    "path": raw_path,
+                    "name": Path(raw_path).name or raw_path,
+                }
+            )
+
+        for source_key in ("data", "items", "content"):
+            payload = result.get(source_key)
+            if payload in (None, "", [], {}):
+                continue
+            preview = str(payload).replace("\n", " ")[:220]
+            fingerprint = ("inline", source_key, preview)
+            if fingerprint in seen:
+                continue
+            seen.add(fingerprint)
+            artifacts.append(
+                {
+                    "task_id": task.get("task_id", ""),
+                    "task_type": task.get("task_type", ""),
+                    "tool_name": task.get("tool_name", ""),
+                    "artifact_type": "structured_data",
+                    "source_key": source_key,
+                    "path": "",
+                    "name": f"{task.get('task_id', 'task')}_{source_key}",
+                    "preview": preview,
+                }
+            )
+
+    return artifacts
+
+
+def _build_delivery_package(state: OmniCoreState) -> dict:
+    tasks = state.get("task_queue", []) or []
+    completed = [task for task in tasks if task.get("status") == "completed"]
+    failed = [task for task in tasks if task.get("status") == "failed"]
+    waiting_approval = [task for task in tasks if task.get("status") == WAITING_FOR_APPROVAL]
+    waiting_event = [task for task in tasks if task.get("status") == WAITING_FOR_EVENT]
+    blocked = [task for task in tasks if task.get("status") == BLOCKED]
+    pending = [
+        task for task in tasks
+        if task.get("status") not in {"completed", "failed", WAITING_FOR_APPROVAL, WAITING_FOR_EVENT, BLOCKED}
+    ]
+    artifacts = _collect_delivery_artifacts(state)
+
+    deliverables = []
+    for artifact in artifacts:
+        if not isinstance(artifact, dict):
+            continue
+        deliverables.append(
+            {
+                "artifact_type": str(artifact.get("artifact_type", "") or "artifact"),
+                "name": str(artifact.get("name", "") or "artifact"),
+                "location": str(artifact.get("path", "") or artifact.get("preview", "") or "").strip(),
+                "task_id": str(artifact.get("task_id", "") or ""),
+                "tool_name": str(artifact.get("tool_name", "") or ""),
+            }
+        )
+
+    issues = []
+    for task in failed:
+        result = task.get("result") if isinstance(task.get("result"), dict) else {}
+        error_message = result.get("error") or result.get("message") or "Unknown error"
+        issues.append(
+            {
+                "task_id": str(task.get("task_id", "") or ""),
+                "description": str(task.get("description", "") or task.get("task_id", "") or "Failed task"),
+                "error": str(error_message),
+            }
+        )
+    for task in waiting_approval:
+        issues.append(
+            {
+                "task_id": str(task.get("task_id", "") or ""),
+                "description": str(task.get("description", "") or task.get("task_id", "") or "Approval needed"),
+                "error": "Waiting for approval",
+            }
+        )
+    for task in waiting_event:
+        issues.append(
+            {
+                "task_id": str(task.get("task_id", "") or ""),
+                "description": str(task.get("description", "") or task.get("task_id", "") or "Waiting for event"),
+                "error": "Waiting for external event",
+            }
+        )
+    for task in blocked:
+        issues.append(
+            {
+                "task_id": str(task.get("task_id", "") or ""),
+                "description": str(task.get("description", "") or task.get("task_id", "") or "Blocked task"),
+                "error": "Task is blocked",
+            }
+        )
+    for task in pending:
+        issues.append(
+            {
+                "task_id": str(task.get("task_id", "") or ""),
+                "description": str(task.get("description", "") or task.get("task_id", "") or "Pending task"),
+                "error": f"Task status is {task.get('status', 'pending')}",
+            }
+        )
+
+    review_status = "approved" if state.get("critic_approved") else "needs_attention"
+    work_context = state.get("shared_memory", {}).get("work_context", {})
+    goal = work_context.get("goal", {}) if isinstance(work_context, dict) else {}
+    project = work_context.get("project", {}) if isinstance(work_context, dict) else {}
+    todo = work_context.get("todo", {}) if isinstance(work_context, dict) else {}
+    open_todos = work_context.get("open_todos", []) if isinstance(work_context, dict) else []
+    if not tasks:
+        headline = "Answered directly without executing worker tasks."
+    elif waiting_approval:
+        headline = f"{len(waiting_approval)} task(s) are prepared and waiting for approval."
+    elif waiting_event:
+        headline = f"{len(waiting_event)} task(s) are waiting for an external event."
+    elif blocked:
+        headline = f"{len(blocked)} task(s) are blocked and require manual intervention."
+    elif not issues:
+        headline = f"Completed all {len(completed)} planned task(s)."
+    else:
+        headline = f"Completed {len(completed)} of {len(tasks)} task(s); follow-up review is recommended."
+
+    recommended_next_step = ""
+    if waiting_approval:
+        recommended_next_step = "Review and approve the waiting action to continue execution."
+    elif waiting_event:
+        recommended_next_step = "Wait for the watched event or adjust the event source."
+    elif blocked:
+        recommended_next_step = "Unblock or rerun the blocked task after resolving the issue."
+    elif failed:
+        recommended_next_step = "Review the failed task(s) or retry from the latest checkpoint."
+    elif pending:
+        recommended_next_step = "Resume the unfinished task(s) to complete the workflow."
+    elif review_status != "approved":
+        recommended_next_step = "Review the critic feedback before reusing this result."
+
+    return {
+        "headline": headline,
+        "intent": str(state.get("current_intent", "") or ""),
+        "review_status": review_status,
+        "goal": {
+            "goal_id": str(goal.get("goal_id", "") or ""),
+            "title": str(goal.get("title", "") or ""),
+        },
+        "project": {
+            "project_id": str(project.get("project_id", "") or ""),
+            "title": str(project.get("title", "") or ""),
+        },
+        "todo": {
+            "todo_id": str(todo.get("todo_id", "") or ""),
+            "title": str(todo.get("title", "") or ""),
+            "status": str(todo.get("status", "") or ""),
+        },
+        "completed_task_count": len(completed),
+        "total_task_count": len(tasks),
+        "completed_tasks": [
+            str(task.get("description", "") or task.get("task_id", "") or "Completed task")
+            for task in completed
+        ],
+        "deliverables": deliverables,
+        "issues": issues,
+        "critic_feedback": str(state.get("critic_feedback", "") or "").strip(),
+        "recommended_next_step": recommended_next_step,
+        "open_todos": [
+            {
+                "todo_id": str(item.get("todo_id", "") or ""),
+                "title": str(item.get("title", "") or ""),
+                "status": str(item.get("status", "") or ""),
+            }
+            for item in open_todos[:8]
+            if isinstance(item, dict)
+        ],
+    }
+
+
+def _build_delivery_summary(state: OmniCoreState) -> str:
+    package = _build_delivery_package(state)
+    state["artifacts"] = _collect_delivery_artifacts(state)
+    state["delivery_package"] = package
+
+    lines = [
+        package["headline"],
+        f"Review status: {package['review_status']}",
+        f"Progress: {package['completed_task_count']}/{package['total_task_count']} task(s) completed.",
+    ]
+
+    completed_tasks = package.get("completed_tasks", [])
+    if completed_tasks:
+        lines.append("")
+        lines.append("Completed work:")
+        for item in completed_tasks:
+            lines.append(f"- {item}")
+
+    deliverables = package.get("deliverables", [])
+    if deliverables:
+        lines.append("")
+        lines.append("Deliverables:")
+        for item in deliverables[:8]:
+            if item.get("location"):
+                lines.append(f"- [{item.get('artifact_type', 'artifact')}] {item.get('name', 'artifact')}: {item.get('location')}")
+            else:
+                lines.append(f"- [{item.get('artifact_type', 'artifact')}] {item.get('name', 'artifact')}")
+
+    issues = package.get("issues", [])
+    if issues:
+        lines.append("")
+        lines.append("Open issues:")
+        for item in issues[:8]:
+            lines.append(f"- {item.get('description', 'Issue')}: {item.get('error', 'Unknown error')}")
+
+    critic_feedback = package.get("critic_feedback", "")
+    if critic_feedback:
+        lines.append("")
+        lines.append(f"Review note: {critic_feedback}")
+
+    next_step = package.get("recommended_next_step", "")
+    if next_step:
+        lines.append("")
+        lines.append(f"Recommended next step: {next_step}")
+
+    open_todos = package.get("open_todos", [])
+    if open_todos:
+        lines.append("")
+        lines.append("Pending work:")
+        for item in open_todos:
+            lines.append(f"- {item.get('title', 'Todo')} [{item.get('status', 'pending')}]")
+
+    return "\n".join(lines)
 
 
 def finalize_node(state: OmniCoreState) -> OmniCoreState:
     """最终输出节点"""
+    if _should_skip_for_resume(state, "finalize"):
+        return state
     if not state["task_queue"]:
         router_reasoning = ""
         for msg in reversed(state.get("messages", [])):
@@ -278,6 +668,19 @@ def finalize_node(state: OmniCoreState) -> OmniCoreState:
             state["final_output"] = router_reasoning or "抱歉，我没有理解你的意思，请再说一次。"
         state["execution_status"] = "completed"
         state["critic_approved"] = True
+        state["delivery_package"] = {
+            "headline": "Answered directly without worker execution.",
+            "intent": str(state.get("current_intent", "") or ""),
+            "review_status": "approved",
+            "completed_task_count": 0,
+            "total_task_count": 0,
+            "completed_tasks": [],
+            "deliverables": [],
+            "issues": [],
+            "critic_feedback": "",
+            "recommended_next_step": "",
+        }
+        _save_runtime_checkpoint(state, "finalize", "Finalize completed without task queue")
         return state
 
     results = []
@@ -287,15 +690,23 @@ def finalize_node(state: OmniCoreState) -> OmniCoreState:
         elif task["status"] == "failed":
             results.append(f"❌ {task['description']}: {task.get('result', {}).get('error', '未知错误')}")
 
-    state["final_output"] = "\n".join(results)
+    state["final_output"] = _build_delivery_summary(state)
 
-    if state["critic_approved"]:
+    statuses = {str(task.get("status", "") or "") for task in state["task_queue"]}
+    if WAITING_FOR_APPROVAL in statuses:
+        state["execution_status"] = WAITING_FOR_APPROVAL
+    elif WAITING_FOR_EVENT in statuses:
+        state["execution_status"] = WAITING_FOR_EVENT
+    elif BLOCKED in statuses:
+        state["execution_status"] = BLOCKED
+    elif state["critic_approved"]:
         state["execution_status"] = "completed"
         log_success("所有任务执行完成")
     else:
         state["execution_status"] = "completed_with_issues"
         log_error(f"任务未通过审查: {state['critic_feedback']}")
 
+    _save_runtime_checkpoint(state, "finalize", "Finalize completed")
     return state
 
 

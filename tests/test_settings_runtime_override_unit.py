@@ -53,3 +53,42 @@ def test_runtime_metrics_override_file_only_applies_tuning_keys():
             os.environ["DEFAULT_MODEL"] = original_default_model
 
         importlib.reload(settings_module)
+
+
+def test_managed_proxy_env_ignores_system_proxy_by_default_and_applies_project_proxy():
+    tracked_keys = [
+        "HTTP_PROXY",
+        "HTTPS_PROXY",
+        "ALL_PROXY",
+        "NO_PROXY",
+        "http_proxy",
+        "https_proxy",
+        "all_proxy",
+        "no_proxy",
+    ]
+    original = {key: os.environ.get(key) for key in tracked_keys}
+
+    try:
+        os.environ["HTTP_PROXY"] = "http://127.0.0.1:9"
+        os.environ["HTTPS_PROXY"] = "http://127.0.0.1:9"
+        os.environ["ALL_PROXY"] = "http://127.0.0.1:9"
+
+        settings_module._apply_managed_proxy_env(
+            allow_system_proxy=False,
+            https_proxy="http://127.0.0.1:7890",
+            no_proxy="localhost,127.0.0.1",
+        )
+
+        assert os.environ.get("HTTP_PROXY", "") == ""
+        assert os.environ.get("http_proxy", "") == ""
+        assert os.environ["HTTPS_PROXY"] == "http://127.0.0.1:7890"
+        assert os.environ["https_proxy"] == "http://127.0.0.1:7890"
+        assert os.environ.get("ALL_PROXY", "") == ""
+        assert os.environ["NO_PROXY"] == "localhost,127.0.0.1"
+        assert os.environ["no_proxy"] == "localhost,127.0.0.1"
+    finally:
+        for key, value in original.items():
+            if value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = value

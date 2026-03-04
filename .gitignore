@@ -41,3 +41,8 @@ nul
 error.txt
 outputs/
 reports/
+
+# Pytest
+.pytest_cache/
+pytest-cache-files-*/
+data/test-runtime/

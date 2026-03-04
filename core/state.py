@@ -47,6 +47,19 @@ class ArtifactItem(TypedDict, total=False):
     tool_name: str
 
 
+class PolicyDecisionItem(TypedDict, total=False):
+    task_id: str
+    tool_name: str
+    action: str
+    target_resource: str
+    risk_level: str
+    decision: str
+    reason: str
+    requires_human_confirm: bool
+    approved_by: str
+    approved_at: str
+
+
 def ensure_task_defaults(task: TaskItem) -> TaskItem:
     """为缺失的 v0.2 可选字段填充默认值（就地修改并返回）"""
     task.setdefault("success_criteria", [])
@@ -92,6 +105,7 @@ class OmniCoreState(TypedDict):
     # 各个 Worker 抓取或处理后的中间数据暂存区
     shared_memory: Dict[str, Any]
     artifacts: List[ArtifactItem]
+    policy_decisions: List[PolicyDecisionItem]
 
     # 独立审查官 (Critic) 的反馈
     critic_feedback: str
@@ -110,6 +124,7 @@ class OmniCoreState(TypedDict):
 
     # 最终输出结果
     final_output: str
+    delivery_package: Dict[str, Any]
 
     # 执行状态: idle, routing, executing, reviewing, completed, error
     execution_status: str
@@ -138,12 +153,14 @@ def create_initial_state(
         current_task_index=0,
         shared_memory={},
         artifacts=[],
+        policy_decisions=[],
         critic_feedback="",
         critic_approved=False,
         human_approved=False,
         needs_human_confirm=False,
         error_trace="",
         final_output="",
+        delivery_package={},
         execution_status="idle",
         replan_count=0,
         validator_passed=True,

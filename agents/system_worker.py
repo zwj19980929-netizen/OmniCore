@@ -2,6 +2,7 @@
 OmniCore System Worker Agent
 负责系统级操作：执行脚本、模拟键鼠、操作应用程序
 """
+import shlex
 import subprocess
 import platform
 from typing import Dict, Any, Optional
@@ -26,6 +27,16 @@ class SystemWorker:
     def __init__(self):
         self.name = "SystemWorker"
         self.platform = platform.system()  # Windows, Darwin, Linux
+        self._blocked_launchers = {
+            "cmd",
+            "powershell",
+            "pwsh",
+            "bash",
+            "sh",
+            "zsh",
+            "wscript",
+            "cscript",
+        }
 
     def _validate_command_safety(self, command: str) -> Optional[str]:
         normalized = str(command or "").strip()
@@ -35,6 +46,34 @@ class SystemWorker:
             if token in normalized:
                 return f"不允许的命令控制符: {token}"
         return None
+
+    def _build_command_args(self, command: str) -> Dict[str, Any]:
+        normalized = str(command or "").strip()
+        if not normalized:
+            return {"success": False, "error": "鍛戒护涓嶈兘涓虹┖"}
+
+        try:
+            argv = shlex.split(normalized, posix=False)
+        except ValueError as exc:
+            return {
+                "success": False,
+                "error": f"鍛戒护瑙ｆ瀽澶辫触: {exc}",
+            }
+
+        if not argv:
+            return {"success": False, "error": "鍛戒护涓嶈兘涓虹┖"}
+
+        executable = Path(str(argv[0])).name.lower()
+        if executable in self._blocked_launchers:
+            return {
+                "success": False,
+                "error": "涓嶅厑璁搁€氳繃 shell/interpreter 鍚姩鍛戒护",
+            }
+
+        return {
+            "success": True,
+            "argv": argv,
+        }
 
     def execute_command(
         self,
@@ -66,6 +105,14 @@ class SystemWorker:
         log_agent_action(self.name, "准备执行命令", command[:50])
 
         # 高危操作确认
+        command_parse = self._build_command_args(command)
+        if not command_parse.get("success"):
+            return {
+                "success": False,
+                "error": command_parse.get("error", "鍛戒护瑙ｆ瀽澶辫触"),
+                "command": command,
+            }
+
         if require_confirm and settings.REQUIRE_HUMAN_CONFIRM:
             confirmed = HumanConfirm.request_system_command_confirmation(
                 command=command,
@@ -80,8 +127,8 @@ class SystemWorker:
 
         try:
             result = subprocess.run(
-                command,
-                shell=True,
+                command_parse["argv"],
+                shell=False,
                 capture_output=True,
                 text=True,
                 timeout=timeout_sec,

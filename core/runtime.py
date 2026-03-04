@@ -2,10 +2,25 @@
 OmniCore 鍏变韩杩愯鏃跺叆鍙?
 缁熶竴 CLI / UI 鐨勪换鍔℃墽琛屻€佸唴缃懡浠ゅ拰璁板繂鎺ュ叆閫昏緫
 """
+from datetime import datetime
+import os
+import signal
+import subprocess
+import sys
+import time
 import traceback
 import threading
 from typing import Optional, List, Dict, Any, TYPE_CHECKING
 
+from config.settings import settings
+from core.statuses import (
+    BLOCKED,
+    WAITING_FOR_APPROVAL,
+    WAITING_FOR_EVENT,
+    WAITING_JOB_STATUSES,
+    is_recoverable_job_status,
+    is_success_job_status,
+)
 from core.state import create_initial_state
 from core.graph import get_graph
 from utils.logger import console, log_agent_action, log_debug_metrics, log_error, log_warning
@@ -13,6 +28,12 @@ from utils.text import sanitize_text, sanitize_value
 
 if TYPE_CHECKING:
     from memory.chroma_store import ChromaMemory
+
+
+_queue_worker_lock = threading.Lock()
+_queue_worker_thread: Optional[threading.Thread] = None
+_queue_worker_process: Optional[subprocess.Popen] = None
+_queue_worker_stop = threading.Event()
 
 
 def _build_special_result(
@@ -29,6 +50,8 @@ def _build_special_result(
         "critic_feedback": "",
         "tasks_completed": 0,
         "tasks": [],
+        "policy_decisions": [],
+        "delivery_package": {},
         "intent": "system_command",
         "is_special_command": True,
         "runtime_metrics": _collect_runtime_metrics(),
@@ -60,6 +83,306 @@ def _collect_runtime_metrics() -> Dict[str, Any]:
     return metrics
 
 
+def _is_pid_running(pid: int) -> bool:
+    if pid <= 0:
+        return False
+    try:
+        os.kill(pid, 0)
+    except OSError:
+        return False
+    return True
+
+
+def _resolve_worker_mode(mode: Optional[str] = None) -> str:
+    resolved = str(mode or settings.QUEUE_WORKER_MODE or "process").strip().lower()
+    if resolved not in {"thread", "process"}:
+        return "process"
+    return resolved
+
+
+def _release_due_schedules() -> List[Dict[str, Any]]:
+    try:
+        from utils.runtime_state_store import get_runtime_state_store
+
+        released = sanitize_value(
+            get_runtime_state_store().release_due_schedules(limit=settings.SCHEDULER_RELEASE_LIMIT)
+        )
+        if released:
+            log_agent_action("Scheduler", "Released due schedules", f"{len(released)} job(s) queued")
+        return released
+    except Exception as e:
+        log_warning(f"Schedule release failed: {e}")
+        return []
+
+
+def _release_directory_watch_events() -> List[Dict[str, Any]]:
+    try:
+        from utils.workflow_automation_store import get_workflow_automation_store
+
+        events = sanitize_value(
+            get_workflow_automation_store().poll_directory_watch_events(limit=5)
+        )
+        for event in events:
+            if not isinstance(event, dict):
+                continue
+            template_id = sanitize_text(event.get("template_id") or "")
+            if template_id:
+                submission = submit_template(
+                    template_id,
+                    session_id=sanitize_text(event.get("session_id") or "") or None,
+                    goal_id=sanitize_text(event.get("goal_id") or "") or None,
+                    project_id=sanitize_text(event.get("project_id") or "") or None,
+                    todo_id=sanitize_text(event.get("todo_id") or "") or None,
+                    file_event_path=sanitize_text(event.get("file_path") or ""),
+                    auto_start_worker=False,
+                    trigger_source="file_event",
+                )
+                if submission:
+                    continue
+                session_id = sanitize_text(event.get("session_id") or "")
+                log_warning(
+                    f"Directory watch template {template_id} is unavailable; "
+                    "falling back to direct file-event prompt."
+                )
+                _create_automation_notification(
+                    session_id=session_id,
+                    title="Directory watch template missing",
+                    message=(
+                        f"Template {template_id} could not be loaded. "
+                        "The file event was queued with a direct fallback prompt instead."
+                    ),
+                )
+
+            base_input = sanitize_text(event.get("user_input") or "")
+            file_path = sanitize_text(event.get("file_path") or "")
+            event_prompt = base_input or "Process the new file event."
+            if file_path:
+                event_prompt = f"{event_prompt}\n\nNew file detected: {file_path}"
+            submit_task(
+                event_prompt,
+                session_id=sanitize_text(event.get("session_id") or "") or None,
+                goal_id=sanitize_text(event.get("goal_id") or "") or None,
+                project_id=sanitize_text(event.get("project_id") or "") or None,
+                todo_id=sanitize_text(event.get("todo_id") or "") or None,
+                auto_start_worker=False,
+                trigger_source="file_event",
+            )
+        if events:
+            log_agent_action("DirectoryWatch", "Released file events", f"{len(events)} job(s) queued")
+        return events
+    except Exception as e:
+        log_warning(f"Directory watch polling failed: {e}")
+        return []
+
+
+def _load_effective_user_preferences(session_id: str) -> Dict[str, Any]:
+    try:
+        from utils.runtime_state_store import get_runtime_state_store
+
+        return sanitize_value(get_runtime_state_store().get_preferences(session_id or None))
+    except Exception as e:
+        log_warning(f"Failed to load user preferences: {e}")
+        return {
+            "default_output_directory": settings.DEFAULT_OUTPUT_DIRECTORY,
+            "preferred_tools": list(settings.DEFAULT_PREFERRED_TOOLS),
+            "preferred_sites": list(settings.DEFAULT_PREFERRED_SITES),
+            "auto_queue_confirmations": bool(settings.DEFAULT_AUTO_QUEUE_CONFIRMATIONS),
+            "task_templates": {},
+        }
+
+
+def _build_current_time_context() -> Dict[str, str]:
+    now = datetime.now().astimezone()
+    timezone_name = now.tzname() or str(now.tzinfo or "")
+    return {
+        "iso_datetime": now.isoformat(timespec="seconds"),
+        "local_date": now.strftime("%Y-%m-%d"),
+        "local_time": now.strftime("%H:%M:%S"),
+        "weekday": now.strftime("%A"),
+        "timezone": timezone_name,
+    }
+
+
+def _load_job_work_scope(job_id: str) -> Dict[str, str]:
+    if not job_id:
+        return {"goal_id": "", "project_id": "", "todo_id": ""}
+    try:
+        from utils.runtime_state_store import get_runtime_state_store
+
+        job_record = get_runtime_state_store().get_job(job_id)
+    except Exception:
+        job_record = {}
+    return {
+        "goal_id": sanitize_text(job_record.get("goal_id") or ""),
+        "project_id": sanitize_text(job_record.get("project_id") or ""),
+        "todo_id": sanitize_text(job_record.get("todo_id") or ""),
+    }
+
+
+def _load_work_runtime_context(
+    *,
+    session_id: str,
+    job_id: str,
+    user_input: str,
+) -> Dict[str, Any]:
+    scope = _load_job_work_scope(job_id)
+    context: Dict[str, Any] = {
+        "scope": scope,
+        "work_context": {},
+        "resource_memory": [],
+        "successful_paths": [],
+    }
+
+    try:
+        from utils.work_context_store import get_work_context_store
+
+        work_store = get_work_context_store()
+        context["work_context"] = sanitize_value(
+            work_store.get_context_snapshot(
+                session_id=session_id,
+                goal_id=scope["goal_id"],
+                project_id=scope["project_id"],
+                todo_id=scope["todo_id"],
+            )
+        )
+        context["successful_paths"] = sanitize_value(
+            work_store.suggest_success_paths(
+                query=user_input,
+                session_id=session_id,
+                goal_id=scope["goal_id"],
+                limit=3,
+            )
+        )
+    except Exception as e:
+        log_warning(f"Failed to load work context: {e}")
+
+    try:
+        from utils.artifact_store import get_artifact_store
+
+        context["resource_memory"] = sanitize_value(
+            get_artifact_store().search_artifacts(
+                session_id=session_id or None,
+                goal_id=scope["goal_id"] or None,
+                project_id=scope["project_id"] or None,
+                todo_id=scope["todo_id"] or None,
+                query=user_input,
+                limit=10,
+            )
+        )
+    except Exception as e:
+        log_warning(f"Failed to load artifact context: {e}")
+
+    return context
+
+
+def _create_job_notification(finalized: Dict[str, Any]) -> None:
+    session_id = sanitize_text(finalized.get("session_id") or "")
+    if not session_id:
+        return
+
+    status = sanitize_text(finalized.get("status") or "")
+    job_id = sanitize_text(finalized.get("job_id") or "")
+    output = sanitize_text(finalized.get("output") or "")
+    error = sanitize_text(finalized.get("error") or "")
+    delivery = finalized.get("delivery_package") or {}
+    headline = sanitize_text(delivery.get("headline") or "")
+    issues = delivery.get("issues") or []
+    pending_policy = [
+        item for item in (finalized.get("policy_decisions") or [])
+        if isinstance(item, dict) and str(item.get("decision", "") or "").strip().lower() == "pending"
+    ]
+
+    title = "Task completed"
+    message = headline or _short_preview(output or error)
+    level = "info"
+    requires_action = False
+    category = "job_result"
+
+    if status == WAITING_FOR_APPROVAL:
+        title = "Task waiting for approval"
+        level = "warning"
+        category = "approval"
+        requires_action = True
+        message = headline or "A prepared action is waiting for your approval."
+    elif status == WAITING_FOR_EVENT:
+        title = "Task waiting for event"
+        level = "info"
+        category = "automation"
+        message = headline or "The task is waiting for an external event."
+    elif status == BLOCKED:
+        title = "Task blocked"
+        level = "warning"
+        category = "job_result"
+        requires_action = True
+        message = headline or "The task is blocked and needs manual attention."
+    elif status in {"completed"} and not issues:
+        level = "success"
+    elif status in {"completed_with_issues"} or issues:
+        title = "Task completed with issues"
+        level = "warning"
+        message = headline or _short_preview(error or output)
+    elif status in {"error", "cancelled"} or not bool(finalized.get("success", False)):
+        title = "Task failed"
+        level = "error"
+        message = _short_preview(error or output or status)
+    if pending_policy:
+        title = "Task requires review"
+        level = "warning"
+        requires_action = True
+        category = "approval"
+        message = _short_preview(
+            "; ".join(
+                f"{item.get('tool_name', '')}:{item.get('target_resource', '')}"
+                for item in pending_policy[:3]
+            )
+            or "Pending approval items"
+        )
+
+    try:
+        from utils.runtime_state_store import get_runtime_state_store
+
+        get_runtime_state_store().create_notification(
+            session_id=session_id,
+            job_id=job_id,
+            title=title,
+            message=message or "No details available.",
+            level=level,
+            category=category,
+            requires_action=requires_action,
+        )
+    except Exception as e:
+        log_warning(f"Notification persistence failed: {e}")
+
+
+def _create_automation_notification(
+    *,
+    session_id: str,
+    title: str,
+    message: str,
+    level: str = "warning",
+) -> None:
+    if not session_id:
+        return
+
+    try:
+        from utils.runtime_state_store import get_runtime_state_store
+
+        get_runtime_state_store().create_notification(
+            session_id=session_id,
+            title=title,
+            message=message,
+            level=level,
+            category="automation",
+            requires_action=False,
+        )
+    except Exception as e:
+        log_warning(f"Automation notification persistence failed: {e}")
+
+
+def _short_preview(text: str, limit: int = 220) -> str:
+    return sanitize_text(text or "")[:limit]
+
+
 def _finalize_runtime_result(result: Dict[str, Any], user_input: str) -> Dict[str, Any]:
     finalized = dict(result)
     runtime_metrics = sanitize_value(finalized.get("runtime_metrics") or _collect_runtime_metrics())
@@ -82,8 +405,12 @@ def _finalize_runtime_result(result: Dict[str, Any], user_input: str) -> Dict[st
         log_warning(f"娣囨繂鐡ㄦ潻鎰攽閹稿洦鐖ｆ径杈Е: {e}")
 
     tasks = sanitize_value(finalized.get("tasks") or [])
+    policy_decisions = sanitize_value(finalized.get("policy_decisions") or [])
+    delivery_package = sanitize_value(finalized.get("delivery_package") or {})
     session_id = sanitize_text(finalized.get("session_id") or "")
     job_id = sanitize_text(finalized.get("job_id") or "")
+    finalized["policy_decisions"] = policy_decisions
+    finalized["delivery_package"] = delivery_package
 
     try:
         from utils.runtime_state_store import get_runtime_state_store
@@ -106,12 +433,20 @@ def _finalize_runtime_result(result: Dict[str, Any], user_input: str) -> Dict[st
                 error=sanitize_text(finalized.get("error") or ""),
                 intent=sanitize_text(finalized.get("intent") or ""),
                 tasks=tasks,
+                policy_decisions=policy_decisions,
                 artifacts=artifacts,
                 is_special_command=bool(finalized.get("is_special_command", False)),
             )
             finalized["artifacts"] = artifacts
             finalized["job_record"] = sanitize_value(completion.get("job_record", {}))
             finalized["session_record"] = sanitize_value(completion.get("session_record", {}))
+            latest_checkpoint = sanitize_value(state_store.get_latest_checkpoint(job_id))
+            if latest_checkpoint:
+                finalized["checkpoint_summary"] = {
+                    "checkpoint_id": sanitize_text(latest_checkpoint.get("checkpoint_id") or ""),
+                    "stage": sanitize_text(latest_checkpoint.get("stage") or ""),
+                    "created_at": sanitize_text(latest_checkpoint.get("created_at") or ""),
+                }
         else:
             finalized.setdefault("artifacts", [])
     except Exception as e:
@@ -119,7 +454,90 @@ def _finalize_runtime_result(result: Dict[str, Any], user_input: str) -> Dict[st
         finalized["runtime_state_store_error"] = sanitize_text(str(e))
         log_warning(f"Runtime state persistence failed: {e}")
 
+    job_record = finalized.get("job_record") or {}
+    goal_id = sanitize_text(job_record.get("goal_id") or "")
+    project_id = sanitize_text(job_record.get("project_id") or "")
+    todo_id = sanitize_text(job_record.get("todo_id") or "")
+
+    lifecycle_status = sanitize_text(finalized.get("status") or "")
+    if lifecycle_status not in WAITING_JOB_STATUSES:
+        try:
+            from utils.artifact_store import get_artifact_store
+
+            cataloged = get_artifact_store().record_artifacts(
+                session_id=session_id,
+                job_id=job_id,
+                artifacts=sanitize_value(finalized.get("artifacts") or []),
+                goal_id=goal_id,
+                project_id=project_id,
+                todo_id=todo_id,
+            )
+            finalized["artifact_catalog_entries"] = sanitize_value(cataloged)
+        except Exception as e:
+            finalized["artifact_store_error"] = sanitize_text(str(e))
+            log_warning(f"Artifact catalog persistence failed: {e}")
+
+        try:
+            from utils.work_context_store import get_work_context_store
+
+            tool_sequence = [
+                str(task.get("tool_name", "") or task.get("task_type", "") or "").strip()
+                for task in tasks
+                if isinstance(task, dict) and str(task.get("status", "") or "") == "completed"
+            ]
+            work_store = get_work_context_store()
+            work_store.record_experience(
+                session_id=session_id,
+                job_id=job_id,
+                user_input=user_input,
+                intent=sanitize_text(finalized.get("intent") or ""),
+                tool_sequence=tool_sequence,
+                success=bool(finalized.get("success", False)),
+                goal_id=goal_id,
+                project_id=project_id,
+                todo_id=todo_id,
+                summary=sanitize_text(finalized.get("output") or finalized.get("error") or ""),
+            )
+            if goal_id or project_id or todo_id:
+                work_store.record_job_link(
+                    job_id=job_id,
+                    goal_id=goal_id,
+                    project_id=project_id,
+                    todo_id=todo_id,
+                    success=bool(finalized.get("success", False)),
+                )
+        except Exception as e:
+            finalized["work_context_store_error"] = sanitize_text(str(e))
+            log_warning(f"Work context persistence failed: {e}")
+
+    _create_job_notification(finalized)
+
     return finalized
+
+
+def _persist_runtime_checkpoint(
+    *,
+    session_id: str,
+    job_id: str,
+    stage: str,
+    state: Dict[str, Any],
+    note: str = "",
+) -> None:
+    if not session_id or not job_id:
+        return
+
+    try:
+        from utils.runtime_state_store import get_runtime_state_store
+
+        get_runtime_state_store().save_checkpoint(
+            session_id=session_id,
+            job_id=job_id,
+            stage=stage,
+            state=state,
+            note=note,
+        )
+    except Exception as e:
+        log_warning(f"Runtime checkpoint persistence failed: {e}")
 
 
 def _handle_special_command(
@@ -167,6 +585,11 @@ def submit_task(
     user_input: str,
     *,
     session_id: Optional[str] = None,
+    auto_start_worker: bool = True,
+    goal_id: Optional[str] = None,
+    project_id: Optional[str] = None,
+    todo_id: Optional[str] = None,
+    trigger_source: str = "manual",
 ) -> Dict[str, Any]:
     clean_user_input = sanitize_text(user_input or "")
     runtime_session_id = sanitize_text(session_id or "")
@@ -181,14 +604,24 @@ def submit_task(
             session_id=runtime_session_id,
             user_input=clean_user_input,
             is_special_command=(clean_user_input or "").strip().lower() in {"memory stats", "clear memory"},
+            goal_id=sanitize_text(goal_id or ""),
+            project_id=sanitize_text(project_id or ""),
+            todo_id=sanitize_text(todo_id or ""),
+            trigger_source=sanitize_text(trigger_source or "manual") or "manual",
         )
-        return {
+        submission = {
             "session_id": runtime_session_id,
             "job_id": sanitize_text(job_record.get("job_id") or ""),
             "status": sanitize_text(job_record.get("status") or "queued"),
             "user_input": clean_user_input,
             "is_special_command": bool(job_record.get("is_special_command", False)),
+            "goal_id": sanitize_text(job_record.get("goal_id") or ""),
+            "project_id": sanitize_text(job_record.get("project_id") or ""),
+            "todo_id": sanitize_text(job_record.get("todo_id") or ""),
         }
+        if auto_start_worker and submission["job_id"]:
+            start_background_worker()
+        return submission
     except Exception as e:
         log_warning(f"Runtime state initialization failed: {e}")
         return {
@@ -200,6 +633,885 @@ def submit_task(
         }
 
 
+def create_scheduled_task(
+    *,
+    user_input: str,
+    session_id: Optional[str] = None,
+    schedule_type: str = "once",
+    run_at: str = "",
+    interval_seconds: int = 0,
+    time_of_day: str = "",
+    note: str = "",
+    auto_start_worker: bool = True,
+    goal_id: Optional[str] = None,
+    project_id: Optional[str] = None,
+    todo_id: Optional[str] = None,
+) -> Dict[str, Any]:
+    clean_user_input = sanitize_text(user_input or "")
+    runtime_session_id = sanitize_text(session_id or "")
+
+    from utils.runtime_state_store import get_runtime_state_store
+
+    state_store = get_runtime_state_store()
+    session_record = state_store.get_or_create_session(session_id=runtime_session_id)
+    runtime_session_id = sanitize_text(session_record.get("session_id") or runtime_session_id)
+    record = state_store.create_schedule(
+        session_id=runtime_session_id,
+        user_input=clean_user_input,
+        schedule_type=schedule_type,
+        run_at=run_at,
+        interval_seconds=interval_seconds,
+        time_of_day=time_of_day,
+        note=note,
+        goal_id=sanitize_text(goal_id or ""),
+        project_id=sanitize_text(project_id or ""),
+        todo_id=sanitize_text(todo_id or ""),
+    )
+    if auto_start_worker:
+        start_background_worker()
+    return sanitize_value(record)
+
+
+def get_scheduled_tasks(
+    *,
+    session_id: Optional[str] = None,
+    status: Optional[str] = None,
+    limit: Optional[int] = 100,
+) -> List[Dict[str, Any]]:
+    from utils.runtime_state_store import get_runtime_state_store
+
+    return sanitize_value(
+        get_runtime_state_store().load_schedules(
+            session_id=session_id,
+            status=status,
+            limit=limit,
+        )
+    )
+
+
+def pause_scheduled_task(schedule_id: str) -> Dict[str, Any]:
+    from utils.runtime_state_store import get_runtime_state_store
+
+    return sanitize_value(get_runtime_state_store().pause_schedule(schedule_id))
+
+
+def resume_scheduled_task(schedule_id: str) -> Dict[str, Any]:
+    from utils.runtime_state_store import get_runtime_state_store
+
+    return sanitize_value(get_runtime_state_store().resume_schedule(schedule_id))
+
+
+def delete_scheduled_task(schedule_id: str) -> Dict[str, Any]:
+    from utils.runtime_state_store import get_runtime_state_store
+
+    return sanitize_value(get_runtime_state_store().delete_schedule(schedule_id))
+
+
+def get_user_preferences(session_id: Optional[str] = None) -> Dict[str, Any]:
+    return sanitize_value(_load_effective_user_preferences(sanitize_text(session_id or "")))
+
+
+def update_user_preferences(
+    preferences: Dict[str, Any],
+    *,
+    session_id: Optional[str] = None,
+) -> Dict[str, Any]:
+    from utils.runtime_state_store import get_runtime_state_store
+
+    return sanitize_value(
+        get_runtime_state_store().update_preferences(
+            preferences=sanitize_value(preferences or {}),
+            session_id=sanitize_text(session_id or "") or None,
+        )
+    )
+
+
+def get_notification_feed(
+    *,
+    session_id: Optional[str] = None,
+    unread_only: bool = False,
+    limit: Optional[int] = 50,
+) -> List[Dict[str, Any]]:
+    from utils.runtime_state_store import get_runtime_state_store
+
+    return sanitize_value(
+        get_runtime_state_store().load_notifications(
+            session_id=sanitize_text(session_id or "") or None,
+            unread_only=bool(unread_only),
+            limit=limit,
+        )
+    )
+
+
+def mark_notification_read(notification_id: str) -> Dict[str, Any]:
+    from utils.runtime_state_store import get_runtime_state_store
+
+    return sanitize_value(get_runtime_state_store().mark_notification_read(notification_id))
+
+
+def mark_all_notifications_read(session_id: Optional[str] = None) -> int:
+    from utils.runtime_state_store import get_runtime_state_store
+
+    return int(
+        get_runtime_state_store().mark_notifications_read(
+            sanitize_text(session_id or "") or None
+        )
+    )
+
+
+def create_goal(
+    *,
+    session_id: str,
+    title: str,
+    description: str = "",
+) -> Dict[str, Any]:
+    from utils.work_context_store import get_work_context_store
+
+    return sanitize_value(
+        get_work_context_store().create_goal(
+            session_id=sanitize_text(session_id),
+            title=sanitize_text(title),
+            description=sanitize_text(description),
+        )
+    )
+
+
+def create_project(
+    *,
+    session_id: str,
+    title: str,
+    goal_id: Optional[str] = None,
+    description: str = "",
+) -> Dict[str, Any]:
+    from utils.work_context_store import get_work_context_store
+
+    return sanitize_value(
+        get_work_context_store().create_project(
+            session_id=sanitize_text(session_id),
+            title=sanitize_text(title),
+            goal_id=sanitize_text(goal_id or ""),
+            description=sanitize_text(description),
+        )
+    )
+
+
+def create_todo(
+    *,
+    session_id: str,
+    title: str,
+    goal_id: Optional[str] = None,
+    project_id: Optional[str] = None,
+    details: str = "",
+) -> Dict[str, Any]:
+    from utils.work_context_store import get_work_context_store
+
+    return sanitize_value(
+        get_work_context_store().create_todo(
+            session_id=sanitize_text(session_id),
+            title=sanitize_text(title),
+            goal_id=sanitize_text(goal_id or ""),
+            project_id=sanitize_text(project_id or ""),
+            details=sanitize_text(details),
+        )
+    )
+
+
+def update_todo_status(todo_id: str, status: str) -> Dict[str, Any]:
+    from utils.work_context_store import get_work_context_store
+
+    return sanitize_value(
+        get_work_context_store().update_todo_status(
+            sanitize_text(todo_id),
+            sanitize_text(status),
+        )
+    )
+
+
+def get_work_dashboard(session_id: str) -> Dict[str, Any]:
+    from utils.work_context_store import get_work_context_store
+    from utils.artifact_store import get_artifact_store
+
+    safe_session_id = sanitize_text(session_id)
+    work_store = get_work_context_store()
+    goals = sanitize_value(work_store.list_goals(session_id=safe_session_id, limit=100))
+    projects = sanitize_value(work_store.list_projects(session_id=safe_session_id, limit=100))
+    todos = sanitize_value(work_store.list_todos(session_id=safe_session_id, limit=200))
+    artifacts = sanitize_value(get_artifact_store().search_artifacts(session_id=safe_session_id, limit=50))
+
+    todo_summary = {
+        "pending": sum(1 for item in todos if str(item.get("status", "")) == "pending"),
+        "in_progress": sum(1 for item in todos if str(item.get("status", "")) == "in_progress"),
+        "done": sum(1 for item in todos if str(item.get("status", "")) == "done"),
+    }
+    return {
+        "goals": goals,
+        "projects": projects,
+        "todos": todos,
+        "artifacts": artifacts,
+        "todo_summary": todo_summary,
+    }
+
+
+def create_work_template(
+    *,
+    session_id: str,
+    name: str,
+    user_input: str,
+    goal_id: Optional[str] = None,
+    project_id: Optional[str] = None,
+    todo_id: Optional[str] = None,
+    source_job_id: str = "",
+    notes: str = "",
+) -> Dict[str, Any]:
+    from utils.workflow_automation_store import get_workflow_automation_store
+
+    return sanitize_value(
+        get_workflow_automation_store().create_template(
+            session_id=sanitize_text(session_id),
+            name=sanitize_text(name),
+            user_input=sanitize_text(user_input),
+            goal_id=sanitize_text(goal_id or ""),
+            project_id=sanitize_text(project_id or ""),
+            todo_id=sanitize_text(todo_id or ""),
+            source_job_id=sanitize_text(source_job_id),
+            notes=sanitize_text(notes),
+        )
+    )
+
+
+def create_template_from_job(job_id: str, template_name: str) -> Dict[str, Any]:
+    from utils.runtime_state_store import get_runtime_state_store
+
+    job_record = sanitize_value(get_runtime_state_store().get_job(job_id))
+    if not job_record:
+        return {}
+    return create_work_template(
+        session_id=sanitize_text(job_record.get("session_id") or ""),
+        name=template_name,
+        user_input=sanitize_text(job_record.get("user_input") or ""),
+        goal_id=sanitize_text(job_record.get("goal_id") or ""),
+        project_id=sanitize_text(job_record.get("project_id") or ""),
+        todo_id=sanitize_text(job_record.get("todo_id") or ""),
+        source_job_id=sanitize_text(job_record.get("job_id") or ""),
+        notes="Saved from successful job",
+    )
+
+
+def list_work_templates(
+    *,
+    session_id: Optional[str] = None,
+    limit: Optional[int] = 100,
+) -> List[Dict[str, Any]]:
+    from utils.workflow_automation_store import get_workflow_automation_store
+
+    return sanitize_value(
+        get_workflow_automation_store().list_templates(
+            session_id=sanitize_text(session_id or "") or None,
+            limit=limit,
+        )
+    )
+
+
+def delete_work_template(template_id: str) -> Dict[str, Any]:
+    from utils.workflow_automation_store import get_workflow_automation_store
+
+    return sanitize_value(get_workflow_automation_store().delete_template(sanitize_text(template_id)))
+
+
+def submit_template(
+    template_id: str,
+    *,
+    session_id: Optional[str] = None,
+    goal_id: Optional[str] = None,
+    project_id: Optional[str] = None,
+    todo_id: Optional[str] = None,
+    file_event_path: str = "",
+    auto_start_worker: bool = True,
+    trigger_source: str = "template",
+) -> Dict[str, Any]:
+    from utils.workflow_automation_store import get_workflow_automation_store
+
+    template = sanitize_value(get_workflow_automation_store().get_template(sanitize_text(template_id)))
+    if not template:
+        return {}
+    user_input = sanitize_text(template.get("user_input") or "")
+    if file_event_path:
+        user_input = f"{user_input}\n\nNew file detected: {sanitize_text(file_event_path)}"
+    return submit_task(
+        user_input,
+        session_id=session_id or sanitize_text(template.get("session_id") or "") or None,
+        goal_id=goal_id or sanitize_text(template.get("goal_id") or "") or None,
+        project_id=project_id or sanitize_text(template.get("project_id") or "") or None,
+        todo_id=todo_id or sanitize_text(template.get("todo_id") or "") or None,
+        auto_start_worker=auto_start_worker,
+        trigger_source=trigger_source,
+    )
+
+
+def create_directory_watch(
+    *,
+    session_id: str,
+    directory_path: str,
+    template_id: str = "",
+    user_input: str = "",
+    goal_id: Optional[str] = None,
+    project_id: Optional[str] = None,
+    todo_id: Optional[str] = None,
+    note: str = "",
+) -> Dict[str, Any]:
+    from utils.workflow_automation_store import get_workflow_automation_store
+
+    watch = get_workflow_automation_store().create_directory_watch(
+        session_id=sanitize_text(session_id),
+        directory_path=sanitize_text(directory_path),
+        template_id=sanitize_text(template_id),
+        user_input=sanitize_text(user_input),
+        goal_id=sanitize_text(goal_id or ""),
+        project_id=sanitize_text(project_id or ""),
+        todo_id=sanitize_text(todo_id or ""),
+        note=sanitize_text(note),
+    )
+    start_background_worker()
+    return sanitize_value(watch)
+
+
+def list_directory_watches(
+    *,
+    session_id: Optional[str] = None,
+    status: Optional[str] = None,
+    limit: Optional[int] = 100,
+) -> List[Dict[str, Any]]:
+    from utils.workflow_automation_store import get_workflow_automation_store
+
+    return sanitize_value(
+        get_workflow_automation_store().list_directory_watches(
+            session_id=sanitize_text(session_id or "") or None,
+            status=sanitize_text(status or "") or None,
+            limit=limit,
+        )
+    )
+
+
+def pause_directory_watch(watch_id: str) -> Dict[str, Any]:
+    from utils.workflow_automation_store import get_workflow_automation_store
+
+    return sanitize_value(
+        get_workflow_automation_store().update_directory_watch_status(
+            sanitize_text(watch_id),
+            "paused",
+        )
+    )
+
+
+def resume_directory_watch(watch_id: str) -> Dict[str, Any]:
+    from utils.workflow_automation_store import get_workflow_automation_store
+
+    return sanitize_value(
+        get_workflow_automation_store().update_directory_watch_status(
+            sanitize_text(watch_id),
+            "waiting_for_event",
+        )
+    )
+
+
+def delete_directory_watch(watch_id: str) -> Dict[str, Any]:
+    from utils.workflow_automation_store import get_workflow_automation_store
+
+    return sanitize_value(
+        get_workflow_automation_store().delete_directory_watch(
+            sanitize_text(watch_id)
+        )
+    )
+
+
+def list_directory_watch_events(
+    *,
+    session_id: Optional[str] = None,
+    limit: Optional[int] = 100,
+) -> List[Dict[str, Any]]:
+    from utils.workflow_automation_store import get_workflow_automation_store
+
+    return sanitize_value(
+        get_workflow_automation_store().list_directory_watch_events(
+            session_id=sanitize_text(session_id or "") or None,
+            limit=limit,
+        )
+    )
+
+
+def _background_queue_worker_loop() -> None:
+    last_job_id = ""
+    while not _queue_worker_stop.is_set():
+        try:
+            from utils.runtime_state_store import get_runtime_state_store
+
+            state_store = get_runtime_state_store()
+            _release_directory_watch_events()
+            state_store.update_worker_state(
+                status="running",
+                worker_id="omnicore-queue-worker",
+                last_job_id=last_job_id,
+                mode="thread",
+            )
+            result = run_next_queued_task()
+            if result is None:
+                _queue_worker_stop.wait(settings.QUEUE_WORKER_POLL_INTERVAL_SECONDS)
+                continue
+            last_job_id = str(result.get("job_id", "") or last_job_id)
+            state_store.update_worker_state(
+                status="running",
+                worker_id="omnicore-queue-worker",
+                last_job_id=last_job_id,
+                note=f"Processed {last_job_id}",
+                mode="thread",
+            )
+            log_agent_action(
+                "QueueWorker",
+                "Processed queued job",
+                f"{result.get('job_id', '')}: {result.get('status', '')}",
+            )
+        except Exception as e:
+            log_warning(f"Background queue worker failed: {e}")
+            _queue_worker_stop.wait(settings.QUEUE_WORKER_POLL_INTERVAL_SECONDS)
+
+
+def run_background_worker_forever() -> None:
+    last_job_id = ""
+    from utils.runtime_state_store import get_runtime_state_store
+
+    state_store = get_runtime_state_store()
+    state_store.update_worker_state(
+        status="running",
+        worker_id="omnicore-queue-worker",
+        last_job_id=last_job_id,
+        note="Foreground worker loop active",
+        mode="process",
+        pid=os.getpid(),
+    )
+    try:
+        while True:
+            _release_directory_watch_events()
+            result = run_next_queued_task()
+            if result is None:
+                time.sleep(settings.QUEUE_WORKER_POLL_INTERVAL_SECONDS)
+                state_store.update_worker_state(
+                    status="running",
+                    worker_id="omnicore-queue-worker",
+                    last_job_id=last_job_id,
+                    note="Idle",
+                    mode="process",
+                    pid=os.getpid(),
+                )
+                continue
+            last_job_id = sanitize_text(result.get("job_id") or last_job_id)
+            state_store.update_worker_state(
+                status="running",
+                worker_id="omnicore-queue-worker",
+                last_job_id=last_job_id,
+                note=f"Processed {last_job_id}",
+                mode="process",
+                pid=os.getpid(),
+            )
+    except KeyboardInterrupt:
+        state_store.update_worker_state(
+            status="stopped",
+            worker_id="omnicore-queue-worker",
+            last_job_id=last_job_id,
+            note="Worker process stopped",
+            mode="process",
+            pid=0,
+        )
+    except Exception as e:
+        state_store.update_worker_state(
+            status="error",
+            worker_id="omnicore-queue-worker",
+            last_job_id=last_job_id,
+            note=f"Worker process crashed: {sanitize_text(str(e))}",
+            mode="process",
+            pid=os.getpid(),
+        )
+        raise
+
+
+def start_background_worker(mode: Optional[str] = None) -> bool:
+    global _queue_worker_thread, _queue_worker_process
+    resolved_mode = _resolve_worker_mode(mode)
+    with _queue_worker_lock:
+        if _queue_worker_thread and _queue_worker_thread.is_alive():
+            return False
+        if _queue_worker_process and _queue_worker_process.poll() is None:
+            return False
+        persisted = {}
+        try:
+            from utils.runtime_state_store import get_runtime_state_store
+
+            persisted = get_runtime_state_store().get_worker_state()
+        except Exception:
+            persisted = {}
+        existing_pid = int(persisted.get("pid", 0) or 0)
+        if existing_pid and _is_pid_running(existing_pid):
+            return False
+        try:
+            from utils.runtime_state_store import get_runtime_state_store
+
+            recovery = get_runtime_state_store().recover_stale_running_jobs(
+                settings.QUEUE_STALE_AFTER_SECONDS
+            )
+            get_runtime_state_store().update_worker_state(
+                status="starting",
+                worker_id="omnicore-queue-worker",
+                note=(
+                    f"Recovered {recovery.get('jobs_requeued', 0)} stale job(s)"
+                    if recovery.get("jobs_requeued", 0)
+                    else "Worker starting"
+                ),
+                mode=resolved_mode,
+            )
+        except Exception as e:
+            log_warning(f"Failed to initialize background worker state: {e}")
+        if resolved_mode == "process":
+            script_path = str((settings.PROJECT_ROOT / "main.py").resolve())
+            creationflags = 0
+            if hasattr(subprocess, "CREATE_NEW_PROCESS_GROUP"):
+                creationflags |= subprocess.CREATE_NEW_PROCESS_GROUP
+            if hasattr(subprocess, "DETACHED_PROCESS"):
+                creationflags |= subprocess.DETACHED_PROCESS
+            _queue_worker_process = subprocess.Popen(
+                [sys.executable, script_path, "worker", "--process-loop"],
+                cwd=str(settings.PROJECT_ROOT),
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                creationflags=creationflags,
+            )
+            try:
+                from utils.runtime_state_store import get_runtime_state_store
+
+                get_runtime_state_store().update_worker_state(
+                    status="running",
+                    worker_id="omnicore-queue-worker",
+                    note="Worker process started",
+                    mode="process",
+                    pid=int(_queue_worker_process.pid or 0),
+                )
+            except Exception as e:
+                log_warning(f"Failed to persist process worker state: {e}")
+            return True
+        _queue_worker_stop.clear()
+        _queue_worker_thread = threading.Thread(
+            target=_background_queue_worker_loop,
+            name="omnicore-queue-worker",
+            daemon=True,
+        )
+        _queue_worker_thread.start()
+        return True
+
+
+def stop_background_worker() -> bool:
+    global _queue_worker_thread, _queue_worker_process
+    with _queue_worker_lock:
+        if _queue_worker_process and _queue_worker_process.poll() is None:
+            pid = int(_queue_worker_process.pid or 0)
+            if pid > 0:
+                try:
+                    os.kill(pid, signal.SIGTERM)
+                except OSError:
+                    pass
+            time.sleep(0.2)
+            alive = _is_pid_running(pid)
+            if not alive:
+                try:
+                    from utils.runtime_state_store import get_runtime_state_store
+
+                    get_runtime_state_store().update_worker_state(
+                        status="stopped",
+                        worker_id="omnicore-queue-worker",
+                        note="Worker process stopped",
+                        mode="process",
+                        pid=0,
+                    )
+                except Exception as e:
+                    log_warning(f"Failed to persist stopped process worker state: {e}")
+                _queue_worker_process = None
+                return True
+        if not _queue_worker_thread or not _queue_worker_thread.is_alive():
+            try:
+                from utils.runtime_state_store import get_runtime_state_store
+
+                persisted = get_runtime_state_store().get_worker_state()
+                pid = int(persisted.get("pid", 0) or 0)
+                if persisted.get("mode") == "process" and pid and _is_pid_running(pid):
+                    try:
+                        os.kill(pid, signal.SIGTERM)
+                    except OSError:
+                        return False
+                    time.sleep(0.2)
+                    stopped = not _is_pid_running(pid)
+                    if stopped:
+                        get_runtime_state_store().update_worker_state(
+                            status="stopped",
+                            worker_id="omnicore-queue-worker",
+                            note="Worker process stopped",
+                            mode="process",
+                            pid=0,
+                        )
+                    return stopped
+            except Exception:
+                pass
+            return False
+        _queue_worker_stop.set()
+        _queue_worker_thread.join(timeout=2.0)
+        stopped = not _queue_worker_thread.is_alive()
+        if stopped:
+            try:
+                from utils.runtime_state_store import get_runtime_state_store
+
+                get_runtime_state_store().update_worker_state(
+                    status="stopped",
+                    worker_id="omnicore-queue-worker",
+                    note="Worker stopped",
+                    mode="thread",
+                )
+            except Exception as e:
+                log_warning(f"Failed to persist stopped worker state: {e}")
+            _queue_worker_thread = None
+        return stopped
+
+
+def get_background_worker_status() -> Dict[str, Any]:
+    with _queue_worker_lock:
+        alive = bool(_queue_worker_thread and _queue_worker_thread.is_alive())
+        thread_name = _queue_worker_thread.name if alive and _queue_worker_thread else ""
+        process_alive = bool(_queue_worker_process and _queue_worker_process.poll() is None)
+        process_pid = int(_queue_worker_process.pid or 0) if process_alive and _queue_worker_process else 0
+    persisted: Dict[str, Any] = {}
+    try:
+        from utils.runtime_state_store import get_runtime_state_store
+
+        persisted = sanitize_value(get_runtime_state_store().get_worker_state())
+    except Exception as e:
+        persisted = {"error": sanitize_text(str(e))}
+    status = {
+        "running": alive or process_alive,
+        "thread_name": thread_name,
+        "mode": "thread" if alive else ("process" if process_alive else sanitize_text(persisted.get("mode") or "")),
+        "pid": process_pid,
+    }
+    if persisted:
+        persisted_pid = int(persisted.get("pid", 0) or 0)
+        if not process_alive and persisted_pid and _is_pid_running(persisted_pid):
+            status["running"] = True
+            status["mode"] = "process"
+            status["pid"] = persisted_pid
+        status["persisted"] = persisted
+        if not alive and persisted.get("status"):
+            status["last_status"] = persisted.get("status")
+    return status
+
+
+def rerun_job(job_id: str) -> Optional[Dict[str, Any]]:
+    try:
+        from utils.runtime_state_store import get_runtime_state_store
+
+        job_record = get_runtime_state_store().get_job(job_id)
+    except Exception as e:
+        log_warning(f"Failed to load job for rerun: {e}")
+        return None
+
+    if not job_record:
+        return None
+
+    return submit_task(
+        str(job_record.get("user_input", "") or ""),
+        session_id=str(job_record.get("session_id", "") or "") or None,
+        goal_id=str(job_record.get("goal_id", "") or "") or None,
+        project_id=str(job_record.get("project_id", "") or "") or None,
+        todo_id=str(job_record.get("todo_id", "") or "") or None,
+    )
+
+
+def resume_failed_job(job_id: str) -> Optional[Dict[str, Any]]:
+    try:
+        from utils.runtime_state_store import get_runtime_state_store
+
+        job_record = get_runtime_state_store().get_job(job_id)
+    except Exception as e:
+        log_warning(f"Failed to load job for resume: {e}")
+        return None
+
+    if not job_record:
+        return None
+
+    if not is_recoverable_job_status(job_record.get("status", "")):
+        return None
+
+    return submit_task(
+        str(job_record.get("user_input", "") or ""),
+        session_id=str(job_record.get("session_id", "") or "") or None,
+        goal_id=str(job_record.get("goal_id", "") or "") or None,
+        project_id=str(job_record.get("project_id", "") or "") or None,
+        todo_id=str(job_record.get("todo_id", "") or "") or None,
+    )
+
+
+def resume_job_from_checkpoint(
+    job_id: str,
+    memory: Optional["ChromaMemory"] = None,
+    conversation_history: Optional[List[Dict[str, Any]]] = None,
+    checkpoint_id: Optional[str] = None,
+) -> Optional[Dict[str, Any]]:
+    try:
+        from utils.runtime_state_store import get_runtime_state_store
+
+        state_store = get_runtime_state_store()
+        job_record = state_store.get_job(job_id)
+        checkpoints = state_store.load_checkpoints(job_id=job_id, limit=None)
+    except Exception as e:
+        log_warning(f"Failed to load checkpoint for resume: {e}")
+        return None
+
+    if not job_record or not checkpoints:
+        return None
+
+    if str(job_record.get("is_special_command", False)).lower() == "true" or bool(job_record.get("is_special_command", False)):
+        return None
+
+    checkpoint = {}
+    if checkpoint_id:
+        for item in checkpoints:
+            if str(item.get("checkpoint_id", "") or "") == str(checkpoint_id):
+                checkpoint = dict(item)
+                break
+    if not checkpoint:
+        non_finalize = [
+            item for item in checkpoints
+            if isinstance(item, dict) and str(item.get("stage", "") or "") != "finalize"
+        ]
+        if non_finalize:
+            checkpoint = dict(non_finalize[-1])
+        else:
+            checkpoint = dict(checkpoints[-1])
+
+    checkpoint_state = checkpoint.get("state")
+    if not isinstance(checkpoint_state, dict):
+        return None
+
+    resumed_state = sanitize_value(checkpoint_state)
+    resumed_state.setdefault("messages", [])
+    resumed_state.setdefault("shared_memory", {})
+    if isinstance(resumed_state["shared_memory"], dict):
+        resumed_state["shared_memory"]["_resume_after_stage"] = sanitize_text(checkpoint.get("stage") or "")
+        resumed_state["shared_memory"]["_resume_checkpoint_id"] = sanitize_text(checkpoint.get("checkpoint_id") or "")
+        resumed_state["shared_memory"]["_resume_requested_at"] = str(int(time.time()))
+
+    result = _execute_submitted_job(
+        sanitize_text(job_record.get("user_input") or ""),
+        runtime_session_id=sanitize_text(job_record.get("session_id") or ""),
+        runtime_job_id=sanitize_text(job_record.get("job_id") or ""),
+        memory=memory,
+        clean_history=sanitize_value(conversation_history or []),
+        initial_state_override=resumed_state,
+    )
+    if isinstance(result, dict):
+        result["resumed_from_checkpoint"] = True
+        result["resume_checkpoint_id"] = sanitize_text(checkpoint.get("checkpoint_id") or "")
+        result["resume_checkpoint_stage"] = sanitize_text(checkpoint.get("stage") or "")
+        result["resume_strategy"] = "checkpoint_replay"
+    return result
+
+
+def approve_waiting_job(job_id: str) -> Optional[Dict[str, Any]]:
+    try:
+        from utils.runtime_state_store import get_runtime_state_store
+
+        state_store = get_runtime_state_store()
+        job_record = state_store.get_job(job_id)
+        checkpoints = state_store.load_checkpoints(job_id=job_id, limit=None)
+    except Exception as e:
+        log_warning(f"Failed to load waiting job for approval: {e}")
+        return None
+
+    if not job_record:
+        return None
+    if str(job_record.get("status", "") or "") != WAITING_FOR_APPROVAL:
+        return None
+    if not checkpoints:
+        return None
+
+    selected_checkpoint: Dict[str, Any] = {}
+    for item in reversed(checkpoints):
+        snapshot = item.get("state", {}) if isinstance(item, dict) else {}
+        tasks = snapshot.get("task_queue", []) if isinstance(snapshot, dict) else []
+        if any(
+            isinstance(task, dict) and str(task.get("status", "") or "") == WAITING_FOR_APPROVAL
+            for task in tasks
+        ):
+            selected_checkpoint = dict(item)
+            break
+    if not selected_checkpoint:
+        return None
+
+    resumed_state = sanitize_value(selected_checkpoint.get("state") or {})
+    resumed_state.setdefault("shared_memory", {})
+    approved_actions = []
+    for task in resumed_state.get("task_queue", []) or []:
+        if not isinstance(task, dict):
+            continue
+        if str(task.get("status", "") or "") != WAITING_FOR_APPROVAL:
+            continue
+        task["status"] = "pending"
+        approved_actions.append(str(task.get("task_id", "") or ""))
+    if not approved_actions:
+        return None
+
+    resumed_state["shared_memory"]["_approved_actions"] = approved_actions
+    resumed_state["shared_memory"]["_resume_after_stage"] = "human_confirm"
+    resumed_state["shared_memory"]["_resume_checkpoint_id"] = sanitize_text(
+        selected_checkpoint.get("checkpoint_id") or ""
+    )
+    resumed_state["shared_memory"]["_approval_resumed_at"] = str(int(time.time()))
+
+    result = _execute_submitted_job(
+        sanitize_text(job_record.get("user_input") or ""),
+        runtime_session_id=sanitize_text(job_record.get("session_id") or ""),
+        runtime_job_id=sanitize_text(job_record.get("job_id") or ""),
+        initial_state_override=resumed_state,
+    )
+    if isinstance(result, dict):
+        result["approved_waiting_job"] = True
+        result["resume_strategy"] = "approval_resume"
+    return result
+
+
+def reject_waiting_job(job_id: str) -> Optional[Dict[str, Any]]:
+    try:
+        from utils.runtime_state_store import get_runtime_state_store
+
+        state_store = get_runtime_state_store()
+        job_record = state_store.get_job(job_id)
+        if not job_record:
+            return None
+        if str(job_record.get("status", "") or "") != WAITING_FOR_APPROVAL:
+            return None
+        updated = state_store.set_job_status(
+            job_id=job_id,
+            status=BLOCKED,
+            error="Approval request rejected by user",
+        )
+        state_store.create_notification(
+            session_id=sanitize_text(updated.get("session_id") or job_record.get("session_id") or ""),
+            job_id=sanitize_text(job_id),
+            title="Approval rejected",
+            message="The waiting action was rejected and the job is now blocked.",
+            level="warning",
+            category="approval",
+            requires_action=False,
+        )
+        return sanitize_value(updated)
+    except Exception as e:
+        log_warning(f"Failed to reject waiting job: {e}")
+        return None
+
+
 def _execute_submitted_job(
     clean_user_input: str,
     *,
@@ -207,7 +1519,15 @@ def _execute_submitted_job(
     runtime_job_id: str,
     memory: Optional["ChromaMemory"] = None,
     clean_history: Optional[List[Dict[str, Any]]] = None,
+    initial_state_override: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
+    user_preferences = _load_effective_user_preferences(runtime_session_id)
+    current_time_context = _build_current_time_context()
+    work_runtime_context = _load_work_runtime_context(
+        session_id=runtime_session_id,
+        job_id=runtime_job_id,
+        user_input=clean_user_input,
+    )
     try:
         from utils.runtime_state_store import get_runtime_state_store
 
@@ -221,30 +1541,100 @@ def _execute_submitted_job(
     except Exception as e:
         log_warning(f"Runtime state start_job failed: {e}")
 
-    special = _handle_special_command(clean_user_input, memory)
+    special = None if initial_state_override else _handle_special_command(clean_user_input, memory)
     if special is not None:
         special["session_id"] = runtime_session_id
         special["job_id"] = runtime_job_id
         return _finalize_runtime_result(special, clean_user_input)
 
-    initial_state = create_initial_state(
-        clean_user_input,
-        session_id=runtime_session_id,
-        job_id=runtime_job_id,
-    )
+    if initial_state_override:
+        initial_state = sanitize_value(initial_state_override)
+        initial_state["user_input"] = clean_user_input
+        initial_state["session_id"] = runtime_session_id
+        initial_state["job_id"] = runtime_job_id
+        initial_state.setdefault("shared_memory", {})
+        initial_state["shared_memory"]["current_time_context"] = current_time_context
+        initial_state["shared_memory"]["user_preferences"] = user_preferences
+        initial_state["shared_memory"]["work_context"] = work_runtime_context.get("work_context", {})
+        initial_state["shared_memory"]["resource_memory"] = work_runtime_context.get("resource_memory", [])
+        initial_state["shared_memory"]["successful_paths"] = work_runtime_context.get("successful_paths", [])
+        initial_state["shared_memory"]["work_scope"] = work_runtime_context.get("scope", {})
+        if clean_history:
+            initial_state["shared_memory"]["conversation_history"] = clean_history
+    else:
+        initial_state = create_initial_state(
+            clean_user_input,
+            session_id=runtime_session_id,
+            job_id=runtime_job_id,
+        )
 
-    if clean_history:
-        initial_state["shared_memory"]["conversation_history"] = clean_history
+        if clean_history:
+            initial_state["shared_memory"]["conversation_history"] = clean_history
+        initial_state["shared_memory"]["current_time_context"] = current_time_context
+        initial_state["shared_memory"]["user_preferences"] = user_preferences
+        initial_state["shared_memory"]["work_context"] = work_runtime_context.get("work_context", {})
+        initial_state["shared_memory"]["resource_memory"] = work_runtime_context.get("resource_memory", [])
+        initial_state["shared_memory"]["successful_paths"] = work_runtime_context.get("successful_paths", [])
+        initial_state["shared_memory"]["work_scope"] = work_runtime_context.get("scope", {})
 
-    if memory:
+        try:
+            from utils.runtime_state_store import get_runtime_state_store
+
+            if runtime_session_id:
+                session_artifacts = get_runtime_state_store().load_artifacts(
+                    session_id=runtime_session_id,
+                    limit=10,
+                )
+                if session_artifacts:
+                    initial_state["shared_memory"]["session_artifacts"] = sanitize_value(session_artifacts)
+        except Exception as e:
+            log_warning(f"Failed to load session artifacts: {e}")
+
+        if memory:
+            try:
+                related_memories = memory.search_memory(clean_user_input, n_results=3)
+                if related_memories:
+                    related_memories = sanitize_value(related_memories)
+                    log_agent_action("Memory", "Found related memories", f"{len(related_memories)} item(s)")
+                    initial_state["shared_memory"]["related_history"] = related_memories
+            except Exception as e:
+                log_warning(f"Failed to query related memories: {e}")
+
+    try:
+        from utils.runtime_state_store import get_runtime_state_store
+
+        if runtime_session_id:
+            session_artifacts = get_runtime_state_store().load_artifacts(
+                session_id=runtime_session_id,
+                limit=10,
+            )
+            if session_artifacts:
+                initial_state["shared_memory"]["session_artifacts"] = sanitize_value(session_artifacts)
+    except Exception as e:
+        log_warning(f"Failed to refresh session artifacts: {e}")
+
+    initial_state["shared_memory"]["current_time_context"] = current_time_context
+    initial_state["shared_memory"]["user_preferences"] = user_preferences
+    initial_state["shared_memory"]["work_context"] = work_runtime_context.get("work_context", {})
+    initial_state["shared_memory"]["resource_memory"] = work_runtime_context.get("resource_memory", [])
+    initial_state["shared_memory"]["successful_paths"] = work_runtime_context.get("successful_paths", [])
+    initial_state["shared_memory"]["work_scope"] = work_runtime_context.get("scope", {})
+
+    if memory and initial_state_override:
         try:
             related_memories = memory.search_memory(clean_user_input, n_results=3)
             if related_memories:
-                related_memories = sanitize_value(related_memories)
-                log_agent_action("Memory", "Found related memories", f"{len(related_memories)} item(s)")
-                initial_state["shared_memory"]["related_history"] = related_memories
+                initial_state["shared_memory"]["related_history"] = sanitize_value(related_memories)
         except Exception as e:
-            log_warning(f"Failed to query related memories: {e}")
+            log_warning(f"Failed to refresh related memories: {e}")
+
+    _persist_runtime_checkpoint(
+        session_id=runtime_session_id,
+        job_id=runtime_job_id,
+        stage="initial_state",
+        state=initial_state,
+        note="Execution state prepared",
+    )
 
     graph = get_graph()
     result_holder: Dict[str, Any] = {}
@@ -325,11 +1715,13 @@ def _execute_submitted_job(
     final_output = sanitize_text(final_state.get("final_output") or "")
     final_error = sanitize_text(final_state.get("error_trace") or "")
     final_tasks = sanitize_value(final_state.get("task_queue", []))
+    final_policy_decisions = sanitize_value(final_state.get("policy_decisions", []))
     final_intent = sanitize_text(final_state.get("current_intent") or "")
     final_feedback = sanitize_text(final_state.get("critic_feedback") or "")
+    final_delivery_package = sanitize_value(final_state.get("delivery_package", {}))
 
     return _finalize_runtime_result({
-        "success": final_state.get("execution_status") in ["completed", "completed_with_issues"],
+        "success": is_success_job_status(final_state.get("execution_status")),
         "output": final_output,
         "error": final_error,
         "status": final_state.get("execution_status"),
@@ -339,6 +1731,8 @@ def _execute_submitted_job(
             if task["status"] == "completed"
         ]),
         "tasks": final_tasks,
+        "policy_decisions": final_policy_decisions,
+        "delivery_package": final_delivery_package,
         "intent": final_intent,
         "is_special_command": False,
         "session_id": sanitize_text(final_state.get("session_id") or runtime_session_id),
@@ -352,6 +1746,9 @@ def run_task(
     memory: Optional["ChromaMemory"] = None,
     conversation_history: Optional[List[Dict[str, Any]]] = None,
     session_id: Optional[str] = None,
+    goal_id: Optional[str] = None,
+    project_id: Optional[str] = None,
+    todo_id: Optional[str] = None,
 ) -> Dict[str, Any]:
     """Execute a task immediately through the compatibility entrypoint."""
     clean_user_input = sanitize_text(user_input or "")
@@ -362,7 +1759,14 @@ def run_task(
 
     log_agent_action("OmniCore", "Receive task", clean_user_input[:50])
 
-    submission = submit_task(clean_user_input, session_id=session_id)
+    submission = submit_task(
+        clean_user_input,
+        session_id=session_id,
+        auto_start_worker=False,
+        goal_id=goal_id,
+        project_id=project_id,
+        todo_id=todo_id,
+    )
     return _execute_submitted_job(
         clean_user_input,
         runtime_session_id=sanitize_text(submission.get("session_id") or ""),
@@ -377,6 +1781,8 @@ def run_next_queued_task(
     conversation_history: Optional[List[Dict[str, Any]]] = None,
 ) -> Optional[Dict[str, Any]]:
     """Claim and execute the next queued job, if any."""
+    _release_due_schedules()
+    _release_directory_watch_events()
     try:
         from utils.runtime_state_store import get_runtime_state_store
 

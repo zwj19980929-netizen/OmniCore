@@ -154,6 +154,23 @@ def evaluate_task_policy(task: Dict[str, Any]) -> PolicyDecision:
             affected_resources=[target] if target else [],
         )
 
+    if tool_name == "api.call" or task_type == "api_worker":
+        method = _normalize_text(params.get("method") or "get") or "get"
+        target = str(params.get("url", "")).strip()
+        if method == "get":
+            return PolicyDecision(
+                requires_confirmation=False,
+                reason="read-only API request",
+                risk_level="low",
+                affected_resources=[target] if target else [],
+            )
+        return PolicyDecision(
+            requires_confirmation=False,
+            reason="mutating API calls use deferred approval before dispatch",
+            risk_level="high",
+            affected_resources=[target] if target else [],
+        )
+
     if "delete" in lowered_description or "remove" in lowered_description:
         return PolicyDecision(
             requires_confirmation=True,
