@@ -322,6 +322,44 @@ def get_browser_runtime_pool() -> BrowserRuntimePool:
         return pool
 
 
+async def close_all_browser_runtime_pools(timeout_seconds: float = 8.0) -> None:
+    timeout = max(float(timeout_seconds or 0), 1.0)
+    current_loop = asyncio.get_running_loop()
+    pending = []
+
+    with _pool_registry_lock:
+        pools = list(_pool_registry.values())
+
+    for pool in pools:
+        if pool.loop.is_closed():
+            continue
+        if pool.loop is current_loop:
+            try:
+                await pool.close_all()
+            except Exception:
+                pass
+            continue
+        try:
+            pending.append(asyncio.run_coroutine_threadsafe(pool.close_all(), pool.loop))
+        except Exception:
+            continue
+
+    for future in pending:
+        try:
+            future.result(timeout=timeout)
+        except Exception:
+            pass
+
+    with _pool_registry_lock:
+        stale_loop_ids = [
+            pool_id
+            for pool_id, pool in _pool_registry.items()
+            if pool.loop.is_closed()
+        ]
+        for stale_loop_id in stale_loop_ids:
+            _pool_registry.pop(stale_loop_id, None)
+
+
 def snapshot_browser_runtime_metrics() -> dict:
     with _pool_registry_lock:
         pool_snapshots = [pool.snapshot_stats() for pool in _pool_registry.values()]

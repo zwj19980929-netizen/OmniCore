@@ -50,24 +50,24 @@ class SystemWorker:
     def _build_command_args(self, command: str) -> Dict[str, Any]:
         normalized = str(command or "").strip()
         if not normalized:
-            return {"success": False, "error": "鍛戒护涓嶈兘涓虹┖"}
+            return {"success": False, "error": "命令不能为空"}
 
         try:
             argv = shlex.split(normalized, posix=False)
         except ValueError as exc:
             return {
                 "success": False,
-                "error": f"鍛戒护瑙ｆ瀽澶辫触: {exc}",
+                "error": f"命令解析失败: {exc}",
             }
 
         if not argv:
-            return {"success": False, "error": "鍛戒护涓嶈兘涓虹┖"}
+            return {"success": False, "error": "命令不能为空"}
 
         executable = Path(str(argv[0])).name.lower()
         if executable in self._blocked_launchers:
             return {
                 "success": False,
-                "error": "涓嶅厑璁搁€氳繃 shell/interpreter 鍚姩鍛戒护",
+                "error": "不允许通过 shell/interpreter 启动命令",
             }
 
         return {
@@ -109,7 +109,7 @@ class SystemWorker:
         if not command_parse.get("success"):
             return {
                 "success": False,
-                "error": command_parse.get("error", "鍛戒护瑙ｆ瀽澶辫触"),
+                "error": command_parse.get("error", "命令解析失败"),
                 "command": command,
             }
 

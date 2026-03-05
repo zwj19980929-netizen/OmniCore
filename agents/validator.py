@@ -5,6 +5,7 @@ OmniCore Validator — 纯 Python 硬规则验证层
 from typing import Dict, Any, List
 from pathlib import Path
 
+from core.statuses import BLOCKED, WAITING_FOR_APPROVAL, WAITING_FOR_EVENT
 from core.state import OmniCoreState
 from utils.logger import log_agent_action, log_success, log_warning
 
@@ -80,11 +81,20 @@ class Validator:
         """
         log_agent_action(self.name, "开始硬规则验证")
         all_passed = True
+        completed_count = 0
+        failed_count = 0
 
         for idx, task in enumerate(state["task_queue"]):
+            status = str(task.get("status", "") or "")
+            if status == "failed":
+                failed_count += 1
+                all_passed = False
+                continue
+
             if task["status"] != "completed":
                 continue
 
+            completed_count += 1
             vr = self.validate_task(task)
             if vr["passed"]:
                 log_success(f"Validator PASS: {task['task_id']}")
@@ -93,6 +103,24 @@ class Validator:
                 log_warning(f"Validator FAIL: {task['task_id']} — {vr['issues']}")
                 state["task_queue"][idx]["status"] = "failed"
                 state["task_queue"][idx]["failure_type"] = vr["failure_type"]
+
+        if state.get("task_queue") and completed_count == 0:
+            # Keep waiting queues untouched; only fail fast when there are failed tasks
+            # or when all tasks have reached terminal non-waiting states without success.
+            statuses = {str(task.get("status", "") or "") for task in state.get("task_queue", [])}
+            has_waiting = any(
+                status in statuses
+                for status in (WAITING_FOR_APPROVAL, WAITING_FOR_EVENT, BLOCKED)
+            )
+            has_failed = failed_count > 0 or "failed" in statuses
+            all_terminal = all(
+                status in {"completed", "failed", WAITING_FOR_APPROVAL, WAITING_FOR_EVENT, BLOCKED}
+                for status in statuses
+            )
+            if has_failed or (all_terminal and not has_waiting):
+                all_passed = False
+                if failed_count == 0:
+                    log_warning("Validator FAIL: no completed tasks in terminal task set")
 
         state["validator_passed"] = all_passed
 

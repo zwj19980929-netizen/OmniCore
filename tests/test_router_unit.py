@@ -65,6 +65,29 @@ def test_router_guesses_browser_tool_when_plan_shape_is_ambiguous():
     assert task["task_type"] == "browser_agent"
 
 
+def test_router_guesses_tool_from_schema_param_overlap_without_keyword_lists():
+    router = RouterAgent()
+
+    result = router._normalize_task_plan_shape(
+        {
+            "tasks": [
+                {
+                    "description": "请继续执行这个流程",
+                    "params": {
+                        "start_url": "https://example.com",
+                        "task": "继续执行",
+                        "headless": True,
+                    },
+                }
+            ]
+        }
+    )
+
+    task = result["tasks"][0]
+    assert task["tool_name"] == "browser.interact"
+    assert task["task_type"] == "browser_agent"
+
+
 class _FakeResponse:
     content = "{}"
 
@@ -82,6 +105,7 @@ class _FakeLLM:
             "intent": "information_query",
             "confidence": 1.0,
             "reasoning": "ok",
+            "direct_answer": "",
             "tasks": [],
             "is_high_risk": False,
         }
@@ -150,6 +174,28 @@ def test_router_includes_current_time_context_from_state():
     assert "Current local time" in fake_llm.last_user_message
     assert "2026-03-04T18:30:00+08:00" in fake_llm.last_user_message
     assert "Wednesday" in fake_llm.last_user_message
+
+
+def test_router_persists_direct_answer_for_taskless_queries():
+    class _FakeLLMDirectAnswer(_FakeLLM):
+        def parse_json_response(self, _response):
+            return {
+                "intent": "information_query",
+                "confidence": 1.0,
+                "reasoning": "无需任务",
+                "direct_answer": "当前时间是 2026-03-05 10:17:54。",
+                "tasks": [],
+                "is_high_risk": False,
+            }
+
+    fake_llm = _FakeLLMDirectAnswer()
+    router = RouterAgent(llm_client=fake_llm)
+    state = create_initial_state("现在的时间是多少？")
+
+    router.route(state)
+
+    assert state["task_queue"] == []
+    assert state["shared_memory"]["router_direct_answer"] == "当前时间是 2026-03-05 10:17:54。"
 
 
 def test_router_includes_work_context_and_success_patterns():

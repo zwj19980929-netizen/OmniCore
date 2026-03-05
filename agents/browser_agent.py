@@ -7,6 +7,7 @@ import json
 import os
 import random
 import re
+from urllib.parse import parse_qs, quote_plus, urlparse
 from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any, Dict, List, Optional, Tuple
@@ -63,6 +64,16 @@ class BrowserAction:
     use_keyboard_fallback: bool = False
     keyboard_key: str = ""
 
+
+@dataclass
+class TaskIntent:
+    intent_type: str = "read"
+    query: str = ""
+    confidence: float = 0.0
+    fields: Dict[str, str] = field(default_factory=dict)
+    requires_interaction: bool = False
+    target_text: str = ""
+
 ACTION_DECISION_PROMPT = """You are a browser control planner. Return JSON only.
 Task: {task}
 URL: {url}
@@ -93,6 +104,7 @@ class BrowserAgent:
         self.llm = llm_client
         self._element_cache: List[PageElement] = []
         self._action_history: List[str] = []
+        self._intent_cache: Dict[str, TaskIntent] = {}
 
         # 如果外部传入 toolkit 就用，否则自建
         if toolkit:
@@ -121,21 +133,22 @@ class BrowserAgent:
     def _normalize_text(self, value: str) -> str:
         return re.sub(r"\s+", " ", (value or "").strip()).lower()
 
-    def _is_read_only_task(self, task: str) -> bool:
-        lowered = self._normalize_text(task)
-        if not lowered:
+    def _is_read_only_task(self, task: str, intent: Optional[TaskIntent] = None) -> bool:
+        normalized = self._normalize_text(task)
+        if not normalized:
             return False
-        interactive_tokens = [
-            "click", "tap", "press", "login", "sign in", "register", "fill", "submit", "upload",
-            "点击", "打开", "登录", "注册", "填写", "提交", "上传",
-        ]
-        read_tokens = [
-            "read", "extract", "scrape", "collect", "summarize", "summary", "list",
-            "读取", "提取", "抓取", "收集", "总结", "汇总", "列出",
-        ]
-        if any(token in lowered for token in interactive_tokens):
+        if intent:
+            if intent.requires_interaction:
+                return False
+            if intent.intent_type in {"search", "form", "auth", "navigate"}:
+                return False
+            if intent.target_text:
+                return False
+        if len(self._extract_structured_pairs(task)) >= 2:
             return False
-        return any(token in lowered for token in read_tokens)
+        if self._extract_click_target_text(task):
+            return False
+        return True
 
     def _action_signature(self, action: BrowserAction) -> str:
         return "|".join([
@@ -211,12 +224,10 @@ class BrowserAgent:
         return chosen
 
     def _choose_llm_element_limit(self, task: str) -> int:
-        lowered = self._normalize_text(task)
-        if any(token in lowered for token in ["search", "find", "lookup", "搜索", "查找"]):
-            return 8
-        if any(token in lowered for token in ["login", "sign in", "register", "signup", "登录", "注册"]):
-            return 10
-        if any(token in lowered for token in ["form", "fill", "submit", "apply", "book", "表单", "填写", "提交"]):
+        pair_count = len(self._extract_structured_pairs(task))
+        if pair_count >= 2:
+            return 12
+        if len(self._derive_primary_query(task).split()) >= 8:
             return 10
         return 8
 
@@ -381,50 +392,12 @@ class BrowserAgent:
         return ranked[0] if ranked else None
 
     def _derive_primary_query(self, task: str) -> str:
-        text = re.sub(r"https?://\S+", " ", task or "")
-        text = re.sub(r"[,.!?:;()\[\]{}]", " ", text)
-        text = re.sub(
-            r"(please|search|find|open|go to|visit|look up|login|register|form|submit|帮我|搜索|查找|打开|访问|登录|注册|填写|表单|提交)",
-            " ", text, flags=re.IGNORECASE,
-        )
-        parts = [part.strip() for part in text.split() if len(part.strip()) >= 2]
-        return " ".join(parts[:8]).strip()
-
-    def _extract_task_credentials(self, task: str) -> Dict[str, str]:
-        credentials: Dict[str, str] = {}
-        email = re.search(r"([A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,})", task or "")
-        if email:
-            credentials["email"] = email.group(1)
-        patterns = {
-            "password": [r"(?:password|pwd|密码)[:：=\s]+([^\s,，;；]+)"],
-            "username": [r"(?:username|user|account|用户名|账号)[:：=\s]+([^\s,，;；]+)"],
-        }
-        for key, pattern_list in patterns.items():
-            for pattern in pattern_list:
-                match = re.search(pattern, task or "", flags=re.IGNORECASE)
-                if match:
-                    credentials[key] = match.group(1)
-                    break
-        return credentials
-
-    def _extract_task_form_fields(self, task: str) -> Dict[str, str]:
-        fields: Dict[str, str] = {}
-        patterns = {
-            "name": [r"(?:name|姓名)[:：=\s]+([^,，;\n]+)"],
-            "phone": [r"(?:phone|mobile|电话|手机号)[:：=\s]+([0-9+\- ]{6,})"],
-            "email": [r"(?:email|邮箱)[:：=\s]+([A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,})"],
-            "company": [r"(?:company|公司)[:：=\s]+([^,，;\n]+)"],
-            "title": [r"(?:title|job title|职位)[:：=\s]+([^,，;\n]+)"],
-            "address": [r"(?:address|地址)[:：=\s]+([^\n]+)"],
-            "verification_code": [r"(?:code|otp|验证码)[:：=\s]+([^,，;\n]+)"],
-        }
-        for key, pattern_list in patterns.items():
-            for pattern in pattern_list:
-                match = re.search(pattern, task or "", flags=re.IGNORECASE)
-                if match:
-                    fields[key] = match.group(1).strip()
-                    break
-        return fields
+        normalized = re.sub(r"https?://\S+", " ", task or "")
+        normalized = re.sub(r"[^\w\u4e00-\u9fff]+", " ", normalized, flags=re.UNICODE)
+        chunks = re.findall(r"[\u4e00-\u9fff]{2,}|[A-Za-z0-9][A-Za-z0-9_+.-]{1,}", normalized)
+        if chunks:
+            return " ".join(chunks[:12]).strip()
+        return ""
 
     def _build_form_fill_action(self, mapping: Dict[str, str]) -> BrowserAction:
         return BrowserAction(
@@ -435,17 +408,26 @@ class BrowserAgent:
         )
 
     def _extract_click_target_text(self, task: str) -> str:
-        patterns = [
-            r"(?:click|open|tap)\s+([A-Za-z0-9_\-\u4e00-\u9fff ]{2,40})",
-            r"(?:点击|打开)\s*([A-Za-z0-9_\-\u4e00-\u9fff ]{2,40})",
-        ]
-        for pattern in patterns:
-            match = re.search(pattern, task or "", flags=re.IGNORECASE)
-            if match:
-                value = self._normalize_text(match.group(1))
-                value = re.split(r"\b(?:button|link|page|页面|按钮)\b", value, maxsplit=1)[0].strip()
-                if len(value) >= 2:
-                    return value
+        for pattern in (
+            r'"([^"\n]{2,64})"',
+            r"'([^'\n]{2,64})'",
+            r"“([^”\n]{2,64})”",
+            r"‘([^’\n]{2,64})’",
+            r"「([^」\n]{2,64})」",
+            r"『([^』\n]{2,64})』",
+            r"《([^》\n]{2,64})》",
+        ):
+            match = re.search(pattern, task or "")
+            if not match:
+                continue
+            value = self._normalize_text(match.group(1))
+            if len(value) >= 2:
+                return value
+        pairs = self._extract_structured_pairs(task)
+        if len(pairs) == 1:
+            value = self._normalize_text(next(iter(pairs.values())))
+            if 2 <= len(value) <= 40:
+                return value
         return ""
 
     def _extract_url_from_task(self, task: str) -> Optional[str]:
@@ -454,72 +436,301 @@ class BrowserAgent:
             return None
         return match.group(0).rstrip('.,);]')
 
+    def _extract_structured_pairs(self, task: str) -> Dict[str, str]:
+        pairs: Dict[str, str] = {}
+        for key, value in re.findall(
+            r"([A-Za-z0-9_\u4e00-\u9fff]{1,24})\s*[:：=]\s*([^\n,，;；]{1,160})",
+            task or "",
+        ):
+            normalized_key = self._normalize_text(key)
+            cleaned_value = re.sub(r"\s+", " ", value).strip()
+            if normalized_key and cleaned_value:
+                pairs[normalized_key] = cleaned_value
+        return pairs
+
+    async def _infer_task_intent(self, task: str) -> TaskIntent:
+        cache_key = self._normalize_text(task)
+        cached = self._intent_cache.get(cache_key)
+        if cached is not None:
+            return cached
+
+        query = self._derive_primary_query(task)
+        fields = self._extract_structured_pairs(task)
+        target_text = self._extract_click_target_text(task)
+
+        if self._extract_url_from_task(task):
+            fallback = TaskIntent(intent_type="navigate", query=query, confidence=0.55, target_text=target_text)
+        elif len(fields) >= 2:
+            fallback = TaskIntent(
+                intent_type="form",
+                query=query,
+                confidence=0.6,
+                fields=fields,
+                requires_interaction=True,
+                target_text=target_text,
+            )
+        else:
+            fallback = TaskIntent(intent_type="search", query=query, confidence=0.35, target_text=target_text)
+
+        try:
+            llm = self._get_llm()
+            response = await llm.achat(
+                messages=[
+                    {
+                        "role": "system",
+                        "content": (
+                            "Classify the browser task into exactly one intent: "
+                            "search, read, form, auth, navigate, unknown. "
+                            "Return JSON only with keys: intent, confidence, query, "
+                            "requires_interaction, fields, target_text."
+                        ),
+                    },
+                    {"role": "user", "content": task or ""},
+                ],
+                temperature=0.1,
+                json_mode=True,
+            )
+            payload = llm.parse_json_response(response)
+            intent_type = str(payload.get("intent", "") or "").strip().lower()
+            if intent_type not in {"search", "read", "form", "auth", "navigate", "unknown"}:
+                intent_type = fallback.intent_type
+
+            confidence = float(payload.get("confidence", 0.0) or 0.0)
+            llm_query = str(payload.get("query", "") or "").strip() or query
+            llm_target = self._normalize_text(str(payload.get("target_text", "") or "").strip())
+            llm_fields = payload.get("fields", {})
+            normalized_fields: Dict[str, str] = {}
+            if isinstance(llm_fields, dict):
+                for raw_key, raw_value in llm_fields.items():
+                    key = self._normalize_text(str(raw_key))
+                    value = str(raw_value or "").strip()
+                    if key and value:
+                        normalized_fields[key] = value
+
+            llm_intent = TaskIntent(
+                intent_type=intent_type,
+                query=llm_query,
+                confidence=max(min(confidence, 1.0), 0.0),
+                fields=normalized_fields,
+                requires_interaction=bool(payload.get("requires_interaction", False)),
+                target_text=llm_target,
+            )
+
+            if llm_intent.confidence >= max(fallback.confidence, 0.5):
+                fallback = llm_intent
+        except Exception as exc:
+            log_warning(f"intent inference fallback: {str(exc)[:120]}")
+
+        if not fallback.query:
+            fallback.query = query
+        if not fallback.fields and fallback.intent_type in {"form", "auth"}:
+            fallback.fields = fields
+        if not fallback.target_text:
+            fallback.target_text = target_text
+        if fallback.intent_type in {"form", "auth"}:
+            fallback.requires_interaction = True
+        if fallback.target_text and fallback.intent_type in {"read", "unknown"}:
+            fallback.intent_type = "navigate"
+            fallback.requires_interaction = True
+
+        self._intent_cache[cache_key] = fallback
+        return fallback
+
+    def _iter_input_candidates(self, elements: List[PageElement]) -> List[PageElement]:
+        candidates: List[PageElement] = []
+        for element in elements:
+            if not element.is_visible or not element.is_clickable:
+                continue
+            if element.element_type in {"input", "text", "search", "email", "password", "textarea"}:
+                candidates.append(element)
+                continue
+            if element.tag in {"input", "textarea"}:
+                candidates.append(element)
+        return candidates
+
+    def _field_match_score(self, field_name: str, element: PageElement) -> float:
+        attrs = element.attributes or {}
+        haystack = self._normalize_text(
+            " ".join(
+                [
+                    element.text,
+                    attrs.get("name", ""),
+                    attrs.get("id", ""),
+                    attrs.get("placeholder", ""),
+                    attrs.get("labelText", ""),
+                    attrs.get("ariaLabel", ""),
+                    attrs.get("title", ""),
+                    attrs.get("type", ""),
+                ]
+            )
+        )
+        score = 0.0
+        for token in self._extract_task_tokens(field_name):
+            if token and token in haystack:
+                score += 2.0
+        if element.element_type in {"text", "search", "email", "password", "textarea"}:
+            score += 0.8
+        if attrs.get("name"):
+            score += 0.2
+        return score
+
+    def _build_form_mapping_from_pairs(
+        self,
+        fields: Dict[str, str],
+        elements: List[PageElement],
+    ) -> Dict[str, str]:
+        if not fields:
+            return {}
+
+        available = self._iter_input_candidates(elements)
+        if not available:
+            return {}
+
+        mapping: Dict[str, str] = {}
+        remaining = list(available)
+
+        for field_name, value in fields.items():
+            if not remaining:
+                break
+            scored = sorted(
+                ((self._field_match_score(field_name, item), item) for item in remaining),
+                key=lambda pair: pair[0],
+                reverse=True,
+            )
+            selected = scored[0][1] if scored else remaining[0]
+            mapping[selected.selector] = value
+            remaining = [item for item in remaining if item.selector != selected.selector]
+
+        return mapping
+
+    def _find_primary_text_input(self, elements: List[PageElement]) -> Optional[PageElement]:
+        candidates = self._iter_input_candidates(elements)
+        if not candidates:
+            return None
+
+        ranked = sorted(
+            candidates,
+            key=lambda item: (
+                1 if (item.attributes or {}).get("placeholder") else 0,
+                1 if (item.attributes or {}).get("labelText") else 0,
+                1 if item.element_type in {"search", "text", "email"} else 0,
+            ),
+            reverse=True,
+        )
+        return ranked[0] if ranked else None
+
+    def _find_primary_submit_control(self, elements: List[PageElement]) -> Optional[PageElement]:
+        controls = [
+            item
+            for item in elements
+            if item.is_visible and item.is_clickable and item.element_type in {"button", "submit", "link"}
+        ]
+        return controls[0] if controls else None
+
+    async def _bootstrap_search_results(self, query: str) -> bool:
+        if not query:
+            return False
+        search_url = f"https://www.bing.com/search?q={quote_plus(query)}"
+        result = await self.toolkit.goto(search_url, timeout=30000)
+        if not result.success:
+            return False
+        await self._wait_for_page_ready()
+        log_agent_action(self.name, "bootstrap_search", query[:120])
+        return True
+
+    def _is_data_relevant(self, query: str, data: List[Dict[str, str]]) -> bool:
+        if not data:
+            return False
+        tokens = [token for token in self._extract_task_tokens(query) if len(token) >= 2][:8]
+        if not tokens:
+            return True
+        for item in data[:8]:
+            haystack = self._normalize_text(" ".join(str(v) for v in item.values() if v))
+            if any(token in haystack for token in tokens):
+                return True
+        return False
+
     # ── Agent decision: local heuristics ───────────────────────
 
-    def _decide_action_locally(self, task: str, elements: List[PageElement]) -> Optional[BrowserAction]:
-        lowered = self._normalize_text(task)
-        click_target = self._extract_click_target_text(task)
+    def _decide_action_locally(
+        self,
+        task: str,
+        elements: List[PageElement],
+        intent: Optional[TaskIntent] = None,
+    ) -> Optional[BrowserAction]:
+        active_intent = intent or TaskIntent(
+            intent_type="read",
+            query=self._derive_primary_query(task),
+            confidence=0.0,
+            fields=self._extract_structured_pairs(task),
+            requires_interaction=False,
+        )
 
+        click_target = active_intent.target_text or self._extract_click_target_text(task)
         if click_target:
-            explicit_target = self._find_best_element(task, elements, kinds=["button", "submit", "link"], keywords=[click_target])
+            explicit_target = self._find_best_element(
+                task,
+                elements,
+                kinds=["button", "submit", "link"],
+                keywords=[click_target],
+            )
             if explicit_target:
-                return BrowserAction(action_type=ActionType.CLICK, target_selector=explicit_target.selector,
-                                     description=f"click target {click_target}", confidence=0.82)
+                return BrowserAction(
+                    action_type=ActionType.CLICK,
+                    target_selector=explicit_target.selector,
+                    description=f"click target {click_target}",
+                    confidence=0.82,
+                )
 
-        if any(token in lowered for token in ["search", "find", "lookup", "搜索", "查找"]):
-            query = self._derive_primary_query(task)
-            input_element = self._find_best_element(task, elements, kinds=["input", "search", "textarea"], keywords=["search", "query", "keyword", "搜索"])
+        if active_intent.intent_type in {"form", "auth"}:
+            mapping = self._build_form_mapping_from_pairs(active_intent.fields, elements)
+            if mapping:
+                return self._build_form_fill_action(mapping)
+            submit_control = self._find_primary_submit_control(elements)
+            if submit_control:
+                return BrowserAction(
+                    action_type=ActionType.CLICK,
+                    target_selector=submit_control.selector,
+                    description="submit interactive form",
+                    confidence=0.62,
+                )
+
+        if active_intent.intent_type == "search":
+            query = active_intent.query or self._derive_primary_query(task)
+            input_element = self._find_primary_text_input(elements)
             if input_element and query:
-                return BrowserAction(action_type=ActionType.INPUT, target_selector=input_element.selector,
-                                     value=query, description="fill search query", confidence=0.92,
-                                     use_keyboard_fallback=True, keyboard_key="Enter")
-            click_element = self._find_best_element(task, elements, kinds=["button", "submit", "link"], keywords=["search", "submit", "go", "搜索", "提交"])
-            if click_element:
-                return BrowserAction(action_type=ActionType.CLICK, target_selector=click_element.selector,
-                                     description="click search action", confidence=0.75,
-                                     use_keyboard_fallback=True, keyboard_key="Enter")
+                return BrowserAction(
+                    action_type=ActionType.INPUT,
+                    target_selector=input_element.selector,
+                    value=query,
+                    description="fill search query",
+                    confidence=0.9,
+                    use_keyboard_fallback=True,
+                    keyboard_key="Enter",
+                )
+            submit_control = self._find_primary_submit_control(elements)
+            if submit_control:
+                return BrowserAction(
+                    action_type=ActionType.CLICK,
+                    target_selector=submit_control.selector,
+                    description="continue search flow",
+                    confidence=0.55,
+                    use_keyboard_fallback=True,
+                    keyboard_key="Enter",
+                )
+            return BrowserAction(
+                action_type=ActionType.EXTRACT,
+                description="extract visible search results",
+                confidence=0.4,
+            )
 
-        if any(token in lowered for token in ["login", "sign in", "register", "signup", "登录", "注册"]):
-            credentials = self._extract_task_credentials(task)
-            if credentials:
-                mapping: Dict[str, str] = {}
-                for field_name, keywords in {
-                    "email": ["email", "mail", "邮箱"],
-                    "username": ["username", "user", "account", "用户名", "账号"],
-                    "password": ["password", "pass", "密码"],
-                }.items():
-                    if field_name not in credentials:
-                        continue
-                    target = self._find_best_element(task, elements, kinds=["input", "email", "password", "text"], keywords=keywords)
-                    if target:
-                        mapping[target.selector] = credentials[field_name]
-                if mapping:
-                    return self._build_form_fill_action(mapping)
-            auth_element = self._find_best_element(task, elements, kinds=["button", "link", "submit"], keywords=["login", "sign in", "register", "signup", "登录", "注册"])
-            if auth_element:
-                return BrowserAction(action_type=ActionType.CLICK, target_selector=auth_element.selector,
-                                     description="open auth flow", confidence=0.7)
+        if active_intent.intent_type in {"read", "navigate", "unknown"} and self._is_read_only_task(task, active_intent):
+            return BrowserAction(
+                action_type=ActionType.EXTRACT,
+                description="extract visible page content",
+                confidence=0.45,
+            )
 
-        if any(token in lowered for token in ["form", "fill", "submit", "apply", "book", "表单", "填写", "提交", "申请", "预约"]):
-            fields = self._extract_task_form_fields(task)
-            if len(fields) >= 2:
-                mapping: Dict[str, str] = {}
-                key_map = {
-                    "name": ["name", "姓名"], "phone": ["phone", "mobile", "电话", "手机号"],
-                    "email": ["email", "邮箱"], "company": ["company", "公司"],
-                    "title": ["title", "职位"], "address": ["address", "地址"],
-                    "verification_code": ["code", "otp", "验证码"],
-                }
-                for field_name, value in fields.items():
-                    target = self._find_best_element(task, elements, kinds=["input", "textarea", "text"], keywords=key_map.get(field_name, [field_name]))
-                    if target:
-                        mapping[target.selector] = value
-                if mapping:
-                    return self._build_form_fill_action(mapping)
-            submit_element = self._find_best_element(task, elements, kinds=["button", "submit", "link"], keywords=["submit", "confirm", "apply", "提交", "确认"])
-            if submit_element:
-                return BrowserAction(action_type=ActionType.CLICK, target_selector=submit_element.selector,
-                                     description="submit form", confidence=0.68)
         return None
 
     # ── Agent decision: LLM ────────────────────────────────────
@@ -559,7 +770,7 @@ class BrowserAgent:
     async def _decide_action_with_llm(self, task: str, elements: List[PageElement]) -> BrowserAction:
         try:
             if not elements:
-                if any(token in self._normalize_text(task) for token in ["extract", "read", "scrape", "summary", "提取", "读取", "总结"]):
+                if self._is_read_only_task(task):
                     return BrowserAction(action_type=ActionType.EXTRACT, description="extract visible data")
                 return BrowserAction(action_type=ActionType.WAIT, value="1", description="no actionable elements", confidence=0.05)
 
@@ -869,13 +1080,33 @@ class BrowserAgent:
         )
         return r.data or [] if r.success else []
 
-    def _task_looks_satisfied(self, task: str, current_url: str) -> bool:
-        lowered = self._normalize_text(task)
-        url = (current_url or "").lower()
-        if any(token in lowered for token in ["search", "find", "lookup", "搜索", "查找"]):
-            return any(token in url for token in ["search", "query", "result"])
-        if any(token in lowered for token in ["login", "sign in", "登录"]):
-            return all(token not in url for token in ["login", "signin"])
+    def _task_looks_satisfied(
+        self,
+        task: str,
+        current_url: str,
+        intent: Optional[TaskIntent] = None,
+    ) -> bool:
+        active_intent = intent or TaskIntent(
+            intent_type="search",
+            query=self._derive_primary_query(task),
+            confidence=0.0,
+        )
+        if active_intent.intent_type == "search":
+            parsed = urlparse(current_url or "")
+            query_string = " ".join(
+                value
+                for values in parse_qs(parsed.query).values()
+                for value in values
+            )
+            haystack = self._normalize_text(f"{parsed.path} {query_string}")
+            tokens = [token for token in self._extract_task_tokens(active_intent.query) if len(token) >= 2][:6]
+            if not tokens:
+                return bool(haystack)
+            return any(token in haystack for token in tokens)
+        if active_intent.intent_type in {"form", "auth"}:
+            return bool(current_url)
+        if active_intent.intent_type == "navigate":
+            return bool(current_url)
         return False
 
     async def _wait_for_page_ready(self) -> None:
@@ -913,10 +1144,20 @@ class BrowserAgent:
                 return {"success": False, "message": f"初始导航失败: {str(nav_err)[:200]}", "url": url, "steps": steps}
 
             await self._wait_for_page_ready()
+            task_intent = await self._infer_task_intent(task)
+            if (
+                task_intent.intent_type == "search"
+                and not start_url
+                and not self._extract_url_from_task(task)
+            ):
+                await self._bootstrap_search_results(task_intent.query or self._derive_primary_query(task))
 
-            if self._is_read_only_task(task):
+            if self._is_read_only_task(task, task_intent):
                 initial_data = await self._maybe_extract_data()
-                if initial_data:
+                if initial_data and (
+                    task_intent.intent_type != "search"
+                    or self._is_data_relevant(task_intent.query, initial_data)
+                ):
                     title_r = await tk.get_title()
                     url_r = await tk.get_current_url()
                     return {"success": True, "message": "read-only task satisfied from initial page",
@@ -937,7 +1178,7 @@ class BrowserAgent:
 
             for step_no in range(1, max_steps + 1):
                 elements = await self._extract_interactive_elements()
-                action = self._decide_action_locally(task, elements)
+                action = self._decide_action_locally(task, elements, task_intent)
                 if action is None:
                     action = await self._decide_action_with_llm(task, elements)
 
@@ -965,7 +1206,7 @@ class BrowserAgent:
                             "requires_confirmation": True, "steps": steps}
 
                 if self._is_action_looping(action):
-                    if self._is_read_only_task(task):
+                    if self._is_read_only_task(task, task_intent):
                         _merge_new_data(await self._maybe_extract_data())
                         url_r = await tk.get_current_url()
                         title_r = await tk.get_title()
@@ -1027,7 +1268,7 @@ class BrowserAgent:
                 if action.action_type in {ActionType.CLICK, ActionType.INPUT, ActionType.FILL_FORM, ActionType.PRESS_KEY}:
                     step_data = await self._maybe_extract_data()
                     _merge_new_data(step_data)
-                    if self._task_looks_satisfied(task, url_r.data or ""):
+                    if self._task_looks_satisfied(task, url_r.data or "", task_intent):
                         title_r = await tk.get_title()
                         return {"success": True, "message": "task reached target page",
                                 "url": url_r.data or "", "title": title_r.data or "",

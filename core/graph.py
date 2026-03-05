@@ -3,9 +3,10 @@ OmniCore LangGraph DAG 编排
 将所有 Agent 串联成完整的执行图
 支持 Worker 失败后反思重规划
 """
+import json
 from pathlib import Path
 from datetime import datetime
-from typing import Literal
+from typing import Any, Dict, List, Literal
 from langgraph.graph import StateGraph, END
 
 from core.statuses import BLOCKED, WAITING_FOR_APPROVAL, WAITING_FOR_EVENT
@@ -36,6 +37,181 @@ _CHECKPOINT_STAGE_ORDER = {
     "replanner": 6,
     "finalize": 7,
 }
+
+_MOJIBAKE_MARKERS = (
+    "\u00c3",
+    "\u00c2",
+    "\u00e6",
+    "\u00e5",
+    "\u00e4",
+    "\u00e7",
+    "\u00e8",
+    "\u00e9",
+    "\u00ea",
+    "\u00ef",
+    "\u00f0",
+)
+
+def _build_finalize_time_hint(current_time_context) -> str:
+    if not isinstance(current_time_context, dict):
+        return ""
+
+    lines = []
+    iso_datetime = str(current_time_context.get("iso_datetime", "") or "").strip()
+    local_date = str(current_time_context.get("local_date", "") or "").strip()
+    local_time = str(current_time_context.get("local_time", "") or "").strip()
+    weekday = str(current_time_context.get("weekday", "") or "").strip()
+    timezone_name = str(current_time_context.get("timezone", "") or "").strip()
+
+    if iso_datetime:
+        lines.append(f"- Current datetime: {iso_datetime}")
+    if local_date:
+        lines.append(f"- Current date: {local_date}")
+    if local_time:
+        lines.append(f"- Current local time: {local_time}")
+    if weekday:
+        lines.append(f"- Weekday: {weekday}")
+    if timezone_name:
+        lines.append(f"- Timezone: {timezone_name}")
+
+    if not lines:
+        return ""
+    return "\n\nCurrent local time (authoritative):\n" + "\n".join(lines)
+
+
+def _looks_like_mojibake(text: str) -> bool:
+    if not isinstance(text, str) or len(text) < 6:
+        return False
+    marker_hits = sum(text.count(marker) for marker in _MOJIBAKE_MARKERS)
+    if marker_hits < 2:
+        return False
+    cjk_count = sum(1 for ch in text if "\u4e00" <= ch <= "\u9fff")
+    return cjk_count == 0
+
+
+def _repair_mojibake_text(text: str) -> str:
+    if not isinstance(text, str) or not text:
+        return text
+    if not _looks_like_mojibake(text):
+        return text
+    try:
+        repaired = text.encode("latin-1", errors="ignore").decode("utf-8", errors="ignore")
+    except Exception:
+        return text
+    if not repaired or repaired == text:
+        return text
+    repaired_cjk = sum(1 for ch in repaired if "\u4e00" <= ch <= "\u9fff")
+    if repaired_cjk == 0:
+        return text
+    return repaired
+
+
+def _normalize_text_value(value: Any) -> str:
+    text = str(value or "").strip()
+    if not text:
+        return ""
+    return _repair_mojibake_text(text)
+
+
+def _normalize_payload(value: Any) -> Any:
+    if isinstance(value, str):
+        return _repair_mojibake_text(value)
+    if isinstance(value, list):
+        return [_normalize_payload(item) for item in value]
+    if isinstance(value, tuple):
+        return tuple(_normalize_payload(item) for item in value)
+    if isinstance(value, dict):
+        normalized: Dict[Any, Any] = {}
+        for key, item in value.items():
+            normalized[key] = _normalize_payload(item)
+        return normalized
+    return value
+
+
+def _payload_preview(payload: Any, limit: int = 220) -> str:
+    normalized = _normalize_payload(payload)
+    try:
+        if isinstance(normalized, (dict, list, tuple)):
+            text = json.dumps(normalized, ensure_ascii=False, default=str)
+        else:
+            text = str(normalized)
+    except Exception:
+        text = str(normalized)
+    return text.replace("\n", " ")[:limit]
+
+
+def _extract_structured_findings(state: OmniCoreState, max_items: int = 5) -> str:
+    title_keys = ("title", "headline", "name", "subject", "text")
+    date_keys = ("date", "time", "datetime", "published_at", "published")
+    link_keys = ("link", "url", "source_url", "article_url")
+    detail_keys = ("summary", "description", "desc", "snippet", "content", "text")
+
+    findings: List[Dict[str, str]] = []
+    seen = set()
+    for task in state.get("task_queue", []) or []:
+        if task.get("status") != "completed":
+            continue
+        result = task.get("result")
+        if not isinstance(result, dict):
+            continue
+        for source_key in ("data", "items", "content"):
+            payload = result.get(source_key)
+            if payload in (None, "", [], {}):
+                continue
+            records = payload if isinstance(payload, list) else [payload]
+            for record in records:
+                if not isinstance(record, dict):
+                    text = _normalize_text_value(record)
+                    if not text:
+                        continue
+                    key = (text[:120], "")
+                    if key in seen:
+                        continue
+                    seen.add(key)
+                    findings.append({"title": text, "date": "", "link": "", "detail": ""})
+                    continue
+
+                title = next((_normalize_text_value(record.get(key)) for key in title_keys if record.get(key)), "")
+                date = next((_normalize_text_value(record.get(key)) for key in date_keys if record.get(key)), "")
+                link = next((_normalize_text_value(record.get(key)) for key in link_keys if record.get(key)), "")
+                detail = next((_normalize_text_value(record.get(key)) for key in detail_keys if record.get(key)), "")
+                if not title and detail:
+                    title = detail[:120]
+                if not title:
+                    continue
+                key = (title[:120], link[:160])
+                if key in seen:
+                    continue
+                seen.add(key)
+                findings.append(
+                    {
+                        "title": title,
+                        "date": date,
+                        "link": link,
+                        "detail": detail if detail and detail != title else "",
+                    }
+                )
+
+    if not findings:
+        return ""
+
+    lines = ["Findings:"]
+    for idx, item in enumerate(findings[:max_items], 1):
+        title = item.get("title", "")
+        date = item.get("date", "")
+        link = item.get("link", "")
+        detail = item.get("detail", "")
+        line = f"{idx}. {title}"
+        if date:
+            line += f" ({date})"
+        if link:
+            line += f" - {link}"
+        lines.append(line)
+        if detail:
+            lines.append(f"   {detail[:180]}")
+    if len(findings) > max_items:
+        lines.append(f"... {len(findings) - max_items} more item(s) extracted.")
+    return "\n".join(lines)
 
 
 def _save_runtime_checkpoint(state: OmniCoreState, stage: str, note: str = "") -> None:
@@ -426,7 +602,7 @@ def _collect_delivery_artifacts(state: OmniCoreState):
             payload = result.get(source_key)
             if payload in (None, "", [], {}):
                 continue
-            preview = str(payload).replace("\n", " ")[:220]
+            preview = _payload_preview(payload)
             fingerprint = ("inline", source_key, preview)
             if fingerprint in seen:
                 continue
@@ -601,6 +777,11 @@ def _build_delivery_summary(state: OmniCoreState) -> str:
         f"Progress: {package['completed_task_count']}/{package['total_task_count']} task(s) completed.",
     ]
 
+    findings_summary = _extract_structured_findings(state)
+    if findings_summary:
+        lines.append("")
+        lines.append(findings_summary)
+
     completed_tasks = package.get("completed_tasks", [])
     if completed_tasks:
         lines.append("")
@@ -650,6 +831,31 @@ def finalize_node(state: OmniCoreState) -> OmniCoreState:
     if _should_skip_for_resume(state, "finalize"):
         return state
     if not state["task_queue"]:
+        shared_memory = state.get("shared_memory", {})
+        if not isinstance(shared_memory, dict):
+            shared_memory = {}
+        current_time_context = shared_memory.get("current_time_context")
+        direct_answer = str(shared_memory.get("router_direct_answer", "") or "").strip()
+
+        if direct_answer:
+            state["final_output"] = direct_answer
+            state["execution_status"] = "completed"
+            state["critic_approved"] = True
+            state["delivery_package"] = {
+                "headline": "Answered directly without worker execution.",
+                "intent": str(state.get("current_intent", "") or ""),
+                "review_status": "approved",
+                "completed_task_count": 0,
+                "total_task_count": 0,
+                "completed_tasks": [],
+                "deliverables": [],
+                "issues": [],
+                "critic_feedback": "",
+                "recommended_next_step": "",
+            }
+            _save_runtime_checkpoint(state, "finalize", "Finalize completed without task queue")
+            return state
+
         router_reasoning = ""
         for msg in reversed(state.get("messages", [])):
             content = getattr(msg, "content", "")
@@ -660,7 +866,7 @@ def finalize_node(state: OmniCoreState) -> OmniCoreState:
             llm = LLMClient()
             response = llm.chat_with_system(
                 system_prompt="你是 OmniCore 智能助手。请根据分析结果，用简洁友好的语言直接回答用户的问题。不要提及内部系统、Router、Worker 等技术细节。",
-                user_message=f"用户问题：{state['user_input']}\n\n分析结果：{router_reasoning}",
+                user_message=f"用户问题：{state['user_input']}\n\n分析结果：{router_reasoning}{_build_finalize_time_hint(current_time_context)}",
                 temperature=0.7,
             )
             state["final_output"] = response.content

@@ -5,6 +5,7 @@ OmniCore Critic Agent - 独立审查官
 from typing import Dict, Any, Optional
 from pathlib import Path
 
+from core.statuses import BLOCKED, WAITING_FOR_APPROVAL, WAITING_FOR_EVENT
 from core.state import OmniCoreState
 from core.llm import LLMClient
 from utils.logger import log_agent_action, logger
@@ -152,10 +153,29 @@ class CriticAgent:
         all_approved = True
         all_issues = []
         all_suggestions = []
+        completed_count = 0
+        failed_count = 0
+        unfinished_count = 0
 
-        # 审查所有已完成的任务
+        # 审查所有已完成的任务，并对失败/未完成任务保持否决。
         for task in state["task_queue"]:
-            if task["status"] == "completed" and task["result"]:
+            status = str(task.get("status", "") or "")
+            if status in {WAITING_FOR_APPROVAL, WAITING_FOR_EVENT, BLOCKED}:
+                continue
+            if status == "failed":
+                failed_count += 1
+                all_approved = False
+                all_issues.append(
+                    f"任务失败: {task.get('description', task.get('task_id', 'unknown'))}"
+                )
+                continue
+            if status != "completed":
+                unfinished_count += 1
+                all_approved = False
+                continue
+
+            completed_count += 1
+            if task["result"]:
                 review_result = self.review_task_result(
                     task_description=task["description"],
                     task_result=task["result"],
@@ -165,6 +185,14 @@ class CriticAgent:
                     all_approved = False
                     all_issues.extend(review_result.get("issues", []))
                     all_suggestions.extend(review_result.get("suggestions", []))
+
+        if state.get("task_queue") and completed_count == 0 and failed_count > 0:
+            all_approved = False
+            all_issues.append("没有任何任务成功完成")
+        if failed_count > 0:
+            all_issues.append(f"失败任务数: {failed_count}")
+        if unfinished_count > 0:
+            all_issues.append(f"未完成任务数: {unfinished_count}")
 
         # 更新状态
         state["critic_approved"] = all_approved

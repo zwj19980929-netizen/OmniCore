@@ -4,11 +4,12 @@ OmniCore 智能 Web Worker Agent
 所有浏览器操作通过 BrowserToolkit 完成。
 """
 import asyncio
+import base64
 import json
 import random
 import re
 from typing import Dict, Any, List, Optional
-from urllib.parse import urljoin
+from urllib.parse import parse_qs, quote_plus, urljoin, urlparse
 import requests
 
 from core.state import OmniCoreState, TaskItem
@@ -167,7 +168,7 @@ class WebWorker:
         )
         cached = self.cache.get(cache_key)
         if isinstance(cached, dict):
-            log_agent_action(self.name, "鍛戒腑 URL 鍒嗘瀽缂撳瓨", task_description[:50])
+            log_agent_action(self.name, "命中 URL 分析缓存", task_description[:50])
             log_debug_metrics("llm_cache.url_analysis", self.cache.snapshot_stats())
             return cached
         response = self.llm.chat_with_system(
@@ -315,7 +316,15 @@ class WebWorker:
             content_type = resp.headers.get("content-type", "").lower()
             if "html" not in content_type:
                 return {"success": False, "error": f"非HTML响应: {content_type}", "data": [], "url": url}
-            html = resp.text
+            current_encoding = str(getattr(resp, "encoding", "") or "").lower()
+            if current_encoding in {"", "iso-8859-1", "latin-1", "ascii"}:
+                apparent_encoding = str(getattr(resp, "apparent_encoding", "") or "").strip()
+                if apparent_encoding:
+                    try:
+                        resp.encoding = apparent_encoding
+                    except Exception:
+                        pass
+            html = str(getattr(resp, "text", "") or "")
             text_data = self._extract_static_text_blocks(html, max(3, min(limit, 6)))
             link_data = self._extract_static_links(html, url, task_description, limit)
             if self._prefers_static_text(task_description):
@@ -366,6 +375,115 @@ class WebWorker:
         results = await self.search_for_urls(query, max_results=1)
         return results[0] if results else None
 
+    @staticmethod
+    def _decode_redirect_url(href: str) -> str:
+        if not href:
+            return ""
+        try:
+            parsed = urlparse(href)
+        except Exception:
+            return href
+        host = (parsed.netloc or "").lower()
+        if "bing.com" not in host and "duckduckgo.com" not in host:
+            return href
+
+        qs = parse_qs(parsed.query or "")
+        candidate = (
+            (qs.get("uddg") or [None])[0]
+            or (qs.get("u") or [None])[0]
+            or (qs.get("url") or [None])[0]
+        )
+        if not candidate:
+            return href
+        if candidate.startswith("http"):
+            return candidate
+
+        # Bing sometimes uses u=a1<base64url(url)>
+        if candidate.startswith("a1"):
+            raw = candidate[2:]
+            padding = "=" * ((4 - len(raw) % 4) % 4)
+            try:
+                decoded = base64.urlsafe_b64decode((raw + padding).encode("ascii")).decode("utf-8", errors="ignore")
+                if decoded.startswith("http"):
+                    return decoded
+            except Exception:
+                pass
+        return href
+
+    @staticmethod
+    def _is_search_engine_domain(url: str) -> bool:
+        try:
+            host = (urlparse(url).netloc or "").lower()
+        except Exception:
+            return True
+        if not host:
+            return True
+        search_hosts = (
+            "bing.com",
+            "baidu.com",
+            "google.com",
+            "duckduckgo.com",
+            "sogou.com",
+            "so.com",
+            "yahoo.com",
+            "yandex.com",
+        )
+        return any(host == domain or host.endswith(f".{domain}") for domain in search_hosts)
+
+    async def _collect_search_links(self, tk: BrowserToolkit, query: str, max_results: int) -> List[str]:
+        selectors = [
+            "li.b_algo h2 a",
+            ".b_algo h2 a",
+            ".result__a",
+            "main a[href]",
+            "a[href]",
+        ]
+        urls: List[str] = []
+        seen = set()
+        query_tokens = {
+            token.strip().lower()
+            for token in RE_TOKEN_SPLIT.split(query or "")
+            if len(token.strip()) >= 2
+        }
+
+        for selector in selectors:
+            links_r = await tk.query_all(selector)
+            if not links_r.success:
+                continue
+            for elem in (links_r.data or [])[: max_results * 12]:
+                try:
+                    href = await elem.get_attribute("href")
+                except Exception:
+                    href = None
+                if not href:
+                    continue
+                href = self._decode_redirect_url(href.strip())
+                if not href.startswith("http"):
+                    continue
+                if self._is_search_engine_domain(href):
+                    continue
+                if href in seen:
+                    continue
+                seen.add(href)
+
+                # Prefer results that mention query tokens in anchor text,
+                # but still keep URL as fallback to avoid empty result sets.
+                include = True
+                try:
+                    text = str((await elem.inner_text()) or "").strip().lower()
+                except Exception:
+                    text = ""
+                if query_tokens and text:
+                    token_hits = sum(1 for token in query_tokens if token in text)
+                    include = token_hits > 0 or len(urls) < max_results // 2
+                if include:
+                    urls.append(href)
+                if len(urls) >= max_results:
+                    return urls
+            if urls:
+                break
+        return urls
+
     async def search_for_urls(self, query: str, max_results: int = 5, tk: BrowserToolkit = None) -> List[str]:
         log_agent_action(self.name, "搜索候选网站", query[:60])
         own_tk = tk is None
@@ -374,32 +492,18 @@ class WebWorker:
             await tk.create_page()
         urls = []
         try:
-            search_url = f"https://www.bing.com/search?q={query}"
-            await tk.goto(search_url)
-            await tk.human_delay(500, 2000)
-
-            r = await tk.query_all("li.b_algo h2 a")
-            if not r.success:
-                return urls
-            for elem in (r.data or [])[:max_results * 2]:
-                href = await elem.get_attribute("href")
-                if not href:
+            encoded_query = quote_plus(query or "")
+            search_candidates = [
+                f"https://www.bing.com/search?q={encoded_query}",
+                f"https://duckduckgo.com/html/?q={encoded_query}",
+            ]
+            for search_url in search_candidates:
+                goto_r = await tk.goto(search_url)
+                if not goto_r.success:
                     continue
-                if any(tracker in href for tracker in [
-                    "bing.com/ck/a", "baidu.com/link", "google.com/url",
-                    "sogou.com/link", "so.com/link",
-                ]):
-                    import urllib.parse
-                    parsed = urllib.parse.urlparse(href)
-                    qs = urllib.parse.parse_qs(parsed.query)
-                    real_url = qs.get("u", qs.get("url", [None]))[0] if qs else None
-                    if real_url and real_url.startswith("http"):
-                        href = real_url
-                    else:
-                        continue
-                if href.startswith("http") and href not in urls:
-                    urls.append(href)
-                if len(urls) >= max_results:
+                await tk.human_delay(300, 1200)
+                urls = await self._collect_search_links(tk, query, max_results=max_results)
+                if urls:
                     break
             if urls:
                 log_success(f"搜索到 {len(urls)} 个候选网站")
@@ -463,6 +567,70 @@ class WebWorker:
         except Exception:
             return None
 
+    async def extract_news_links_fallback(
+        self,
+        tk: BrowserToolkit,
+        task_description: str,
+        limit: int = 10,
+    ) -> List[Dict[str, Any]]:
+        """Fallback extractor for news/article pages when selector analysis returns empty."""
+        r = await tk.evaluate_js(
+            """(limit) => {
+                const nodes = Array.from(document.querySelectorAll("a[href]"));
+                const seen = new Set();
+                const out = [];
+                const abs = (href) => {
+                    try { return new URL(href, location.href).toString(); } catch { return ""; }
+                };
+                const scoreText = (txt) => {
+                    let s = 0;
+                    if (!txt) return s;
+                    const n = txt.trim().length;
+                    if (n >= 18 && n <= 180) s += 2;
+                    if (/[0-9]{4}|\\d{1,2}:\\d{2}/.test(txt)) s += 1;
+                    return s;
+                };
+                for (const a of nodes) {
+                    const href = abs(a.getAttribute("href") || "");
+                    if (!href || !href.startsWith("http")) continue;
+                    const text = (a.innerText || a.textContent || "").trim().replace(/\\s+/g, " ");
+                    if (!text || text.length < 12) continue;
+                    const parentSkip = a.closest("nav, header, footer, aside");
+                    if (parentSkip) continue;
+                    if (seen.has(href)) continue;
+                    seen.add(href);
+                    out.push({ title: text.slice(0, 220), link: href, _score: scoreText(text) });
+                }
+                out.sort((a, b) => b._score - a._score);
+                return out.slice(0, Math.max(limit * 3, 30));
+            }""",
+            max(3, min(limit, 20)),
+        )
+        if not r.success or not isinstance(r.data, list):
+            return []
+
+        task_tokens = {
+            token.strip().lower()
+            for token in RE_TOKEN_SPLIT.split(task_description or "")
+            if len(token.strip()) >= 2
+        }
+        filtered: List[Dict[str, Any]] = []
+        for item in r.data:
+            if not isinstance(item, dict):
+                continue
+            title = str(item.get("title", "") or "").strip()
+            link = str(item.get("link", "") or "").strip()
+            if not title or not link:
+                continue
+            title_lower = title.lower()
+            token_hits = sum(1 for token in task_tokens if token in title_lower)
+            if token_hits == 0 and len(filtered) >= max(2, limit // 2):
+                continue
+            filtered.append({"title": title, "link": link})
+            if len(filtered) >= limit:
+                break
+        return filtered
+
     # ── page analysis & extraction (uses toolkit) ─────────────
 
     async def analyze_page_structure(self, tk: BrowserToolkit, task_description: str) -> Dict[str, Any]:
@@ -488,7 +656,7 @@ class WebWorker:
         )
         cached = self.cache.get(cache_key)
         if isinstance(cached, dict):
-            log_agent_action(self.name, "鍛戒腑椤甸潰缁撴瀯鍒嗘瀽缂撳瓨", normalized_url[:80])
+            log_agent_action(self.name, "命中页面结构分析缓存", normalized_url[:80])
             log_debug_metrics("llm_cache.page_analysis", self.cache.snapshot_stats())
             return cached
         if len(html) > 15000:
@@ -575,21 +743,35 @@ class WebWorker:
         # Step 1: LLM 分析确定最佳目标 URL
         url_info = await self.determine_target_url(task_description)
         best_url = url_info.get("url", "")
+        backup_urls = [
+            str(item).strip()
+            for item in (url_info.get("backup_urls") or [])
+            if str(item).strip().startswith("http")
+        ]
         if not url and best_url:
             url = best_url
+        elif not url and backup_urls:
+            url = backup_urls[0]
         elif not url and url_info.get("need_search"):
             query = url_info.get("search_query", task_description)
             url = await self.search_for_url(query)
+        if not url and backup_urls:
+            url = backup_urls[0]
         if not url:
             return {"success": False, "error": "无法确定目标网站 URL", "data": []}
 
         # Step 1.5: 纯读场景优先静态抓取
         if self._can_use_static_fetch(task_description, url):
-            static_result = self._static_fetch(url, task_description, limit)
-            if static_result.get("success"):
-                log_success(f"静态抓取成功，获取 {static_result.get('count', 0)} 条数据")
-                return static_result
-            log_warning(f"静态抓取失败，回退浏览器模式: {static_result.get('error', '')[:80]}")
+            static_try_urls = [url] + [item for item in backup_urls if item != url]
+            static_error = ""
+            for static_url in static_try_urls[:3]:
+                static_result = self._static_fetch(static_url, task_description, limit)
+                if static_result.get("success"):
+                    log_success(f"静态抓取成功，获取 {static_result.get('count', 0)} 条数据")
+                    return static_result
+                static_error = str(static_result.get("error", "") or "")
+                log_warning(f"静态抓取失败，回退浏览器模式: {static_error[:80]}")
+            # static fetch failed for all candidates; continue with browser mode
 
         tk = self._create_toolkit()
         await tk.create_page()
@@ -741,6 +923,12 @@ class WebWorker:
                     best_api = max(api_responses, key=lambda x: len(x["data"]))
                     data = best_api["data"][:limit]
                     log_success(f"从 API 响应中提取到 {len(data)} 条数据")
+
+                if not data:
+                    fallback_links = await self.extract_news_links_fallback(tk, task_description, limit=limit)
+                    if fallback_links:
+                        data = fallback_links
+                        log_success(f"通用新闻链接兜底提取成功，获取 {len(data)} 条数据")
 
                 if data:
                     quality = self.validate_data_quality(data, task_description, limit)

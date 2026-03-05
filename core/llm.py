@@ -44,6 +44,11 @@ class LLMClient:
         "moonshot": "https://api.moonshot.cn/v1",
         "openai": "https://api.openai.com/v1",
         "deepseek": "https://api.deepseek.com",
+        "minimax": "https://api.minimaxi.com/v1",
+    }
+    MINIMAX_ALT_BASE = {
+        "https://api.minimaxi.com/v1": "https://api.minimax.io/v1",
+        "https://api.minimax.io/v1": "https://api.minimaxi.com/v1",
     }
 
     def __init__(
@@ -58,7 +63,7 @@ class LLMClient:
         Args:
             model: 模型名称，如 "gemini/gemini-2.5-pro" 或 "gpt-4o"
             capability: 按能力自动选择模型，如 "vision", "image_gen", "stt"
-            provider: 限定厂家，如 "gemini", "kimi"
+            provider: 限定厂家，如 "gemini", "kimi", "minimax"
         """
         if model:
             self.model = model
@@ -106,6 +111,9 @@ class LLMClient:
         kimi_key = getattr(settings, "KIMI_API_KEY", "")
         if kimi_key:
             os.environ["KIMI_API_KEY"] = kimi_key
+        minimax_key = getattr(settings, "MINIMAX_API_KEY", "")
+        if minimax_key:
+            os.environ["MINIMAX_API_KEY"] = minimax_key
 
     def _load_provider_config(self) -> Dict[str, Any]:
         """从 models.yaml 加载 provider_config"""
@@ -136,6 +144,10 @@ class LLMClient:
         elif provider == "deepseek":
             if settings.DEEPSEEK_API_KEY:
                 return settings.DEEPSEEK_API_KEY
+        elif provider == "minimax":
+            minimax_key = getattr(settings, "MINIMAX_API_KEY", "")
+            if minimax_key:
+                return minimax_key
 
         cfg = self.provider_config.get(provider, {})
         env_name = cfg.get("api_key_env", "")
@@ -154,6 +166,8 @@ class LLMClient:
             return "kimi"
         if "deepseek" in model_lower:
             return "deepseek"
+        if "minimax" in model_lower or model_lower.startswith("abab"):
+            return "minimax"
         return "openai"
 
     def _get_litellm_model(self) -> str:
@@ -161,7 +175,7 @@ class LLMClient:
         provider = self._get_provider_from_model()
         model_id = self.model.split("/")[-1] if "/" in self.model else self.model
 
-        if provider in ("kimi", "moonshot"):
+        if provider in ("kimi", "moonshot", "minimax"):
             return f"openai/{model_id}"
         if provider == "gemini":
             return f"gemini/{model_id}"
@@ -317,6 +331,16 @@ class LLMClient:
             return min(requested, 8192)
         return requested
 
+    @classmethod
+    def _maybe_get_minimax_fallback_base(cls, *, provider: str, api_base: str, error: Exception) -> str:
+        if provider != "minimax":
+            return ""
+        message = str(error or "")
+        if "invalid api key (2049)" not in message:
+            return ""
+        current = str(api_base or "").rstrip("/")
+        return cls.MINIMAX_ALT_BASE.get(current, "")
+
     def chat(
         self,
         messages: List[Dict[str, str]],
@@ -349,7 +373,23 @@ class LLMClient:
             if json_mode:
                 kwargs["response_format"] = {"type": "json_object"}
 
-            response = completion(**kwargs)
+            try:
+                response = completion(**kwargs)
+            except Exception as first_error:
+                fallback_base = self._maybe_get_minimax_fallback_base(
+                    provider=self._get_provider_from_model(),
+                    api_base=str(kwargs.get("api_base", "") or ""),
+                    error=first_error,
+                )
+                if not fallback_base:
+                    raise
+                retry_kwargs = dict(kwargs)
+                retry_kwargs["api_base"] = fallback_base
+                logger.warning(
+                    "MiniMax 鉴权失败，自动切换备用官方域名重试: "
+                    f"{kwargs.get('api_base')} -> {fallback_base}"
+                )
+                response = completion(**retry_kwargs)
 
             content = sanitize_text(response.choices[0].message.content or "")
             if not content:
@@ -410,7 +450,23 @@ class LLMClient:
             if json_mode:
                 kwargs["response_format"] = {"type": "json_object"}
 
-            response = await acompletion(**kwargs)
+            try:
+                response = await acompletion(**kwargs)
+            except Exception as first_error:
+                fallback_base = self._maybe_get_minimax_fallback_base(
+                    provider=self._get_provider_from_model(),
+                    api_base=str(kwargs.get("api_base", "") or ""),
+                    error=first_error,
+                )
+                if not fallback_base:
+                    raise
+                retry_kwargs = dict(kwargs)
+                retry_kwargs["api_base"] = fallback_base
+                logger.warning(
+                    "MiniMax 异步鉴权失败，自动切换备用官方域名重试: "
+                    f"{kwargs.get('api_base')} -> {fallback_base}"
+                )
+                response = await acompletion(**retry_kwargs)
 
             return LLMResponse(
                 content=sanitize_text(response.choices[0].message.content or ""),

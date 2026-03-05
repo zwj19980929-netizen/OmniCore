@@ -103,16 +103,47 @@ capability_overrides:
       max_tokens: 64000
       cost_tier: medium
 
+  minimax:
+    MiniMax-M2.5:
+      capabilities: [text_chat, text_long, code, reasoning]
+      max_tokens: 204800
+      cost_tier: high
+      description: "顶尖性能与极致性价比，轻松驾驭复杂任务"
+      output_tps: 60
+    MiniMax-M2.5-highspeed:
+      capabilities: [text_chat, text_long, code, reasoning]
+      max_tokens: 204800
+      cost_tier: high
+      description: "M2.5 极速版：效果不变，更快，更敏捷"
+      output_tps: 100
+    MiniMax-M2.1:
+      capabilities: [text_chat, text_long, code, reasoning]
+      max_tokens: 204800
+      cost_tier: medium
+      description: "强大多语言编程能力，全面升级编程体验"
+      output_tps: 60
+    MiniMax-M2.1-highspeed:
+      capabilities: [text_chat, text_long, code, reasoning]
+      max_tokens: 204800
+      cost_tier: medium
+      description: "M2.1 极速版：效果不变，更快，更敏捷"
+      output_tps: 100
+    MiniMax-M2:
+      capabilities: [text_chat, text_long]
+      max_tokens: 204800
+      cost_tier: medium
+      description: "专为高效编码与 Agent 工作流而生"
+
 # 能力到模型的全局优先级（用户未指定厂家时的默认选择）
 capability_defaults:
-  text_chat: ["deepseek/deepseek-chat", "kimi/moonshot-v1-32k", "gemini/gemini-2.0-flash"]
-  text_long: ["gemini/gemini-2.5-pro", "kimi/moonshot-v1-128k", "deepseek/deepseek-chat"]
+  text_chat: ["minimax/MiniMax-M2.5", "deepseek/deepseek-chat", "kimi/moonshot-v1-32k", "gemini/gemini-2.0-flash"]
+  text_long: ["minimax/MiniMax-M2.5", "gemini/gemini-2.5-pro", "kimi/moonshot-v1-128k", "deepseek/deepseek-chat"]
   vision: ["gemini/gemini-2.5-pro", "openai/gpt-4o", "kimi/kimi-latest"]
   image_gen: ["openai/dall-e-3", "gemini/imagen-3.0-generate"]
   stt: ["openai/whisper-1"]
   tts: ["openai/tts-1", "openai/tts-1-hd"]
-  code: ["deepseek/deepseek-coder", "openai/o1-mini", "gemini/gemini-2.5-pro"]
-  reasoning: ["openai/o1", "openai/o1-mini", "deepseek/deepseek-reasoner"]
+  code: ["minimax/MiniMax-M2.5", "deepseek/deepseek-coder", "openai/o1-mini", "gemini/gemini-2.5-pro"]
+  reasoning: ["minimax/MiniMax-M2.5", "openai/o1", "openai/o1-mini", "deepseek/deepseek-reasoner"]
 
 # 厂家 API 配置
 provider_config:
@@ -133,3 +164,15 @@ provider_config:
     api_key_env: "DEEPSEEK_API_KEY"
     auth_mode: "bearer"
     api_base: "https://api.deepseek.com"
+  minimax:
+    api_key_env: "MINIMAX_API_KEY"
+    auth_mode: "bearer"
+    api_base: "https://api.minimaxi.com/v1"
+    list_endpoint: "https://api.minimaxi.com/v1/models"
+    disable_model_discovery: true
+    static_models:
+      - MiniMax-M2.5
+      - MiniMax-M2.5-highspeed
+      - MiniMax-M2.1
+      - MiniMax-M2.1-highspeed
+      - MiniMax-M2

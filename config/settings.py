@@ -125,6 +125,7 @@ class Settings:
     GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
     DEEPSEEK_API_KEY = os.getenv("DEEPSEEK_API_KEY", "")
     KIMI_API_KEY = os.getenv("KIMI_API_KEY", "")
+    MINIMAX_API_KEY = os.getenv("MINIMAX_API_KEY", "")
     ALLOW_SYSTEM_PROXY = os.getenv("ALLOW_SYSTEM_PROXY", "false").lower() == "true"
     OMNICORE_HTTP_PROXY = os.getenv("OMNICORE_HTTP_PROXY", "").strip()
     OMNICORE_HTTPS_PROXY = os.getenv("OMNICORE_HTTPS_PROXY", "").strip()
@@ -132,7 +133,7 @@ class Settings:
     OMNICORE_NO_PROXY = os.getenv("OMNICORE_NO_PROXY", "").strip()
 
     # === 模型智能路由 ===
-    PREFERRED_PROVIDER = os.getenv("PREFERRED_PROVIDER", "")  # gemini/kimi/openai/deepseek
+    PREFERRED_PROVIDER = os.getenv("PREFERRED_PROVIDER", "")  # gemini/kimi/openai/deepseek/minimax
     COST_PREFERENCE = os.getenv("COST_PREFERENCE", "low")  # low/medium/high
     MODELS_CONFIG_PATH = os.getenv("MODELS_CONFIG_PATH", "config/models.yaml")
 

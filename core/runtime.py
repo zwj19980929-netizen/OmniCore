@@ -1,6 +1,6 @@
-﻿"""
-OmniCore 鍏变韩杩愯鏃跺叆鍙?
-缁熶竴 CLI / UI 鐨勪换鍔℃墽琛屻€佸唴缃懡浠ゅ拰璁板繂鎺ュ叆閫昏緫
+"""
+OmniCore shared runtime entrypoint.
+Unifies task execution, built-in commands, and memory integration for CLI/UI.
 """
 from datetime import datetime
 import os
@@ -402,7 +402,7 @@ def _finalize_runtime_result(result: Dict[str, Any], user_input: str) -> Dict[st
     except Exception as e:
         finalized.setdefault("runtime_delta", {})
         finalized["runtime_metrics_store_error"] = sanitize_text(str(e))
-        log_warning(f"娣囨繂鐡ㄦ潻鎰攽閹稿洦鐖ｆ径杈Е: {e}")
+        log_warning(f"Runtime metrics persistence failed: {e}")
 
     tasks = sanitize_value(finalized.get("tasks") or [])
     policy_decisions = sanitize_value(finalized.get("policy_decisions") or [])
@@ -550,20 +550,20 @@ def _handle_special_command(
         if not memory:
             return _build_special_result(
                 success=False,
-                error="璁板繂绯荤粺鏈垵濮嬪寲",
+                error="记忆系统未初始化",
                 status="error",
             )
         stats = memory.get_stats()
         return _build_special_result(
             success=True,
-            output=f"璁板繂缁熻: {stats}",
+            output=f"记忆统计: {stats}",
         )
 
     if command == "clear memory":
         if not memory:
             return _build_special_result(
                 success=False,
-                error="璁板繂绯荤粺鏈垵濮嬪寲",
+                error="记忆系统未初始化",
                 status="error",
             )
         cleared = memory.clear_all()

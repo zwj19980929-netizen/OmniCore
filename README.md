@@ -51,6 +51,7 @@ Copy-Item .env.example .env
 - `DEEPSEEK_API_KEY`
 - `ANTHROPIC_API_KEY`
 - `GEMINI_API_KEY`
+- `MINIMAX_API_KEY`
 
 如果你需要代理，建议只通过项目自己的代理环境变量配置，而不是依赖外部 shell 的全局代理：
 
@@ -172,6 +173,12 @@ OmniCore/
 
 ```bash
 pytest tests -q
+```
+
+提交前建议再跑一遍编码健康检查：
+
+```bash
+python -m utils.encoding_health
 ```
 
 当前仓库已收敛到统一测试缓存目录。若出现 `PytestCacheWarning`，通常只和缓存写权限有关，不影响功能判断。

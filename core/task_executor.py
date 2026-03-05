@@ -1,12 +1,14 @@
-﻿"""
-OmniCore 浠诲姟鎵规鎵ц鍣紙寮傛浼樺寲鐗堬級
-- 缁熶竴浣跨敤寮傛鎵ц妯″紡
-- Worker 瀹炰緥澶嶇敤
-- 浣跨敤 asyncio.gather 杩涜骞惰璋冨害
 """
+OmniCore task batch executor (async-optimized)
+- Unified async execution mode
+- Worker instance reuse
+- Parallel scheduling via asyncio.gather
+"""
+import atexit
 import asyncio
 import copy
-from typing import Dict, Any, List, Tuple
+import threading
+from typing import Dict, Any, List, Optional, Tuple
 
 from agents.paod import classify_failure
 from config.settings import settings
@@ -20,11 +22,97 @@ from core.tool_registry import get_builtin_tool_registry
 from utils.logger import log_agent_action
 
 
+_EXECUTOR_LOOP_LOCK = threading.Lock()
+_EXECUTOR_LOOP: Optional[asyncio.AbstractEventLoop] = None
+_EXECUTOR_THREAD: Optional[threading.Thread] = None
+
+
+def _executor_loop_main(loop: asyncio.AbstractEventLoop) -> None:
+    asyncio.set_event_loop(loop)
+    try:
+        loop.run_forever()
+    finally:
+        pending = [task for task in asyncio.all_tasks(loop) if not task.done()]
+        for task in pending:
+            task.cancel()
+        if pending:
+            try:
+                loop.run_until_complete(asyncio.gather(*pending, return_exceptions=True))
+            except Exception:
+                pass
+        try:
+            loop.run_until_complete(loop.shutdown_asyncgens())
+        except Exception:
+            pass
+        try:
+            loop.run_until_complete(loop.shutdown_default_executor())
+        except Exception:
+            pass
+        loop.close()
+
+
+def _ensure_executor_loop() -> asyncio.AbstractEventLoop:
+    global _EXECUTOR_LOOP, _EXECUTOR_THREAD
+    with _EXECUTOR_LOOP_LOCK:
+        if (
+            _EXECUTOR_LOOP is not None
+            and _EXECUTOR_THREAD is not None
+            and _EXECUTOR_THREAD.is_alive()
+            and not _EXECUTOR_LOOP.is_closed()
+        ):
+            return _EXECUTOR_LOOP
+
+        loop = asyncio.new_event_loop()
+        thread = threading.Thread(
+            target=_executor_loop_main,
+            args=(loop,),
+            name="omnicore-task-executor-loop",
+            daemon=True,
+        )
+        thread.start()
+        _EXECUTOR_LOOP = loop
+        _EXECUTOR_THREAD = thread
+        return loop
+
+
+def shutdown_executor_runtime(timeout_seconds: float = 8.0) -> None:
+    global _EXECUTOR_LOOP, _EXECUTOR_THREAD
+    with _EXECUTOR_LOOP_LOCK:
+        loop = _EXECUTOR_LOOP
+        thread = _EXECUTOR_THREAD
+        _EXECUTOR_LOOP = None
+        _EXECUTOR_THREAD = None
+
+    if loop is None or loop.is_closed():
+        return
+
+    timeout = max(float(timeout_seconds or 0), 1.0)
+
+    try:
+        from utils.browser_runtime_pool import close_all_browser_runtime_pools
+
+        future = asyncio.run_coroutine_threadsafe(close_all_browser_runtime_pools(), loop)
+        future.result(timeout=timeout)
+    except Exception:
+        pass
+
+    try:
+        loop.call_soon_threadsafe(loop.stop)
+    except Exception:
+        return
+
+    if thread is not None and thread.is_alive():
+        thread.join(timeout=timeout)
+
+
+atexit.register(shutdown_executor_runtime)
+
+
 def _infer_task_dependencies(task: Dict[str, Any], task_queue: List[Dict[str, Any]]) -> List[str]:
     """
-    浠庝换鍔″弬鏁颁腑鎺ㄦ柇闅愬紡渚濊禆銆?
-    閲嶇偣瑕嗙洊 file_worker 鐨?data_source/data_sources锛?
-    閬垮厤 Router 婕忓啓 depends_on 鏃惰骞惰璋冨害鎵撲贡銆?
+    Infer implicit dependencies from task parameters.
+    Prioritizes file_worker data_source/data_sources references.
+    Prevents dependency races when Router omits depends_on.
     """
     params = task.get("params", {})
     references: List[str] = []
@@ -221,8 +309,8 @@ def _apply_task_outcome(state: OmniCoreState, idx: int, outcome: Dict[str, Any])
 
 async def run_ready_batch_async(state: OmniCoreState) -> OmniCoreState:
     """
-    寮傛鎵ц褰撳墠鎵规 ready 浠诲姟銆?
-    浣跨敤 asyncio.gather 杩涜骞惰璋冨害銆?
+    Execute the current ready batch asynchronously.
+    Uses asyncio.gather for parallel dispatch.
     """
     ready_indexes = collect_ready_task_indexes(state)
     batch_indexes = _select_batch_indexes(state, ready_indexes)
@@ -236,12 +324,12 @@ async def run_ready_batch_async(state: OmniCoreState) -> OmniCoreState:
         f"{state['task_queue'][idx]['task_id']}:{state['task_queue'][idx].get('tool_name') or state['task_queue'][idx]['task_type']}"
         for idx in batch_indexes
     ]
-    log_agent_action("TaskExecutor", f"鎵ц鎵规浠诲姟 ({len(batch_indexes)})", ", ".join(task_labels))
+    log_agent_action("TaskExecutor", f"执行批次任务 ({len(batch_indexes)})", ", ".join(task_labels))
 
     shared_memory_snapshot = dict(state["shared_memory"])
 
     if len(batch_indexes) == 1:
-        # 涓茶鎵ц
+        # 串行执行
         outcomes: List[Tuple[int, Dict[str, Any]]] = []
         for idx in batch_indexes:
             outcome = await _execute_single_task_async(
@@ -249,7 +337,7 @@ async def run_ready_batch_async(state: OmniCoreState) -> OmniCoreState:
             )
             outcomes.append((idx, outcome))
     else:
-        # 骞惰鎵ц
+        # 并行执行
         tasks = [
             _execute_single_task_async(state["task_queue"][idx], shared_memory_snapshot)
             for idx in batch_indexes
@@ -283,17 +371,9 @@ async def run_ready_batch_async(state: OmniCoreState) -> OmniCoreState:
 
 def run_ready_batch(state: OmniCoreState) -> OmniCoreState:
     """
-    鎵ц褰撳墠鎵规 ready 浠诲姟锛堝悓姝ュ寘瑁呭櫒锛夈€?
-    妫€娴嬫槸鍚﹀凡鍦ㄤ簨浠跺惊鐜腑杩愯锛岄伩鍏嶅祵濂楄皟鐢ㄩ棶棰樸€?
+    Execute the current ready batch (sync wrapper).
+    Reuses a dedicated background event loop to avoid loop churn on Windows.
     """
-    try:
-        loop = asyncio.get_running_loop()
-        # 宸插湪浜嬩欢寰幆涓紝涓嶈兘鐢?asyncio.run
-        # 鍒涘缓涓€涓柊浠诲姟骞剁瓑寰呭畬鎴?
-        import concurrent.futures
-        with concurrent.futures.ThreadPoolExecutor() as executor:
-            future = executor.submit(asyncio.run, run_ready_batch_async(state))
-            return future.result()
-    except RuntimeError:
-        # 娌℃湁杩愯涓殑浜嬩欢寰幆锛屽彲浠ュ畨鍏ㄤ娇鐢?asyncio.run
-        return asyncio.run(run_ready_batch_async(state))
+    loop = _ensure_executor_loop()
+    future = asyncio.run_coroutine_threadsafe(run_ready_batch_async(state), loop)
+    return future.result()

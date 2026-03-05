@@ -34,6 +34,13 @@ class ModelDiscovery:
     """
 
     CACHE_TTL = timedelta(hours=1)
+    MINIMAX_FALLBACK_MODELS = (
+        "MiniMax-M2.5",
+        "MiniMax-M2.5-highspeed",
+        "MiniMax-M2.1",
+        "MiniMax-M2.1-highspeed",
+        "MiniMax-M2",
+    )
 
     def __init__(self, api_keys: Dict[str, str], provider_config: Optional[Dict[str, Any]] = None):
         self.api_keys = api_keys
@@ -53,6 +60,41 @@ class ModelDiscovery:
     def _get_provider_cfg(self, provider: str) -> Dict[str, Any]:
         cfg = self.provider_config.get(provider, {})
         return cfg if isinstance(cfg, dict) else {}
+
+    @staticmethod
+    def _to_bool(value: Any, default: bool = False) -> bool:
+        if isinstance(value, bool):
+            return value
+        if value is None:
+            return default
+        token = str(value).strip().lower()
+        if not token:
+            return default
+        return token in {"1", "true", "yes", "on"}
+
+    def _get_static_model_ids(self, provider: str, fallback: Tuple[str, ...]) -> List[str]:
+        cfg = self._get_provider_cfg(provider)
+        raw = cfg.get("static_models", [])
+        if not isinstance(raw, list):
+            raw = []
+
+        model_ids: List[str] = []
+        for item in raw:
+            model_id = str(item or "").strip()
+            if model_id:
+                model_ids.append(model_id)
+
+        if not model_ids:
+            model_ids = list(fallback)
+
+        deduped: List[str] = []
+        seen = set()
+        for model_id in model_ids:
+            if model_id in seen:
+                continue
+            deduped.append(model_id)
+            seen.add(model_id)
+        return deduped
 
     def _get_api_key(self, provider: str) -> str:
         key = self.api_keys.get(provider, "")
@@ -107,6 +149,13 @@ class ModelDiscovery:
             resp = requests.get(endpoint, headers=headers, params=params, timeout=15)
             resp.raise_for_status()
             return resp.json()
+        except requests.HTTPError as e:
+            status_code = getattr(getattr(e, "response", None), "status_code", None)
+            if status_code == 404:
+                logger.warning(f"{provider} 模型发现端点不可用(404): {endpoint}")
+            else:
+                logger.error(f"{provider} 模型发现失败: {e}")
+            return None
         except Exception as e:
             logger.error(f"{provider} 模型发现失败: {e}")
             return None
@@ -247,6 +296,60 @@ class ModelDiscovery:
         logger.info(f"DeepSeek 模型发现完成，共 {len(models)} 个模型")
         return models
 
+    def list_minimax_models(self) -> List[ModelInfo]:
+        """
+        MiniMax - OpenAI 兼容格式
+        """
+        if self._is_cache_valid("minimax"):
+            return self._cache["minimax"]
+
+        cfg = self._get_provider_cfg("minimax")
+        static_model_ids = self._get_static_model_ids("minimax", self.MINIMAX_FALLBACK_MODELS)
+        disable_discovery = self._to_bool(cfg.get("disable_model_discovery", True), default=True)
+        if disable_discovery:
+            static_models = [
+                ModelInfo(id=model_id, provider="minimax", display_name=model_id)
+                for model_id in static_model_ids
+            ]
+            self._set_cache("minimax", static_models)
+            logger.info("MiniMax 使用静态模型清单（已禁用 /models 动态发现）")
+            return static_models
+
+        data = self._request_models(
+            provider="minimax",
+            default_endpoint="https://api.minimaxi.com/v1/models",
+        )
+        if data is None:
+            fallback = [
+                ModelInfo(id=model_id, provider="minimax", display_name=model_id)
+                for model_id in static_model_ids
+            ]
+            self._set_cache("minimax", fallback)
+            logger.warning("MiniMax /models 不可用，回退到静态模型列表")
+            return fallback
+
+        models: List[ModelInfo] = []
+        for m in self._iter_model_records(data):
+            model_id = m.get("id") or m.get("name")
+            if not model_id:
+                continue
+            models.append(ModelInfo(
+                id=model_id,
+                provider="minimax",
+                display_name=model_id,
+            ))
+
+        if not models:
+            models = [
+                ModelInfo(id=model_id, provider="minimax", display_name=model_id)
+                for model_id in static_model_ids
+            ]
+            logger.warning("MiniMax 返回空模型列表，回退到静态模型列表")
+
+        self._set_cache("minimax", models)
+        logger.info(f"MiniMax 模型发现完成，共 {len(models)} 个模型")
+        return models
+
     def list_models(self, provider: str) -> List[ModelInfo]:
         """按厂家名获取模型列表"""
         method_map = {
@@ -254,6 +357,7 @@ class ModelDiscovery:
             "kimi": self.list_kimi_models,
             "openai": self.list_openai_models,
             "deepseek": self.list_deepseek_models,
+            "minimax": self.list_minimax_models,
         }
         fn = method_map.get(provider)
         if not fn:
@@ -264,7 +368,7 @@ class ModelDiscovery:
     def list_all(self) -> Dict[str, List[ModelInfo]]:
         """获取所有厂家的模型"""
         result = {}
-        for provider in ["gemini", "kimi", "openai", "deepseek"]:
+        for provider in ["gemini", "kimi", "openai", "deepseek", "minimax"]:
             result[provider] = self.list_models(provider)
         return result
 

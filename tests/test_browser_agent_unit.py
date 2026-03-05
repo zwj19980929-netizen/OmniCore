@@ -1,6 +1,6 @@
 import asyncio
 
-from agents.browser_agent import ActionType, BrowserAction, BrowserAgent, PageElement
+from agents.browser_agent import ActionType, BrowserAction, BrowserAgent, PageElement, TaskIntent
 
 
 class LLMGuard:
@@ -10,6 +10,14 @@ class LLMGuard:
     async def achat(self, *_args, **_kwargs):
         self.called = True
         raise AssertionError("LLM should not be called")
+
+    def parse_json_response(self, _response):
+        return {}
+
+
+class FailingIntentLLM:
+    async def achat(self, *_args, **_kwargs):
+        raise RuntimeError("intent llm unavailable")
 
     def parse_json_response(self, _response):
         return {}
@@ -70,7 +78,7 @@ def test_noise_filter_keeps_help_entry():
     assert agent._is_noise_element(element) is False
 
 
-def test_local_decision_supports_explicit_click_target():
+def test_local_decision_supports_explicit_click_target_from_quoted_text():
     agent = BrowserAgent(headless=True)
     elements = [
         PageElement(
@@ -95,11 +103,47 @@ def test_local_decision_supports_explicit_click_target():
         ),
     ]
 
-    action = agent._decide_action_locally("点击帮助中心", elements)
+    action = agent._decide_action_locally('请操作 "帮助中心"', elements)
 
     assert action is not None
     assert action.action_type == ActionType.CLICK
     assert action.target_selector == "a.help"
+
+
+def test_local_decision_uses_intent_target_text():
+    agent = BrowserAgent(headless=True)
+    elements = [
+        PageElement(
+            index=0,
+            tag="button",
+            text="登录",
+            element_type="button",
+            selector="#login",
+            attributes={"labelText": "登录"},
+            is_visible=True,
+            is_clickable=True,
+        ),
+        PageElement(
+            index=1,
+            tag="button",
+            text="帮助中心",
+            element_type="button",
+            selector="#help",
+            attributes={"labelText": "帮助中心"},
+            is_visible=True,
+            is_clickable=True,
+        ),
+    ]
+
+    action = agent._decide_action_locally(
+        "继续当前流程",
+        elements,
+        TaskIntent(intent_type="navigate", target_text="登录", confidence=0.8, requires_interaction=True),
+    )
+
+    assert action is not None
+    assert action.action_type == ActionType.CLICK
+    assert action.target_selector == "#login"
 
 
 def test_decide_action_with_llm_skips_llm_when_no_elements_for_extract_task():
@@ -177,3 +221,40 @@ def test_action_loop_detection_counts_repeated_signatures():
     agent._record_action(action)
 
     assert agent._is_action_looping(action) is True
+
+
+def test_infer_task_intent_fallback_uses_structured_pairs():
+    agent = BrowserAgent(llm_client=FailingIntentLLM(), headless=True)
+
+    intent = asyncio.run(agent._infer_task_intent("name: alice, email: alice@example.com"))
+
+    assert intent.intent_type == "form"
+    assert intent.requires_interaction is True
+    assert "name" in intent.fields
+    assert "email" in intent.fields
+
+
+def test_decide_action_locally_prefers_intent_driven_search_input():
+    agent = BrowserAgent(headless=True)
+    elements = [
+        PageElement(
+            index=0,
+            tag="input",
+            text="",
+            element_type="search",
+            selector="#search-box",
+            attributes={"placeholder": "Search"},
+            is_visible=True,
+            is_clickable=True,
+        )
+    ]
+
+    action = agent._decide_action_locally(
+        "今天美伊发生了什么",
+        elements,
+        TaskIntent(intent_type="search", query="今天 美伊 发生 了 什么", confidence=0.9),
+    )
+
+    assert action is not None
+    assert action.action_type == ActionType.INPUT
+    assert action.target_selector == "#search-box"

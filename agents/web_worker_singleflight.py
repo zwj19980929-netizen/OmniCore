@@ -31,14 +31,14 @@ async def determine_target_url_with_singleflight(self, task_description: str) ->
         return cached
 
     async def _compute_url_analysis() -> Dict[str, Any]:
-        response = await asyncio.to_thread(
-            self.llm.chat_with_system,
-            system_prompt=URL_ANALYSIS_PROMPT.format(task_description=task_description),
-            user_message="Please infer the best target URL for this task",
-            temperature=0.2,
-            json_mode=True,
-        )
         try:
+            response = await asyncio.to_thread(
+                self.llm.chat_with_system,
+                system_prompt=URL_ANALYSIS_PROMPT.format(task_description=task_description),
+                user_message="Please infer the best target URL for this task",
+                temperature=0.2,
+                json_mode=True,
+            )
             result = self.llm.parse_json_response(response)
             if result.get("url") or result.get("need_search"):
                 self.cache.set(
@@ -106,19 +106,19 @@ async def analyze_page_structure_with_singleflight(
         html = html[:15000] + "\n... (truncated)"
 
     async def _compute_page_analysis() -> Dict[str, Any]:
-        response = await asyncio.to_thread(
-            self.llm.chat_with_system,
-            system_prompt=PAGE_ANALYSIS_PROMPT.format(
-                task_description=task_description,
-                html_content=html,
-                current_url=url_result.data or "",
-            ),
-            user_message="Please analyze the page structure and return selectors",
-            temperature=0.2,
-            max_tokens=4096,
-            json_mode=True,
-        )
         try:
+            response = await asyncio.to_thread(
+                self.llm.chat_with_system,
+                system_prompt=PAGE_ANALYSIS_PROMPT.format(
+                    task_description=task_description,
+                    html_content=html,
+                    current_url=url_result.data or "",
+                ),
+                user_message="Please analyze the page structure and return selectors",
+                temperature=0.2,
+                max_tokens=4096,
+                json_mode=True,
+            )
             config = self.llm.parse_json_response(response)
             if config.get("item_selector"):
                 self.cache.set(
