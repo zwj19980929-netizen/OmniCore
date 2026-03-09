@@ -2,7 +2,10 @@ import shutil
 import uuid
 import asyncio
 from pathlib import Path
+from types import SimpleNamespace
 
+import core.tool_adapters as tool_adapters_module
+import utils.browser_toolkit as browser_toolkit_module
 from config.settings import settings
 from core.tool_adapters import (
     BaseToolAdapter,
@@ -172,3 +175,64 @@ def test_api_worker_adapter_waits_for_approval_before_mutating_calls():
 
     assert outcome["status"] == "waiting_for_approval"
     assert outcome["result"]["approval_required"] is True
+
+
+def test_browser_agent_adapter_closes_toolkit_it_created(monkeypatch):
+    created_toolkits = []
+
+    class FakeToolkit:
+        def __init__(self, **_kwargs):
+            self.closed = False
+            created_toolkits.append(self)
+
+        async def close(self):
+            self.closed = True
+            return SimpleNamespace(success=True, error=None)
+
+    class FakeAgent:
+        def __init__(self, toolkit):
+            self.toolkit = toolkit
+
+        async def run(self, _task_desc, _start_url, max_steps=8):
+            assert max_steps == 6
+            return {"success": True, "message": "ok", "steps": []}
+
+        async def close(self):
+            return None
+
+    class FakeWorkerPool:
+        def create_browser_agent(self, llm_client=None, headless=True, toolkit=None):
+            assert llm_client is None
+            assert headless is True
+            return FakeAgent(toolkit)
+
+    async def _fake_get_instance(_cls):
+        return FakeWorkerPool()
+
+    monkeypatch.setattr(browser_toolkit_module, "BrowserToolkit", FakeToolkit)
+    monkeypatch.setattr(tool_adapters_module, "resolve_model_for_task", lambda _task: None)
+    monkeypatch.setattr(tool_adapters_module.WorkerPool, "get_instance", classmethod(_fake_get_instance))
+
+    registry = build_tool_adapter_registry()
+    adapter = registry.get("browser_agent")
+    tool = get_builtin_tool_registry().get("browser.interact")
+
+    outcome = asyncio.run(
+        adapter.execute(
+            {
+                "task_id": "task_browser",
+                "task_type": "browser_agent",
+                "tool_name": "browser.interact",
+                "description": "search latest news",
+                "params": {"task": "search latest news", "headless": True, "max_steps": 6},
+                "execution_trace": [],
+            },
+            {},
+            tool,
+        )
+    )
+
+    assert outcome["status"] == "completed"
+    assert outcome["result"]["success"] is True
+    assert len(created_toolkits) == 1
+    assert created_toolkits[0].closed is True

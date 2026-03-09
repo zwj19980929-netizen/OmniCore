@@ -694,7 +694,19 @@ class BrowserAgentAdapter(BaseToolAdapter):
                 log_error(f"BrowserAgent execution failed: {exc}")
                 break
             finally:
-                await agent.close()
+                try:
+                    await agent.close()
+                except Exception as exc:
+                    log_warning(f"BrowserAgent cleanup failed after browser task: {exc}")
+                try:
+                    toolkit_close_result = await toolkit.close()
+                except Exception as exc:
+                    log_warning(f"BrowserToolkit cleanup raised after browser task: {exc}")
+                else:
+                    if not toolkit_close_result.success:
+                        log_warning(
+                            f"BrowserToolkit cleanup failed after browser task: {toolkit_close_result.error}"
+                        )
 
         if result is not None:
             trace = []

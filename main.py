@@ -7,6 +7,7 @@ import time
 import traceback
 from typing import List, Dict
 
+from core.statuses import WAITING_JOB_STATUSES
 from core.runtime import (
     get_background_worker_status,
     run_background_worker_forever,
@@ -15,6 +16,7 @@ from core.runtime import (
     stop_background_worker,
 )
 from memory.chroma_store import ChromaMemory
+from utils.cli_result_view import build_cli_result_view
 from utils.logger import console, log_error
 
 from rich.panel import Panel
@@ -87,18 +89,12 @@ def interactive_mode():
 
             # 显示结果
             console.print()
-            if result["success"]:
-                console.print(Panel(
-                    result.get("output", "任务完成"),
-                    title="✅ 执行结果",
-                    border_style="green",
-                ))
-            else:
-                console.print(Panel(
-                    result.get("error", result.get("output", "执行失败")),
-                    title="❌ 执行失败",
-                    border_style="red",
-                ))
+            view = build_cli_result_view(result)
+            console.print(Panel(
+                view["body"],
+                title=view["title"],
+                border_style=view["border_style"],
+            ))
 
         except KeyboardInterrupt:
             console.print("\n[yellow]操作已中断[/yellow]")
@@ -143,10 +139,12 @@ def main():
         # 命令行参数模式
         user_input = " ".join(sys.argv[1:])
         result = run_task(user_input)
-        if result["success"]:
-            print(result.get("output", "完成"))
+        status = str(result.get("status", "") or "")
+        view = build_cli_result_view(result)
+        if result["success"] or status in WAITING_JOB_STATUSES:
+            print(view["body"])
         else:
-            print(f"错误: {result.get('error', '未知错误')}")
+            print(f"Error: {view['body']}")
             sys.exit(1)
     else:
         # 交互式模式

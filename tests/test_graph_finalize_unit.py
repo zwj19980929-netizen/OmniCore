@@ -332,3 +332,71 @@ def test_finalize_node_prefers_router_direct_answer_without_llm(monkeypatch):
     assert result["execution_status"] == "completed"
     assert result["critic_approved"] is True
     assert result["final_output"] == "当前时间是 2026-03-05 星期四 10:17:54（CST）。"
+
+
+def test_finalize_node_passes_replan_answer_guidance_to_synthesizer(monkeypatch):
+    class _CapturingLLM:
+        last_user_message = ""
+
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def chat_with_system(self, *, user_message, **_kwargs):
+            type(self).last_user_message = user_message
+            return type("Resp", (), {"content": "Based on the verified timeline, it lasted 6 days."})()
+
+    monkeypatch.setattr(graph_module, "LLMClient", _CapturingLLM)
+
+    state = {
+        "messages": [],
+        "user_input": "最近美伊冲突持续了几天？",
+        "session_id": "session_guidance",
+        "job_id": "job_guidance",
+        "current_intent": "information_query",
+        "intent_confidence": 1.0,
+        "task_queue": [
+            {
+                "task_id": "task_1",
+                "task_type": "web_worker",
+                "tool_name": "web.fetch_and_extract",
+                "description": "Fetch authoritative conflict timeline",
+                "params": {"url": "https://example.com/report"},
+                "status": "completed",
+                "result": {
+                    "success": True,
+                    "data": [
+                        {
+                            "title": "Conflict timeline",
+                            "summary": "Started on 2026-03-01 and latest report is 2026-03-06.",
+                            "link": "https://example.com/report",
+                        }
+                    ],
+                },
+                "priority": 10,
+            }
+        ],
+        "current_task_index": 0,
+        "shared_memory": {
+            "_final_answer_instructions": [
+                "Based on the extracted dates, calculate duration and answer the user directly."
+            ]
+        },
+        "artifacts": [],
+        "critic_feedback": "",
+        "critic_approved": True,
+        "human_approved": True,
+        "needs_human_confirm": False,
+        "error_trace": "",
+        "final_output": "",
+        "delivery_package": {},
+        "execution_status": "reviewing",
+        "replan_count": 0,
+        "validator_passed": True,
+    }
+
+    result = finalize_node(state)
+
+    assert result["execution_status"] == "completed"
+    assert result["final_output"] == "Based on the verified timeline, it lasted 6 days."
+    assert "Answer guidance:" in _CapturingLLM.last_user_message
+    assert "calculate duration and answer the user directly" in _CapturingLLM.last_user_message

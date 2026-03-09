@@ -128,6 +128,11 @@ class BrowserToolkit:
             )
             return ToolkitResult(success=True)
         except Exception as e:
+            cleanup_result = await self.close()
+            if not cleanup_result.success:
+                log_warning(
+                    f"BrowserToolkit launch cleanup failed: {cleanup_result.error}"
+                )
             return ToolkitResult(success=False, error=str(e))
 
     async def create_page(self) -> ToolkitResult:
@@ -184,6 +189,11 @@ class BrowserToolkit:
             self._in_iframe = False
             return ToolkitResult(success=True, data=self._page)
         except Exception as e:
+            cleanup_result = await self.close()
+            if not cleanup_result.success:
+                log_warning(
+                    f"BrowserToolkit create_page cleanup failed: {cleanup_result.error}"
+                )
             return ToolkitResult(success=False, error=str(e))
 
     async def close(self) -> ToolkitResult:

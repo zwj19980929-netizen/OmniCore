@@ -18,6 +18,20 @@ def test_llm_detects_minimax_provider_from_abab_model_id():
     assert client._get_litellm_model() == "openai/abab6.5s-chat"
 
 
+def test_llm_keeps_openai_provider_prefix_for_openai_models():
+    client = LLMClient(model="openai/GPT-5.4")
+
+    assert client._get_provider_from_model() == "openai"
+    assert client._get_litellm_model() == "openai/GPT-5.4"
+
+
+def test_llm_adds_openai_provider_prefix_for_bare_openai_models():
+    client = LLMClient(model="gpt-4o")
+
+    assert client._get_provider_from_model() == "openai"
+    assert client._get_litellm_model() == "openai/gpt-4o"
+
+
 def test_llm_minimax_extra_kwargs_respect_provider_config(monkeypatch):
     monkeypatch.setattr(settings, "MINIMAX_API_KEY", "")
     monkeypatch.setenv("UNITTEST_MINIMAX_KEY", "minimax-test-key")

@@ -139,6 +139,17 @@ class _FailIfCalledLLM(_FakeLLM):
         raise AssertionError("LLM should not be called for deterministic weather routing")
 
 
+class _QueuedLLM(_FakeLLM):
+    def __init__(self, payloads):
+        super().__init__()
+        self.payloads = list(payloads)
+
+    def parse_json_response(self, _response):
+        if not self.payloads:
+            raise AssertionError("No queued payloads left")
+        return self.payloads.pop(0)
+
+
 def test_router_includes_recent_session_artifacts_in_context():
     fake_llm = _FakeLLM()
     router = RouterAgent(llm_client=fake_llm)
@@ -301,6 +312,64 @@ def test_router_persists_direct_answer_for_taskless_queries():
 
     assert state["task_queue"] == []
     assert state["shared_memory"]["router_direct_answer"] == "当前时间是 2026-03-05 10:17:54。"
+
+
+def test_router_fact_freshness_guard_replaces_direct_answer_with_verification_tasks():
+    fake_llm = _QueuedLLM(
+        [
+            {
+                "intent": "information_query",
+                "confidence": 0.98,
+                "reasoning": "direct answer candidate",
+                "direct_answer": "截至目前，伊朗最高领袖仍是阿里·哈梅内伊。",
+                "tasks": [],
+                "is_high_risk": False,
+            },
+            {
+                "requires_verification": True,
+                "confidence": 0.95,
+                "reason": "This asks about a current public office holder and should be verified online first.",
+                "queries": [
+                    "current Supreme Leader of Iran March 2026",
+                    "Ali Khamenei official update March 2026",
+                ],
+            },
+        ]
+    )
+    router = RouterAgent(llm_client=fake_llm)
+
+    result = router.analyze_intent(
+        "给我查询一下最近伊朗最新的最高领袖是谁？",
+        current_time_context={"local_date": "2026-03-09"},
+    )
+
+    assert result["direct_answer"] == ""
+    assert len(result["tasks"]) == 2
+    assert all(task["tool_name"] == "web.fetch_and_extract" for task in result["tasks"])
+    assert "Verification guard" in result["reasoning"]
+    assert result["tasks"][0]["params"]["query"] == "current Supreme Leader of Iran March 2026"
+
+
+def test_router_fact_freshness_guard_skips_local_time_question():
+    class _TimeAnswerLLM(_FakeLLM):
+        def parse_json_response(self, _response):
+            return {
+                "intent": "information_query",
+                "confidence": 1.0,
+                "reasoning": "无需任务",
+                "direct_answer": "当前时间是 2026-03-05 10:17:54。",
+                "tasks": [],
+                "is_high_risk": False,
+            }
+
+    fake_llm = _TimeAnswerLLM()
+    router = RouterAgent(llm_client=fake_llm)
+
+    result = router.analyze_intent("现在的时间是多少？")
+
+    assert result["direct_answer"] == "当前时间是 2026-03-05 10:17:54。"
+    assert result["tasks"] == []
+    assert fake_llm.call_count == 1
 
 
 def test_router_includes_work_context_and_success_patterns():

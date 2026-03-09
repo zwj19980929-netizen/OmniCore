@@ -24,6 +24,19 @@ class FailingIntentLLM:
         return {}
 
 
+class SemanticAssessmentLLM:
+    def __init__(self, payload):
+        self.payload = payload
+        self.calls = 0
+
+    async def achat(self, *_args, **_kwargs):
+        self.calls += 1
+        return {"ok": True}
+
+    def parse_json_response(self, _response):
+        return self.payload
+
+
 def test_find_best_element_skips_hidden_or_disabled_controls():
     agent = BrowserAgent(headless=True)
     elements = [
@@ -224,6 +237,236 @@ def test_action_loop_detection_counts_repeated_signatures():
     assert agent._is_action_looping(action) is True
 
 
+def test_data_relevance_rejects_single_generic_token_overlap():
+    agent = BrowserAgent(headless=True)
+
+    relevant = agent._is_data_relevant(
+        "Ali Khamenei death ayatollah killed iran us conflict",
+        [{"title": "AliExpress Summer Sale", "link": "https://www.aliexpress.com/"}],
+    )
+
+    assert relevant is False
+
+
+def test_observation_driven_action_uses_visible_answer_on_search_page():
+    agent = BrowserAgent(headless=True)
+    elements = [
+        PageElement(
+            index=0,
+            tag="input",
+            text="",
+            element_type="search",
+            selector="#sb_form_q",
+            attributes={"placeholder": "Search", "value": "ali khamenei death ayatollah killed iran us conflict"},
+            is_visible=True,
+            is_clickable=True,
+        )
+    ]
+    intent = TaskIntent(
+        intent_type="search",
+        query="ali khamenei death ayatollah killed iran us conflict",
+        confidence=0.9,
+    )
+    data = [
+        {
+            "title": "Ali Khamenei reportedly alive after rumors spread during Iran-US crisis",
+            "text": "Recent reports and public appearances indicate Ali Khamenei is alive.",
+            "link": "https://example.com/report",
+        }
+    ]
+
+    action = agent._choose_observation_driven_action(
+        "核实阿亚图拉·阿里·哈梅内伊是否在最近冲突中死亡",
+        "https://www.bing.com/search?q=ali+khamenei+death",
+        elements,
+        intent,
+        data,
+    )
+
+    assert action is not None
+    assert action.action_type == ActionType.EXTRACT
+
+
+def test_assess_page_with_llm_prefers_extract_and_caches_result():
+    llm = SemanticAssessmentLLM(
+        {
+            "page_relevant": True,
+            "goal_satisfied": True,
+            "confidence": 0.86,
+            "action": {
+                "type": "extract",
+                "description": "visible snippet already answers the question",
+            },
+        }
+    )
+    agent = BrowserAgent(llm_client=llm, headless=True)
+    elements = [
+        PageElement(
+            index=0,
+            tag="input",
+            text="",
+            element_type="search",
+            selector="#sb_form_q",
+            attributes={"placeholder": "Search", "value": "ali khamenei death ayatollah killed iran us conflict"},
+            is_visible=True,
+            is_clickable=True,
+        )
+    ]
+    intent = TaskIntent(
+        intent_type="search",
+        query="ali khamenei death ayatollah killed iran us conflict",
+        confidence=0.9,
+    )
+    data = [
+        {
+            "title": "Ali Khamenei reportedly alive after rumors spread during Iran-US crisis",
+            "text": "Recent reports and public appearances indicate Ali Khamenei is alive.",
+            "link": "https://example.com/report",
+        }
+    ]
+
+    action_1 = asyncio.run(
+        agent._assess_page_with_llm(
+            "核实阿亚图拉阿里哈梅内伊是否在最近冲突中死亡",
+            "https://www.bing.com/search?q=ali+khamenei+death",
+            "ali khamenei - Search",
+            elements,
+            intent,
+            data,
+        )
+    )
+    action_2 = asyncio.run(
+        agent._assess_page_with_llm(
+            "核实阿亚图拉阿里哈梅内伊是否在最近冲突中死亡",
+            "https://www.bing.com/search?q=ali+khamenei+death",
+            "ali khamenei - Search",
+            elements,
+            intent,
+            data,
+        )
+    )
+
+    assert action_1 is not None
+    assert action_1.action_type == ActionType.EXTRACT
+    assert action_2 is not None
+    assert action_2.action_type == ActionType.EXTRACT
+    assert llm.calls == 1
+
+
+def test_assess_page_with_llm_can_click_semantic_result_candidate():
+    llm = SemanticAssessmentLLM(
+        {
+            "page_relevant": True,
+            "goal_satisfied": False,
+            "confidence": 0.79,
+            "action": {
+                "type": "click",
+                "element_index": 1,
+                "description": "open the strongest source result",
+            },
+        }
+    )
+    agent = BrowserAgent(llm_client=llm, headless=True)
+    elements = [
+        PageElement(
+            index=0,
+            tag="input",
+            text="",
+            element_type="search",
+            selector="#sb_form_q",
+            attributes={"placeholder": "Search", "value": "ali khamenei death ayatollah killed iran us conflict"},
+            is_visible=True,
+            is_clickable=True,
+        ),
+        PageElement(
+            index=1,
+            tag="a",
+            text="Reuters: Public appearances indicate Khamenei is alive",
+            element_type="link",
+            selector="a.result",
+            attributes={"href": "https://www.reuters.com/world/middle-east/khamenei-update"},
+            is_visible=True,
+            is_clickable=True,
+        ),
+    ]
+    intent = TaskIntent(
+        intent_type="search",
+        query="ali khamenei death ayatollah killed iran us conflict",
+        confidence=0.9,
+    )
+    data = [
+        {
+            "title": "Rumors spread online after the crisis",
+            "text": "Search snippets mention public appearances but do not provide the full source context.",
+            "link": "https://example.com/summary",
+        }
+    ]
+
+    action = asyncio.run(
+        agent._assess_page_with_llm(
+            "核实阿亚图拉阿里哈梅内伊是否在最近冲突中死亡",
+            "https://www.bing.com/search?q=ali+khamenei+death",
+            "ali khamenei - Search",
+            elements,
+            intent,
+            data,
+        )
+    )
+
+    assert action is not None
+    assert action.action_type == ActionType.CLICK
+    assert action.target_selector == "a.result"
+
+
+def test_assess_page_with_llm_does_not_repeat_same_query_input():
+    llm = SemanticAssessmentLLM(
+        {
+            "page_relevant": True,
+            "goal_satisfied": False,
+            "confidence": 0.61,
+            "action": {
+                "type": "input",
+                "element_index": 0,
+                "value": "ali khamenei death ayatollah killed iran us conflict",
+                "description": "search again",
+            },
+        }
+    )
+    agent = BrowserAgent(llm_client=llm, headless=True)
+    elements = [
+        PageElement(
+            index=0,
+            tag="input",
+            text="",
+            element_type="search",
+            selector="#sb_form_q",
+            attributes={"placeholder": "Search", "value": "ali khamenei death ayatollah killed iran us conflict"},
+            is_visible=True,
+            is_clickable=True,
+        )
+    ]
+    intent = TaskIntent(
+        intent_type="search",
+        query="ali khamenei death ayatollah killed iran us conflict",
+        confidence=0.9,
+    )
+
+    action = asyncio.run(
+        agent._assess_page_with_llm(
+            "核实阿亚图拉阿里哈梅内伊是否在最近冲突中死亡",
+            "https://www.bing.com/search?q=ali+khamenei+death",
+            "ali khamenei - Search",
+            elements,
+            intent,
+            [],
+        )
+    )
+
+    assert action is not None
+    assert action.action_type == ActionType.PRESS_KEY
+    assert action.value == "Enter"
+
+
 def test_infer_task_intent_fallback_uses_structured_pairs():
     agent = BrowserAgent(llm_client=FailingIntentLLM(), headless=True)
 
@@ -294,6 +537,40 @@ class _ReadOnlyToolkit:
         return ToolkitResult(success=True, data=self._current_url)
 
 
+class _SearchResultsToolkit:
+    fast_mode = False
+    page = None
+
+    def __init__(self, url: str, data):
+        self._url = url
+        self._data = data
+
+    async def get_current_url(self):
+        return ToolkitResult(success=True, data=self._url)
+
+    async def evaluate_js(self, *_args, **_kwargs):
+        return ToolkitResult(success=True, data=self._data)
+
+
+class _SnapshotToolkit:
+    fast_mode = False
+    page = None
+
+    def __init__(self, url: str, title: str, html: str):
+        self._url = url
+        self._title = title
+        self.html = html
+
+    async def get_current_url(self):
+        return ToolkitResult(success=True, data=self._url)
+
+    async def get_title(self):
+        return ToolkitResult(success=True, data=self._title)
+
+    async def get_page_html(self):
+        return ToolkitResult(success=True, data=self.html)
+
+
 def test_infer_task_intent_treats_direct_url_as_read_only():
     agent = BrowserAgent(llm_client=FailingIntentLLM(), headless=True)
 
@@ -309,6 +586,63 @@ def test_derive_primary_query_compresses_weather_browser_demo_instruction():
     query = agent._derive_primary_query("查询合肥明天的天气，并完整展示浏览器操作过程。请先打开浏览器再访问页面。")
 
     assert query == "合肥 明天 天气"
+
+
+def test_refine_search_query_strips_instructional_sentence_into_short_query():
+    agent = BrowserAgent(headless=True)
+
+    query = agent._refine_search_query(
+        "browser task",
+        "has there been an official announcement about the death of Ali Khamenei in the last 14 days",
+    )
+
+    assert query == "death ali khamenei"
+
+
+def test_extract_data_for_intent_prefers_structured_search_results():
+    toolkit = _SearchResultsToolkit(
+        "https://www.bing.com/search?q=ali+khamenei+death",
+        [
+            {
+                "title": "Reuters: Ali Khamenei appears in public after online death rumors",
+                "text": "Recent public appearances indicate the reports of his death are false.",
+                "link": "https://www.reuters.com/world/middle-east/khamenei-update",
+                "source": "Reuters",
+                "date": "2026-03-08",
+            }
+        ],
+    )
+    agent = BrowserAgent(headless=True, toolkit=toolkit)
+
+    data = asyncio.run(
+        agent._extract_data_for_intent(
+            TaskIntent(intent_type="search", query="ali khamenei death", confidence=0.9)
+        )
+    )
+
+    assert len(data) == 1
+    assert data[0]["source"] == "Reuters"
+    assert "reports of his death" in data[0]["text"]
+
+
+def test_verify_action_effect_accepts_content_hash_change_without_url_change():
+    toolkit = _SnapshotToolkit(
+        "https://www.bing.com/search?q=ali+khamenei+death",
+        "ali khamenei - Search",
+        "<html><body>before</body></html>",
+    )
+    agent = BrowserAgent(headless=True, toolkit=toolkit)
+
+    before = asyncio.run(agent._snapshot_page_state())
+    toolkit.html = "<html><body>after search results updated</body></html>"
+    success = asyncio.run(
+        agent._verify_action_effect(
+            before,
+            BrowserAction(action_type=ActionType.CLICK, target_selector="a.result"),
+        )
+    )
+
+    assert success is True
 
 
 def test_task_looks_satisfied_requires_matching_target_url():

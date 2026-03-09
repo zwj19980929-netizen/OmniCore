@@ -47,6 +47,25 @@ ROUTER_OUTPUT_APPENDIX = """
 - If `tasks` is non-empty, set `direct_answer` to an empty string.
 """
 
+FACT_VERIFICATION_GUARD_PROMPT = """
+You decide whether a user question must be verified online before giving a direct final answer.
+Return JSON only with keys:
+- requires_verification: boolean
+- confidence: number
+- reason: string
+- queries: array of short search queries
+
+Require verification when the question depends on recent/current facts, leadership/office holder status,
+alive/dead status, recent events, recent appointments or removals, or other time-sensitive public facts.
+Do not require verification for timeless explanations, math, coding help, or asking the local time/date itself.
+
+If verification is needed, each query must be short, search-engine ready, and evidence-oriented.
+Do not output full task instructions as queries.
+
+Current local date: {current_date}
+User question: {user_input}
+"""
+
 _EXPLICIT_LOCATION_REQUEST_TOKENS = (
     "near me",
     "nearby",
@@ -197,6 +216,41 @@ _WEATHER_DEFAULT_SOURCE_URLS = (
     "https://www.moji.com/",
 )
 
+_FACT_FRESHNESS_CUE_TOKENS = (
+    "latest",
+    "recent",
+    "current",
+    "currently",
+    "today",
+    "now",
+    "as of",
+    "截至",
+    "目前",
+    "现在",
+    "最近",
+    "最新",
+    "当前",
+)
+
+_LOCAL_CLOCK_QUERY_TOKENS = (
+    "current time",
+    "time is it",
+    "what time",
+    "today's date",
+    "what date",
+    "time now",
+    "the time",
+    "现在几点",
+    "现在的时间",
+    "当前时间",
+    "几点了",
+    "时间是多少",
+    "今天几号",
+    "今天星期几",
+    "现在日期",
+    "日期是多少",
+)
+
 
 class RouterAgent:
     """
@@ -207,6 +261,145 @@ class RouterAgent:
     def __init__(self, llm_client: LLMClient = None):
         self.llm = llm_client or LLMClient()
         self.name = "Router"
+
+    @staticmethod
+    def _normalize_query_candidates(raw_queries: Any) -> List[str]:
+        if isinstance(raw_queries, str):
+            candidates = [raw_queries]
+        elif isinstance(raw_queries, list):
+            candidates = [str(item or "") for item in raw_queries]
+        else:
+            candidates = []
+
+        normalized: List[str] = []
+        seen = set()
+        for candidate in candidates:
+            query = re.sub(r"\s+", " ", str(candidate or "")).strip().strip("\"'")
+            if len(query) < 4 or len(query) > 120:
+                continue
+            key = query.lower()
+            if key in seen:
+                continue
+            seen.add(key)
+            normalized.append(query)
+        return normalized[:2]
+
+    @staticmethod
+    def _looks_like_local_clock_query(user_input: str) -> bool:
+        normalized = str(user_input or "").strip().lower()
+        if not normalized:
+            return False
+        return any(token in normalized for token in _LOCAL_CLOCK_QUERY_TOKENS)
+
+    @classmethod
+    def _should_consult_fact_verification_guard(
+        cls,
+        user_input: str,
+        result: Dict[str, Any],
+    ) -> bool:
+        tasks = result.get("tasks", []) or []
+        if tasks:
+            return False
+
+        direct_answer = str(result.get("direct_answer", "") or "").strip()
+        if not direct_answer:
+            return False
+
+        if cls._looks_like_local_clock_query(user_input):
+            return False
+
+        normalized = f"{user_input} {direct_answer}".lower()
+        return any(token in normalized for token in _FACT_FRESHNESS_CUE_TOKENS)
+
+    def _assess_fact_verification_need(
+        self,
+        user_input: str,
+        current_time_context: Dict[str, Any] | None = None,
+    ) -> Dict[str, Any]:
+        current_date = (
+            str((current_time_context or {}).get("local_date", "") or "").strip()
+            or date.today().isoformat()
+        )
+        response = self.llm.chat_with_system(
+            system_prompt=FACT_VERIFICATION_GUARD_PROMPT.format(
+                current_date=current_date,
+                user_input=user_input,
+            ),
+            user_message=user_input,
+            temperature=0.1,
+            max_tokens=800,
+            json_mode=True,
+        )
+        return self.llm.parse_json_response(response)
+
+    @classmethod
+    def _build_fact_verification_tasks(
+        cls,
+        user_input: str,
+        queries: List[str],
+    ) -> List[Dict[str, Any]]:
+        task_list: List[Dict[str, Any]] = []
+        effective_queries = queries or [str(user_input or "").strip()[:96]]
+
+        for index, query in enumerate(effective_queries[:2], 1):
+            description = (
+                f"Verify the current factual claim using recent authoritative sources: {query}"
+            )
+            task_list.append(
+                {
+                    "description": description,
+                    "tool_name": "web.fetch_and_extract",
+                    "tool_args": {
+                        "task": (
+                            "Verify the user's time-sensitive factual question with recent authoritative "
+                            f"sources. User question: {user_input}. Search query: {query}. Collect title, "
+                            "source, published date, snippet, and link. Prefer official statements and major "
+                            "news outlets. Avoid rumors, aggregators, shopping sites, and unrelated results."
+                        ),
+                        "query": query,
+                        "limit": 8,
+                    },
+                    "priority": 10 - index,
+                    "fallbacks": [
+                        {"type": "retry", "param_patch": {"limit": 12}},
+                    ],
+                    "success_criteria": [
+                        "result.success == True",
+                        "len(result.data) > 0",
+                    ],
+                }
+            )
+        return task_list
+
+    def _apply_fact_verification_guard(
+        self,
+        user_input: str,
+        result: Dict[str, Any],
+        current_time_context: Dict[str, Any] | None = None,
+    ) -> Dict[str, Any]:
+        if not self._should_consult_fact_verification_guard(user_input, result):
+            return result
+
+        try:
+            assessment = self._assess_fact_verification_need(user_input, current_time_context)
+        except Exception as exc:
+            logger.warning(f"Router fact verification guard fallback: {exc}")
+            return result
+
+        if not bool(assessment.get("requires_verification", False)):
+            return result
+
+        queries = self._normalize_query_candidates(assessment.get("queries"))
+        guarded_result = dict(result)
+        guarded_result["direct_answer"] = ""
+        guarded_result["tasks"] = self._build_fact_verification_tasks(user_input, queries)
+        guard_reason = str(assessment.get("reason", "") or "").strip()
+        if guard_reason:
+            existing_reason = str(guarded_result.get("reasoning", "") or "").strip()
+            guarded_result["reasoning"] = (
+                f"{existing_reason}\nVerification guard: {guard_reason}".strip()
+            )
+        return self._normalize_task_plan_shape(guarded_result)
 
     @staticmethod
     def _tokenize_text(text: str) -> set[str]:
@@ -1028,6 +1221,11 @@ class RouterAgent:
                 self.llm.parse_json_response(response)
             )
             result = self._repair_task_params_from_user_input(user_input, result)
+            result = self._apply_fact_verification_guard(
+                user_input,
+                result,
+                current_time_context,
+            )
             log_agent_action(
                 self.name,
                 f"意图识别完成: {result.get('intent')}",

@@ -33,6 +33,39 @@ class _FakeLLM:
         }
 
 
+class _SynthesisTaskLLM:
+    def chat_with_system(self, *, user_message, **_kwargs):
+        self.last_user_message = user_message
+        return _FakeResponse()
+
+    def parse_json_response(self, _response):
+        return {
+            "analysis": "need a concise conclusion after extraction",
+            "failed_approach": "previous answer lacked a final summary",
+            "new_strategy": "keep the fetch task and let finalize write the answer",
+            "should_give_up": False,
+            "direct_answer": "",
+            "tasks": [
+                {
+                    "task_id": "replan_task_fetch",
+                    "tool_name": "web.fetch_and_extract",
+                    "description": "Fetch authoritative reports about the timeline",
+                    "params": {"url": "https://example.com/report"},
+                    "priority": 10,
+                    "depends_on": [],
+                },
+                {
+                    "task_id": "replan_task_summary",
+                    "tool_name": "system.control",
+                    "description": "Based on the extracted dates, calculate duration and answer the user directly.",
+                    "params": {},
+                    "priority": 8,
+                    "depends_on": ["replan_task_fetch"],
+                },
+            ],
+        }
+
+
 def _make_state(user_input: str, failed_params: dict, failed_result: dict):
     return {
         "messages": [],
@@ -174,3 +207,24 @@ def test_replanner_does_not_treat_generic_weather_homepage_as_authoritative(monk
     replanner_node(state)
 
     assert "Authoritative target URL" not in fake_llm.last_user_message
+
+
+def test_replanner_strips_non_executable_system_summary_task(monkeypatch):
+    fake_llm = _SynthesisTaskLLM()
+    monkeypatch.setattr(graph_module, "LLMClient", lambda: fake_llm)
+
+    state = _make_state(
+        user_input="最近美伊冲突持续了几天？",
+        failed_params={"task": "fetch recent conflict timeline"},
+        failed_result={"success": False, "error": "sources were too broad"},
+    )
+
+    result = replanner_node(state)
+
+    task_ids = [task["task_id"] for task in result["task_queue"]]
+    assert task_ids == ["replan_task_fetch"]
+    assert result["needs_human_confirm"] is False
+    assert result["human_approved"] is True
+    assert result["shared_memory"]["_final_answer_instructions"] == [
+        "Based on the extracted dates, calculate duration and answer the user directly."
+    ]

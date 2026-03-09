@@ -3,6 +3,7 @@ OmniCore browser automation agent.
 Agent 决策层 — 通过 BrowserToolkit 执行所有浏览器操作。
 """
 import asyncio
+import hashlib
 import json
 import os
 import random
@@ -74,6 +75,45 @@ class TaskIntent:
     requires_interaction: bool = False
     target_text: str = ""
 
+
+_QUERY_STOP_TOKENS = frozenset(
+    {
+        "the", "and", "for", "with", "from", "that", "this", "into", "about",
+        "what", "when", "where", "which", "who", "whom", "whose", "how",
+        "is", "are", "was", "were", "be", "been", "being", "do", "does", "did",
+        "has", "have", "had", "there", "their", "them", "they", "then", "than",
+        "will", "would", "could", "should", "can", "may", "might", "must",
+        "if", "whether", "after", "before", "during", "within", "last", "past",
+        "days", "day", "weeks", "week", "months", "month", "official", "announcement",
+        "confirm", "confirmed", "confirmation", "public", "statement",
+        "latest", "recent", "today", "news", "article", "articles", "report", "reports",
+        "search", "query", "result", "results", "page", "site", "website", "source", "sources",
+        "open", "click", "input", "show", "extract", "read", "find", "look", "lookup", "retrieve",
+        "current", "recently", "recentest", "verify", "verification", "rumor", "rumors",
+        "最近", "最新", "当前", "今天", "新闻", "报道", "文章", "分析", "来源", "网页", "页面", "网站",
+        "搜索", "查询", "结果", "打开", "点击", "输入", "提取", "读取", "显示", "获取", "核实", "传闻",
+    }
+)
+
+_FACT_QUERY_HINTS = (
+    "who is",
+    "is dead",
+    "died",
+    "killed",
+    "death",
+    "alive",
+    "whether",
+    "是否",
+    "是谁",
+    "死了",
+    "死亡",
+    "被炸死",
+    "还活着",
+    "公开露面",
+    "讲话",
+    "声明",
+)
+
 ACTION_DECISION_PROMPT = """You are a browser control planner. Return JSON only.
 Task: {task}
 URL: {url}
@@ -91,6 +131,37 @@ Important decision rules:
 
 Return keys: thinking, action, confidence, requires_human_confirm. The action object must contain: type, element_index, value, description, fallback_selector, use_keyboard, keyboard_key."""
 
+PAGE_ASSESSMENT_PROMPT = """You are evaluating whether the current browser page already advances the task.
+Return JSON only with keys:
+- page_relevant: boolean
+- goal_satisfied: boolean
+- reason: string
+- evidence_indexes: array of integers
+- confidence: number
+- action: object with keys type, element_index, target_selector, value, description, fallback_selector, use_keyboard, keyboard_key
+
+Task: {task}
+Intent: {intent}
+Query: {query}
+Current URL: {url}
+Page title: {title}
+Last action: {last_action}
+Visible data:
+{data}
+
+Candidate elements:
+{elements}
+
+Rules:
+- Use only the visible data and candidate elements provided above.
+- If the visible data already likely answers the task, choose action.type="extract".
+- If the task is already complete without further extraction, choose action.type="done".
+- If the page is a search results page and the snippets are relevant enough to answer the task, prefer "extract" over clicking through.
+- If the current page is relevant but incomplete and a candidate likely leads to the best source or detail page, choose "click" and reference the element_index.
+- Choose "input" only if the current page is not already showing relevant results or the search box clearly needs a different query.
+- If you cannot justify a meaningful action from the evidence, choose "wait".
+"""
+
 
 class BrowserAgent:
     def __init__(
@@ -105,6 +176,7 @@ class BrowserAgent:
         self._element_cache: List[PageElement] = []
         self._action_history: List[str] = []
         self._intent_cache: Dict[str, TaskIntent] = {}
+        self._page_assessment_cache: Dict[str, Optional[BrowserAction]] = {}
 
         # 如果外部传入 toolkit 就用，否则自建
         if toolkit:
@@ -341,6 +413,82 @@ class BrowserAgent:
             if len(token) >= 2
         ]
 
+    def _extract_query_tokens(self, query: str) -> List[str]:
+        tokens: List[str] = []
+        for token in self._extract_task_tokens(query):
+            if token in _QUERY_STOP_TOKENS:
+                continue
+            if token.isdigit():
+                continue
+            if len(token) < 3 and not any("\u4e00" <= ch <= "\u9fff" for ch in token):
+                continue
+            if token not in tokens:
+                tokens.append(token)
+        return tokens[:8]
+
+    def _score_text_relevance(self, query: str, text: str) -> float:
+        haystack = self._normalize_text(text)
+        if not haystack:
+            return 0.0
+
+        score = 0.0
+        query_norm = self._normalize_text(query)
+        if query_norm and query_norm in haystack:
+            score += 8.0
+
+        token_hits = 0
+        strong_hits = 0
+        for token in self._extract_query_tokens(query):
+            if token not in haystack:
+                continue
+            token_hits += 1
+            weight = 2.0 if len(token) >= 5 or any("\u4e00" <= ch <= "\u9fff" for ch in token) else 1.0
+            score += weight
+            if weight >= 2.0:
+                strong_hits += 1
+
+        if token_hits >= 2:
+            score += 2.0
+        if strong_hits >= 2:
+            score += 2.0
+        return score
+
+    def _data_has_substantive_text(self, data: List[Dict[str, str]]) -> bool:
+        for item in data[:8]:
+            if not isinstance(item, dict):
+                continue
+            text = str(item.get("text", "") or "").strip()
+            if len(text) >= 40:
+                return True
+            extra_keys = {key for key in item.keys() if key not in {"title", "link", "url", "index"}}
+            if extra_keys:
+                return True
+        return False
+
+    def _search_results_have_answer_evidence(self, query: str, data: List[Dict[str, str]]) -> bool:
+        if not data:
+            return False
+        if not query:
+            return self._data_has_substantive_text(data)
+
+        relevant_hits = 0
+        for item in data[:8]:
+            if not isinstance(item, dict):
+                continue
+            title = str(item.get("title", "") or "").strip()
+            snippet = str(item.get("text", "") or "").strip()
+            source = str(item.get("source", "") or "").strip()
+            date_hint = str(item.get("date", "") or "").strip()
+            haystack = " ".join(part for part in [title, snippet, source, date_hint] if part)
+            score = self._score_text_relevance(query, haystack)
+            if score >= 6.0:
+                relevant_hits += 1
+            elif score >= 4.0 and (len(snippet) >= 40 or len(title) >= 24 or source):
+                relevant_hits += 1
+            if relevant_hits >= 1:
+                return True
+        return False
+
     def _refine_search_query(self, task: str, candidate: str = "") -> str:
         raw = str(candidate or task or "")
         raw = re.sub(r"https?://\S+", " ", raw)
@@ -386,6 +534,9 @@ class BrowserAgent:
 
         if not tokens:
             return ""
+        compact_tokens = self._extract_query_tokens(" ".join(tokens))
+        if len(compact_tokens) >= 2:
+            tokens = compact_tokens
         return " ".join(tokens[:8]).strip()
 
     def _format_elements_for_llm(self, task: str, elements: List[PageElement], max_items: Optional[int] = None) -> str:
@@ -403,6 +554,225 @@ class BrowserAgent:
             selector = element.selector[:72]
             lines.append(f"[{element.index}] type={element.element_type} selector={selector} info={descriptor}")
         return "\n".join(lines)
+
+    def _format_data_for_llm(self, data: List[Dict[str, str]], max_items: int = 8) -> str:
+        lines: List[str] = []
+        for index, item in enumerate(data[:max_items]):
+            if not isinstance(item, dict):
+                continue
+            title = str(item.get("title", "") or "")[:100]
+            text = str(item.get("text", "") or "")[:220]
+            link = str(item.get("link", item.get("url", "")) or "")[:140]
+            parts = [part for part in [title, text, link] if part]
+            if parts:
+                lines.append(f"[{index}] " + " | ".join(parts))
+        return "\n".join(lines) or "(no visible data)"
+
+    def _format_assessment_elements_for_llm(
+        self,
+        task: str,
+        current_url: str,
+        elements: List[PageElement],
+        max_items: int = 10,
+    ) -> str:
+        prioritized = self._prioritize_elements(task, elements, limit=max_items * 2)
+        ranked: List[Tuple[float, PageElement]] = []
+        for element in prioritized:
+            attrs = element.attributes or {}
+            score = self._score_element_for_context(task, element)
+            href = str(attrs.get("href", "") or "")
+            if href and not self._is_search_engine_url(href):
+                score += 1.2
+            if self._is_search_engine_url(current_url) and href and not self._is_search_engine_url(href):
+                score += 1.2
+            if attrs.get("value"):
+                score += 0.3
+            ranked.append((score, element))
+
+        lines: List[str] = []
+        seen_selectors = set()
+        for _, element in sorted(ranked, key=lambda item: item[0], reverse=True):
+            if element.selector in seen_selectors:
+                continue
+            seen_selectors.add(element.selector)
+            attrs = element.attributes or {}
+            details = " | ".join(
+                part for part in [
+                    element.text[:60],
+                    attrs.get("labelText", "")[:48],
+                    attrs.get("placeholder", "")[:48],
+                    attrs.get("value", "")[:48],
+                    attrs.get("href", "")[:100],
+                ] if part
+            )
+            lines.append(
+                f"[{element.index}] type={element.element_type} selector={element.selector[:72]} info={details}"
+            )
+            if len(lines) >= max_items:
+                break
+        return "\n".join(lines) or "(no actionable elements)"
+
+    def _clone_action(self, action: Optional[BrowserAction]) -> Optional[BrowserAction]:
+        if action is None:
+            return None
+        return BrowserAction(
+            action_type=action.action_type,
+            target_selector=action.target_selector,
+            value=action.value,
+            description=action.description,
+            confidence=action.confidence,
+            requires_confirmation=action.requires_confirmation,
+            fallback_selector=action.fallback_selector,
+            use_keyboard_fallback=action.use_keyboard_fallback,
+            keyboard_key=action.keyboard_key,
+        )
+
+    def _page_assessment_cache_key(
+        self,
+        task: str,
+        current_url: str,
+        title: str,
+        intent: Optional[TaskIntent],
+        data: List[Dict[str, str]],
+        elements: List[PageElement],
+        last_action: Optional[BrowserAction] = None,
+    ) -> str:
+        active_intent = intent or TaskIntent(intent_type="read", query="", confidence=0.0)
+        payload = {
+            "task": self._normalize_text(task)[:240],
+            "url": current_url[:220],
+            "title": title[:120],
+            "intent": active_intent.intent_type,
+            "query": active_intent.query[:160],
+            "last_action": self._action_signature(last_action) if last_action else "",
+            "data": [
+                {
+                    "title": str(item.get("title", "") or "")[:80],
+                    "text": str(item.get("text", "") or "")[:140],
+                    "link": str(item.get("link", item.get("url", "")) or "")[:120],
+                }
+                for item in (data or [])[:8]
+                if isinstance(item, dict)
+            ],
+            "elements": [
+                {
+                    "index": element.index,
+                    "type": element.element_type,
+                    "selector": element.selector[:80],
+                    "text": element.text[:80],
+                    "href": str((element.attributes or {}).get("href", "") or "")[:120],
+                    "value": str((element.attributes or {}).get("value", "") or "")[:80],
+                }
+                for element in (elements or [])[:10]
+            ],
+        }
+        return hashlib.sha1(
+            json.dumps(payload, ensure_ascii=False, sort_keys=True).encode("utf-8")
+        ).hexdigest()
+
+    def _should_assess_page_with_llm(
+        self,
+        task: str,
+        current_url: str,
+        intent: Optional[TaskIntent],
+        data: List[Dict[str, str]],
+        elements: List[PageElement],
+        last_action: Optional[BrowserAction] = None,
+    ) -> bool:
+        if not data and not elements:
+            return False
+        active_intent = intent or TaskIntent(intent_type="read", query="", confidence=0.0)
+        if data and self._is_read_only_task(task, active_intent):
+            return True
+        if self._is_search_engine_url(current_url):
+            query = active_intent.query or self._derive_primary_query(task)
+            return bool(data) or self._search_input_matches_query(elements, query)
+        if data and (self._data_has_substantive_text(data) or len(data) >= 2):
+            return True
+        if last_action and last_action.action_type in {ActionType.INPUT, ActionType.CLICK} and data:
+            return True
+        return False
+
+    async def _assess_page_with_llm(
+        self,
+        task: str,
+        current_url: str,
+        title: str,
+        elements: List[PageElement],
+        intent: Optional[TaskIntent],
+        data: List[Dict[str, str]],
+        last_action: Optional[BrowserAction] = None,
+    ) -> Optional[BrowserAction]:
+        if not self._should_assess_page_with_llm(task, current_url, intent, data, elements, last_action):
+            return None
+
+        cache_key = self._page_assessment_cache_key(
+            task,
+            current_url,
+            title,
+            intent,
+            data,
+            elements,
+            last_action,
+        )
+        if cache_key in self._page_assessment_cache:
+            return self._clone_action(self._page_assessment_cache[cache_key])
+
+        try:
+            active_intent = intent or TaskIntent(intent_type="read", query="", confidence=0.0)
+            llm = self._get_llm()
+            response = await llm.achat(
+                messages=[
+                    {"role": "system", "content": "Return JSON only."},
+                    {
+                        "role": "user",
+                        "content": PAGE_ASSESSMENT_PROMPT.format(
+                            task=task or "",
+                            intent=active_intent.intent_type,
+                            query=active_intent.query or self._derive_primary_query(task),
+                            url=current_url or "",
+                            title=title or "",
+                            last_action=(last_action.description or last_action.action_type.value) if last_action else "none",
+                            data=self._format_data_for_llm(data),
+                            elements=self._format_assessment_elements_for_llm(task, current_url, elements),
+                        ),
+                    },
+                ],
+                temperature=0.1,
+                max_tokens=1200,
+                json_mode=True,
+            )
+            payload = llm.parse_json_response(response)
+            action = self._action_from_llm(payload, elements)
+            if action.action_type == ActionType.FAILED:
+                self._page_assessment_cache[cache_key] = None
+                return None
+
+            query = active_intent.query or self._derive_primary_query(task)
+            if action.action_type == ActionType.INPUT and self._search_input_matches_query(elements, action.value or query):
+                submit_control = self._find_primary_submit_control(elements)
+                if submit_control is not None:
+                    action = BrowserAction(
+                        action_type=ActionType.CLICK,
+                        target_selector=submit_control.selector,
+                        description="submit assessed search query",
+                        confidence=max(action.confidence, 0.45),
+                        use_keyboard_fallback=True,
+                        keyboard_key="Enter",
+                    )
+                else:
+                    action = BrowserAction(
+                        action_type=ActionType.PRESS_KEY,
+                        value="Enter",
+                        description="submit assessed search query",
+                        confidence=max(action.confidence, 0.35),
+                    )
+
+            self._page_assessment_cache[cache_key] = self._clone_action(action)
+            return self._clone_action(action)
+        except Exception as exc:
+            log_warning(f"LLM page assessment failed: {exc}")
+            return None
 
     # ── element extraction (Agent's "eyes", uses toolkit.evaluate_js) ──
 
@@ -476,6 +846,7 @@ class BrowserAgent:
                   type: el.getAttribute('type') || '',
                   role: el.getAttribute('role') || '',
                   href: el.getAttribute('href') || '',
+                  value: (typeof el.value === 'string' ? el.value : '') || '',
                   placeholder: el.getAttribute('placeholder') || '',
                   ariaLabel: el.getAttribute('aria-label') || '',
                   title: el.getAttribute('title') || '',
@@ -655,7 +1026,9 @@ class BrowserAgent:
                             "Classify the browser task into exactly one intent: "
                             "search, read, form, auth, navigate, unknown. "
                             "Return JSON only with keys: intent, confidence, query, "
-                            "requires_interaction, fields, target_text."
+                            "requires_interaction, fields, target_text. "
+                            "If intent is search, query must be a short search-engine query, "
+                            "not a full sentence or task instructions."
                         ),
                     },
                     {"role": "user", "content": task or ""},
@@ -814,15 +1187,104 @@ class BrowserAgent:
         log_agent_action(self.name, "bootstrap_search", query[:120])
         return True
 
+    def _search_input_matches_query(self, elements: List[PageElement], query: str) -> bool:
+        if not query:
+            return False
+        input_element = self._find_primary_text_input(elements)
+        if input_element is None:
+            return False
+        current_value = str((input_element.attributes or {}).get("value", "") or "").strip()
+        if not current_value:
+            return False
+        return self._normalize_text(current_value) == self._normalize_text(query)
+
+    def _page_data_satisfies_goal(
+        self,
+        task: str,
+        current_url: str,
+        intent: Optional[TaskIntent],
+        data: List[Dict[str, str]],
+    ) -> bool:
+        active_intent = intent or TaskIntent(intent_type="read", query="", confidence=0.0)
+        query = active_intent.query or self._derive_primary_query(task)
+        if query and not self._is_data_relevant(query, data):
+            return False
+        if not self._is_search_engine_url(current_url):
+            return bool(data)
+        return self._search_results_have_answer_evidence(query, data)
+
+    def _choose_observation_driven_action(
+        self,
+        task: str,
+        current_url: str,
+        elements: List[PageElement],
+        intent: Optional[TaskIntent],
+        data: List[Dict[str, str]],
+    ) -> Optional[BrowserAction]:
+        active_intent = intent or TaskIntent(intent_type="read", query="", confidence=0.0)
+        query = active_intent.query or self._derive_primary_query(task)
+
+        if data and self._page_data_satisfies_goal(task, current_url, active_intent, data):
+            return BrowserAction(
+                action_type=ActionType.EXTRACT,
+                description="use current page results",
+                confidence=0.82,
+            )
+
+        if not self._is_search_engine_url(current_url):
+            return None
+
+        if self._search_input_matches_query(elements, query):
+            click_action = self._find_search_result_click_action(
+                task,
+                current_url,
+                elements,
+                active_intent,
+            )
+            if click_action is not None:
+                return click_action
+
+            if data and self._search_results_have_answer_evidence(query, data):
+                return BrowserAction(
+                    action_type=ActionType.EXTRACT,
+                    description="extract visible search results",
+                    confidence=0.68,
+                )
+
+            submit_control = self._find_primary_submit_control(elements)
+            if submit_control is not None:
+                return BrowserAction(
+                    action_type=ActionType.CLICK,
+                    target_selector=submit_control.selector,
+                    description="submit current search query",
+                    confidence=0.45,
+                    use_keyboard_fallback=True,
+                    keyboard_key="Enter",
+                )
+
+            return BrowserAction(
+                action_type=ActionType.PRESS_KEY,
+                value="Enter",
+                description="submit current search query",
+                confidence=0.35,
+            )
+
+        return None
+
     def _is_data_relevant(self, query: str, data: List[Dict[str, str]]) -> bool:
         if not data:
             return False
-        tokens = [token for token in self._extract_task_tokens(query) if len(token) >= 2][:8]
+        tokens = self._extract_query_tokens(query)
         if not tokens:
             return True
+
+        best_score = 0.0
         for item in data[:8]:
-            haystack = self._normalize_text(" ".join(str(v) for v in item.values() if v))
-            if any(token in haystack for token in tokens):
+            if not isinstance(item, dict):
+                continue
+            haystack = " ".join(str(v) for v in item.values() if v)
+            best_score = max(best_score, self._score_text_relevance(query, haystack))
+            if best_score >= 4.0:
                 return True
         return False
 
@@ -1188,10 +1650,12 @@ class BrowserAgent:
         url_r = await tk.get_current_url()
         title_r = await tk.get_title()
         html_r = await tk.get_page_html()
+        html = str(html_r.data or "")
         return {
             "url": url_r.data or "",
             "title": title_r.data or "",
-            "content_len": len(html_r.data or ""),
+            "content_len": len(html),
+            "content_hash": hashlib.sha1(html[:12000].encode("utf-8", errors="ignore")).hexdigest() if html else "",
         }
 
     def _action_must_change_state(self, action: BrowserAction) -> bool:
@@ -1209,6 +1673,8 @@ class BrowserAgent:
         if after["title"] != before["title"]:
             return True
         if abs(after["content_len"] - before["content_len"]) > 80:
+            return True
+        if after.get("content_hash") and after.get("content_hash") != before.get("content_hash"):
             return True
         if action.action_type == ActionType.INPUT:
             r = await self.toolkit.get_input_value(action.target_selector)
@@ -1231,6 +1697,112 @@ class BrowserAgent:
             if r.success and self._normalize_text(r.data) == self._normalize_text(str(expected)):
                 matched += 1
         return matched > 0
+
+    async def _extract_search_results_data(self) -> List[Dict[str, str]]:
+        current_url_r = await self.toolkit.get_current_url()
+        current_url = current_url_r.data or ""
+        if not self._is_search_engine_url(current_url):
+            return []
+
+        r = await self.toolkit.evaluate_js(
+            r"""
+            () => {
+              const normalize = (value) => (value || '').replace(/\s+/g, ' ').trim();
+              const isVisible = (element) => {
+                if (!element) return false;
+                const style = window.getComputedStyle(element);
+                if (!style || style.visibility === 'hidden' || style.display === 'none') return false;
+                const rect = element.getBoundingClientRect();
+                return rect.width > 0 && rect.height > 0;
+              };
+              const cleanHost = (value) => String(value || '').replace(/^www\./, '').toLowerCase();
+              const currentHost = cleanHost(location.hostname || '');
+              const selectorMap = {
+                'bing.com': ['li.b_algo', '.b_news li', '.b_ans'],
+                'google.com': ['div.g', '.tF2Cxc', '[data-sokoban-container]'],
+                'baidu.com': ['.result', '.c-container', '.result-op'],
+                'duckduckgo.com': ['[data-testid="result"]', '.result'],
+                'sogou.com': ['.vrwrap', '.rb', '.results .fb']
+              };
+              let selectors = ['main a[href]', 'article a[href]'];
+              for (const [host, values] of Object.entries(selectorMap)) {
+                if (currentHost === host || currentHost.endsWith(`.${host}`)) {
+                  selectors = values;
+                  break;
+                }
+              }
+
+              const seen = new Set();
+              const items = [];
+              for (const container of Array.from(document.querySelectorAll(selectors.join(', ')))) {
+                if (!isVisible(container)) continue;
+                const anchor = container.matches('a[href]')
+                  ? container
+                  : container.querySelector('h2 a, h3 a, a[href]');
+                if (!anchor || !isVisible(anchor)) continue;
+                const href = anchor.href || anchor.getAttribute('href') || '';
+                if (!href || /^javascript:/i.test(href)) continue;
+
+                let linkHost = '';
+                try {
+                  linkHost = cleanHost(new URL(href, location.href).hostname);
+                } catch (_error) {
+                  continue;
+                }
+                if (!linkHost || linkHost === currentHost) continue;
+
+                const titleNode = container.querySelector('h2, h3') || anchor;
+                const title = normalize(
+                  titleNode?.innerText ||
+                  titleNode?.textContent ||
+                  anchor.getAttribute('aria-label') ||
+                  anchor.getAttribute('title') ||
+                  ''
+                );
+                if (title.length < 4) continue;
+
+                const snippetNode = container.querySelector(
+                  '.b_caption p, .snippet, .st, .c-abstract, .compText, p, [data-testid="result-snippet"]'
+                );
+                let text = normalize(snippetNode?.innerText || snippetNode?.textContent || '');
+                if (!text) {
+                  const raw = normalize(container.innerText || container.textContent || '');
+                  text = normalize(raw.replace(title, ''));
+                }
+                if (text.length > 280) {
+                  text = text.slice(0, 280);
+                }
+
+                const sourceNode = container.querySelector(
+                  'cite, .cite, .b_attribution, .source, .news-source, [data-testid="result-source"]'
+                );
+                const dateNode = container.querySelector('time, .news-date, .timestamp, .date');
+                let dateHint = normalize(dateNode?.innerText || dateNode?.textContent || '');
+                if (!dateHint && text) {
+                  const match = text.match(
+                    /\\b(?:\\d{4}[-/]\\d{1,2}[-/]\\d{1,2}|\\d+\\s+(?:hours?|days?|weeks?|months?)\\s+ago)\\b/i
+                  );
+                  dateHint = match ? match[0] : '';
+                }
+
+                const item = {
+                  title,
+                  text,
+                  link: href,
+                  source: normalize(sourceNode?.innerText || sourceNode?.textContent || ''),
+                  date: dateHint,
+                };
+                const key = `${item.title}|${item.link}`;
+                if (seen.has(key)) continue;
+                seen.add(key);
+                items.push(item);
+                if (items.length >= 10) break;
+              }
+              return items;
+            }
+            """,
+        )
+        return r.data or [] if r.success else []
 
     # ── data extraction ────────────────────────────────────────
 
@@ -1342,20 +1914,40 @@ class BrowserAgent:
         active_intent = intent or TaskIntent(intent_type="read", query="", confidence=0.0)
         current_url_r = await self.toolkit.get_current_url()
         current_url = current_url_r.data or ""
+        if active_intent.intent_type == "search" or self._is_search_engine_url(current_url):
+            serp_data = await self._extract_search_results_data()
+            if serp_data:
+                return serp_data
         prefer_links = active_intent.intent_type == "search" or self._is_search_engine_url(current_url)
         return await self._maybe_extract_data(
             prefer_content=not prefer_links,
             prefer_links=prefer_links,
         )
 
-    def _task_requires_detail_page(self, task: str, intent: Optional[TaskIntent] = None) -> bool:
+    def _task_requires_detail_page_legacy(self, task: str, intent: Optional[TaskIntent] = None) -> bool:
         normalized = self._normalize_text(task)
         active_intent = intent or TaskIntent(intent_type="read", query="", confidence=0.0)
         detail_tokens = (
             "weather", "forecast", "temperature", "humidity", "wind", "aqi", "air quality",
-            "detail", "详情", "具体", "温度", "湿度", "风力", "空气质量", "天气", "天气预报",
+            "detail", "details", "news", "article", "articles", "report", "reports", "source", "sources",
+            "statement", "speech", "fact", "verify", "death", "died", "killed", "alive",
+            "详情", "具体", "温度", "湿度", "风力", "空气质量", "天气", "天气预报",
+            "新闻", "报道", "来源", "声明", "讲话", "死亡", "死了", "是否", "核实", "公开露面",
         )
         return active_intent.intent_type in {"search", "navigate"} and any(token in normalized for token in detail_tokens)
+
+    def _task_requires_detail_page(self, task: str, intent: Optional[TaskIntent] = None) -> bool:
+        active_intent = intent or TaskIntent(intent_type="read", query="", confidence=0.0)
+        if active_intent.intent_type not in {"search", "navigate"}:
+            return False
+        if self._extract_url_from_task(task):
+            return True
+        if active_intent.target_text or active_intent.requires_interaction:
+            return True
+        if self._task_mentions_interaction(task):
+            return True
+        query = active_intent.query or self._derive_primary_query(task)
+        return len(self._extract_query_tokens(query)) >= 2
 
     def _find_search_result_click_action(
         self,
@@ -1371,7 +1963,7 @@ class BrowserAgent:
         if not self._task_requires_detail_page(task, active_intent):
             return None
 
-        query_tokens = [token for token in self._extract_task_tokens(active_intent.query) if len(token) >= 2][:6]
+        query_tokens = self._extract_query_tokens(active_intent.query)
         best_match: Optional[tuple[float, PageElement]] = None
         for element in elements:
             if not element.is_visible or not element.is_clickable:
@@ -1392,15 +1984,12 @@ class BrowserAgent:
                 attrs.get("title", ""),
                 href,
             ]))
-            score = 0.0
-            for token in query_tokens:
-                if token in haystack:
-                    score += 2.0
+            score = self._score_text_relevance(active_intent.query, haystack)
             if "weather.com.cn" in haystack or "moji.com" in haystack or "tianqi.com" in haystack:
                 score += 3.0
             if "天气" in haystack or "weather" in haystack:
                 score += 2.0
-            if score <= 0:
+            if query_tokens and score < 4.0:
                 continue
             if best_match is None or score > best_match[0]:
                 best_match = (score, element)
@@ -1491,6 +2080,7 @@ class BrowserAgent:
         url = expected_url or "about:blank"
         steps: List[Dict[str, Any]] = []
         self._action_history = []
+        self._page_assessment_cache.clear()
 
         try:
             # 初始导航
@@ -1538,12 +2128,16 @@ class BrowserAgent:
                 and not self._extract_url_from_task(task)
             ):
                 await self._bootstrap_search_results(task_intent.query or self._derive_primary_query(task))
+                current_url_r = await tk.get_current_url()
+                current_url = current_url_r.data or ""
 
+            initial_data = await self._extract_data_for_intent(task_intent)
             if self._is_read_only_task(task, task_intent):
-                initial_data = await self._extract_data_for_intent(task_intent)
-                if initial_data and (
-                    task_intent.intent_type != "search"
-                    or self._is_data_relevant(task_intent.query, initial_data)
+                if initial_data and self._page_data_satisfies_goal(
+                    task,
+                    current_url or "",
+                    task_intent,
+                    initial_data,
                 ):
                     title_r = await tk.get_title()
                     url_r = await tk.get_current_url()
@@ -1554,6 +2148,7 @@ class BrowserAgent:
             # 累积数据容器
             _accumulated_data: List[Dict[str, str]] = []
             _seen_keys: set = set()
+            last_action: Optional[BrowserAction] = None
 
             def _merge_new_data(new_items: List[Dict[str, str]]):
                 for item in (new_items or []):
@@ -1577,12 +2172,32 @@ class BrowserAgent:
                         "data": _accumulated_data,
                     }
                 elements = await self._extract_interactive_elements()
-                action = self._find_search_result_click_action(
+                observed_data = await self._extract_data_for_intent(task_intent)
+                _merge_new_data(observed_data)
+                action = await self._assess_page_with_llm(
                     task,
                     current_url_r.data or "",
+                    title_r.data or "",
                     elements,
                     task_intent,
+                    _accumulated_data or observed_data,
+                    last_action=last_action,
                 )
+                if action is None:
+                    action = self._choose_observation_driven_action(
+                        task,
+                        current_url_r.data or "",
+                        elements,
+                        task_intent,
+                        _accumulated_data or observed_data,
+                    )
+                if action is None:
+                    action = self._find_search_result_click_action(
+                        task,
+                        current_url_r.data or "",
+                        elements,
+                        task_intent,
+                    )
                 if action is None:
                     action = self._decide_action_locally(task, elements, task_intent)
                 if action is None:
@@ -1627,6 +2242,7 @@ class BrowserAgent:
                             "url": url_r.data or "", "title": title_r.data or "",
                             "expected_url": expected_url, "steps": steps, "data": _accumulated_data}
                 self._record_action(action)
+                last_action = action
 
                 before = await self._snapshot_page_state()
                 success = await self._execute_action(action)
@@ -1644,6 +2260,7 @@ class BrowserAgent:
                         if success:
                             action = recovery
                             self._record_action(action)
+                            last_action = action
 
                 url_r = await tk.get_current_url()
                 steps.append({

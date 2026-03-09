@@ -6,6 +6,7 @@ OmniCore LiteLLM 统一接口封装
 import json
 import base64
 import asyncio
+import re
 from typing import Optional, List, Dict, Any, Union
 from pathlib import Path
 import os
@@ -175,7 +176,7 @@ class LLMClient:
         provider = self._get_provider_from_model()
         model_id = self.model.split("/")[-1] if "/" in self.model else self.model
 
-        if provider in ("kimi", "moonshot", "minimax"):
+        if provider in ("openai", "kimi", "moonshot", "minimax"):
             return f"openai/{model_id}"
         if provider == "gemini":
             return f"gemini/{model_id}"
@@ -322,6 +323,10 @@ class LLMClient:
 
     def _safe_max_tokens(self, requested: int) -> int:
         """根据模型限制返回安全的 max_tokens 值"""
+        known_limit = self._get_known_max_output_tokens()
+        if known_limit:
+            return min(requested, known_limit)
+
         model_lower = self.model.lower()
         if "deepseek" in model_lower:
             return min(requested, 8192)
@@ -330,6 +335,82 @@ class LLMClient:
         if "moonshot" in model_lower or "kimi" in model_lower:
             return min(requested, 8192)
         return requested
+
+    def _get_known_max_output_tokens(self) -> Optional[int]:
+        """尝试从 LiteLLM 元数据或本地经验规则推断输出 token 上限。"""
+        provider = self._get_provider_from_model()
+        model_id = self.model.split("/")[-1] if "/" in self.model else self.model
+        model_id_lower = model_id.lower()
+
+        if provider == "openai" and model_id_lower.startswith("gpt-5"):
+            return 4096
+
+        lookup_keys = [
+            self._get_litellm_model(),
+            self.model,
+            model_id,
+            model_id_lower,
+            f"{provider}/{model_id}",
+            f"{provider}/{model_id_lower}",
+        ]
+
+        seen = set()
+        for key in lookup_keys:
+            if not key or key in seen:
+                continue
+            seen.add(key)
+
+            model_info = litellm.model_cost.get(key)
+            if not isinstance(model_info, dict):
+                continue
+
+            for field in ("max_output_tokens", "max_completion_tokens", "max_tokens"):
+                value = model_info.get(field)
+                if isinstance(value, int) and value > 0:
+                    return value
+
+        return None
+
+    @staticmethod
+    def _extract_completion_token_limit(error: Exception) -> Optional[int]:
+        """从上游报错中提取允许的 completion token 上限。"""
+        message = str(error or "")
+        patterns = (
+            r"supports at most (\d+) completion tokens",
+            r"supports at most (\d+) output tokens",
+            r"max[_ ]tokens .*?supports at most (\d+)",
+        )
+
+        for pattern in patterns:
+            match = re.search(pattern, message, re.IGNORECASE)
+            if not match:
+                continue
+            try:
+                limit = int(match.group(1))
+            except (TypeError, ValueError):
+                continue
+            if limit > 0:
+                return limit
+
+        return None
+
+    def _maybe_get_reduced_max_tokens_kwargs(
+        self,
+        kwargs: Dict[str, Any],
+        error: Exception,
+    ) -> Optional[Dict[str, Any]]:
+        """当上游明确返回 max_tokens 上限时，构造一次降级重试参数。"""
+        current_limit = kwargs.get("max_tokens")
+        if not isinstance(current_limit, int) or current_limit <= 0:
+            return None
+
+        supported_limit = self._extract_completion_token_limit(error)
+        if supported_limit is None or supported_limit >= current_limit:
+            return None
+
+        retry_kwargs = dict(kwargs)
+        retry_kwargs["max_tokens"] = supported_limit
+        return retry_kwargs
 
     @classmethod
     def _maybe_get_minimax_fallback_base(cls, *, provider: str, api_base: str, error: Exception) -> str:
@@ -376,20 +457,28 @@ class LLMClient:
             try:
                 response = completion(**kwargs)
             except Exception as first_error:
-                fallback_base = self._maybe_get_minimax_fallback_base(
-                    provider=self._get_provider_from_model(),
-                    api_base=str(kwargs.get("api_base", "") or ""),
-                    error=first_error,
-                )
-                if not fallback_base:
-                    raise
-                retry_kwargs = dict(kwargs)
-                retry_kwargs["api_base"] = fallback_base
-                logger.warning(
-                    "MiniMax 鉴权失败，自动切换备用官方域名重试: "
-                    f"{kwargs.get('api_base')} -> {fallback_base}"
-                )
-                response = completion(**retry_kwargs)
+                retry_kwargs = self._maybe_get_reduced_max_tokens_kwargs(kwargs, first_error)
+                if retry_kwargs is not None:
+                    logger.warning(
+                        "LLM max_tokens 超出模型限制，自动降级重试: "
+                        f"{kwargs.get('max_tokens')} -> {retry_kwargs['max_tokens']}"
+                    )
+                    response = completion(**retry_kwargs)
+                else:
+                    fallback_base = self._maybe_get_minimax_fallback_base(
+                        provider=self._get_provider_from_model(),
+                        api_base=str(kwargs.get("api_base", "") or ""),
+                        error=first_error,
+                    )
+                    if not fallback_base:
+                        raise
+                    retry_kwargs = dict(kwargs)
+                    retry_kwargs["api_base"] = fallback_base
+                    logger.warning(
+                        "MiniMax 鉴权失败，自动切换备用官方域名重试: "
+                        f"{kwargs.get('api_base')} -> {fallback_base}"
+                    )
+                    response = completion(**retry_kwargs)
 
             content = sanitize_text(response.choices[0].message.content or "")
             if not content:
@@ -453,20 +542,28 @@ class LLMClient:
             try:
                 response = await acompletion(**kwargs)
             except Exception as first_error:
-                fallback_base = self._maybe_get_minimax_fallback_base(
-                    provider=self._get_provider_from_model(),
-                    api_base=str(kwargs.get("api_base", "") or ""),
-                    error=first_error,
-                )
-                if not fallback_base:
-                    raise
-                retry_kwargs = dict(kwargs)
-                retry_kwargs["api_base"] = fallback_base
-                logger.warning(
-                    "MiniMax 异步鉴权失败，自动切换备用官方域名重试: "
-                    f"{kwargs.get('api_base')} -> {fallback_base}"
-                )
-                response = await acompletion(**retry_kwargs)
+                retry_kwargs = self._maybe_get_reduced_max_tokens_kwargs(kwargs, first_error)
+                if retry_kwargs is not None:
+                    logger.warning(
+                        "LLM max_tokens 超出模型限制，自动降级重试: "
+                        f"{kwargs.get('max_tokens')} -> {retry_kwargs['max_tokens']}"
+                    )
+                    response = await acompletion(**retry_kwargs)
+                else:
+                    fallback_base = self._maybe_get_minimax_fallback_base(
+                        provider=self._get_provider_from_model(),
+                        api_base=str(kwargs.get("api_base", "") or ""),
+                        error=first_error,
+                    )
+                    if not fallback_base:
+                        raise
+                    retry_kwargs = dict(kwargs)
+                    retry_kwargs["api_base"] = fallback_base
+                    logger.warning(
+                        "MiniMax 异步鉴权失败，自动切换备用官方域名重试: "
+                        f"{kwargs.get('api_base')} -> {fallback_base}"
+                    )
+                    response = await acompletion(**retry_kwargs)
 
             return LLMResponse(
                 content=sanitize_text(response.choices[0].message.content or ""),

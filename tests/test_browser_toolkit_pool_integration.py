@@ -56,7 +56,8 @@ class FakeBrowser:
 
 
 class FakePool:
-    def __init__(self):
+    def __init__(self, browser_factory=FakeBrowser):
+        self.browser_factory = browser_factory
         self.browser = None
         self.acquires = 0
         self.reuse_hits = 0
@@ -67,7 +68,7 @@ class FakePool:
     async def acquire_browser(self, headless=True):
         self.acquires += 1
         if self.browser is None or not self.browser.is_connected():
-            self.browser = FakeBrowser()
+            self.browser = self.browser_factory()
             self.launches += 1
         else:
             self.reuse_hits += 1
@@ -128,6 +129,11 @@ class FakeCircuitOpenPool:
 
     def snapshot_stats(self):
         return {"circuit_open": True}
+
+
+class FailingContextBrowser(FakeBrowser):
+    async def new_context(self, **_kwargs):
+        raise RuntimeError("context creation boom")
 
 
 def test_browser_toolkit_uses_pool_and_releases_leases(monkeypatch):
@@ -198,5 +204,27 @@ def test_browser_toolkit_falls_back_to_direct_launch_when_pool_is_open(monkeypat
 
         await toolkit.close()
         assert fake_browser.closed is True
+
+    asyncio.run(_run())
+
+
+def test_browser_toolkit_releases_lease_when_create_page_fails(monkeypatch):
+    async def _run():
+        fake_pool = FakePool(browser_factory=FailingContextBrowser)
+        monkeypatch.setattr(settings, "BROWSER_POOL_ENABLED", True)
+        monkeypatch.setattr("utils.browser_toolkit.get_browser_runtime_pool", lambda: fake_pool)
+
+        toolkit = BrowserToolkit(headless=True, block_heavy_resources=False)
+        result = await toolkit.create_page()
+
+        assert result.success is False
+        assert "context creation boom" in (result.error or "")
+        assert fake_pool.acquires == 1
+        assert fake_pool.releases == 1
+        assert fake_pool.active_leases == 0
+        assert toolkit._browser_lease is None
+        assert toolkit._browser is None
+        assert toolkit.context is None
+        assert toolkit.page is None
 
     asyncio.run(_run())

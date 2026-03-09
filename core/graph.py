@@ -325,6 +325,56 @@ def _repair_replan_task_params(
     return repaired
 
 
+_SYSTEM_EXECUTION_PARAM_KEYS = (
+    "command",
+    "application",
+    "args",
+    "working_directory",
+)
+
+
+def _has_actionable_system_params(params: Any) -> bool:
+    if not isinstance(params, dict):
+        return False
+
+    for key in _SYSTEM_EXECUTION_PARAM_KEYS:
+        value = params.get(key)
+        if isinstance(value, str) and value.strip():
+            return True
+        if isinstance(value, (list, tuple)) and any(str(item).strip() for item in value):
+            return True
+    return False
+
+
+def _extract_finalize_instructions_from_replan_tasks(
+    tasks: List[Dict[str, Any]],
+) -> tuple[List[Dict[str, Any]], List[str]]:
+    executable_tasks: List[Dict[str, Any]] = []
+    finalize_instructions: List[str] = []
+
+    for raw_task in tasks or []:
+        if not isinstance(raw_task, dict):
+            continue
+
+        task_data = dict(raw_task)
+        tool_name = str(task_data.get("tool_name", "") or "").strip()
+        task_type = str(task_data.get("task_type", "") or "").strip()
+        params = task_data.get("params")
+        if params is None:
+            params = task_data.get("tool_args", {})
+
+        is_system_task = tool_name == "system.control" or task_type == "system_worker"
+        if is_system_task and not _has_actionable_system_params(params):
+            instruction = _normalize_text_value(task_data.get("description", ""))
+            if instruction:
+                finalize_instructions.append(instruction)
+            continue
+
+        executable_tasks.append(task_data)
+
+    return executable_tasks, finalize_instructions
+
+
 def _is_task_preservable_for_replan(task: Dict[str, Any]) -> bool:
     if not isinstance(task, dict):
         return False
@@ -390,6 +440,53 @@ def _should_skip_for_resume(state: OmniCoreState, stage: str) -> bool:
 
     shared_memory.pop("_resume_after_stage", None)
     return False
+
+
+def _task_statuses(state: OmniCoreState) -> set[str]:
+    return {
+        str(task.get("status", "") or "")
+        for task in state.get("task_queue", []) or []
+        if isinstance(task, dict)
+    }
+
+
+def _has_waiting_tasks(state: OmniCoreState) -> bool:
+    statuses = _task_statuses(state)
+    return any(status in statuses for status in (WAITING_FOR_APPROVAL, WAITING_FOR_EVENT, BLOCKED))
+
+
+def _mark_confirmation_required_tasks_waiting(state: OmniCoreState) -> None:
+    shared_memory = state.get("shared_memory", {})
+    if not isinstance(shared_memory, dict):
+        shared_memory = {}
+        state["shared_memory"] = shared_memory
+
+    approved_actions = {
+        str(item).strip()
+        for item in (shared_memory.get("_approved_actions", []) or [])
+        if str(item).strip()
+    }
+
+    has_waiting = False
+    for task in state.get("task_queue", []) or []:
+        if not isinstance(task, dict):
+            continue
+
+        task_id = str(task.get("task_id", "") or "")
+        status = str(task.get("status", "") or "")
+        requires_confirmation = bool(task.get("requires_confirmation", False))
+        already_approved = task_id in approved_actions or bool(state.get("human_approved", False))
+
+        if requires_confirmation and not already_approved:
+            if status in {"", "pending", "running"}:
+                task["status"] = WAITING_FOR_APPROVAL
+                status = WAITING_FOR_APPROVAL
+            if status == WAITING_FOR_APPROVAL:
+                has_waiting = True
+
+    state["needs_human_confirm"] = has_waiting
+    if has_waiting and not collect_ready_task_indexes(state):
+        state["execution_status"] = WAITING_FOR_APPROVAL
 
 
 def route_node(state: OmniCoreState) -> OmniCoreState:
@@ -540,10 +637,17 @@ def _legacy_replanner_node(state: OmniCoreState) -> OmniCoreState:
 
     try:
         result = llm.parse_json_response(response)
-        result["tasks"] = _repair_replan_task_params(
+        repaired_tasks = _repair_replan_task_params(
             result.get("tasks", []),
             authoritative_target_url,
         )
+        result["tasks"], finalize_instructions = _extract_finalize_instructions_from_replan_tasks(
+            repaired_tasks
+        )
+        if finalize_instructions:
+            shared_memory["_final_answer_instructions"] = finalize_instructions
+        else:
+            shared_memory.pop("_final_answer_instructions", None)
         log_agent_action("Replanner", f"分析: {result.get('analysis', '')[:80]}")
 
         # 检查是否应该放弃并直接回答用户
@@ -580,6 +684,7 @@ def _legacy_replanner_node(state: OmniCoreState) -> OmniCoreState:
                 task.get("requires_confirmation", False) for task in new_tasks
             )
             state["human_approved"] = not state["needs_human_confirm"]
+            _mark_confirmation_required_tasks_waiting(state)
             state["error_trace"] = ""
             log_success(f"重规划完成，新增 {len(new_tasks)} 个任务（已清空旧任务）")
         else:
@@ -695,6 +800,8 @@ Requirements:
 - If there is an authoritative target URL, prefer keeping that URL and changing extraction/waiting strategy before switching sites.
 - If some tasks already succeeded and were critic-approved, do not recreate them.
 - If the task should be abandoned, set should_give_up=true and provide a direct_answer.
+- Do not create system_worker tasks for summarization, calculation, or final answer writing.
+- Use system_worker only for real executable system actions with explicit command/application/args.
 
 Return:
 ```json
@@ -769,6 +876,7 @@ Return:
                 for task in state["task_queue"]
             )
             state["human_approved"] = not state["needs_human_confirm"]
+            _mark_confirmation_required_tasks_waiting(state)
             state["error_trace"] = ""
             log_success(
                 f"閲嶈鍒掑畬鎴愶紝淇濈暀 {len(preserved_tasks)} 涓粨鏋滐紝鏂板 {len(new_tasks)} 涓换鍔?"
@@ -1235,8 +1343,20 @@ def _synthesize_user_facing_answer(
     if not evidence:
         return delivery_summary
 
-    current_time_context = state.get("shared_memory", {}).get("current_time_context")
-    current_location_context = state.get("shared_memory", {}).get("current_location_context")
+    shared_memory = state.get("shared_memory", {})
+    if not isinstance(shared_memory, dict):
+        shared_memory = {}
+
+    current_time_context = shared_memory.get("current_time_context")
+    current_location_context = shared_memory.get("current_location_context")
+    final_answer_instructions = shared_memory.get("_final_answer_instructions", [])
+    if not isinstance(final_answer_instructions, list):
+        final_answer_instructions = [final_answer_instructions]
+    instruction_lines = [
+        f"- {str(item).strip()}"
+        for item in final_answer_instructions
+        if str(item).strip()
+    ]
     deliverables = package.get("deliverables", []) or []
     issues = package.get("issues", []) or []
     completed_tasks = package.get("completed_tasks", []) or []
@@ -1501,15 +1621,19 @@ def should_continue_after_route(state: OmniCoreState) -> Literal["human_confirm"
 
 
 def get_first_executor(state: OmniCoreState) -> Literal["parallel_executor", "validator", "end"]:
-    if not state["human_approved"]:
-        return "end"
     if collect_ready_task_indexes(state):
         return "parallel_executor"
+    if _has_waiting_tasks(state):
+        return "validator"
+    if not state["human_approved"]:
+        return "end"
     return "validator"
 
 
 def after_validator(state: OmniCoreState) -> Literal["critic", "replanner", "finalize"]:
     """Validator 之后：passed → critic，failed + replan_count < MAX → replanner，否则 finalize"""
+    if _has_waiting_tasks(state):
+        return "finalize"
     if state.get("validator_passed", True):
         return "critic"
     if any(str(task.get("status", "") or "") == "completed" for task in state.get("task_queue", [])):
@@ -1521,6 +1645,8 @@ def after_validator(state: OmniCoreState) -> Literal["critic", "replanner", "fin
 
 def should_retry_or_finish(state: OmniCoreState) -> Literal["finalize", "replanner"]:
     """Critic 审查后决定是否重试"""
+    if _has_waiting_tasks(state):
+        return "finalize"
     if state["critic_approved"]:
         return "finalize"
     if state.get("replan_count", 0) < MAX_REPLAN:
@@ -1548,8 +1674,20 @@ def _synthesize_user_facing_answer(
     if not evidence:
         return delivery_summary
 
-    current_time_context = state.get("shared_memory", {}).get("current_time_context")
-    current_location_context = state.get("shared_memory", {}).get("current_location_context")
+    shared_memory = state.get("shared_memory", {})
+    if not isinstance(shared_memory, dict):
+        shared_memory = {}
+
+    current_time_context = shared_memory.get("current_time_context")
+    current_location_context = shared_memory.get("current_location_context")
+    final_answer_instructions = shared_memory.get("_final_answer_instructions", [])
+    if not isinstance(final_answer_instructions, list):
+        final_answer_instructions = [final_answer_instructions]
+    instruction_lines = [
+        f"- {str(item).strip()}"
+        for item in final_answer_instructions
+        if str(item).strip()
+    ]
     deliverables = package.get("deliverables", []) or []
     issues = package.get("issues", []) or []
     completed_tasks = package.get("completed_tasks", []) or []
@@ -1589,12 +1727,14 @@ def _synthesize_user_facing_answer(
                 "Do not mention internal runtime components such as Router, Worker, Critic, "
                 "Validator, task queue, or delivery package.\n"
                 "If the evidence is partial, say so explicitly.\n"
-                "If files or artifacts were produced, briefly mention where they are."
+                "If files or artifacts were produced, briefly mention where they are.\n"
+                "If answer guidance is provided, follow it only when the executed evidence supports it."
             ),
             user_message=(
                 f"Original user request:\n{state.get('user_input', '')}\n\n"
                 f"Execution headline:\n{package.get('headline', '')}\n\n"
                 f"Evidence:\n{evidence}\n\n"
+                f"Answer guidance:\n{chr(10).join(instruction_lines) if instruction_lines else '- None'}\n\n"
                 f"Completed work:\n{chr(10).join(completed_lines) if completed_lines else '- None'}\n\n"
                 f"Deliverables:\n{chr(10).join(deliverable_lines) if deliverable_lines else '- None'}\n\n"
                 f"Open issues:\n{chr(10).join(issue_lines) if issue_lines else '- None'}"
@@ -1716,6 +1856,8 @@ Requirements:
 - If there is an authoritative target URL, prefer keeping that URL and changing extraction/waiting strategy before switching sites.
 - If some tasks already succeeded and were critic-approved, do not recreate them.
 - If the task should be abandoned, set should_give_up=true and provide a direct_answer.
+- Do not create system_worker tasks for summarization, calculation, or final answer writing.
+- Use system_worker only for real executable system actions with explicit command/application/args.
 
 Return:
 ```json
@@ -1750,10 +1892,17 @@ Return:
 
     try:
         result = _normalize_payload(llm.parse_json_response(response))
-        result["tasks"] = _repair_replan_task_params(
+        repaired_tasks = _repair_replan_task_params(
             result.get("tasks", []),
             authoritative_target_url,
         )
+        result["tasks"], finalize_instructions = _extract_finalize_instructions_from_replan_tasks(
+            repaired_tasks
+        )
+        if finalize_instructions:
+            shared_memory["_final_answer_instructions"] = finalize_instructions
+        else:
+            shared_memory.pop("_final_answer_instructions", None)
         log_agent_action("Replanner", f"分析: {str(result.get('analysis', '') or '')[:80]}")
 
         if result.get("should_give_up", False):
@@ -1793,6 +1942,7 @@ Return:
                 for task in state["task_queue"]
             )
             state["human_approved"] = not state["needs_human_confirm"]
+            _mark_confirmation_required_tasks_waiting(state)
             state["error_trace"] = ""
             log_success(
                 f"重规划完成，保留 {len(preserved_tasks)} 个结果，新增 {len(new_tasks)} 个任务"
