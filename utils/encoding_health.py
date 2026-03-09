@@ -8,6 +8,7 @@ should not appear in source files.
 from __future__ import annotations
 
 import argparse
+import sys
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterable, List, Sequence
@@ -37,6 +38,10 @@ DEFAULT_EXCLUDE_DIRS = {
 DEFAULT_EXCLUDE_FILES = {
     "utils/encoding_health.py",
 }
+
+IGNORE_LINE_MARKER = "encoding-health: ignore-line"
+IGNORE_START_MARKER = "encoding-health: ignore-start"
+IGNORE_END_MARKER = "encoding-health: ignore-end"
 
 # Common mojibake fragments observed in UTF-8/GBK mis-decoding cases.
 MOJIBAKE_TOKENS = (
@@ -125,7 +130,17 @@ def scan_file(file_path: Path) -> List[EncodingIssue]:
         )
         return issues
 
+    ignore_block = False
     for line_no, line in enumerate(content.splitlines(), 1):
+        if IGNORE_START_MARKER in line:
+            ignore_block = True
+            continue
+        if IGNORE_END_MARKER in line:
+            ignore_block = False
+            continue
+        if ignore_block or IGNORE_LINE_MARKER in line:
+            continue
+
         for col_no, ch in enumerate(line, 1):
             code = ord(ch)
             if 0xE000 <= code <= 0xF8FF:
@@ -187,6 +202,11 @@ def scan_project(
 
 
 def main(argv: Sequence[str] | None = None) -> int:
+    for stream in (sys.stdout, sys.stderr):
+        reconfigure = getattr(stream, "reconfigure", None)
+        if callable(reconfigure):
+            reconfigure(encoding="utf-8", errors="replace")
+
     parser = argparse.ArgumentParser(description="Check repository encoding health.")
     parser.add_argument(
         "--root",

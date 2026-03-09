@@ -174,6 +174,7 @@ def test_runtime_state_store_releases_due_schedules_and_persists_preferences():
             session_id=session["session_id"],
             preferences={
                 "default_output_directory": "D:/tmp/exports",
+                "user_location": "Shanghai, China",
                 "preferred_tools": ["file.read_write", "web.fetch_and_extract"],
                 "auto_queue_confirmations": True,
             },
@@ -190,6 +191,7 @@ def test_runtime_state_store_releases_due_schedules_and_persists_preferences():
         queue_summary = store.get_queue_summary()
 
         assert updated_preferences["default_output_directory"] == "D:/tmp/exports"
+        assert updated_preferences["user_location"] == "Shanghai, China"
         assert updated_preferences["auto_queue_confirmations"] is True
         assert released
         assert released[0]["schedule_id"] == schedule["schedule_id"]

@@ -163,6 +163,14 @@ class CriticAgent:
             if status in {WAITING_FOR_APPROVAL, WAITING_FOR_EVENT, BLOCKED}:
                 continue
             if status == "failed":
+                task["critic_approved"] = False
+                task["critic_review"] = {
+                    "approved": False,
+                    "score": 0.0,
+                    "issues": [f"任务失败: {task.get('description', task.get('task_id', 'unknown'))}"],
+                    "suggestions": [],
+                    "summary": "task failed before critic review",
+                }
                 failed_count += 1
                 all_approved = False
                 all_issues.append(
@@ -170,6 +178,7 @@ class CriticAgent:
                 )
                 continue
             if status != "completed":
+                task["critic_approved"] = False
                 unfinished_count += 1
                 all_approved = False
                 continue
@@ -180,6 +189,9 @@ class CriticAgent:
                     task_description=task["description"],
                     task_result=task["result"],
                 )
+                task["critic_review"] = review_result
+                task["critic_approved"] = bool(review_result.get("approved"))
+                task["critic_score"] = float(review_result.get("score", 0.0) or 0.0)
 
                 if not review_result.get("approved"):
                     all_approved = False

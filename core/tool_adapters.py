@@ -653,6 +653,9 @@ class BrowserAgentAdapter(BaseToolAdapter):
         task_desc = params.get("task", task.get("description", ""))
         start_url = params.get("start_url", "")
         headless = params.get("headless", settings.BROWSER_FAST_MODE)
+        max_steps = params.get("max_steps", 8)
+        if not isinstance(max_steps, int) or max_steps <= 0:
+            max_steps = 8
         resolved_model = resolve_model_for_task(task)
 
         result = None
@@ -679,7 +682,7 @@ class BrowserAgentAdapter(BaseToolAdapter):
             )
 
             try:
-                result = await agent.run(task_desc, start_url)
+                result = await agent.run(task_desc, start_url, max_steps=max_steps)
                 break
             except Exception as exc:
                 last_error = exc

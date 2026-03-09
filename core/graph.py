@@ -6,6 +6,7 @@ OmniCore LangGraph DAG 编排
 import json
 from pathlib import Path
 from datetime import datetime
+from urllib.parse import urlparse
 from typing import Any, Dict, List, Literal
 from langgraph.graph import StateGraph, END
 
@@ -77,6 +78,27 @@ def _build_finalize_time_hint(current_time_context) -> str:
     if not lines:
         return ""
     return "\n\nCurrent local time (authoritative):\n" + "\n".join(lines)
+
+
+def _build_finalize_location_hint(current_location_context) -> str:
+    if not isinstance(current_location_context, dict):
+        return ""
+
+    lines = []
+    location_name = str(current_location_context.get("location", "") or "").strip()
+    timezone_name = str(current_location_context.get("timezone", "") or "").strip()
+    source_name = str(current_location_context.get("source", "") or "").strip()
+
+    if location_name:
+        lines.append(f"- User location: {location_name}")
+    if timezone_name:
+        lines.append(f"- Location timezone: {timezone_name}")
+    if source_name:
+        lines.append(f"- Source: {source_name}")
+
+    if not lines:
+        return ""
+    return "\n\nCurrent user location (authoritative):\n" + "\n".join(lines)
 
 
 def _looks_like_mojibake(text: str) -> bool:
@@ -234,6 +256,120 @@ def _save_runtime_checkpoint(state: OmniCoreState, stage: str, note: str = "") -
         log_warning(f"Runtime checkpoint persistence failed: {exc}")
 
 
+def _derive_authoritative_target_url(state: OmniCoreState) -> str:
+    def _is_generic_entry_url(value: str) -> bool:
+        candidate = str(value or "").strip()
+        if not candidate:
+            return False
+        parsed = urlparse(candidate)
+        host = parsed.netloc.lower()
+        path = (parsed.path or "").rstrip("/")
+        normalized = candidate.lower()
+        if host.startswith("www."):
+            host = host[4:]
+        if any(token in normalized for token in ("/ok.html", "/captcha", "/verify", "/challenge", "/forbidden", "/blocked")):
+            return True
+        if host in {"google.com", "bing.com", "baidu.com", "duckduckgo.com", "sogou.com"}:
+            return True
+        if host in {"weather.com.cn", "moji.com", "tianqi.com"} and path in {"", "/index", "/index.html"}:
+            return True
+        return not path
+
+    direct_url = RouterAgent._extract_first_url(str(state.get("user_input", "") or ""))
+    if direct_url:
+        return direct_url
+
+    for task in state.get("task_queue", []) or []:
+        if not isinstance(task, dict):
+            continue
+        params = task.get("params", {}) if isinstance(task.get("params"), dict) else {}
+        result = task.get("result", {}) if isinstance(task.get("result"), dict) else {}
+        for candidate in (
+            result.get("expected_url"),
+            params.get("start_url"),
+            params.get("url"),
+            result.get("url"),
+        ):
+            value = str(candidate or "").strip()
+            if value and not _is_generic_entry_url(value):
+                return value
+    return ""
+
+
+def _repair_replan_task_params(
+    tasks: List[Dict[str, Any]],
+    target_url: str,
+) -> List[Dict[str, Any]]:
+    if not target_url:
+        return tasks
+
+    repaired = []
+    for raw_task in tasks or []:
+        task_data = dict(raw_task)
+        params = task_data.get("params")
+        if not isinstance(params, dict):
+            params = {}
+
+        tool_name = str(task_data.get("tool_name", "") or "").strip()
+        task_type = str(task_data.get("task_type", "") or "").strip()
+        if (
+            (tool_name == "browser.interact" or task_type == "browser_agent")
+            and not str(params.get("start_url", "") or "").strip()
+        ):
+            params = dict(params)
+            params["start_url"] = target_url
+            task_data["params"] = params
+
+        repaired.append(task_data)
+
+    return repaired
+
+
+def _is_task_preservable_for_replan(task: Dict[str, Any]) -> bool:
+    if not isinstance(task, dict):
+        return False
+    if str(task.get("status", "") or "") != "completed":
+        return False
+    return bool(task.get("critic_approved", False))
+
+
+def _build_replan_failure_record(task: Dict[str, Any]) -> Dict[str, Any]:
+    result = task.get("result", {}) if isinstance(task.get("result"), dict) else {}
+    review = task.get("critic_review", {}) if isinstance(task.get("critic_review"), dict) else {}
+    params = task.get("params", {}) if isinstance(task.get("params"), dict) else {}
+
+    expected_url = (
+        result.get("expected_url")
+        or params.get("start_url")
+        or params.get("url")
+        or ""
+    )
+    visited_url = result.get("url") or ""
+    error = result.get("error") or result.get("message") or ""
+    failure_type = str(task.get("failure_type", "") or "unknown")
+
+    if str(task.get("status", "") or "") == "completed" and not bool(task.get("critic_approved", False)):
+        failure_type = "critic_rejected"
+        review_issues = review.get("issues", []) if isinstance(review.get("issues"), list) else []
+        error = error or "; ".join(str(item) for item in review_issues if str(item).strip())
+        error = error or str(review.get("summary", "") or "critic rejected the task result")
+
+    if not error:
+        error = "unknown error"
+
+    url = expected_url or visited_url or ""
+    if expected_url and visited_url and visited_url != expected_url:
+        url = f"{visited_url} (expected {expected_url})"
+
+    return {
+        "url": url,
+        "expected_url": str(expected_url or "").strip(),
+        "visited_url": str(visited_url or "").strip(),
+        "error": str(error),
+        "failure_type": failure_type,
+    }
+
+
 def _should_skip_for_resume(state: OmniCoreState, stage: str) -> bool:
     shared_memory = state.get("shared_memory", {})
     if not isinstance(shared_memory, dict):
@@ -276,7 +412,7 @@ def parallel_executor_node(state: OmniCoreState) -> OmniCoreState:
     return state
 
 
-def replanner_node(state: OmniCoreState) -> OmniCoreState:
+def _legacy_replanner_node(state: OmniCoreState) -> OmniCoreState:
     """反思重规划节点：分析失败原因，制定新策略"""
     if _should_skip_for_resume(state, "replanner"):
         return state
@@ -285,6 +421,7 @@ def replanner_node(state: OmniCoreState) -> OmniCoreState:
 
     # 如果已经是最后一次重规划，标记为"必须给出答案"模式
     is_final_attempt = state["replan_count"] >= MAX_REPLAN
+    authoritative_target_url = _derive_authoritative_target_url(state)
 
     # 记录本轮失败策略到历史（防止 Replanner 兜圈子）
     replan_history = state.get("shared_memory", {}).get("_replan_history", [])
@@ -293,11 +430,25 @@ def replanner_node(state: OmniCoreState) -> OmniCoreState:
     failures = []
     tried_urls = []
     current_strategies = []
+    preserved_tasks = []
     for task in state["task_queue"]:
-        if task["status"] == "failed":
-            result = task.get("result", {}) if isinstance(task.get("result"), dict) else {}
+        if _is_task_preservable_for_replan(task):
+            preserved_tasks.append(task)
+            continue
+
+        if task["status"] == "failed" or (
+            task["status"] == "completed" and not bool(task.get("critic_approved", False))
+        ):
+            failure_record = _build_replan_failure_record(task)
+            url = failure_record["url"]
+            error = failure_record["error"]
+            failure_type = failure_record["failure_type"]
             error = result.get("error", "未知错误")
             url = result.get("url") or task.get("params", {}).get("url") or task.get("params", {}).get("start_url") or ""
+            error = result.get("error") or result.get("message") or error
+            url = expected_url or visited_url or url
+            if expected_url and visited_url and visited_url != expected_url:
+                url = f"{visited_url} (expected {expected_url})"
             failure_type = task.get("failure_type", "unknown")
             trace_summary = ""
             for step in task.get("execution_trace", [])[-3:]:
@@ -306,7 +457,7 @@ def replanner_node(state: OmniCoreState) -> OmniCoreState:
                 f"- 任务: {task['description']}\n  访问的URL: {url}\n  失败类型: {failure_type}\n  失败原因: {error}{trace_summary}"
             )
             if url:
-                tried_urls.append(url)
+                tried_urls.append(expected_url or visited_url or url)
             current_strategies.append(f"{task['task_type']}: {task['description'][:80]}")
 
     # 把本轮策略加入历史
@@ -322,6 +473,12 @@ def replanner_node(state: OmniCoreState) -> OmniCoreState:
         failure_summary += f"\n\n已尝试过的URL（不要再访问）：{', '.join(tried_urls)}"
 
     # 构建历史策略摘要，让 Replanner 知道之前都试过什么
+    if authoritative_target_url:
+        failure_summary += (
+            f"\n\nAuthoritative target URL: {authoritative_target_url}"
+            "\nIf this is still the user's target page, preserve this URL and change the extraction or waiting strategy before changing sites."
+        )
+
     history_summary = ""
     if len(replan_history) > 1:
         history_summary = "\n\n## 之前已经尝试过的策略（绝对不要重复）：\n"
@@ -383,6 +540,10 @@ def replanner_node(state: OmniCoreState) -> OmniCoreState:
 
     try:
         result = llm.parse_json_response(response)
+        result["tasks"] = _repair_replan_task_params(
+            result.get("tasks", []),
+            authoritative_target_url,
+        )
         log_agent_action("Replanner", f"分析: {result.get('analysis', '')[:80]}")
 
         # 检查是否应该放弃并直接回答用户
@@ -436,6 +597,198 @@ def replanner_node(state: OmniCoreState) -> OmniCoreState:
     return state
 
 
+# encoding-health: ignore-start
+def replanner_node(state: OmniCoreState) -> OmniCoreState:
+    """Reflect on failed execution and produce a better next plan."""
+    if _should_skip_for_resume(state, "replanner"):
+        return state
+
+    state["replan_count"] = state.get("replan_count", 0) + 1
+    log_agent_action("Replanner", f"寮€濮嬪弽鎬濋噸瑙勫垝锛堢 {state['replan_count']} 娆★級")
+
+    is_final_attempt = state["replan_count"] >= MAX_REPLAN
+    authoritative_target_url = _derive_authoritative_target_url(state)
+    replan_history = state.get("shared_memory", {}).get("_replan_history", [])
+
+    failures: List[str] = []
+    tried_urls: List[str] = []
+    current_strategies: List[str] = []
+    preserved_tasks: List[Dict[str, Any]] = []
+
+    for task in state.get("task_queue", []) or []:
+        if _is_task_preservable_for_replan(task):
+            preserved_tasks.append(task)
+            continue
+
+        status = str(task.get("status", "") or "")
+        critic_rejected = status == "completed" and not bool(task.get("critic_approved", False))
+        if status not in {"failed", "completed"} or (status == "completed" and not critic_rejected):
+            continue
+
+        failure_record = _build_replan_failure_record(task)
+        trace_summary = ""
+        for step in task.get("execution_trace", [])[-3:]:
+            trace_summary += (
+                f"\n    step {step.get('step_no')}: {step.get('plan')} "
+                f"鈫?{step.get('observation', '')[:80]}"
+            )
+
+        failures.append(
+            f"- 浠诲姟: {task['description']}\n"
+            f"  璁块棶鐨刄RL: {failure_record['url']}\n"
+            f"  澶辫触绫诲瀷: {failure_record['failure_type']}\n"
+            f"  澶辫触鍘熷洜: {failure_record['error']}{trace_summary}"
+        )
+
+        tried_url = (
+            failure_record["expected_url"]
+            or failure_record["visited_url"]
+            or failure_record["url"]
+        )
+        if tried_url:
+            tried_urls.append(tried_url)
+        current_strategies.append(
+            f"{task.get('task_type', '')}: {str(task.get('description', '') or '')[:80]}"
+        )
+
+    replan_history.append(
+        {
+            "round": state["replan_count"],
+            "strategies": current_strategies,
+            "urls": tried_urls,
+        }
+    )
+    state["shared_memory"]["_replan_history"] = replan_history
+
+    failure_summary = (
+        "\n".join(failures)
+        if failures
+        else "鏃犳槑纭け璐ヤ俊鎭紝浣嗙幇鏈夌粨鏋滀笉绗﹀悎棰勬湡"
+    )
+    if tried_urls:
+        failure_summary += f"\n\n宸插皾璇曡繃鐨刄RL锛堜笉瑕佸啀璁块棶锛夛細{', '.join(tried_urls)}"
+    if authoritative_target_url:
+        failure_summary += (
+            f"\n\nAuthoritative target URL: {authoritative_target_url}"
+            "\nIf the user still wants this page, keep the URL and change extraction, waiting, or navigation strategy before switching sites."
+        )
+
+    history_summary = ""
+    if len(replan_history) > 1:
+        history_summary = "\n\n## Previous failed strategies (do not repeat)\n"
+        for item in replan_history[:-1]:
+            history_summary += f"Round {item['round']}:\n"
+            for strategy in item.get("strategies", []):
+                history_summary += f"- {strategy}\n"
+            if item.get("urls"):
+                history_summary += f"Visited URLs: {', '.join(item['urls'])}\n"
+
+    llm = LLMClient()
+    response = llm.chat_with_system(
+        system_prompt="""You are OmniCore's replanning specialist.
+
+Return JSON only.
+
+Requirements:
+- Preserve the user's original goal.
+- Do not repeat the same failing path.
+- If there is an authoritative target URL, prefer keeping that URL and changing extraction/waiting strategy before switching sites.
+- If some tasks already succeeded and were critic-approved, do not recreate them.
+- If the task should be abandoned, set should_give_up=true and provide a direct_answer.
+
+Return:
+```json
+{
+  "analysis": "why the previous attempt failed",
+  "failed_approach": "what was fundamentally wrong",
+  "new_strategy": "the new strategy",
+  "should_give_up": false,
+  "give_up_reason": "",
+  "direct_answer": "",
+  "tasks": [
+    {
+      "task_id": "replan_task_1",
+      "task_type": "web_worker|browser_agent|file_worker|system_worker",
+      "description": "new task description",
+      "params": {},
+      "priority": 10,
+      "depends_on": []
+    }
+  ]
+}
+```""",
+        user_message=(
+            f"User request: {state['user_input']}\n\n"
+            f"Failure summary:\n{failure_summary}{history_summary}\n\n"
+            f"Replan round: {state['replan_count']} "
+            f"({'final attempt' if is_final_attempt else 'more retries allowed'})"
+        ),
+        temperature=0.3,
+        json_mode=True,
+    )
+
+    try:
+        result = llm.parse_json_response(response)
+        result["tasks"] = _repair_replan_task_params(
+            result.get("tasks", []),
+            authoritative_target_url,
+        )
+        log_agent_action("Replanner", f"鍒嗘瀽: {str(result.get('analysis', '') or '')[:80]}")
+
+        if result.get("should_give_up", False):
+            log_warning(f"Replanner 鍐冲畾鏀惧純: {result.get('give_up_reason', '')}")
+            state["final_output"] = result.get("direct_answer", "鎶辨瓑锛屾棤娉曞畬鎴愭偍鐨勮姹傘€?")
+            state["execution_status"] = "completed_with_issues"
+            state["critic_approved"] = False
+            state["task_queue"] = preserved_tasks
+            state["policy_decisions"] = [
+                build_policy_decision_from_task(task)
+                for task in state["task_queue"]
+            ]
+            return state
+
+        log_agent_action("Replanner", f"鏂扮瓥鐣? {str(result.get('new_strategy', '') or '')[:80]}")
+
+        new_tasks = [
+            build_task_item_from_plan(
+                task_data,
+                task_id_prefix="replan",
+                default_priority=10,
+            )
+            for task_data in result.get("tasks", [])
+        ]
+
+        if new_tasks or preserved_tasks:
+            state["task_queue"] = preserved_tasks + new_tasks
+            state["policy_decisions"] = [
+                build_policy_decision_from_task(task)
+                for task in state["task_queue"]
+            ]
+            state["needs_human_confirm"] = any(
+                task.get("requires_confirmation", False)
+                for task in state["task_queue"]
+            )
+            state["human_approved"] = not state["needs_human_confirm"]
+            state["error_trace"] = ""
+            log_success(
+                f"閲嶈鍒掑畬鎴愶紝淇濈暀 {len(preserved_tasks)} 涓粨鏋滐紝鏂板 {len(new_tasks)} 涓换鍔?"
+            )
+        else:
+            log_warning("閲嶈鍒掓湭浜х敓鏂颁换鍔?")
+
+    except Exception as exc:
+        log_error(f"閲嶈鍒掑け璐? {exc}")
+
+    from langchain_core.messages import SystemMessage
+
+    state["messages"].append(
+        SystemMessage(content=f"Replanner 閲嶈鍒掑畬鎴愶紙绗?{state['replan_count']} 娆★級")
+    )
+    _save_runtime_checkpoint(state, "replanner", "Replanner completed")
+    return state
+
+
+# encoding-health: ignore-end
 def critic_node(state: OmniCoreState) -> OmniCoreState:
     """Critic 审查节点"""
     if _should_skip_for_resume(state, "critic"):
@@ -826,7 +1179,127 @@ def _build_delivery_summary(state: OmniCoreState) -> str:
     return "\n".join(lines)
 
 
-def finalize_node(state: OmniCoreState) -> OmniCoreState:
+def _should_keep_delivery_summary_as_final_output(
+    state: OmniCoreState,
+    package: Dict[str, Any],
+) -> bool:
+    statuses = {
+        str(task.get("status", "") or "")
+        for task in state.get("task_queue", []) or []
+        if isinstance(task, dict)
+    }
+    if WAITING_FOR_APPROVAL in statuses or WAITING_FOR_EVENT in statuses or BLOCKED in statuses:
+        return True
+    return int(package.get("completed_task_count", 0) or 0) <= 0
+
+
+def _build_execution_evidence_for_answer(state: OmniCoreState) -> str:
+    sections: List[str] = []
+
+    findings_summary = _extract_structured_findings(state, max_items=8)
+    if findings_summary:
+        sections.append(findings_summary)
+
+    task_result_lines = []
+    for task in state.get("task_queue", []) or []:
+        if not isinstance(task, dict):
+            continue
+        if str(task.get("status", "") or "") != "completed":
+            continue
+        result = task.get("result")
+        if result in (None, "", [], {}):
+            continue
+        task_result_lines.append(
+            f"- {str(task.get('description', '') or task.get('task_id', '') or 'Completed task')}: "
+            f"{_payload_preview(result, limit=500)}"
+        )
+        if len(task_result_lines) >= 4:
+            break
+    if task_result_lines:
+        sections.append("Completed task results:\n" + "\n".join(task_result_lines))
+
+    return "\n\n".join(section for section in sections if section).strip()
+
+
+def _synthesize_user_facing_answer(
+    state: OmniCoreState,
+    delivery_summary: str,
+) -> str:
+    package = state.get("delivery_package", {}) or {}
+    if not isinstance(package, dict):
+        package = {}
+    if _should_keep_delivery_summary_as_final_output(state, package):
+        return delivery_summary
+
+    evidence = _build_execution_evidence_for_answer(state)
+    if not evidence:
+        return delivery_summary
+
+    current_time_context = state.get("shared_memory", {}).get("current_time_context")
+    current_location_context = state.get("shared_memory", {}).get("current_location_context")
+    deliverables = package.get("deliverables", []) or []
+    issues = package.get("issues", []) or []
+    completed_tasks = package.get("completed_tasks", []) or []
+
+    deliverable_lines = []
+    for item in deliverables[:5]:
+        if not isinstance(item, dict):
+            continue
+        location = str(item.get("location", "") or "").strip()
+        label = str(item.get("name", "") or item.get("artifact_type", "") or "deliverable")
+        if location:
+            deliverable_lines.append(f"- {label}: {location}")
+        else:
+            deliverable_lines.append(f"- {label}")
+
+    issue_lines = []
+    for item in issues[:5]:
+        if not isinstance(item, dict):
+            continue
+        issue_lines.append(
+            f"- {str(item.get('description', '') or item.get('task_id', '') or 'Issue')}: "
+            f"{str(item.get('error', '') or 'Unknown error')}"
+        )
+
+    completed_lines = [
+        f"- {str(item or '').strip()}"
+        for item in completed_tasks[:5]
+        if str(item or "").strip()
+    ]
+
+    try:
+        llm = LLMClient()
+        response = llm.chat_with_system(
+            system_prompt=(
+                "你是 OmniCore 智能助手。请基于已经执行出的结果，直接回答用户原始问题。"
+                "回答必须面向用户，不要描述内部执行过程，不要提 Router、Worker、Critic、Validator、"
+                "任务队列、delivery package 等内部术语。"
+                "如果证据只支持部分结论，要明确说“根据当前抓取到的信息”或“目前结果显示”。"
+                "如果有生成文件或可交付产物，简短说明在哪里。"
+            ),
+            user_message=(
+                f"用户原始问题：{state.get('user_input', '')}\n\n"
+                f"执行结果概览：{package.get('headline', '')}\n\n"
+                f"提炼出的证据：\n{evidence}\n\n"
+                f"已完成的工作：\n{chr(10).join(completed_lines) if completed_lines else '- 无'}\n\n"
+                f"可交付产物：\n{chr(10).join(deliverable_lines) if deliverable_lines else '- 无'}\n\n"
+                f"未解决问题：\n{chr(10).join(issue_lines) if issue_lines else '- 无'}"
+                f"{_build_finalize_time_hint(current_time_context)}"
+                f"{_build_finalize_location_hint(current_location_context)}"
+            ),
+            temperature=0.4,
+            max_tokens=1200,
+        )
+        synthesized = str(getattr(response, "content", "") or "").strip()
+        if synthesized:
+            return synthesized
+    except Exception:
+        pass
+
+    return delivery_summary
+
+
+def _legacy_finalize_node(state: OmniCoreState) -> OmniCoreState:
     """最终输出节点"""
     if _should_skip_for_resume(state, "finalize"):
         return state
@@ -835,6 +1308,7 @@ def finalize_node(state: OmniCoreState) -> OmniCoreState:
         if not isinstance(shared_memory, dict):
             shared_memory = {}
         current_time_context = shared_memory.get("current_time_context")
+        current_location_context = shared_memory.get("current_location_context")
         direct_answer = str(shared_memory.get("router_direct_answer", "") or "").strip()
 
         if direct_answer:
@@ -862,16 +1336,27 @@ def finalize_node(state: OmniCoreState) -> OmniCoreState:
             if "Router 分析完成" in content:
                 router_reasoning = content.replace("Router 分析完成: ", "")
                 break
-        try:
+        if False:
             llm = LLMClient()
             response = llm.chat_with_system(
                 system_prompt="你是 OmniCore 智能助手。请根据分析结果，用简洁友好的语言直接回答用户的问题。不要提及内部系统、Router、Worker 等技术细节。",
-                user_message=f"用户问题：{state['user_input']}\n\n分析结果：{router_reasoning}{_build_finalize_time_hint(current_time_context)}",
+                user_message=(
+                    f"用户问题：{state['user_input']}\n\n"
+                    f"分析结果：{router_reasoning}"
+                    f"{_build_finalize_time_hint(current_time_context)}"
+                    f"{_build_finalize_location_hint(current_location_context)}"
+                ),
                 temperature=0.7,
             )
             state["final_output"] = response.content
-        except:
+        if True:
+            state["final_output"] = (
+                router_reasoning
+                or "这次没有形成可执行计划，也没有拿到可验证的结果，所以我不能直接给你事实性答案。请重试，或明确要查询的目标。"
+            )
+            """
             state["final_output"] = router_reasoning or "抱歉，我没有理解你的意思，请再说一次。"
+            """
         state["execution_status"] = "completed"
         state["critic_approved"] = True
         state["delivery_package"] = {
@@ -896,7 +1381,8 @@ def finalize_node(state: OmniCoreState) -> OmniCoreState:
         elif task["status"] == "failed":
             results.append(f"❌ {task['description']}: {task.get('result', {}).get('error', '未知错误')}")
 
-    state["final_output"] = _build_delivery_summary(state)
+    delivery_summary = _build_delivery_summary(state)
+    state["final_output"] = _synthesize_user_facing_answer(state, delivery_summary)
 
     statuses = {str(task.get("status", "") or "") for task in state["task_queue"]}
     if WAITING_FOR_APPROVAL in statuses:
@@ -918,6 +1404,96 @@ def finalize_node(state: OmniCoreState) -> OmniCoreState:
 
 # === 条件路由函数 ===
 
+# encoding-health: ignore-start
+def finalize_node(state: OmniCoreState) -> OmniCoreState:
+    """Build the final user-facing output from direct answers or executed tasks."""
+    if _should_skip_for_resume(state, "finalize"):
+        return state
+
+    if not state["task_queue"]:
+        shared_memory = state.get("shared_memory", {})
+        if not isinstance(shared_memory, dict):
+            shared_memory = {}
+
+        direct_answer = str(shared_memory.get("router_direct_answer", "") or "").strip()
+        if direct_answer:
+            state["final_output"] = direct_answer
+            state["execution_status"] = "completed"
+            state["critic_approved"] = True
+            state["delivery_package"] = {
+                "headline": "Answered directly without worker execution.",
+                "intent": str(state.get("current_intent", "") or ""),
+                "review_status": "approved",
+                "completed_task_count": 0,
+                "total_task_count": 0,
+                "completed_tasks": [],
+                "deliverables": [],
+                "issues": [],
+                "critic_feedback": "",
+                "recommended_next_step": "",
+            }
+            _save_runtime_checkpoint(state, "finalize", "Finalize completed without task queue")
+            return state
+
+        router_reasoning = ""
+        for msg in reversed(state.get("messages", [])):
+            content = getattr(msg, "content", "")
+            if "Router 鍒嗘瀽瀹屾垚" in content:
+                router_reasoning = content.replace("Router 鍒嗘瀽瀹屾垚: ", "")
+                break
+
+        final_output = (
+            "杩欐娌℃湁褰㈡垚鍙墽琛岃鍒掞紝涔熸病鏈夋嬁鍒板彲楠岃瘉鐨勭粨鏋滐紝鎵€浠ユ垜涓嶈兘鐩存帴缁欎綘浜嬪疄鎬х瓟妗堛€傝閲嶈瘯锛屾垨鏄庣‘瑕佹煡璇㈢殑鐩爣銆?"
+        )
+        if router_reasoning:
+            final_output += f"\n\nSystem note: {router_reasoning}"
+
+        state["final_output"] = final_output
+        state["execution_status"] = "completed_with_issues"
+        state["critic_approved"] = False
+        state["delivery_package"] = {
+            "headline": "No verified result was produced.",
+            "intent": str(state.get("current_intent", "") or ""),
+            "review_status": "needs_attention",
+            "completed_task_count": 0,
+            "total_task_count": 0,
+            "completed_tasks": [],
+            "deliverables": [],
+            "issues": [
+                {
+                    "task_id": "",
+                    "description": "No executable plan or verifiable result",
+                    "error": router_reasoning or "Router did not produce a valid executable answer.",
+                }
+            ],
+            "critic_feedback": router_reasoning or "No verifiable result was produced.",
+            "recommended_next_step": "Retry the request, or specify the exact target/source to query.",
+        }
+        _save_runtime_checkpoint(state, "finalize", "Finalize completed without task queue")
+        return state
+
+    delivery_summary = _build_delivery_summary(state)
+    state["final_output"] = _synthesize_user_facing_answer(state, delivery_summary)
+
+    statuses = {str(task.get("status", "") or "") for task in state["task_queue"]}
+    if WAITING_FOR_APPROVAL in statuses:
+        state["execution_status"] = WAITING_FOR_APPROVAL
+    elif WAITING_FOR_EVENT in statuses:
+        state["execution_status"] = WAITING_FOR_EVENT
+    elif BLOCKED in statuses:
+        state["execution_status"] = BLOCKED
+    elif state["critic_approved"]:
+        state["execution_status"] = "completed"
+        log_success("鎵€鏈変换鍔℃墽琛屽畬鎴?")
+    else:
+        state["execution_status"] = "completed_with_issues"
+        log_error(f"浠诲姟鏈€氳繃瀹℃煡: {state['critic_feedback']}")
+
+    _save_runtime_checkpoint(state, "finalize", "Finalize completed")
+    return state
+
+
+# encoding-health: ignore-end
 def should_continue_after_route(state: OmniCoreState) -> Literal["human_confirm", "finalize"]:
     if not state["task_queue"]:
         return "finalize"
@@ -935,6 +1511,8 @@ def get_first_executor(state: OmniCoreState) -> Literal["parallel_executor", "va
 def after_validator(state: OmniCoreState) -> Literal["critic", "replanner", "finalize"]:
     """Validator 之后：passed → critic，failed + replan_count < MAX → replanner，否则 finalize"""
     if state.get("validator_passed", True):
+        return "critic"
+    if any(str(task.get("status", "") or "") == "completed" for task in state.get("task_queue", [])):
         return "critic"
     if state.get("replan_count", 0) < MAX_REPLAN:
         return "replanner"
@@ -954,6 +1532,374 @@ def after_parallel_executor(state: OmniCoreState) -> Literal["parallel_executor"
     if collect_ready_task_indexes(state):
         return "parallel_executor"
     return "validator"
+
+
+def _synthesize_user_facing_answer(
+    state: OmniCoreState,
+    delivery_summary: str,
+) -> str:
+    package = state.get("delivery_package", {}) or {}
+    if not isinstance(package, dict):
+        package = {}
+    if _should_keep_delivery_summary_as_final_output(state, package):
+        return delivery_summary
+
+    evidence = _build_execution_evidence_for_answer(state)
+    if not evidence:
+        return delivery_summary
+
+    current_time_context = state.get("shared_memory", {}).get("current_time_context")
+    current_location_context = state.get("shared_memory", {}).get("current_location_context")
+    deliverables = package.get("deliverables", []) or []
+    issues = package.get("issues", []) or []
+    completed_tasks = package.get("completed_tasks", []) or []
+
+    deliverable_lines = []
+    for item in deliverables[:5]:
+        if not isinstance(item, dict):
+            continue
+        location = str(item.get("location", "") or "").strip()
+        label = str(item.get("name", "") or item.get("artifact_type", "") or "deliverable")
+        if location:
+            deliverable_lines.append(f"- {label}: {location}")
+        else:
+            deliverable_lines.append(f"- {label}")
+
+    issue_lines = []
+    for item in issues[:5]:
+        if not isinstance(item, dict):
+            continue
+        issue_lines.append(
+            f"- {str(item.get('description', '') or item.get('task_id', '') or 'Issue')}: "
+            f"{str(item.get('error', '') or 'Unknown error')}"
+        )
+
+    completed_lines = [
+        f"- {str(item or '').strip()}"
+        for item in completed_tasks[:5]
+        if str(item or "").strip()
+    ]
+
+    try:
+        llm = LLMClient()
+        response = llm.chat_with_system(
+            system_prompt=(
+                "You are OmniCore's user-facing answer synthesizer.\n"
+                "Write a direct answer for the user based only on executed evidence.\n"
+                "Do not mention internal runtime components such as Router, Worker, Critic, "
+                "Validator, task queue, or delivery package.\n"
+                "If the evidence is partial, say so explicitly.\n"
+                "If files or artifacts were produced, briefly mention where they are."
+            ),
+            user_message=(
+                f"Original user request:\n{state.get('user_input', '')}\n\n"
+                f"Execution headline:\n{package.get('headline', '')}\n\n"
+                f"Evidence:\n{evidence}\n\n"
+                f"Completed work:\n{chr(10).join(completed_lines) if completed_lines else '- None'}\n\n"
+                f"Deliverables:\n{chr(10).join(deliverable_lines) if deliverable_lines else '- None'}\n\n"
+                f"Open issues:\n{chr(10).join(issue_lines) if issue_lines else '- None'}"
+                f"{_build_finalize_time_hint(current_time_context)}"
+                f"{_build_finalize_location_hint(current_location_context)}"
+            ),
+            temperature=0.4,
+            max_tokens=1200,
+        )
+        synthesized = _normalize_text_value(getattr(response, "content", ""))
+        if synthesized:
+            return synthesized
+    except Exception:
+        pass
+
+    return delivery_summary
+
+
+def replanner_node(state: OmniCoreState) -> OmniCoreState:
+    """Reflect on failed execution and produce a better next plan."""
+    if _should_skip_for_resume(state, "replanner"):
+        return state
+
+    shared_memory = state.get("shared_memory", {})
+    if not isinstance(shared_memory, dict):
+        shared_memory = {}
+        state["shared_memory"] = shared_memory
+
+    state["replan_count"] = state.get("replan_count", 0) + 1
+    log_agent_action("Replanner", f"开始反思重规划（第 {state['replan_count']} 次）")
+
+    is_final_attempt = state["replan_count"] >= MAX_REPLAN
+    authoritative_target_url = _derive_authoritative_target_url(state)
+    replan_history = shared_memory.get("_replan_history", [])
+
+    failures: List[str] = []
+    tried_urls: List[str] = []
+    current_strategies: List[str] = []
+    preserved_tasks: List[Dict[str, Any]] = []
+
+    for task in state.get("task_queue", []) or []:
+        if _is_task_preservable_for_replan(task):
+            preserved_tasks.append(task)
+            continue
+
+        status = str(task.get("status", "") or "")
+        critic_rejected = status == "completed" and not bool(task.get("critic_approved", False))
+        if status not in {"failed", "completed"} or (status == "completed" and not critic_rejected):
+            continue
+
+        failure_record = _build_replan_failure_record(task)
+        trace_summary = ""
+        for step in task.get("execution_trace", [])[-3:]:
+            trace_summary += (
+                f"\n    step {step.get('step_no')}: {step.get('plan')} "
+                f"-> {step.get('observation', '')[:80]}"
+            )
+
+        failures.append(
+            f"- 任务: {task['description']}\n"
+            f"  访问 URL: {failure_record['url']}\n"
+            f"  失败类型: {failure_record['failure_type']}\n"
+            f"  失败原因: {failure_record['error']}{trace_summary}"
+        )
+
+        tried_url = (
+            failure_record["expected_url"]
+            or failure_record["visited_url"]
+            or failure_record["url"]
+        )
+        if tried_url:
+            tried_urls.append(tried_url)
+        current_strategies.append(
+            f"{task.get('task_type', '')}: {str(task.get('description', '') or '')[:80]}"
+        )
+
+    replan_history.append(
+        {
+            "round": state["replan_count"],
+            "strategies": current_strategies,
+            "urls": tried_urls,
+        }
+    )
+    shared_memory["_replan_history"] = replan_history
+
+    failure_summary = (
+        "\n".join(failures)
+        if failures
+        else "没有拿到明确的失败证据，但当前结果仍然不满足用户需求。"
+    )
+    if tried_urls:
+        failure_summary += f"\n\n已尝试过的 URL（避免重复走相同路径）: {', '.join(tried_urls)}"
+    if authoritative_target_url:
+        failure_summary += (
+            f"\n\nAuthoritative target URL: {authoritative_target_url}"
+            "\nIf the user still wants this page, keep the URL and change extraction, waiting, "
+            "or navigation strategy before switching sites."
+        )
+
+    history_summary = ""
+    if len(replan_history) > 1:
+        history_summary = "\n\n## Previous failed strategies (do not repeat)\n"
+        for item in replan_history[:-1]:
+            history_summary += f"Round {item['round']}:\n"
+            for strategy in item.get("strategies", []):
+                history_summary += f"- {strategy}\n"
+            if item.get("urls"):
+                history_summary += f"Visited URLs: {', '.join(item['urls'])}\n"
+
+    llm = LLMClient()
+    response = llm.chat_with_system(
+        system_prompt="""You are OmniCore's replanning specialist.
+
+Return JSON only.
+
+Requirements:
+- Preserve the user's original goal.
+- Do not repeat the same failing path.
+- If there is an authoritative target URL, prefer keeping that URL and changing extraction/waiting strategy before switching sites.
+- If some tasks already succeeded and were critic-approved, do not recreate them.
+- If the task should be abandoned, set should_give_up=true and provide a direct_answer.
+
+Return:
+```json
+{
+  "analysis": "why the previous attempt failed",
+  "failed_approach": "what was fundamentally wrong",
+  "new_strategy": "the new strategy",
+  "should_give_up": false,
+  "give_up_reason": "",
+  "direct_answer": "",
+  "tasks": [
+    {
+      "task_id": "replan_task_1",
+      "task_type": "web_worker|browser_agent|file_worker|system_worker",
+      "description": "new task description",
+      "params": {},
+      "priority": 10,
+      "depends_on": []
+    }
+  ]
+}
+```""",
+        user_message=(
+            f"User request: {state['user_input']}\n\n"
+            f"Failure summary:\n{failure_summary}{history_summary}\n\n"
+            f"Replan round: {state['replan_count']} "
+            f"({'final attempt' if is_final_attempt else 'more retries allowed'})"
+        ),
+        temperature=0.3,
+        json_mode=True,
+    )
+
+    try:
+        result = _normalize_payload(llm.parse_json_response(response))
+        result["tasks"] = _repair_replan_task_params(
+            result.get("tasks", []),
+            authoritative_target_url,
+        )
+        log_agent_action("Replanner", f"分析: {str(result.get('analysis', '') or '')[:80]}")
+
+        if result.get("should_give_up", False):
+            log_warning(f"Replanner 决定放弃: {result.get('give_up_reason', '')}")
+            state["final_output"] = result.get(
+                "direct_answer",
+                "抱歉，当前没有足够的可验证证据来继续完成这个请求。",
+            )
+            state["execution_status"] = "completed_with_issues"
+            state["critic_approved"] = False
+            state["task_queue"] = preserved_tasks
+            state["policy_decisions"] = [
+                build_policy_decision_from_task(task)
+                for task in state["task_queue"]
+            ]
+            return state
+
+        log_agent_action("Replanner", f"新策略: {str(result.get('new_strategy', '') or '')[:80]}")
+
+        new_tasks = [
+            build_task_item_from_plan(
+                task_data,
+                task_id_prefix="replan",
+                default_priority=10,
+            )
+            for task_data in result.get("tasks", [])
+        ]
+
+        if new_tasks or preserved_tasks:
+            state["task_queue"] = preserved_tasks + new_tasks
+            state["policy_decisions"] = [
+                build_policy_decision_from_task(task)
+                for task in state["task_queue"]
+            ]
+            state["needs_human_confirm"] = any(
+                task.get("requires_confirmation", False)
+                for task in state["task_queue"]
+            )
+            state["human_approved"] = not state["needs_human_confirm"]
+            state["error_trace"] = ""
+            log_success(
+                f"重规划完成，保留 {len(preserved_tasks)} 个结果，新增 {len(new_tasks)} 个任务"
+            )
+        else:
+            log_warning("重规划未生成新任务")
+
+    except Exception as exc:
+        log_error(f"重规划失败: {exc}")
+
+    from langchain_core.messages import SystemMessage
+
+    state["messages"].append(
+        SystemMessage(content=f"Replanner 重规划完成（第 {state['replan_count']} 次）")
+    )
+    _save_runtime_checkpoint(state, "replanner", "Replanner completed")
+    return state
+
+
+def finalize_node(state: OmniCoreState) -> OmniCoreState:
+    """Build the final user-facing output from direct answers or executed tasks."""
+    if _should_skip_for_resume(state, "finalize"):
+        return state
+
+    if not state["task_queue"]:
+        shared_memory = state.get("shared_memory", {})
+        if not isinstance(shared_memory, dict):
+            shared_memory = {}
+
+        direct_answer = str(shared_memory.get("router_direct_answer", "") or "").strip()
+        if direct_answer:
+            state["final_output"] = direct_answer
+            state["execution_status"] = "completed"
+            state["critic_approved"] = True
+            state["delivery_package"] = {
+                "headline": "Answered directly without worker execution.",
+                "intent": str(state.get("current_intent", "") or ""),
+                "review_status": "approved",
+                "completed_task_count": 0,
+                "total_task_count": 0,
+                "completed_tasks": [],
+                "deliverables": [],
+                "issues": [],
+                "critic_feedback": "",
+                "recommended_next_step": "",
+            }
+            _save_runtime_checkpoint(state, "finalize", "Finalize completed without task queue")
+            return state
+
+        router_reasoning = ""
+        for msg in reversed(state.get("messages", [])):
+            raw_content = str(getattr(msg, "content", "") or "")
+            content = _normalize_text_value(raw_content)
+            if "Router 分析完成" in content:
+                router_reasoning = content.replace("Router 分析完成: ", "")
+                break
+            if "Router 鍒嗘瀽瀹屾垚" in raw_content:
+                router_reasoning = raw_content.replace("Router 鍒嗘瀽瀹屾垚: ", "")
+                break
+
+        final_output = "这次没有形成可执行计划，也没有拿到可验证的结果，所以我不能直接给你事实性答案。请重试，或明确要查询的目标。"
+        if router_reasoning:
+            final_output += f"\n\nSystem note: {router_reasoning}"
+
+        state["final_output"] = final_output
+        state["execution_status"] = "completed_with_issues"
+        state["critic_approved"] = False
+        state["delivery_package"] = {
+            "headline": "No verified result was produced.",
+            "intent": str(state.get("current_intent", "") or ""),
+            "review_status": "needs_attention",
+            "completed_task_count": 0,
+            "total_task_count": 0,
+            "completed_tasks": [],
+            "deliverables": [],
+            "issues": [
+                {
+                    "task_id": "",
+                    "description": "No executable plan or verifiable result",
+                    "error": router_reasoning or "Router did not produce a valid executable answer.",
+                }
+            ],
+            "critic_feedback": router_reasoning or "No verifiable result was produced.",
+            "recommended_next_step": "Retry the request, or specify the exact target/source to query.",
+        }
+        _save_runtime_checkpoint(state, "finalize", "Finalize completed without task queue")
+        return state
+
+    delivery_summary = _build_delivery_summary(state)
+    state["final_output"] = _synthesize_user_facing_answer(state, delivery_summary)
+
+    statuses = {str(task.get("status", "") or "") for task in state["task_queue"]}
+    if WAITING_FOR_APPROVAL in statuses:
+        state["execution_status"] = WAITING_FOR_APPROVAL
+    elif WAITING_FOR_EVENT in statuses:
+        state["execution_status"] = WAITING_FOR_EVENT
+    elif BLOCKED in statuses:
+        state["execution_status"] = BLOCKED
+    elif state["critic_approved"]:
+        state["execution_status"] = "completed"
+        log_success("所有任务执行完成")
+    else:
+        state["execution_status"] = "completed_with_issues"
+        log_error(f"任务未通过审查: {state['critic_feedback']}")
+
+    _save_runtime_checkpoint(state, "finalize", "Finalize completed")
+    return state
 
 
 def build_graph() -> StateGraph:

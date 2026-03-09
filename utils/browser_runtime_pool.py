@@ -44,8 +44,8 @@ class BrowserLease:
     async def release(self) -> None:
         if self._released:
             return
-        self._released = True
         await self.pool.release_browser(self)
+        self._released = True
 
 
 class BrowserRuntimePool:

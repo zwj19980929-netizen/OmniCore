@@ -43,6 +43,27 @@ def test_router_preserves_explicit_tool_args():
     assert task["params"]["url"] == "https://example.com"
 
 
+def test_router_repairs_missing_browser_start_url_from_user_input():
+    router = RouterAgent()
+
+    result = router._repair_task_params_from_user_input(
+        "https://www.weather.com.cn/weather/101220101.shtml",
+        {
+            "tasks": [
+                {
+                    "tool_name": "browser.interact",
+                    "params": {"task": "open the page and read it"},
+                    "tool_args": {"task": "open the page and read it"},
+                }
+            ]
+        },
+    )
+
+    task = result["tasks"][0]
+    assert task["params"]["start_url"] == "https://www.weather.com.cn/weather/101220101.shtml"
+    assert task["tool_args"]["start_url"] == "https://www.weather.com.cn/weather/101220101.shtml"
+
+
 def test_router_guesses_browser_tool_when_plan_shape_is_ambiguous():
     router = RouterAgent()
 
@@ -95,8 +116,10 @@ class _FakeResponse:
 class _FakeLLM:
     def __init__(self):
         self.last_user_message = ""
+        self.call_count = 0
 
     def chat_with_system(self, *, system_prompt, user_message, **kwargs):
+        self.call_count += 1
         self.last_user_message = user_message
         return _FakeResponse()
 
@@ -109,6 +132,11 @@ class _FakeLLM:
             "tasks": [],
             "is_high_risk": False,
         }
+
+
+class _FailIfCalledLLM(_FakeLLM):
+    def chat_with_system(self, *, system_prompt, user_message, **kwargs):
+        raise AssertionError("LLM should not be called for deterministic weather routing")
 
 
 def test_router_includes_recent_session_artifacts_in_context():
@@ -145,6 +173,7 @@ def test_router_includes_user_preferences_in_context():
         "save the report",
         user_preferences={
             "default_output_directory": "D:/tmp/exports",
+            "user_location": "Shanghai, China",
             "preferred_tools": ["file.read_write"],
             "preferred_sites": ["example.com"],
             "task_templates": {"daily": "Generate the daily digest"},
@@ -174,6 +203,82 @@ def test_router_includes_current_time_context_from_state():
     assert "Current local time" in fake_llm.last_user_message
     assert "2026-03-04T18:30:00+08:00" in fake_llm.last_user_message
     assert "Wednesday" in fake_llm.last_user_message
+
+
+def test_router_uses_current_location_context_in_deterministic_weather_route():
+    router = RouterAgent(llm_client=_FailIfCalledLLM())
+    state = create_initial_state("what's the weather like near me?")
+    state["shared_memory"]["current_location_context"] = {
+        "location": "Shanghai, China",
+        "timezone": "CST",
+        "source": "user_preference",
+    }
+
+    router.route(state)
+
+    assert state["current_intent"] == "weather_query"
+    assert len(state["task_queue"]) == 2
+    assert "Shanghai, China" in state["task_queue"][0]["description"]
+    assert state["task_queue"][0]["tool_name"] == "web.fetch_and_extract"
+
+
+def test_router_short_circuits_weather_query_to_deterministic_sources():
+    router = RouterAgent(llm_client=_FailIfCalledLLM())
+
+    result = router.analyze_intent(
+        "帮我查一下明天的合肥天气",
+        current_time_context={"local_date": "2026-03-06"},
+    )
+
+    assert result["intent"] == "weather_query"
+    assert len(result["tasks"]) == 2
+    assert result["tasks"][0]["tool_name"] == "web.fetch_and_extract"
+    assert "weather.com.cn" in result["tasks"][0]["description"]
+    assert "2026-03-07" in result["tasks"][0]["description"]
+    assert result["tasks"][1]["tool_name"] == "web.fetch_and_extract"
+    assert "moji.com" in result["tasks"][1]["description"]
+
+
+def test_router_uses_browser_route_for_weather_browser_demo():
+    router = RouterAgent(llm_client=_FailIfCalledLLM())
+
+    result = router.analyze_intent("给我查查合肥的天气，我想看看你是怎么操作浏览器的")
+
+    assert result["intent"] == "weather_query_with_browser_demo"
+    assert len(result["tasks"]) == 2
+    assert result["tasks"][0]["tool_name"] == "browser.interact"
+    assert result["tasks"][0]["params"]["headless"] is False
+    assert result["tasks"][0]["params"]["start_url"] == "https://www.bing.com/"
+    assert "合肥" in result["tasks"][0]["description"]
+    assert result["tasks"][1]["tool_name"] == "web.fetch_and_extract"
+
+
+def test_router_keeps_direct_weather_url_authoritative_in_deterministic_route():
+    router = RouterAgent(llm_client=_FailIfCalledLLM())
+
+    result = router.analyze_intent(
+        "https://www.weather.com.cn/weather/101220101.shtml 有啊，你通过网页有头操作渲染完成之后就有数据了"
+    )
+
+    assert result["intent"] == "weather_query_with_browser_demo"
+    assert result["tasks"][0]["params"]["start_url"] == "https://www.weather.com.cn/weather/101220101.shtml"
+    assert result["tasks"][1]["params"]["url"] == "https://www.weather.com.cn/weather/101220101.shtml"
+
+
+def test_router_skips_current_location_context_for_non_geographic_task():
+    fake_llm = _FakeLLM()
+    router = RouterAgent(llm_client=fake_llm)
+    state = create_initial_state("save the report to disk")
+    state["shared_memory"]["current_location_context"] = {
+        "location": "Shanghai, China",
+        "timezone": "CST",
+        "source": "user_preference",
+    }
+
+    router.route(state)
+
+    assert "Current user location" not in fake_llm.last_user_message
+    assert "Shanghai, China" not in fake_llm.last_user_message
 
 
 def test_router_persists_direct_answer_for_taskless_queries():

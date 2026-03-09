@@ -31,6 +31,56 @@ def test_validator_fails_when_failed_tasks_exist():
     assert result["validator_passed"] is False
 
 
+def test_validator_fails_browser_task_when_expected_data_is_missing():
+    validator = Validator()
+    state = _base_state(
+        [
+            {
+                "task_id": "task_browser",
+                "task_type": "browser_agent",
+                "description": "extract and show Hefei weather data",
+                "status": "completed",
+                "params": {"task": "extract Hefei weather"},
+                "result": {
+                    "success": True,
+                    "url": "https://www.weather.com.cn/weather/101220101.shtml",
+                    "expected_url": "https://www.weather.com.cn/weather/101220101.shtml",
+                    "data": [],
+                },
+            }
+        ]
+    )
+
+    result = validator.validate(state)
+    assert result["validator_passed"] is False
+    assert result["task_queue"][0]["status"] == "failed"
+
+
+def test_validator_fails_browser_task_when_navigation_lands_on_wrong_site():
+    validator = Validator()
+    state = _base_state(
+        [
+            {
+                "task_id": "task_browser",
+                "task_type": "browser_agent",
+                "description": "open target weather page and extract data",
+                "status": "completed",
+                "params": {"task": "extract Hefei weather"},
+                "result": {
+                    "success": True,
+                    "url": "https://www.google.com/",
+                    "expected_url": "https://www.weather.com.cn/weather/101220101.shtml",
+                    "data": [{"title": "Google"}],
+                },
+            }
+        ]
+    )
+
+    result = validator.validate(state)
+    assert result["validator_passed"] is False
+    assert result["task_queue"][0]["failure_type"] == "navigation_error"
+
+
 def test_critic_rejects_when_all_tasks_failed():
     critic = CriticAgent()
     state = _base_state(

@@ -4,6 +4,7 @@ OmniCore Validator — 纯 Python 硬规则验证层
 """
 from typing import Dict, Any, List
 from pathlib import Path
+from urllib.parse import urlparse
 
 from core.statuses import BLOCKED, WAITING_FOR_APPROVAL, WAITING_FOR_EVENT
 from core.state import OmniCoreState
@@ -15,6 +16,84 @@ class Validator:
 
     def __init__(self):
         self.name = "Validator"
+
+    @staticmethod
+    def _urls_look_related(expected_url: str, current_url: str) -> bool:
+        expected = str(expected_url or "").strip()
+        current = str(current_url or "").strip()
+        if not expected or not current:
+            return False
+        try:
+            expected_host = (urlparse(expected).netloc or "").lower()
+            current_host = (urlparse(current).netloc or "").lower()
+        except Exception:
+            return expected.rstrip("/") == current.rstrip("/")
+        if expected_host.startswith("www."):
+            expected_host = expected_host[4:]
+        if current_host.startswith("www."):
+            current_host = current_host[4:]
+        if not expected_host or not current_host:
+            return expected.rstrip("/") == current.rstrip("/")
+        return (
+            expected_host == current_host
+            or expected_host.endswith(f".{current_host}")
+            or current_host.endswith(f".{expected_host}")
+        )
+
+    @staticmethod
+    def _task_requires_structured_data(task: Dict[str, Any]) -> bool:
+        params = task.get("params", {}) if isinstance(task.get("params"), dict) else {}
+        description = " ".join(
+            str(item or "")
+            for item in (
+                task.get("description"),
+                params.get("task"),
+            )
+        ).lower()
+        retrieval_keywords = (
+            "extract",
+            "read",
+            "show",
+            "search",
+            "find",
+            "weather",
+            "forecast",
+            "temperature",
+            "humidity",
+            "air quality",
+            "summary",
+            "content",
+            "提取",
+            "读取",
+            "展示",
+            "搜索",
+            "查询",
+            "天气",
+            "预报",
+            "气温",
+            "湿度",
+            "空气质量",
+            "总结",
+            "内容",
+        )
+        interaction_keywords = (
+            "login",
+            "sign in",
+            "register",
+            "submit",
+            "pay",
+            "upload",
+            "download",
+            "登录",
+            "注册",
+            "提交",
+            "支付",
+            "上传",
+            "下载",
+        )
+        if any(keyword in description for keyword in interaction_keywords):
+            return False
+        return any(keyword in description for keyword in retrieval_keywords)
 
     # ------------------------------------------------------------------
     # 单任务验证
@@ -61,6 +140,16 @@ class Validator:
             if not success:
                 issues.append("browser_agent: success 标志为 False")
                 return {"passed": False, "failure_type": task.get("failure_type", "unknown"), "issues": issues}
+
+            expected_url = str(result.get("expected_url", "") or "").strip() if isinstance(result, dict) else ""
+            current_url = str(result.get("url", "") or "").strip() if isinstance(result, dict) else ""
+            if expected_url and current_url and not self._urls_look_related(expected_url, current_url):
+                issues.append(f"browser_agent: landed on unexpected url {current_url}")
+                return {"passed": False, "failure_type": "navigation_error", "issues": issues}
+            data = result.get("data", []) if isinstance(result, dict) else []
+            if self._task_requires_structured_data(task) and not data:
+                issues.append("browser_agent: expected extracted data but result.data is empty")
+                return {"passed": False, "failure_type": "selector_not_found", "issues": issues}
 
         elif task_type == "system_worker":
             rc = result.get("return_code") if isinstance(result, dict) else None

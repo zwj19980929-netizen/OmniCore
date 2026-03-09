@@ -1,6 +1,7 @@
 import asyncio
 
 from agents.browser_agent import ActionType, BrowserAction, BrowserAgent, PageElement, TaskIntent
+from utils.browser_toolkit import ToolkitResult
 
 
 class LLMGuard:
@@ -258,3 +259,169 @@ def test_decide_action_locally_prefers_intent_driven_search_input():
     assert action is not None
     assert action.action_type == ActionType.INPUT
     assert action.target_selector == "#search-box"
+
+
+class _ReadOnlyToolkit:
+    fast_mode = False
+    page = None
+
+    def __init__(self, landing_url: str, data, title: str = "Hefei Weather"):
+        self._landing_url = landing_url
+        self._current_url = ""
+        self._data = data
+        self._title = title
+
+    async def create_page(self):
+        return ToolkitResult(success=True)
+
+    async def goto(self, url: str, **_kwargs):
+        self._current_url = self._landing_url or url
+        return ToolkitResult(success=True, data=self._current_url)
+
+    async def wait_for_load(self, *_args, **_kwargs):
+        return ToolkitResult(success=True)
+
+    async def human_delay(self, *_args, **_kwargs):
+        return ToolkitResult(success=True)
+
+    async def evaluate_js(self, *_args, **_kwargs):
+        return ToolkitResult(success=True, data=self._data)
+
+    async def get_title(self):
+        return ToolkitResult(success=True, data=self._title)
+
+    async def get_current_url(self):
+        return ToolkitResult(success=True, data=self._current_url)
+
+
+def test_infer_task_intent_treats_direct_url_as_read_only():
+    agent = BrowserAgent(llm_client=FailingIntentLLM(), headless=True)
+
+    intent = asyncio.run(agent._infer_task_intent("https://www.weather.com.cn/weather/101220101.shtml"))
+
+    assert intent.intent_type == "read"
+    assert intent.requires_interaction is False
+
+
+def test_derive_primary_query_compresses_weather_browser_demo_instruction():
+    agent = BrowserAgent(headless=True)
+
+    query = agent._derive_primary_query("查询合肥明天的天气，并完整展示浏览器操作过程。请先打开浏览器再访问页面。")
+
+    assert query == "合肥 明天 天气"
+
+
+def test_task_looks_satisfied_requires_matching_target_url():
+    agent = BrowserAgent(headless=True)
+    intent = TaskIntent(intent_type="navigate", query="", confidence=0.8)
+
+    assert agent._task_looks_satisfied(
+        "open target page",
+        "https://www.google.com/",
+        intent,
+        target_url="https://www.weather.com.cn/weather/101220101.shtml",
+    ) is False
+    assert agent._task_looks_satisfied(
+        "open target page",
+        "https://www.weather.com.cn/weather/101220101.shtml",
+        intent,
+        target_url="https://www.weather.com.cn/weather/101220101.shtml",
+    ) is True
+
+
+def test_run_direct_url_extracts_current_page_content_without_interaction():
+    toolkit = _ReadOnlyToolkit(
+        landing_url="https://www.weather.com.cn/weather/101220101.shtml",
+        data=[{"index": 1, "text": "03/07 Cloudy 8C to 15C East wind"}],
+    )
+    agent = BrowserAgent(llm_client=FailingIntentLLM(), headless=True, toolkit=toolkit)
+
+    result = asyncio.run(agent.run("https://www.weather.com.cn/weather/101220101.shtml"))
+
+    assert result["success"] is True
+    assert result["url"] == "https://www.weather.com.cn/weather/101220101.shtml"
+    assert result["expected_url"] == "https://www.weather.com.cn/weather/101220101.shtml"
+    assert "03/07" in result["data"][0]["text"]
+
+
+def test_run_direct_url_fails_when_browser_lands_on_unexpected_page():
+    toolkit = _ReadOnlyToolkit(
+        landing_url="https://www.google.com/",
+        data=[{"title": "Google", "link": "https://www.google.com/"}],
+    )
+    agent = BrowserAgent(llm_client=FailingIntentLLM(), headless=True, toolkit=toolkit)
+
+    result = asyncio.run(agent.run("https://www.weather.com.cn/weather/101220101.shtml"))
+
+    assert result["success"] is False
+    assert "unexpected page" in result["message"]
+
+
+def test_run_fails_fast_on_blocked_same_site_holding_page():
+    toolkit = _ReadOnlyToolkit(
+        landing_url="https://www.weather.com.cn/ok.html",
+        data=[],
+        title="403 Forbidden",
+    )
+    agent = BrowserAgent(llm_client=FailingIntentLLM(), headless=True, toolkit=toolkit)
+
+    result = asyncio.run(agent.run("Open the weather page and extract data", start_url="https://www.weather.com.cn/"))
+
+    assert result["success"] is False
+    assert "blocked page" in result["message"]
+
+
+def test_find_search_result_click_action_prefers_external_weather_detail_result():
+    agent = BrowserAgent(headless=True)
+    elements = [
+        PageElement(
+            index=0,
+            tag="a",
+            text="图片",
+            element_type="link",
+            selector="a.images",
+            attributes={"href": "https://www.bing.com/images"},
+            is_visible=True,
+            is_clickable=True,
+        ),
+        PageElement(
+            index=1,
+            tag="a",
+            text="合肥天气预报",
+            element_type="link",
+            selector="a.weather",
+            attributes={"href": "https://www.weather.com.cn/weather/101220101.shtml"},
+            is_visible=True,
+            is_clickable=True,
+        ),
+    ]
+
+    action = agent._find_search_result_click_action(
+        "查询合肥天气，并展示浏览器操作过程",
+        "https://www.bing.com/search?q=%E5%90%88%E8%82%A5+%E5%A4%A9%E6%B0%94",
+        elements,
+        TaskIntent(intent_type="search", query="合肥 天气", confidence=0.9),
+    )
+
+    assert action is not None
+    assert action.action_type == ActionType.CLICK
+    assert action.target_selector == "a.weather"
+
+
+def test_run_with_start_url_and_read_description_stays_in_read_mode():
+    toolkit = _ReadOnlyToolkit(
+        landing_url="https://www.weather.com.cn/weather/101220101.shtml",
+        data=[{"index": 1, "text": "Tomorrow Cloudy 8C to 15C"}],
+    )
+    agent = BrowserAgent(llm_client=FailingIntentLLM(), headless=True, toolkit=toolkit)
+
+    result = asyncio.run(
+        agent.run(
+            "Open the page, wait for rendering, and extract tomorrow weather",
+            start_url="https://www.weather.com.cn/weather/101220101.shtml",
+        )
+    )
+
+    assert result["success"] is True
+    assert result["expected_url"] == "https://www.weather.com.cn/weather/101220101.shtml"
+    assert "Tomorrow" in result["data"][0]["text"]

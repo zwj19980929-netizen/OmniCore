@@ -590,6 +590,11 @@ def main() -> None:
         "Auto-approve queued confirmations",
         value=bool(preferences.get("auto_queue_confirmations", False)),
     )
+    user_location = st.text_input(
+        "User Location",
+        value=str(preferences.get("user_location", "") or ""),
+        help="Example: Shanghai, China or San Francisco, CA",
+    )
     preferred_tools_input = st.text_input(
         "Preferred Tools (comma separated)",
         value=preferred_tools_text,
@@ -602,6 +607,7 @@ def main() -> None:
         update_user_preferences(
             {
                 "default_output_directory": default_output_directory,
+                "user_location": user_location,
                 "auto_queue_confirmations": auto_queue_confirmations,
                 "preferred_tools": [item.strip() for item in preferred_tools_input.split(",") if item.strip()],
                 "preferred_sites": [item.strip() for item in preferred_sites_input.split(",") if item.strip()],

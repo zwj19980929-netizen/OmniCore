@@ -184,6 +184,7 @@ def _load_effective_user_preferences(session_id: str) -> Dict[str, Any]:
         log_warning(f"Failed to load user preferences: {e}")
         return {
             "default_output_directory": settings.DEFAULT_OUTPUT_DIRECTORY,
+            "user_location": settings.DEFAULT_USER_LOCATION,
             "preferred_tools": list(settings.DEFAULT_PREFERRED_TOOLS),
             "preferred_sites": list(settings.DEFAULT_PREFERRED_SITES),
             "auto_queue_confirmations": bool(settings.DEFAULT_AUTO_QUEUE_CONFIRMATIONS),
@@ -201,6 +202,37 @@ def _build_current_time_context() -> Dict[str, str]:
         "weekday": now.strftime("%A"),
         "timezone": timezone_name,
     }
+
+
+def _build_current_location_context(
+    user_preferences: Optional[Dict[str, Any]] = None,
+    current_time_context: Optional[Dict[str, str]] = None,
+) -> Dict[str, str]:
+    location = ""
+    source = ""
+    if isinstance(user_preferences, dict):
+        location = sanitize_text(user_preferences.get("user_location") or "")
+        if location:
+            source = "user_preference"
+
+    if not location:
+        location = sanitize_text(settings.DEFAULT_USER_LOCATION)
+        if location:
+            source = "default_setting"
+
+    if not location:
+        return {}
+
+    context = {
+        "location": location,
+        "source": source or "configured",
+    }
+    timezone_name = ""
+    if isinstance(current_time_context, dict):
+        timezone_name = sanitize_text(current_time_context.get("timezone") or "")
+    if timezone_name:
+        context["timezone"] = timezone_name
+    return context
 
 
 def _load_job_work_scope(job_id: str) -> Dict[str, str]:
@@ -1523,6 +1555,10 @@ def _execute_submitted_job(
 ) -> Dict[str, Any]:
     user_preferences = _load_effective_user_preferences(runtime_session_id)
     current_time_context = _build_current_time_context()
+    current_location_context = _build_current_location_context(
+        user_preferences,
+        current_time_context,
+    )
     work_runtime_context = _load_work_runtime_context(
         session_id=runtime_session_id,
         job_id=runtime_job_id,
@@ -1554,6 +1590,7 @@ def _execute_submitted_job(
         initial_state["job_id"] = runtime_job_id
         initial_state.setdefault("shared_memory", {})
         initial_state["shared_memory"]["current_time_context"] = current_time_context
+        initial_state["shared_memory"]["current_location_context"] = current_location_context
         initial_state["shared_memory"]["user_preferences"] = user_preferences
         initial_state["shared_memory"]["work_context"] = work_runtime_context.get("work_context", {})
         initial_state["shared_memory"]["resource_memory"] = work_runtime_context.get("resource_memory", [])
@@ -1571,6 +1608,7 @@ def _execute_submitted_job(
         if clean_history:
             initial_state["shared_memory"]["conversation_history"] = clean_history
         initial_state["shared_memory"]["current_time_context"] = current_time_context
+        initial_state["shared_memory"]["current_location_context"] = current_location_context
         initial_state["shared_memory"]["user_preferences"] = user_preferences
         initial_state["shared_memory"]["work_context"] = work_runtime_context.get("work_context", {})
         initial_state["shared_memory"]["resource_memory"] = work_runtime_context.get("resource_memory", [])
@@ -1614,6 +1652,7 @@ def _execute_submitted_job(
         log_warning(f"Failed to refresh session artifacts: {e}")
 
     initial_state["shared_memory"]["current_time_context"] = current_time_context
+    initial_state["shared_memory"]["current_location_context"] = current_location_context
     initial_state["shared_memory"]["user_preferences"] = user_preferences
     initial_state["shared_memory"]["work_context"] = work_runtime_context.get("work_context", {})
     initial_state["shared_memory"]["resource_memory"] = work_runtime_context.get("resource_memory", [])

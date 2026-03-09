@@ -70,6 +70,43 @@ def test_browser_lease_release_is_idempotent():
     asyncio.run(_run())
 
 
+def test_browser_lease_release_can_retry_after_pool_release_failure():
+    async def _run():
+        pool = BrowserRuntimePool(asyncio.get_running_loop())
+
+        async def _fake_launch(headless: bool):
+            return FakeBrowser()
+
+        pool._launch_browser_locked = _fake_launch
+        lease = await pool.acquire_browser(headless=True)
+        original_release_browser = pool.release_browser
+        attempts = 0
+
+        async def _flaky_release(current_lease):
+            nonlocal attempts
+            attempts += 1
+            if attempts == 1:
+                raise RuntimeError("temporary release failure")
+            await original_release_browser(current_lease)
+
+        pool.release_browser = _flaky_release
+
+        try:
+            await lease.release()
+            assert False, "expected the first release to fail"
+        except RuntimeError:
+            pass
+
+        assert lease._released is False
+
+        await lease.release()
+
+        assert lease._released is True
+        assert pool.snapshot_stats()["releases"] == 1
+
+    asyncio.run(_run())
+
+
 def test_pool_waits_for_capacity_then_reuses_browser(monkeypatch):
     async def _run():
         monkeypatch.setattr(settings, "BROWSER_POOL_MAX_BROWSERS_PER_KEY", 1)

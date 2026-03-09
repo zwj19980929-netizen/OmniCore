@@ -245,9 +245,44 @@ class WebWorker:
         desc = (task_description or "").lower()
         text_keywords = [
             "read", "summary", "summarize", "extract text", "article", "content",
+            "weather", "forecast", "temperature", "humidity", "air quality", "wind",
             "读取", "总结", "概述", "正文", "文章", "内容",
         ]
-        return any(k in desc for k in text_keywords)
+        return any(k in desc for k in text_keywords) or self._task_mentions_weather(task_description)
+
+    def _task_mentions_weather(self, task_description: str) -> bool:
+        desc = (task_description or "").lower()
+        weather_keywords = [
+            "weather", "forecast", "temperature", "humidity", "air quality", "aqi", "wind",
+            "天气", "预报", "气温", "湿度", "空气质量", "风力",
+        ]
+        return any(keyword in desc for keyword in weather_keywords)
+
+    def _looks_like_weather_text(self, text: str) -> bool:
+        value = (text or "").lower()
+        weather_signals = [
+            "°c", "℃", "temperature", "humidity", "air quality", "aqi", "wind",
+            "weather", "forecast", "today", "tomorrow",
+            "气温", "湿度", "空气质量", "风力", "天气", "预报", "今天", "明天",
+        ]
+        return any(signal in value for signal in weather_signals) or bool(re.search(r"\b\d{1,2}\s*(?:°c|℃)\b", value))
+
+    def _static_data_looks_useful(self, task_description: str, data: List[Dict[str, Any]]) -> bool:
+        if not data:
+            return False
+        detail_task = self._prefers_static_text(task_description) or self._task_mentions_weather(task_description)
+        if not detail_task:
+            return True
+        text_items = [
+            str(item.get("text", "") or "").strip()
+            for item in data
+            if isinstance(item, dict) and str(item.get("text", "") or "").strip()
+        ]
+        if not text_items:
+            return False
+        if self._task_mentions_weather(task_description):
+            return any(self._looks_like_weather_text(item) for item in text_items[:8])
+        return True
 
     def _extract_static_links(self, html: str, base_url: str, task_description: str, limit: int) -> List[Dict[str, Any]]:
         cleaned = self._clean_html_text(html)
@@ -283,15 +318,19 @@ class WebWorker:
             item.pop("_order", None)
         return results
 
-    def _extract_static_text_blocks(self, html: str, limit: int) -> List[Dict[str, Any]]:
+    def _extract_static_text_blocks(self, html: str, limit: int, task_description: str = "") -> List[Dict[str, Any]]:
         cleaned = self._clean_html_text(html)
         blocks: List[Dict[str, Any]] = []
         seen = set()
         patterns = [RE_PARAGRAPH_BLOCK, RE_CONTENT_BLOCK]
+        weather_task = self._task_mentions_weather(task_description)
         for pattern in patterns:
             for match in pattern.finditer(cleaned):
                 text = self._strip_tags(match.group(2))
-                if len(text) < 40:
+                min_length = 12 if weather_task else 40
+                if len(text) < min_length:
+                    continue
+                if weather_task and not self._looks_like_weather_text(text) and len(text) < 40:
                     continue
                 key = RE_WHITESPACE.sub(" ", text).strip().lower()[:120]
                 if key in seen:
@@ -325,7 +364,7 @@ class WebWorker:
                     except Exception:
                         pass
             html = str(getattr(resp, "text", "") or "")
-            text_data = self._extract_static_text_blocks(html, max(3, min(limit, 6)))
+            text_data = self._extract_static_text_blocks(html, max(3, min(limit, 6)), task_description)
             link_data = self._extract_static_links(html, url, task_description, limit)
             if self._prefers_static_text(task_description):
                 data = text_data or link_data
@@ -333,6 +372,8 @@ class WebWorker:
                 data = link_data or text_data
             if not data:
                 return {"success": False, "error": "静态抓取未提取到有效内容", "data": [], "url": url}
+            if not self._static_data_looks_useful(task_description, data):
+                return {"success": False, "error": "static fetch returned navigation links instead of usable detail data", "data": [], "url": url}
             return {"success": True, "data": data, "count": len(data), "source": url,
                     "mode": "static_fetch_text" if "text" in data[0] else "static_fetch"}
         except Exception as e:
@@ -430,6 +471,61 @@ class WebWorker:
         )
         return any(host == domain or host.endswith(f".{domain}") for domain in search_hosts)
 
+    async def _legacy_collect_search_links(self, tk: BrowserToolkit, query: str, max_results: int) -> List[str]:
+        selectors = [
+            "li.b_algo h2 a",
+            ".b_algo h2 a",
+            ".result__a",
+            "main a[href]",
+            "a[href]",
+            "天气", "预报", "气温", "湿度", "空气质量", "风力",
+        ]
+        urls: List[str] = []
+        seen = set()
+        query_tokens = {
+            token.strip().lower()
+            for token in RE_TOKEN_SPLIT.split(query or "")
+            if len(token.strip()) >= 2
+        }
+
+        for selector in selectors:
+            links_r = await tk.query_all(selector)
+            if not links_r.success:
+                continue
+            for elem in (links_r.data or [])[: max_results * 12]:
+                try:
+                    href = await elem.get_attribute("href")
+                except Exception:
+                    href = None
+                if not href:
+                    continue
+                href = self._decode_redirect_url(href.strip())
+                if not href.startswith("http"):
+                    continue
+                if self._is_search_engine_domain(href):
+                    continue
+                if href in seen:
+                    continue
+                seen.add(href)
+
+                # Prefer results that mention query tokens in anchor text,
+                # but still keep URL as fallback to avoid empty result sets.
+                include = True
+                try:
+                    text = str((await elem.inner_text()) or "").strip().lower()
+                except Exception:
+                    text = ""
+                if query_tokens and text:
+                    token_hits = sum(1 for token in query_tokens if token in text)
+                    include = token_hits > 0 or len(urls) < max_results // 2
+                if include:
+                    urls.append(href)
+                if len(urls) >= max_results:
+                    return urls
+            if urls:
+                break
+        return urls
+
     async def _collect_search_links(self, tk: BrowserToolkit, query: str, max_results: int) -> List[str]:
         selectors = [
             "li.b_algo h2 a",
@@ -466,8 +562,6 @@ class WebWorker:
                     continue
                 seen.add(href)
 
-                # Prefer results that mention query tokens in anchor text,
-                # but still keep URL as fallback to avoid empty result sets.
                 include = True
                 try:
                     text = str((await elem.inner_text()) or "").strip().lower()

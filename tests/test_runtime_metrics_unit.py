@@ -85,6 +85,7 @@ class FakeRuntimeStateStore:
     def get_preferences(self, session_id=None):
         return {
             "default_output_directory": "",
+            "user_location": "Shanghai, China",
             "preferred_tools": ["file.read_write"],
             "preferred_sites": [],
             "auto_queue_confirmations": False,

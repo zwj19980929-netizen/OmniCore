@@ -133,6 +133,106 @@ class BrowserAgent:
     def _normalize_text(self, value: str) -> str:
         return re.sub(r"\s+", " ", (value or "").strip()).lower()
 
+    def _task_mentions_interaction(self, task: str) -> bool:
+        normalized = self._normalize_text(re.sub(r"https?://\S+", " ", task or ""))
+        if not normalized:
+            return False
+        interaction_tokens = (
+            "click",
+            "tap",
+            "press",
+            "search",
+            "type",
+            "input",
+            "fill",
+            "submit",
+            "select",
+            "login",
+            "log in",
+            "sign in",
+            "upload",
+            "download",
+            "scroll",
+            "点击",
+            "搜索",
+            "输入",
+            "填写",
+            "提交",
+            "选择",
+            "登录",
+            "上传",
+            "下载",
+            "滚动",
+        )
+        return any(token in normalized for token in interaction_tokens)
+
+    @staticmethod
+    def _is_search_engine_url(url: str) -> bool:
+        host = urlparse(url or "").netloc.lower()
+        if host.startswith("www."):
+            host = host[4:]
+        return any(
+            host == domain or host.endswith(f".{domain}")
+            for domain in ("google.com", "bing.com", "baidu.com", "duckduckgo.com", "sogou.com")
+        )
+
+    @staticmethod
+    def _urls_look_related(expected_url: str, current_url: str) -> bool:
+        if not expected_url:
+            return bool(current_url)
+        if not current_url:
+            return False
+
+        expected = urlparse(expected_url)
+        current = urlparse(current_url)
+        expected_host = expected.netloc.lower()
+        current_host = current.netloc.lower()
+
+        if expected_host.startswith("www."):
+            expected_host = expected_host[4:]
+        if current_host.startswith("www."):
+            current_host = current_host[4:]
+
+        if not expected_host or not current_host:
+            return expected_url.rstrip("/") == current_url.rstrip("/")
+
+        return (
+            expected_host == current_host
+            or expected_host.endswith(f".{current_host}")
+            or current_host.endswith(f".{expected_host}")
+        )
+
+    @staticmethod
+    def _looks_like_blocked_page(url: str, title: str = "") -> bool:
+        normalized_url = (url or "").lower()
+        normalized_title = (title or "").lower()
+        blocked_url_tokens = (
+            "/ok.html",
+            "/forbidden",
+            "/denied",
+            "/captcha",
+            "/verify",
+            "/challenge",
+            "/blocked",
+            "/security-check",
+        )
+        blocked_title_tokens = (
+            "403",
+            "forbidden",
+            "access denied",
+            "request denied",
+            "robot check",
+            "security check",
+            "captcha",
+            "验证码",
+            "安全验证",
+            "访问受限",
+            "拒绝访问",
+        )
+        return any(token in normalized_url for token in blocked_url_tokens) or any(
+            token in normalized_title for token in blocked_title_tokens
+        )
+
     def _is_read_only_task(self, task: str, intent: Optional[TaskIntent] = None) -> bool:
         normalized = self._normalize_text(task)
         if not normalized:
@@ -140,13 +240,17 @@ class BrowserAgent:
         if intent:
             if intent.requires_interaction:
                 return False
-            if intent.intent_type in {"search", "form", "auth", "navigate"}:
+            if intent.intent_type in {"search", "form", "auth"}:
                 return False
             if intent.target_text:
+                return False
+            if intent.intent_type == "navigate" and self._task_mentions_interaction(task):
                 return False
         if len(self._extract_structured_pairs(task)) >= 2:
             return False
         if self._extract_click_target_text(task):
+            return False
+        if self._task_mentions_interaction(task):
             return False
         return True
 
@@ -236,6 +340,53 @@ class BrowserAgent:
             token for token in re.split(r"[^a-zA-Z0-9_\u4e00-\u9fff]+", self._normalize_text(task))
             if len(token) >= 2
         ]
+
+    def _refine_search_query(self, task: str, candidate: str = "") -> str:
+        raw = str(candidate or task or "")
+        raw = re.sub(r"https?://\S+", " ", raw)
+        normalized = re.sub(r"\s+", " ", raw).strip()
+        if not normalized:
+            return ""
+
+        weather_match = re.search(
+            r"(?:查询|查|搜索|搜|获取|看看)?\s*([\u4e00-\u9fff]{2,12}?)(?:(今天|明天|后天|当前))?(?:的)?(?:天气|天气预报|气温|空气质量)",
+            normalized,
+        )
+        if weather_match:
+            location = weather_match.group(1)
+            timeframe = weather_match.group(2) or ""
+            return " ".join(part for part in [location, timeframe, "天气"] if part).strip()
+
+        for pattern in (
+            r"(?:搜索|查询|查找|查一下|查查|搜一下|搜|获取)([^。！？\n]{2,80})",
+            r"(?:search|find|get|look up|query)\s+([^\n.?!]{2,80})",
+        ):
+            match = re.search(pattern, normalized, flags=re.IGNORECASE)
+            if match:
+                normalized = match.group(1)
+                break
+
+        normalized = re.split(r"(?:并|然后|并且|且|and then|then|click|点击|打开|访问|extract|提取|展示|show|向用户|给用户)", normalized, maxsplit=1, flags=re.IGNORECASE)[0]
+        stop_tokens = {
+            "打开", "浏览器", "访问", "页面", "网页", "网站", "点击", "输入", "搜索", "查询", "查找",
+            "提取", "展示", "显示", "查看", "操作", "过程", "结果", "用户", "详细", "详情", "完整",
+            "use", "open", "browser", "page", "website", "click", "input", "search", "query",
+            "extract", "show", "display", "user", "details", "process", "result", "results", "visible",
+            "retrieve", "rendering", "after", "wait", "render", "data",
+        }
+        tokens: List[str] = []
+        for token in re.findall(r"[\u4e00-\u9fff]{2,}|[A-Za-z0-9][A-Za-z0-9_+.-]{1,}", normalized):
+            lowered = token.lower()
+            if lowered in stop_tokens:
+                continue
+            if lowered.isdigit() and len(lowered) >= 4:
+                continue
+            if lowered not in tokens:
+                tokens.append(lowered)
+
+        if not tokens:
+            return ""
+        return " ".join(tokens[:8]).strip()
 
     def _format_elements_for_llm(self, task: str, elements: List[PageElement], max_items: Optional[int] = None) -> str:
         limit = max_items or self._choose_llm_element_limit(task)
@@ -392,11 +543,14 @@ class BrowserAgent:
         return ranked[0] if ranked else None
 
     def _derive_primary_query(self, task: str) -> str:
+        refined = self._refine_search_query(task)
+        if refined:
+            return refined
         normalized = re.sub(r"https?://\S+", " ", task or "")
         normalized = re.sub(r"[^\w\u4e00-\u9fff]+", " ", normalized, flags=re.UNICODE)
         chunks = re.findall(r"[\u4e00-\u9fff]{2,}|[A-Za-z0-9][A-Za-z0-9_+.-]{1,}", normalized)
         if chunks:
-            return " ".join(chunks[:12]).strip()
+            return " ".join(chunks[:8]).strip()
         return ""
 
     def _build_form_fill_action(self, mapping: Dict[str, str]) -> BrowserAction:
@@ -457,9 +611,28 @@ class BrowserAgent:
         query = self._derive_primary_query(task)
         fields = self._extract_structured_pairs(task)
         target_text = self._extract_click_target_text(task)
+        extracted_url = self._extract_url_from_task(task)
 
-        if self._extract_url_from_task(task):
-            fallback = TaskIntent(intent_type="navigate", query=query, confidence=0.55, target_text=target_text)
+        if extracted_url:
+            if len(fields) >= 2:
+                fallback = TaskIntent(
+                    intent_type="form",
+                    query=query,
+                    confidence=0.6,
+                    fields=fields,
+                    requires_interaction=True,
+                    target_text=target_text,
+                )
+            elif target_text or self._task_mentions_interaction(task):
+                fallback = TaskIntent(
+                    intent_type="navigate",
+                    query=query,
+                    confidence=0.55,
+                    requires_interaction=True,
+                    target_text=target_text,
+                )
+            else:
+                fallback = TaskIntent(intent_type="read", query=query, confidence=0.6, target_text=target_text)
         elif len(fields) >= 2:
             fallback = TaskIntent(
                 intent_type="form",
@@ -496,7 +669,7 @@ class BrowserAgent:
                 intent_type = fallback.intent_type
 
             confidence = float(payload.get("confidence", 0.0) or 0.0)
-            llm_query = str(payload.get("query", "") or "").strip() or query
+            llm_query = self._refine_search_query(task, str(payload.get("query", "") or "").strip()) or query
             llm_target = self._normalize_text(str(payload.get("target_text", "") or "").strip())
             llm_fields = payload.get("fields", {})
             normalized_fields: Dict[str, str] = {}
@@ -523,12 +696,15 @@ class BrowserAgent:
 
         if not fallback.query:
             fallback.query = query
+        fallback.query = self._refine_search_query(task, fallback.query) or fallback.query
         if not fallback.fields and fallback.intent_type in {"form", "auth"}:
             fallback.fields = fields
         if not fallback.target_text:
             fallback.target_text = target_text
         if fallback.intent_type in {"form", "auth"}:
             fallback.requires_interaction = True
+        if extracted_url and not fallback.target_text and not fallback.requires_interaction:
+            fallback.intent_type = "read"
         if fallback.target_text and fallback.intent_type in {"read", "unknown"}:
             fallback.intent_type = "navigate"
             fallback.requires_interaction = True
@@ -1058,33 +1234,216 @@ class BrowserAgent:
 
     # ── data extraction ────────────────────────────────────────
 
-    async def _maybe_extract_data(self) -> List[Dict[str, str]]:
+    async def _maybe_extract_data(
+        self,
+        *,
+        prefer_content: bool = False,
+        prefer_links: bool = False,
+    ) -> List[Dict[str, str]]:
+        mode = "auto"
+        if prefer_content:
+            mode = "content"
+        elif prefer_links:
+            mode = "links"
+
         r = await self.toolkit.evaluate_js(
             r"""
-            () => {
-              const links = Array.from(document.querySelectorAll('a[href]'))
-                .slice(0, 10)
-                .map(a => ({
-                  title: (a.innerText || a.textContent || '').replace(/\s+/g, ' ').trim(),
-                  link: a.href,
-                }))
-                .filter(item => item.title || item.link);
+            (mode) => {
+              const normalize = (value) => (value || '').replace(/\s+/g, ' ').trim();
+              const isVisible = (element) => {
+                if (!element) return false;
+                const style = window.getComputedStyle(element);
+                if (!style || style.visibility === 'hidden' || style.display === 'none') return false;
+                const rect = element.getBoundingClientRect();
+                return rect.width > 0 && rect.height > 0;
+              };
+              const isExcluded = (element) => Boolean(
+                element.closest('nav, header, footer, aside, form, [role="navigation"], script, style, noscript')
+              );
+              const dedupe = (items, keyFactory) => {
+                const seen = new Set();
+                const result = [];
+                for (const item of items) {
+                  const key = keyFactory(item);
+                  if (!key || seen.has(key)) continue;
+                  seen.add(key);
+                  result.push(item);
+                }
+                return result;
+              };
+
+              const contentSelectors = [
+                'main li', 'article li', '[role="main"] li', 'section li',
+                '#7d li', '#15d li', '.forecast li', '.weather li',
+                'main p', 'article p', '[role="main"] p', 'section p',
+                'main h1', 'article h1', 'main h2', 'article h2',
+                'main h3', 'article h3', 'tr'
+              ].join(', ');
+
+              const denseContent = dedupe(
+                Array.from(document.querySelectorAll(contentSelectors))
+                  .filter(element => !isExcluded(element) && isVisible(element))
+                  .map((element, index) => ({
+                    index: index + 1,
+                    text: normalize(element.innerText || element.textContent || ''),
+                  }))
+                  .filter(item => item.text.length >= 4 && item.text.length <= 240),
+                (item) => item.text
+              ).slice(0, 12);
+
+              const bodyText = normalize(document.body ? document.body.innerText : '');
+              const bodyLines = dedupe(
+                bodyText
+                  .split(/\n+/)
+                  .map((text, index) => ({
+                    index: index + 1,
+                    text: normalize(text),
+                  }))
+                  .filter(item => item.text.length >= 8 && item.text.length <= 240),
+                (item) => item.text
+              ).slice(0, 12);
+
+              const contentBlocks = denseContent.length >= 3 ? denseContent : bodyLines;
+
+              const links = dedupe(
+                Array.from(document.querySelectorAll('a[href]'))
+                  .filter(element => !isExcluded(element) && isVisible(element))
+                  .map((element) => ({
+                    title: normalize(
+                      element.innerText ||
+                      element.textContent ||
+                      element.getAttribute('aria-label') ||
+                      element.getAttribute('title') ||
+                      ''
+                    ),
+                    link: element.href || element.getAttribute('href') || '',
+                  }))
+                  .filter(item => (
+                    item.link &&
+                    item.title &&
+                    !/^javascript:/i.test(item.link) &&
+                    item.title.length >= 2
+                  )),
+                (item) => `${item.title}|${item.link}`
+              ).slice(0, 10);
+
+              if (mode === 'content') return contentBlocks.length ? contentBlocks : links;
+              if (mode === 'links') return links.length ? links : contentBlocks;
+              if (contentBlocks.length >= 4) return contentBlocks;
               if (links.length) return links;
-              return Array.from(document.querySelectorAll('main p, article p, section p, p, li'))
-                .map(node => (node.innerText || node.textContent || '').replace(/\s+/g, ' ').trim())
-                .filter(Boolean)
-                .slice(0, 8)
-                .map((text, idx) => ({ index: idx + 1, text }));
+              return contentBlocks;
             }
-            """
+            """,
+            mode,
         )
         return r.data or [] if r.success else []
+
+    async def _extract_data_for_intent(self, intent: Optional[TaskIntent] = None) -> List[Dict[str, str]]:
+        active_intent = intent or TaskIntent(intent_type="read", query="", confidence=0.0)
+        current_url_r = await self.toolkit.get_current_url()
+        current_url = current_url_r.data or ""
+        prefer_links = active_intent.intent_type == "search" or self._is_search_engine_url(current_url)
+        return await self._maybe_extract_data(
+            prefer_content=not prefer_links,
+            prefer_links=prefer_links,
+        )
+
+    def _task_requires_detail_page(self, task: str, intent: Optional[TaskIntent] = None) -> bool:
+        normalized = self._normalize_text(task)
+        active_intent = intent or TaskIntent(intent_type="read", query="", confidence=0.0)
+        detail_tokens = (
+            "weather", "forecast", "temperature", "humidity", "wind", "aqi", "air quality",
+            "detail", "详情", "具体", "温度", "湿度", "风力", "空气质量", "天气", "天气预报",
+        )
+        return active_intent.intent_type in {"search", "navigate"} and any(token in normalized for token in detail_tokens)
+
+    def _find_search_result_click_action(
+        self,
+        task: str,
+        current_url: str,
+        elements: List[PageElement],
+        intent: Optional[TaskIntent] = None,
+    ) -> Optional[BrowserAction]:
+        if not self._is_search_engine_url(current_url):
+            return None
+
+        active_intent = intent or TaskIntent(intent_type="search", query=self._derive_primary_query(task), confidence=0.0)
+        if not self._task_requires_detail_page(task, active_intent):
+            return None
+
+        query_tokens = [token for token in self._extract_task_tokens(active_intent.query) if len(token) >= 2][:6]
+        best_match: Optional[tuple[float, PageElement]] = None
+        for element in elements:
+            if not element.is_visible or not element.is_clickable:
+                continue
+            if element.element_type not in {"link", "button"} and element.tag not in {"a", "button"}:
+                continue
+            if self._is_noise_element(element):
+                continue
+
+            attrs = element.attributes or {}
+            href = str(attrs.get("href", "") or "")
+            if not href or self._is_search_engine_url(href):
+                continue
+
+            haystack = self._normalize_text(" ".join([
+                element.text,
+                attrs.get("labelText", ""),
+                attrs.get("title", ""),
+                href,
+            ]))
+            score = 0.0
+            for token in query_tokens:
+                if token in haystack:
+                    score += 2.0
+            if "weather.com.cn" in haystack or "moji.com" in haystack or "tianqi.com" in haystack:
+                score += 3.0
+            if "天气" in haystack or "weather" in haystack:
+                score += 2.0
+            if score <= 0:
+                continue
+            if best_match is None or score > best_match[0]:
+                best_match = (score, element)
+
+        if best_match is None:
+            return None
+
+        return BrowserAction(
+            action_type=ActionType.CLICK,
+            target_selector=best_match[1].selector,
+            description="open the most relevant detail result",
+            confidence=min(best_match[0] / 10.0, 0.88),
+        )
+
+    def _coerce_intent_for_direct_page(
+        self,
+        task: str,
+        intent: TaskIntent,
+        target_url: str = "",
+    ) -> TaskIntent:
+        if not target_url:
+            return intent
+        if intent.intent_type in {"form", "auth"}:
+            return intent
+        if intent.target_text or intent.requires_interaction:
+            return intent
+        if self._task_mentions_interaction(task):
+            return intent
+        return TaskIntent(
+            intent_type="read",
+            query=intent.query,
+            confidence=max(intent.confidence, 0.7),
+            fields=intent.fields,
+            requires_interaction=False,
+            target_text="",
+        )
 
     def _task_looks_satisfied(
         self,
         task: str,
         current_url: str,
         intent: Optional[TaskIntent] = None,
+        target_url: str = "",
     ) -> bool:
         active_intent = intent or TaskIntent(
             intent_type="search",
@@ -1092,6 +1451,8 @@ class BrowserAgent:
             confidence=0.0,
         )
         if active_intent.intent_type == "search":
+            if self._is_search_engine_url(current_url):
+                return False
             parsed = urlparse(current_url or "")
             query_string = " ".join(
                 value
@@ -1106,7 +1467,9 @@ class BrowserAgent:
         if active_intent.intent_type in {"form", "auth"}:
             return bool(current_url)
         if active_intent.intent_type == "navigate":
-            return bool(current_url)
+            if target_url:
+                return self._urls_look_related(target_url, current_url)
+            return bool(current_url) and not active_intent.target_text
         return False
 
     async def _wait_for_page_ready(self) -> None:
@@ -1124,7 +1487,8 @@ class BrowserAgent:
         if not r.success:
             return {"success": False, "message": f"浏览器启动失败: {r.error}", "steps": []}
 
-        url = start_url or self._extract_url_from_task(task) or "https://www.google.com"
+        expected_url = start_url or self._extract_url_from_task(task) or ""
+        url = expected_url or "about:blank"
         steps: List[Dict[str, Any]] = []
         self._action_history = []
 
@@ -1144,7 +1508,30 @@ class BrowserAgent:
                 return {"success": False, "message": f"初始导航失败: {str(nav_err)[:200]}", "url": url, "steps": steps}
 
             await self._wait_for_page_ready()
+            current_url_r = await tk.get_current_url()
+            current_url = current_url_r.data or ""
+            title_r = await tk.get_title()
+            page_title = title_r.data or ""
+            if self._looks_like_blocked_page(current_url, page_title):
+                return {
+                    "success": False,
+                    "message": f"navigation landed on blocked page: {page_title or current_url}",
+                    "url": current_url,
+                    "expected_url": expected_url,
+                    "title": page_title,
+                    "steps": steps,
+                }
+            if expected_url and current_url and not self._urls_look_related(expected_url, current_url):
+                return {
+                    "success": False,
+                    "message": f"navigation landed on unexpected page: expected {expected_url}, got {current_url}",
+                    "url": current_url,
+                    "expected_url": expected_url,
+                    "title": page_title,
+                    "steps": steps,
+                }
             task_intent = await self._infer_task_intent(task)
+            task_intent = self._coerce_intent_for_direct_page(task, task_intent, expected_url)
             if (
                 task_intent.intent_type == "search"
                 and not start_url
@@ -1153,7 +1540,7 @@ class BrowserAgent:
                 await self._bootstrap_search_results(task_intent.query or self._derive_primary_query(task))
 
             if self._is_read_only_task(task, task_intent):
-                initial_data = await self._maybe_extract_data()
+                initial_data = await self._extract_data_for_intent(task_intent)
                 if initial_data and (
                     task_intent.intent_type != "search"
                     or self._is_data_relevant(task_intent.query, initial_data)
@@ -1162,7 +1549,7 @@ class BrowserAgent:
                     url_r = await tk.get_current_url()
                     return {"success": True, "message": "read-only task satisfied from initial page",
                             "url": url_r.data or "", "title": title_r.data or "",
-                            "steps": steps, "data": initial_data}
+                            "expected_url": expected_url, "steps": steps, "data": initial_data}
 
             # 累积数据容器
             _accumulated_data: List[Dict[str, str]] = []
@@ -1177,47 +1564,68 @@ class BrowserAgent:
                         _accumulated_data.append(item)
 
             for step_no in range(1, max_steps + 1):
+                current_url_r = await tk.get_current_url()
+                title_r = await tk.get_title()
+                if self._looks_like_blocked_page(current_url_r.data or "", title_r.data or ""):
+                    return {
+                        "success": False,
+                        "message": f"browser landed on blocked page during execution: {title_r.data or current_url_r.data or ''}",
+                        "url": current_url_r.data or "",
+                        "title": title_r.data or "",
+                        "expected_url": expected_url,
+                        "steps": steps,
+                        "data": _accumulated_data,
+                    }
                 elements = await self._extract_interactive_elements()
-                action = self._decide_action_locally(task, elements, task_intent)
+                action = self._find_search_result_click_action(
+                    task,
+                    current_url_r.data or "",
+                    elements,
+                    task_intent,
+                )
+                if action is None:
+                    action = self._decide_action_locally(task, elements, task_intent)
                 if action is None:
                     action = await self._decide_action_with_llm(task, elements)
 
                 if action.action_type == ActionType.DONE:
-                    data = await self._maybe_extract_data()
+                    data = await self._extract_data_for_intent(task_intent)
                     _merge_new_data(data)
                     log_success("browser task completed")
                     url_r = await tk.get_current_url()
                     title_r = await tk.get_title()
                     return {"success": True, "message": "task completed",
                             "url": url_r.data or "", "title": title_r.data or "",
-                            "steps": steps, "data": _accumulated_data or data}
+                            "expected_url": expected_url, "steps": steps, "data": _accumulated_data or data}
 
                 if action.action_type == ActionType.EXTRACT:
-                    data = await self._maybe_extract_data()
+                    data = await self._extract_data_for_intent(task_intent)
                     _merge_new_data(data)
                     url_r = await tk.get_current_url()
                     title_r = await tk.get_title()
                     return {"success": True, "message": "data extracted",
                             "url": url_r.data or "", "title": title_r.data or "",
-                            "steps": steps, "data": _accumulated_data or data}
+                            "expected_url": expected_url, "steps": steps, "data": _accumulated_data or data}
 
                 if action.requires_confirmation and settings.REQUIRE_HUMAN_CONFIRM:
                     return {"success": False, "message": "action requires human confirmation",
                             "requires_confirmation": True, "steps": steps}
 
                 if self._is_action_looping(action):
-                    if self._is_read_only_task(task, task_intent):
-                        _merge_new_data(await self._maybe_extract_data())
-                        url_r = await tk.get_current_url()
-                        title_r = await tk.get_title()
-                        return {"success": True, "message": "repeated action avoided; extracted current page",
-                                "url": url_r.data or "", "title": title_r.data or "",
-                                "steps": steps, "data": _accumulated_data}
                     url_r = await tk.get_current_url()
                     title_r = await tk.get_title()
+                    if self._looks_like_blocked_page(url_r.data or "", title_r.data or ""):
+                        return {"success": False, "message": f"browser stuck on blocked page: {title_r.data or url_r.data or ''}",
+                                "url": url_r.data or "", "title": title_r.data or "",
+                                "expected_url": expected_url, "steps": steps, "data": _accumulated_data}
+                    if self._is_read_only_task(task, task_intent):
+                        _merge_new_data(await self._extract_data_for_intent(task_intent))
+                        return {"success": True, "message": "repeated action avoided; extracted current page",
+                                "url": url_r.data or "", "title": title_r.data or "",
+                                "expected_url": expected_url, "steps": steps, "data": _accumulated_data}
                     return {"success": False, "message": f"repeated action loop detected at step {step_no}",
                             "url": url_r.data or "", "title": title_r.data or "",
-                            "steps": steps, "data": _accumulated_data}
+                            "expected_url": expected_url, "steps": steps, "data": _accumulated_data}
                 self._record_action(action)
 
                 before = await self._snapshot_page_state()
@@ -1263,35 +1671,46 @@ class BrowserAgent:
                     return {"success": False,
                             "message": f"连续 {_consecutive_fails} 步失败，放弃执行 (最后在 step {step_no})",
                             "url": url_r.data or "", "title": title_r.data or "",
-                            "steps": steps, "data": _accumulated_data or await self._maybe_extract_data()}
+                            "expected_url": expected_url,
+                            "steps": steps, "data": _accumulated_data or await self._extract_data_for_intent(task_intent)}
 
                 if action.action_type in {ActionType.CLICK, ActionType.INPUT, ActionType.FILL_FORM, ActionType.PRESS_KEY}:
-                    step_data = await self._maybe_extract_data()
+                    step_data = await self._extract_data_for_intent(task_intent)
                     _merge_new_data(step_data)
-                    if self._task_looks_satisfied(task, url_r.data or "", task_intent):
+                    candidate_data = _accumulated_data or step_data
+                    requires_data = self._is_read_only_task(task, task_intent) or task_intent.intent_type == "search"
+                    has_sufficient_data = bool(candidate_data)
+                    if task_intent.intent_type == "search" and candidate_data:
+                        has_sufficient_data = self._is_data_relevant(task_intent.query, candidate_data)
+                    if (
+                        self._task_looks_satisfied(task, url_r.data or "", task_intent, target_url=expected_url)
+                        and (has_sufficient_data or not requires_data)
+                    ):
                         title_r = await tk.get_title()
                         return {"success": True, "message": "task reached target page",
                                 "url": url_r.data or "", "title": title_r.data or "",
-                                "steps": steps, "data": _accumulated_data or await self._maybe_extract_data()}
+                                "expected_url": expected_url,
+                                "steps": steps, "data": candidate_data or await self._extract_data_for_intent(task_intent)}
 
                 if action.action_type == ActionType.SCROLL:
-                    step_data = await self._maybe_extract_data()
+                    step_data = await self._extract_data_for_intent(task_intent)
                     _merge_new_data(step_data)
 
             # max steps reached
-            _merge_new_data(await self._maybe_extract_data())
+            _merge_new_data(await self._extract_data_for_intent(task_intent))
             url_r = await tk.get_current_url()
             title_r = await tk.get_title()
             return {
                 "success": len(_accumulated_data) > 0,
                 "message": "max steps reached" + (f", but collected {len(_accumulated_data)} items" if _accumulated_data else ""),
                 "url": url_r.data or "", "title": title_r.data or "",
+                "expected_url": expected_url,
                 "steps": steps, "data": _accumulated_data,
             }
         except Exception as exc:
             log_error(f"browser task failed: {exc}")
             url_r = await tk.get_current_url()
-            return {"success": False, "message": str(exc), "url": url_r.data or "", "steps": steps}
+            return {"success": False, "message": str(exc), "url": url_r.data or "", "expected_url": expected_url, "steps": steps}
 
 
 async def _run_browser_task_async(task: str, start_url: Optional[str] = None, headless: bool = True) -> Dict[str, Any]:

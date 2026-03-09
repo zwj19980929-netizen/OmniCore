@@ -921,6 +921,7 @@ class RuntimeStateStore:
         if not merged:
             merged = {
                 "default_output_directory": settings.DEFAULT_OUTPUT_DIRECTORY,
+                "user_location": settings.DEFAULT_USER_LOCATION,
                 "preferred_tools": list(settings.DEFAULT_PREFERRED_TOOLS),
                 "preferred_sites": list(settings.DEFAULT_PREFERRED_SITES),
                 "auto_queue_confirmations": bool(settings.DEFAULT_AUTO_QUEUE_CONFIRMATIONS),
@@ -928,6 +929,7 @@ class RuntimeStateStore:
             }
 
         merged.setdefault("default_output_directory", settings.DEFAULT_OUTPUT_DIRECTORY)
+        merged.setdefault("user_location", settings.DEFAULT_USER_LOCATION)
         merged.setdefault("preferred_tools", list(settings.DEFAULT_PREFERRED_TOOLS))
         merged.setdefault("preferred_sites", list(settings.DEFAULT_PREFERRED_SITES))
         merged.setdefault("auto_queue_confirmations", bool(settings.DEFAULT_AUTO_QUEUE_CONFIRMATIONS))
@@ -942,6 +944,7 @@ class RuntimeStateStore:
     ) -> Dict[str, Any]:
         allowed = {
             "default_output_directory",
+            "user_location",
             "preferred_tools",
             "preferred_sites",
             "auto_queue_confirmations",

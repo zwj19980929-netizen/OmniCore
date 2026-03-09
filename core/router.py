@@ -4,6 +4,7 @@ Receives user instructions, detects intent, and decomposes work into DAG tasks.
 """
 import json
 import re
+from datetime import date, timedelta
 from pathlib import Path
 from typing import List, Dict, Any
 
@@ -46,6 +47,156 @@ ROUTER_OUTPUT_APPENDIX = """
 - If `tasks` is non-empty, set `direct_answer` to an empty string.
 """
 
+_EXPLICIT_LOCATION_REQUEST_TOKENS = (
+    "near me",
+    "nearby",
+    "around me",
+    "nearest",
+    "my location",
+    "where am i",
+    "local",
+    "附近",
+    "周边",
+    "周围",
+    "离我最近",
+    "我附近",
+    "我这里",
+    "本地",
+    "当地",
+    "我所在",
+    "我在哪",
+    "我的位置",
+    "定位",
+)
+
+_LOCATION_SENSITIVE_TOPIC_TOKENS = (
+    "weather",
+    "temperature",
+    "rain",
+    "aqi",
+    "air quality",
+    "traffic",
+    "commute",
+    "restaurant",
+    "restaurants",
+    "cafe",
+    "cafes",
+    "coffee",
+    "hotel",
+    "hotels",
+    "pharmacy",
+    "hospital",
+    "cinema",
+    "movie theater",
+    "movie theatre",
+    "events",
+    "event",
+    "taxi",
+    "subway",
+    "bus",
+    "delivery",
+    "food delivery",
+    "天气",
+    "气温",
+    "温度",
+    "下雨",
+    "空气质量",
+    "路况",
+    "通勤",
+    "餐厅",
+    "饭店",
+    "咖啡店",
+    "酒店",
+    "旅馆",
+    "药店",
+    "医院",
+    "电影院",
+    "活动",
+    "演出",
+    "打车",
+    "地铁",
+    "公交",
+    "外卖",
+)
+
+_WEATHER_QUERY_TOKENS = (
+    "weather",
+    "forecast",
+    "temperature",
+    "humidity",
+    "air quality",
+    "aqi",
+    "wind",
+    "weather.com.cn",
+    "moji.com",
+    "/weather/",
+    "天气",
+    "天气预报",
+    "气温",
+    "空气质量",
+    "风力",
+    "湿度",
+)
+
+_WEATHER_QUERY_CUE_TOKENS = (
+    "帮我",
+    "给我",
+    "查",
+    "查询",
+    "看看",
+    "看下",
+    "搜",
+    "搜索",
+    "what",
+    "how",
+    "today",
+    "tomorrow",
+    "forecast",
+    "today's",
+    "明天",
+    "今天",
+    "后天",
+    "现在",
+    "near me",
+    "附近",
+    "当地",
+)
+
+_WEATHER_BROWSER_DEMO_TOKENS = (
+    "浏览器",
+    "怎么操作浏览器",
+    "操作浏览器",
+    "网页操作",
+    "展示浏览器",
+    "browser demo",
+    "show browser",
+    "show steps",
+    "visible browser",
+    "有头",
+    "headful",
+    "炫技",
+)
+
+_WEATHER_RENDER_TOKENS = (
+    "渲染",
+    "render",
+    "headless false",
+    "headless: false",
+    "有头",
+    "headful",
+)
+
+_WEATHER_DOMAIN_HINTS = (
+    "weather.com.cn",
+    "moji.com",
+    "tianqi.com",
+)
+
+_WEATHER_DEFAULT_SOURCE_URLS = (
+    "https://www.weather.com.cn/",
+    "https://www.moji.com/",
+)
+
 
 class RouterAgent:
     """
@@ -66,6 +217,350 @@ class RouterAgent:
             if len(token) >= 2:
                 normalized.add(token)
         return normalized
+
+    @staticmethod
+    def _extract_first_url(text: str) -> str:
+        match = re.search(r"https?://\S+", str(text or ""))
+        if not match:
+            return ""
+        return match.group(0).rstrip(".,);]")
+
+    @staticmethod
+    def _contains_any(text: str, tokens: tuple[str, ...]) -> bool:
+        normalized = str(text or "").lower()
+        return any(token in normalized for token in tokens if token)
+
+    @classmethod
+    def _looks_like_weather_query(cls, user_input: str) -> bool:
+        normalized = str(user_input or "").strip().lower()
+        if not normalized:
+            return False
+
+        if any(domain in normalized for domain in _WEATHER_DOMAIN_HINTS):
+            return True
+
+        has_weather_topic = cls._contains_any(normalized, _WEATHER_QUERY_TOKENS)
+        if not has_weather_topic:
+            return False
+
+        return (
+            bool(cls._extract_first_url(user_input))
+            or cls._contains_any(normalized, _WEATHER_QUERY_CUE_TOKENS)
+            or "?" in normalized
+            or "？" in normalized
+        )
+
+    @classmethod
+    def _wants_browser_weather_route(cls, user_input: str) -> bool:
+        normalized = str(user_input or "").strip().lower()
+        if not normalized:
+            return False
+        if cls._contains_any(normalized, _WEATHER_BROWSER_DEMO_TOKENS):
+            return True
+        return bool(cls._extract_first_url(user_input)) and cls._contains_any(
+            normalized,
+            _WEATHER_RENDER_TOKENS,
+        )
+
+    @staticmethod
+    def _normalize_preferred_site(site: str) -> str:
+        value = str(site or "").strip()
+        if not value:
+            return ""
+        if not value.startswith(("http://", "https://")):
+            value = f"https://{value.lstrip('/')}"
+        return value.rstrip("/") + "/"
+
+    @classmethod
+    def _preferred_weather_source_urls(cls, user_preferences: dict | None = None) -> list[str]:
+        source_urls: list[str] = []
+        for item in (user_preferences or {}).get("preferred_sites", []) or []:
+            normalized = cls._normalize_preferred_site(item)
+            if normalized and any(domain in normalized.lower() for domain in _WEATHER_DOMAIN_HINTS):
+                source_urls.append(normalized)
+
+        for default_url in _WEATHER_DEFAULT_SOURCE_URLS:
+            if default_url not in source_urls:
+                source_urls.append(default_url)
+        return source_urls
+
+    @staticmethod
+    def _sanitize_weather_location(candidate: str) -> str:
+        cleaned = str(candidate or "").strip()
+        cleaned = re.sub(
+            r"^(?:给我|帮我|麻烦|请|我想看|我想知道|想知道|查查|查一下|查询|看看|看下|搜一下|搜索一下)+",
+            "",
+            cleaned,
+            flags=re.IGNORECASE,
+        )
+        cleaned = re.sub(
+            r"^(?:show|tell me|find|get|check|what(?:'s| is)?|how is)\s+",
+            "",
+            cleaned,
+            flags=re.IGNORECASE,
+        )
+        cleaned = re.sub(
+            r"(?:今天|明天|后天|现在|当前|本地|当地|附近|周末|本周|这周|未来几天|未来7天|一周|天气预报|天气情况|气温|空气质量)+$",
+            "",
+            cleaned,
+            flags=re.IGNORECASE,
+        )
+        cleaned = cleaned.strip(" ,，。！？?：:;；")
+        if len(cleaned) < 2 or len(cleaned) > 32:
+            return ""
+        return cleaned
+
+    @classmethod
+    def _extract_weather_location(
+        cls,
+        user_input: str,
+        current_location_context: dict | None = None,
+    ) -> str:
+        raw_text = str(user_input or "").strip()
+        normalized = raw_text.lower()
+
+        if cls._contains_any(normalized, _EXPLICIT_LOCATION_REQUEST_TOKENS):
+            context_location = str((current_location_context or {}).get("location", "") or "").strip()
+            if context_location:
+                return context_location
+
+        chinese_patterns = (
+            r"([\u4e00-\u9fff]{2,12})的?(?:天气|天气预报|气温|空气质量)",
+            r"(?:天气|天气预报|气温|空气质量)[^\u4e00-\u9fff]{0,4}([\u4e00-\u9fff]{2,12})",
+        )
+        for pattern in chinese_patterns:
+            match = re.search(pattern, raw_text)
+            if match:
+                candidate = cls._sanitize_weather_location(match.group(1))
+                if candidate:
+                    return candidate
+
+        english_patterns = (
+            r"\bweather in ([a-z][a-z .'\-]{1,40})",
+            r"\bforecast for ([a-z][a-z .'\-]{1,40})",
+            r"\b([a-z][a-z .'\-]{1,40}) weather\b",
+        )
+        for pattern in english_patterns:
+            match = re.search(pattern, normalized, flags=re.IGNORECASE)
+            if match:
+                candidate = cls._sanitize_weather_location(match.group(1))
+                if candidate:
+                    return candidate
+
+        if current_location_context and cls._should_include_location_context(user_input):
+            context_location = str(current_location_context.get("location", "") or "").strip()
+            if context_location:
+                return context_location
+        return ""
+
+    @staticmethod
+    def _parse_local_base_date(current_time_context: dict | None = None) -> date | None:
+        local_date = str((current_time_context or {}).get("local_date", "") or "").strip()
+        if not local_date:
+            return None
+        try:
+            return date.fromisoformat(local_date)
+        except ValueError:
+            return None
+
+    @classmethod
+    def _describe_weather_timeframe(
+        cls,
+        user_input: str,
+        current_time_context: dict | None = None,
+    ) -> str:
+        normalized = str(user_input or "").strip().lower()
+        base_date = cls._parse_local_base_date(current_time_context)
+
+        def _with_date(label: str, offset_days: int) -> str:
+            if base_date is None:
+                return label
+            return f"{label}（{(base_date + timedelta(days=offset_days)).isoformat()}）"
+
+        if "后天" in normalized or "day after tomorrow" in normalized:
+            return _with_date("后天", 2)
+        if "明天" in normalized or "tomorrow" in normalized:
+            return _with_date("明天", 1)
+        if "周末" in normalized or "weekend" in normalized:
+            return "本周末"
+        if "本周" in normalized or "这周" in normalized or "7天" in normalized or "7-day" in normalized:
+            return "本周"
+        if "今天" in normalized or "today" in normalized or "当前" in normalized or "现在" in normalized:
+            return _with_date("今天", 0)
+        return _with_date("当前", 0) if base_date is not None else "当前"
+
+    @staticmethod
+    def _source_label(source_url: str) -> str:
+        label = re.sub(r"^https?://", "", str(source_url or "").strip(), flags=re.IGNORECASE)
+        return label.rstrip("/") or str(source_url or "").strip()
+
+    @classmethod
+    def _build_deterministic_weather_plan(
+        cls,
+        user_input: str,
+        *,
+        user_preferences: dict | None = None,
+        current_time_context: dict | None = None,
+        current_location_context: dict | None = None,
+    ) -> Dict[str, Any] | None:
+        if not cls._looks_like_weather_query(user_input):
+            return None
+
+        direct_url = cls._extract_first_url(user_input)
+        wants_browser = cls._wants_browser_weather_route(user_input)
+        source_urls = cls._preferred_weather_source_urls(user_preferences)
+        primary_source_url = direct_url or source_urls[0]
+        backup_source_url = source_urls[1] if len(source_urls) > 1 else source_urls[0]
+        location_hint = cls._extract_weather_location(user_input, current_location_context)
+        timeframe_hint = cls._describe_weather_timeframe(user_input, current_time_context)
+        target_label = f"{location_hint}的{timeframe_hint}天气" if location_hint else f"{timeframe_hint}天气"
+        field_text = "temperature, weather condition, humidity, wind, and air quality (AQI)"
+        browser_query = " ".join(part for part in [location_hint, timeframe_hint, "天气"] if part).strip() or "天气"
+
+        tasks: list[dict[str, Any]] = []
+        if wants_browser:
+            browser_start_url = primary_source_url if direct_url else "https://www.bing.com/"
+            browser_description = (
+                f"Use a visible browser to retrieve {target_label}. "
+                + (
+                    f"Start from {primary_source_url} and treat the user-provided weather URL as authoritative. "
+                    if direct_url
+                    else f"Start from Bing, search the concise query '{browser_query}', open the most relevant weather detail page, then extract {field_text}. "
+                )
+                +
+                f"Extract {field_text}. Do not stop at search-result pages, news pages, navigation pages, "
+                f"403/redirect holding pages, or unrelated cities."
+            )
+            tasks.append(
+                {
+                    "task_id": "task_1",
+                    "tool_name": "browser.interact",
+                    "description": browser_description,
+                    "params": {
+                        "task": browser_description,
+                        "start_url": browser_start_url,
+                        "headless": False,
+                        "max_steps": 10,
+                        "show_steps": True,
+                    },
+                    "priority": 10,
+                    "success_criteria": [
+                        "result.success == True",
+                        "len(result.data) > 0",
+                        "len(result.steps) > 0",
+                    ],
+                }
+            )
+
+            backup_description = (
+                f"Use {cls._source_label(backup_source_url)} as a deterministic backup source for {target_label}. "
+                f"Prefer city weather detail pages over news pages and navigation pages. "
+                f"Extract {field_text} and reject unrelated cities."
+            )
+            tasks.append(
+                {
+                    "task_id": "task_2",
+                    "tool_name": "web.fetch_and_extract",
+                    "description": backup_description,
+                    "params": {
+                        "url": direct_url if direct_url else "",
+                        "limit": 8,
+                    },
+                    "priority": 9,
+                    "success_criteria": [
+                        "result.success == True",
+                        "len(result.data) > 0",
+                    ],
+                    "fallbacks": [
+                        {"type": "retry", "param_patch": {"limit": 12}},
+                    ],
+                }
+            )
+        else:
+            primary_description = (
+                f"Directly obtain {target_label} from {cls._source_label(primary_source_url)} as the primary weather source. "
+                f"Prefer city weather detail or forecast pages over news pages and navigation pages. "
+                f"Extract {field_text}. Reject unrelated cities and generic weather news."
+            )
+            tasks.append(
+                {
+                    "task_id": "task_1",
+                    "tool_name": "web.fetch_and_extract",
+                    "description": primary_description,
+                    "params": {
+                        "url": direct_url if direct_url else "",
+                        "limit": 8,
+                    },
+                    "priority": 10,
+                    "success_criteria": [
+                        "result.success == True",
+                        "len(result.data) > 0",
+                    ],
+                    "fallbacks": [
+                        {"type": "retry", "param_patch": {"limit": 12}},
+                    ],
+                }
+            )
+
+            if not direct_url:
+                backup_description = (
+                    f"Use {cls._source_label(backup_source_url)} as the secondary weather source for {target_label}. "
+                    f"Extract {field_text}. Prefer weather detail pages and reject news, navigation pages, "
+                    f"and unrelated cities."
+                )
+                tasks.append(
+                    {
+                        "task_id": "task_2",
+                        "tool_name": "web.fetch_and_extract",
+                        "description": backup_description,
+                        "params": {
+                            "url": "",
+                            "limit": 8,
+                        },
+                        "priority": 9,
+                        "success_criteria": [
+                            "result.success == True",
+                            "len(result.data) > 0",
+                        ],
+                        "fallbacks": [
+                            {"type": "retry", "param_patch": {"limit": 12}},
+                        ],
+                    }
+                )
+
+        route_reason = (
+            "Structured weather query matched the deterministic weather route. "
+            "The router fixed the tool choice, source priority, and required weather fields before execution."
+        )
+        if location_hint:
+            route_reason += f" Location resolved as {location_hint}."
+        if timeframe_hint:
+            route_reason += f" Timeframe resolved as {timeframe_hint}."
+
+        return {
+            "intent": "weather_query_with_browser_demo" if wants_browser else "weather_query",
+            "confidence": 0.99 if direct_url or location_hint else 0.95,
+            "reasoning": route_reason,
+            "direct_answer": "",
+            "tasks": tasks,
+            "is_high_risk": False,
+        }
+
+    @classmethod
+    def _should_include_location_context(cls, user_input: str) -> bool:
+        normalized_text = str(user_input or "").strip().lower()
+        if not normalized_text:
+            return False
+
+        if any(token in normalized_text for token in _EXPLICIT_LOCATION_REQUEST_TOKENS):
+            return True
+
+        text_tokens = cls._tokenize_text(normalized_text)
+        topic_tokens = {
+            token.lower()
+            for token in _LOCATION_SENSITIVE_TOPIC_TOKENS
+        }
+        return bool(text_tokens & topic_tokens)
 
     @classmethod
     def _collect_schema_keys(cls, schema: Any) -> set[str]:
@@ -219,6 +714,43 @@ class RouterAgent:
         result["tasks"] = normalized_tasks
         return result
 
+    @classmethod
+    def _repair_task_params_from_user_input(
+        cls,
+        user_input: str,
+        result: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        direct_url = cls._extract_first_url(user_input)
+        if not direct_url:
+            return result
+
+        repaired_tasks = []
+        for raw_task in result.get("tasks", []) or []:
+            task_data = dict(raw_task)
+            params = task_data.get("params")
+            if not isinstance(params, dict):
+                params = {}
+            tool_args = task_data.get("tool_args")
+            if isinstance(tool_args, dict):
+                tool_args = dict(tool_args)
+            else:
+                tool_args = dict(params)
+
+            tool_name = str(task_data.get("tool_name", "") or "").strip()
+            if tool_name == "browser.interact" and not str(params.get("start_url", "") or "").strip():
+                params["start_url"] = direct_url
+                tool_args["start_url"] = direct_url
+            elif tool_name == "web.fetch_and_extract" and not str(params.get("url", "") or "").strip():
+                params["url"] = direct_url
+                tool_args["url"] = direct_url
+
+            task_data["params"] = params
+            task_data["tool_args"] = tool_args
+            repaired_tasks.append(task_data)
+
+        result["tasks"] = repaired_tasks
+        return result
+
     @staticmethod
     def _build_router_system_prompt() -> str:
         dynamic_catalog = "\n".join(build_dynamic_tool_prompt_lines())
@@ -269,6 +801,7 @@ class RouterAgent:
         session_artifacts: list = None,
         user_preferences: dict = None,
         current_time_context: dict = None,
+        current_location_context: dict = None,
         work_context: dict = None,
         resource_memory: list = None,
         successful_paths: list = None,
@@ -285,6 +818,22 @@ class RouterAgent:
             包含意图和任务列表的字典
         """
         log_agent_action(self.name, "开始分析用户意图", user_input[:50] + "...")
+
+        deterministic_plan = self._build_deterministic_weather_plan(
+            user_input,
+            user_preferences=user_preferences,
+            current_time_context=current_time_context,
+            current_location_context=current_location_context,
+        )
+        if deterministic_plan is not None:
+            deterministic_plan = self._normalize_task_plan_shape(deterministic_plan)
+            deterministic_plan = self._repair_task_params_from_user_input(user_input, deterministic_plan)
+            log_agent_action(
+                self.name,
+                f"意图识别完成: {deterministic_plan.get('intent')}",
+                f"deterministic route, 子任务数: {len(deterministic_plan.get('tasks', []))}",
+            )
+            return deterministic_plan
 
         # 构建包含对话历史的用户消息
         user_message = ""
@@ -378,6 +927,22 @@ class RouterAgent:
                 user_message += "\n".join(time_lines)
                 user_message += "\n\n---\n"
 
+        if current_location_context and self._should_include_location_context(user_input):
+            location_lines = []
+            location_name = str(current_location_context.get("location", "") or "").strip()
+            timezone_name = str(current_location_context.get("timezone", "") or "").strip()
+            source_name = str(current_location_context.get("source", "") or "").strip()
+            if location_name:
+                location_lines.append(f"- User location: {location_name}")
+            if timezone_name:
+                location_lines.append(f"- Location timezone: {timezone_name}")
+            if source_name:
+                location_lines.append(f"- Source: {source_name}")
+            if location_lines:
+                user_message += "## Current user location (treat this as the authoritative user location for geography-dependent planning):\n"
+                user_message += "\n".join(location_lines)
+                user_message += "\n\n---\n"
+
         if work_context:
             context_lines = []
             goal = work_context.get("goal") if isinstance(work_context, dict) else {}
@@ -462,6 +1027,7 @@ class RouterAgent:
             result = self._normalize_task_plan_shape(
                 self.llm.parse_json_response(response)
             )
+            result = self._repair_task_params_from_user_input(user_input, result)
             log_agent_action(
                 self.name,
                 f"意图识别完成: {result.get('intent')}",
@@ -497,6 +1063,7 @@ class RouterAgent:
         session_artifacts = state.get("shared_memory", {}).get("session_artifacts")
         user_preferences = state.get("shared_memory", {}).get("user_preferences")
         current_time_context = state.get("shared_memory", {}).get("current_time_context")
+        current_location_context = state.get("shared_memory", {}).get("current_location_context")
         work_context = state.get("shared_memory", {}).get("work_context")
         resource_memory = state.get("shared_memory", {}).get("resource_memory")
         successful_paths = state.get("shared_memory", {}).get("successful_paths")
@@ -507,6 +1074,7 @@ class RouterAgent:
             session_artifacts,
             user_preferences,
             current_time_context,
+            current_location_context,
             work_context,
             resource_memory,
             successful_paths,

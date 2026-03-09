@@ -506,6 +506,58 @@ class LLMClient:
         """
         import re
         content = response.content.strip()
+        candidates = [content]
+        normalized_braces = content.replace("{{", "{").replace("}}", "}")
+        if normalized_braces != content:
+            candidates.append(normalized_braces)
+
+        def _try_parse(candidate: str):
+            block = candidate
+            if "```json" in block:
+                start = block.find("```json") + 7
+                end = block.find("```", start)
+                block = block[start:end].strip() if end != -1 else block[start:].strip()
+            elif "```" in block:
+                start = block.find("```") + 3
+                end = block.find("```", start)
+                block = block[start:end].strip() if end != -1 else block[start:].strip()
+
+            try:
+                return json.loads(block)
+            except json.JSONDecodeError:
+                pass
+
+            try:
+                brace_count = 0
+                start_idx = -1
+                end_idx = -1
+                for i, char in enumerate(block):
+                    if char == '{':
+                        if start_idx == -1:
+                            start_idx = i
+                        brace_count += 1
+                    elif char == '}':
+                        brace_count -= 1
+                        if brace_count == 0 and start_idx != -1:
+                            end_idx = i + 1
+                            break
+                if start_idx != -1 and end_idx != -1:
+                    return json.loads(block[start_idx:end_idx])
+            except json.JSONDecodeError:
+                pass
+
+            try:
+                json_match = re.search(r'\{[\s\S]*\}', block)
+                if json_match:
+                    return json.loads(json_match.group(0))
+            except json.JSONDecodeError:
+                pass
+            return None
+
+        for candidate in candidates:
+            parsed = _try_parse(candidate)
+            if parsed is not None:
+                return parsed
 
         # 尝试提取 JSON 块
         if "```json" in content:

@@ -2,7 +2,13 @@ from core.graph import _repair_mojibake_text, finalize_node
 import core.graph as graph_module
 
 
-def test_finalize_node_builds_delivery_summary_with_artifacts():
+def test_finalize_node_builds_delivery_summary_with_artifacts(monkeypatch):
+    class _FailingLLM:
+        def __init__(self, *args, **kwargs):
+            raise RuntimeError("LLM unavailable")
+
+    monkeypatch.setattr(graph_module, "LLMClient", _FailingLLM)
+
     state = {
         "messages": [],
         "user_input": "summarize and save the results",
@@ -61,7 +67,13 @@ def test_finalize_node_builds_delivery_summary_with_artifacts():
     assert result["artifacts"][0]["path"] == "D:/tmp/report.txt"
 
 
-def test_finalize_node_includes_parsed_findings_from_structured_data():
+def test_finalize_node_includes_parsed_findings_from_structured_data(monkeypatch):
+    class _FailingLLM:
+        def __init__(self, *args, **kwargs):
+            raise RuntimeError("LLM unavailable")
+
+    monkeypatch.setattr(graph_module, "LLMClient", _FailingLLM)
+
     state = {
         "messages": [],
         "user_input": "What happened in US-Iran today?",
@@ -118,13 +130,85 @@ def test_finalize_node_includes_parsed_findings_from_structured_data():
     assert "https://example.com/news/1" in result["final_output"]
 
 
+def test_finalize_node_prefers_user_facing_answer_for_completed_tasks(monkeypatch):
+    class _FakeResponse:
+        def __init__(self, content):
+            self.content = content
+
+    class _FakeLLM:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def chat_with_system(self, *args, **kwargs):
+            return _FakeResponse(
+                "根据当前抓取到的最新信息，美伊相关局势仍在升级，既有军事施压，也出现了重新接触和降温信号。"
+            )
+
+    monkeypatch.setattr(graph_module, "LLMClient", _FakeLLM)
+
+    state = {
+        "messages": [],
+        "user_input": "我想知道最近美伊局势怎么样了？",
+        "session_id": "session_synth",
+        "job_id": "job_synth",
+        "current_intent": "information_query",
+        "intent_confidence": 1.0,
+        "task_queue": [
+            {
+                "task_id": "task_1",
+                "task_type": "web_worker",
+                "tool_name": "web.fetch_and_extract",
+                "description": "Fetch latest US-Iran updates",
+                "params": {"limit": 10},
+                "status": "completed",
+                "result": {
+                    "success": True,
+                    "data": [
+                        {
+                            "title": "US-Iran maritime tensions rise in Gulf",
+                            "date": "2026-03-05",
+                            "link": "https://example.com/news/1",
+                        }
+                    ],
+                },
+                "priority": 10,
+            }
+        ],
+        "current_task_index": 0,
+        "shared_memory": {},
+        "artifacts": [],
+        "critic_feedback": "All tasks approved",
+        "critic_approved": True,
+        "human_approved": True,
+        "needs_human_confirm": False,
+        "error_trace": "",
+        "final_output": "",
+        "delivery_package": {},
+        "execution_status": "reviewing",
+        "replan_count": 0,
+        "validator_passed": True,
+    }
+
+    result = finalize_node(state)
+
+    assert result["execution_status"] == "completed"
+    assert result["final_output"].startswith("根据当前抓取到的最新信息")
+    assert result["delivery_package"]["completed_task_count"] == 1
+
+
 def test_repair_mojibake_text_roundtrip_utf8_latin1():
     original = "\u65e5\u672c\u7d27\u6025\u8bc4\u4f30"
     mojibake = original.encode("utf-8").decode("latin-1")
     assert _repair_mojibake_text(mojibake) == original
 
 
-def test_finalize_node_marks_waiting_for_approval_state():
+def test_finalize_node_marks_waiting_for_approval_state(monkeypatch):
+    class _ShouldNotCallLLM:
+        def __init__(self, *args, **kwargs):
+            raise AssertionError("LLMClient should not be called for waiting states")
+
+    monkeypatch.setattr(graph_module, "LLMClient", _ShouldNotCallLLM)
+
     state = {
         "messages": [],
         "user_input": "send the prepared webhook",
@@ -164,6 +248,44 @@ def test_finalize_node_marks_waiting_for_approval_state():
     assert result["execution_status"] == "waiting_for_approval"
     assert "waiting for approval" in result["final_output"].lower()
     assert result["delivery_package"]["recommended_next_step"]
+
+
+def test_finalize_node_refuses_fact_answer_without_direct_answer_or_evidence(monkeypatch):
+    class _ShouldNotCallLLM:
+        def __init__(self, *args, **kwargs):
+            raise AssertionError("LLMClient should not be called for unsupported no-task fallback")
+
+    monkeypatch.setattr(graph_module, "LLMClient", _ShouldNotCallLLM)
+
+    state = {
+        "messages": [type("Msg", (), {"content": "Router 分析完成: 解析失败: malformed json"})()],
+        "user_input": "你把你获取到的信息给我看看",
+        "session_id": "session_no_evidence",
+        "job_id": "job_no_evidence",
+        "current_intent": "unknown",
+        "intent_confidence": 0.0,
+        "task_queue": [],
+        "current_task_index": 0,
+        "shared_memory": {},
+        "artifacts": [],
+        "critic_feedback": "",
+        "critic_approved": False,
+        "human_approved": True,
+        "needs_human_confirm": False,
+        "error_trace": "",
+        "final_output": "",
+        "delivery_package": {},
+        "execution_status": "reviewing",
+        "replan_count": 0,
+        "validator_passed": True,
+    }
+
+    result = finalize_node(state)
+
+    assert result["execution_status"] == "completed_with_issues"
+    assert result["critic_approved"] is False
+    assert "System note:" in result["final_output"]
+    assert result["delivery_package"]["review_status"] == "needs_attention"
 
 
 def test_finalize_node_prefers_router_direct_answer_without_llm(monkeypatch):
