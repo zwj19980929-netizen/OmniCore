@@ -33,6 +33,15 @@ def test_builtin_tool_registry_can_lookup_by_name_and_task_type():
     assert browser_tool.spec.name == "browser.interact"
 
 
+def test_web_fetch_and_extract_accepts_headless_flag():
+    registry = get_builtin_tool_registry()
+
+    web_tool = registry.get("web.fetch_and_extract")
+
+    assert web_tool is not None
+    assert "headless" in web_tool.spec.input_schema["properties"]
+
+
 def test_builtin_tool_registry_can_resolve_task_by_tool_name_first():
     registry = get_builtin_tool_registry()
 

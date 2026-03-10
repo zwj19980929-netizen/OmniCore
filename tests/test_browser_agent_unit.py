@@ -37,6 +37,35 @@ class SemanticAssessmentLLM:
         return self.payload
 
 
+class _BootstrapSearchToolkit:
+    def __init__(self):
+        self.visited = []
+        self.current_url = ""
+        self.fast_mode = False
+
+    async def goto(self, url, timeout=30000):
+        self.current_url = url
+        self.visited.append(url)
+        return ToolkitResult(success=True, data=url)
+
+    async def wait_for_load(self, *_args, **_kwargs):
+        return ToolkitResult(success=True)
+
+    async def human_delay(self, *_args, **_kwargs):
+        return ToolkitResult(success=True)
+
+    async def wait_for_selector(self, _selector, timeout=None):
+        del timeout
+        if "google.com" in self.current_url:
+            return ToolkitResult(success=True, data=True)
+        return ToolkitResult(success=False, error="blank")
+
+    async def evaluate_js(self, _script, _arg=None):
+        if "google.com" in self.current_url:
+            return ToolkitResult(success=True, data={"matches": 1, "textLength": 1200})
+        return ToolkitResult(success=True, data={"matches": 0, "textLength": 20})
+
+
 def test_find_best_element_skips_hidden_or_disabled_controls():
     agent = BrowserAgent(headless=True)
     elements = [
@@ -76,6 +105,17 @@ def test_find_best_element_skips_hidden_or_disabled_controls():
 
     assert chosen is not None
     assert chosen.selector == "#visible"
+
+
+def test_bootstrap_search_results_falls_back_to_google_when_bing_is_blank():
+    toolkit = _BootstrapSearchToolkit()
+    agent = BrowserAgent(headless=False, toolkit=toolkit)
+
+    success = asyncio.run(agent._bootstrap_search_results("US Iran war escalation 2026"))
+
+    assert success is True
+    assert any("bing.com/search" in url for url in toolkit.visited)
+    assert any("google.com/search" in url for url in toolkit.visited)
 
 
 def test_noise_filter_keeps_help_entry():

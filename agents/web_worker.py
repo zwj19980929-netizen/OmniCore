@@ -8,7 +8,7 @@ import base64
 import json
 import random
 import re
-from typing import Dict, Any, List, Optional
+from typing import Dict, Any, List, Optional, Set, Tuple
 from urllib.parse import parse_qs, quote_plus, urljoin, urlparse
 import requests
 
@@ -53,6 +53,52 @@ RE_CONTENT_BLOCK = re.compile(
 
 # 分词相关
 RE_TOKEN_SPLIT = re.compile(r"[\s,.;:|/\\]+")
+RE_DIRECT_URL = re.compile(r"https?://[^\s)>\]\"']+", re.IGNORECASE)
+RE_DOMAIN_HINT = re.compile(r"\b(?:[a-zA-Z0-9-]+\.)+[a-zA-Z]{2,}\b")
+RE_WORD_TOKEN = re.compile(r"[A-Za-z0-9][A-Za-z0-9_-]*|[\u4e00-\u9fff]{1,}")
+
+SEARCH_QUERY_PLANNER_PROMPT = """You plan concise search-engine queries for a web research agent.
+
+Return JSON with this schema:
+{
+  "queries": ["short query 1", "short query 2"],
+  "preferred_domains": ["example.com"],
+  "reasoning": "brief reason"
+}
+
+Rules:
+- Output 1 to 4 short search queries only.
+- Queries must be concise search phrases, not full task instructions.
+- Preserve important entities, dates, locations, and source/domain hints.
+- If a domain is important, use site:domain in one of the queries.
+- Prefer article/report/statement discovery queries over homepage navigation queries.
+"""
+
+SEARCH_RESULT_RANKING_PROMPT = """You are ranking search-result cards for a web research task.
+
+Return JSON with this schema:
+{
+  "selected_indexes": [1, 3],
+  "serp_sufficient": false,
+  "reasoning": "brief reason"
+}
+
+Rules:
+- Select the results most likely to contain evidence needed for the task.
+- Prefer direct articles/statements/report pages over homepages, section pages, category pages, docs, forums, and ecommerce pages.
+- If the visible snippets alone are already enough to answer the task safely, set serp_sufficient to true.
+- Use the 1-based indexes from the provided result list.
+"""
+
+GENERIC_SEARCH_STOPWORDS = {
+    "a", "an", "and", "are", "as", "at", "be", "by", "current", "detail", "details",
+    "extract", "find", "for", "from", "get", "give", "how", "in", "into", "latest",
+    "most", "news", "of", "on", "or", "recent", "report", "reports", "search",
+    "source", "sources", "statement", "statements", "that", "the", "their", "this",
+    "to", "using", "verify", "with",
+    "一下", "一些", "使用", "信息", "内容", "分析", "声明", "报道", "搜索", "提取", "搜集",
+    "最新", "最近", "材料", "核实", "来源", "请", "请你", "请帮我", "资料", "通过",
+}
 
 # ==================== 延迟导入 ====================
 def _import_paod():
@@ -155,10 +201,124 @@ class WebWorker:
             block_heavy_resources=self.block_heavy_resources,
         )
 
+    def _extract_direct_urls(self, text: str) -> List[str]:
+        urls: List[str] = []
+        seen: Set[str] = set()
+        for match in RE_DIRECT_URL.findall(text or ""):
+            url = str(match or "").strip().rstrip(".,)")
+            if not url or url in seen:
+                continue
+            seen.add(url)
+            urls.append(url)
+        return urls
+
+    def _extract_domain_hints(self, text: str) -> List[str]:
+        domains: List[str] = []
+        seen: Set[str] = set()
+        for match in RE_DOMAIN_HINT.findall(text or ""):
+            value = str(match or "").strip().lower().strip(".,)")
+            if not value or "@" in value or value in seen:
+                continue
+            seen.add(value)
+            domains.append(value)
+        return domains
+
+    def _tokenize_query_terms(self, text: str) -> List[str]:
+        terms: List[str] = []
+        seen: Set[str] = set()
+        for token in RE_WORD_TOKEN.findall(text or ""):
+            value = str(token or "").strip().lower()
+            if not value:
+                continue
+            if value in GENERIC_SEARCH_STOPWORDS:
+                continue
+            if len(value) == 1 and not re.search(r"[\u4e00-\u9fff]", value):
+                continue
+            if value in seen:
+                continue
+            seen.add(value)
+            terms.append(value)
+        return terms
+
+    def _compact_query_text(self, text: str, max_terms: int = 8) -> str:
+        terms = self._tokenize_query_terms(text)
+        if not terms:
+            return str(text or "").strip()[:80]
+        return " ".join(terms[:max_terms]).strip()
+
+    def _build_site_search_query(self, task_description: str, domain: str) -> str:
+        compact = self._compact_query_text(task_description, max_terms=6)
+        if not compact:
+            compact = domain
+        return f"site:{domain} {compact}".strip()
+
+    def _fallback_search_queries(
+        self,
+        task_description: str,
+        *,
+        base_query: str = "",
+        domain_hints: Optional[List[str]] = None,
+        max_queries: int = 3,
+    ) -> List[str]:
+        domain_hints = [item for item in (domain_hints or []) if item]
+        queries: List[str] = []
+        candidates = [str(base_query or "").strip(), self._compact_query_text(task_description, max_terms=8)]
+
+        if domain_hints:
+            candidates.insert(0, self._build_site_search_query(task_description, domain_hints[0]))
+            if base_query:
+                candidates.append(f"site:{domain_hints[0]} {self._compact_query_text(base_query, max_terms=8)}".strip())
+
+        seen: Set[str] = set()
+        for candidate in candidates:
+            value = re.sub(r"\s+", " ", str(candidate or "").strip())
+            if not value or value in seen:
+                continue
+            seen.add(value)
+            queries.append(value)
+            if len(queries) >= max_queries:
+                break
+        return queries
+
+    def _is_probably_detail_url(self, url: str) -> bool:
+        try:
+            parsed = urlparse(url or "")
+        except Exception:
+            return False
+        path = (parsed.path or "").strip("/")
+        if not path:
+            return False
+        if re.search(r"\.(?:html?|shtml|php|aspx?)$", path, re.IGNORECASE):
+            return True
+        segments = [segment for segment in path.split("/") if segment]
+        if len(segments) >= 2 and any(any(ch.isdigit() for ch in segment) for segment in segments):
+            return True
+        if any("-" in segment and len(segment) >= 12 for segment in segments):
+            return True
+        return len(segments) >= 3
+
     # ── URL determination (pure LLM, no browser) ────────────
 
     async def determine_target_url(self, task_description: str) -> Dict[str, Any]:
         log_agent_action(self.name, "分析目标 URL", task_description[:50])
+        direct_urls = self._extract_direct_urls(task_description)
+        if direct_urls:
+            return {
+                "url": direct_urls[0],
+                "backup_urls": direct_urls[1:3],
+                "need_search": False,
+                "search_query": "",
+            }
+
+        domain_hints = self._extract_domain_hints(task_description)
+        if self._task_mentions_weather(task_description) and domain_hints:
+            return {
+                "url": "",
+                "backup_urls": [],
+                "need_search": True,
+                "search_query": self._build_site_search_query(task_description, domain_hints[0]),
+            }
+
         task_signature = self.cache.build_task_signature(task_description)
         cache_key = self.cache.build_key(
             "url_analysis",
@@ -178,6 +338,21 @@ class WebWorker:
         )
         try:
             result = self.llm.parse_json_response(response)
+            result.setdefault("backup_urls", [])
+            result.setdefault("need_search", False)
+            result.setdefault("search_query", "")
+            url_value = str(result.get("url", "") or "").strip()
+            if url_value and not self._is_probably_detail_url(url_value):
+                domain = str(urlparse(url_value).netloc or "").strip()
+                result["backup_urls"] = [url_value] + [
+                    str(item).strip()
+                    for item in (result.get("backup_urls") or [])
+                    if str(item).strip() and str(item).strip() != url_value
+                ]
+                result["url"] = ""
+                result["need_search"] = True
+                if domain and not str(result.get("search_query", "") or "").strip():
+                    result["search_query"] = self._build_site_search_query(task_description, domain)
             if result.get("url") or result.get("need_search"):
                 self.cache.set(
                     cache_key,
@@ -189,7 +364,12 @@ class WebWorker:
             return result
         except Exception as e:
             log_error(f"URL 分析失败: {e}")
-            return {"url": "", "need_search": True, "search_query": task_description}
+            return {
+                "url": "",
+                "backup_urls": [],
+                "need_search": True,
+                "search_query": self._compact_query_text(task_description, max_terms=8) or task_description,
+            }
 
     # ── static fetch (no browser) ──────────────────────────────
 
@@ -412,9 +592,315 @@ class WebWorker:
 
     # ── search (uses toolkit) ──────────────────────────────────
 
+    def plan_search_queries(
+        self,
+        task_description: str,
+        *,
+        base_query: str = "",
+        domain_hints: Optional[List[str]] = None,
+        max_queries: int = 3,
+    ) -> List[str]:
+        domain_hints = [item for item in (domain_hints or self._extract_domain_hints(task_description)) if item]
+        fallback = self._fallback_search_queries(
+            task_description,
+            base_query=base_query,
+            domain_hints=domain_hints,
+            max_queries=max_queries,
+        )
+        payload = {
+            "task": task_description,
+            "base_query": base_query,
+            "domain_hints": domain_hints,
+            "fallback_queries": fallback,
+        }
+        try:
+            response = self.llm.chat_with_system(
+                system_prompt=SEARCH_QUERY_PLANNER_PROMPT,
+                user_message=json.dumps(payload, ensure_ascii=False),
+                temperature=0.2,
+                json_mode=True,
+            )
+            parsed = self.llm.parse_json_response(response)
+            queries: List[str] = []
+            seen: Set[str] = set()
+            for item in (parsed.get("queries") or []):
+                value = re.sub(r"\s+", " ", str(item or "").strip())
+                if not value or value in seen:
+                    continue
+                seen.add(value)
+                queries.append(value)
+                if len(queries) >= max_queries:
+                    break
+            return queries or fallback
+        except Exception:
+            return fallback
+
+    def _score_search_result_candidate(self, card: Dict[str, Any], task_description: str, query: str) -> int:
+        haystack = " ".join(
+            [
+                str(card.get("title", "") or ""),
+                str(card.get("snippet", "") or ""),
+                str(card.get("source", "") or ""),
+                str(card.get("link", "") or ""),
+            ]
+        ).lower()
+        score = 0
+        for token in self._tokenize_query_terms(f"{task_description} {query}"):
+            if token in haystack:
+                score += 3
+        if self._is_probably_detail_url(str(card.get("link", "") or "")):
+            score += 2
+        if len(str(card.get("snippet", "") or "").strip()) >= 30:
+            score += 1
+        return score
+
+    def _rerank_search_results(
+        self,
+        task_description: str,
+        query: str,
+        cards: List[Dict[str, Any]],
+        max_results: int = 5,
+    ) -> Tuple[List[Dict[str, Any]], bool]:
+        if not cards:
+            return [], False
+        ranked_fallback = sorted(
+            cards,
+            key=lambda card: self._score_search_result_candidate(card, task_description, query),
+            reverse=True,
+        )
+        if len(cards) == 1:
+            return ranked_fallback[:1], False
+
+        payload_cards = []
+        for idx, card in enumerate(cards[:12], 1):
+            payload_cards.append(
+                {
+                    "index": idx,
+                    "title": str(card.get("title", "") or "")[:200],
+                    "source": str(card.get("source", "") or "")[:80],
+                    "snippet": str(card.get("snippet", "") or "")[:320],
+                    "link": str(card.get("link", "") or "")[:240],
+                }
+            )
+        try:
+            response = self.llm.chat_with_system(
+                system_prompt=SEARCH_RESULT_RANKING_PROMPT,
+                user_message=json.dumps(
+                    {
+                        "task": task_description,
+                        "query": query,
+                        "results": payload_cards,
+                    },
+                    ensure_ascii=False,
+                ),
+                temperature=0.1,
+                json_mode=True,
+            )
+            parsed = self.llm.parse_json_response(response)
+            selected_indexes = []
+            for item in (parsed.get("selected_indexes") or []):
+                try:
+                    selected_indexes.append(int(item))
+                except Exception:
+                    continue
+            chosen: List[Dict[str, Any]] = []
+            seen_links: Set[str] = set()
+            for index in selected_indexes:
+                if index < 1 or index > len(cards):
+                    continue
+                card = cards[index - 1]
+                link = str(card.get("link", "") or "")
+                if not link or link in seen_links:
+                    continue
+                seen_links.add(link)
+                chosen.append(card)
+                if len(chosen) >= max_results:
+                    break
+            if chosen:
+                return chosen, bool(parsed.get("serp_sufficient"))
+        except Exception:
+            pass
+        return ranked_fallback[:max_results], False
+
+    async def _extract_search_result_cards(
+        self,
+        tk: BrowserToolkit,
+        query: str,
+        max_results: int,
+    ) -> List[Dict[str, Any]]:
+        result = await tk.evaluate_js(
+            """(limit) => {
+                const root = document.querySelector('#b_results, #search, main, [role="main"]') || document.body;
+                const candidates = Array.from(root.querySelectorAll('li, article, div')).slice(0, 500);
+                const compact = (text) => (text || '').replace(/\\s+/g, ' ').trim();
+                const seen = new Set();
+                const cards = [];
+
+                const getSnippet = (node, title) => {
+                    const parts = [];
+                    const snippetNodes = node.querySelectorAll('p, .b_caption p, .snippet, .c-abstract, [class*="snippet"], [class*="caption"], [data-testid*="snippet"]');
+                    for (const child of snippetNodes) {
+                        const text = compact(child.innerText || child.textContent || '');
+                        if (text && text !== title) parts.push(text);
+                        if (parts.join(' ').length > 260) break;
+                    }
+                    if (!parts.length) {
+                        const raw = compact(node.innerText || node.textContent || '');
+                        const trimmed = raw.startsWith(title) ? raw.slice(title.length).trim() : raw;
+                        if (trimmed) parts.push(trimmed);
+                    }
+                    return compact(parts.join(' ')).slice(0, 320);
+                };
+
+                for (const node of candidates) {
+                    const anchor = node.querySelector('h1 a[href], h2 a[href], h3 a[href], h4 a[href], a[href]');
+                    if (!anchor) continue;
+                    const href = anchor.href || anchor.getAttribute('href') || '';
+                    if (!href || !/^https?:/i.test(href)) continue;
+                    if (seen.has(href)) continue;
+                    const titleNode = node.querySelector('h1, h2, h3, h4') || anchor;
+                    const title = compact(titleNode.innerText || titleNode.textContent || '').slice(0, 220);
+                    if (!title || title.length < 8) continue;
+                    seen.add(href);
+                    const sourceNode = node.querySelector('cite, .source, .b_attribution, [class*="source"], [data-testid*="source"]');
+                    const dateNode = node.querySelector('time, [datetime], .news_dt, [class*="date"]');
+                    cards.push({
+                        title,
+                        link: href,
+                        source: compact(sourceNode ? (sourceNode.innerText || sourceNode.textContent || '') : '').slice(0, 120),
+                        date: compact(dateNode ? (dateNode.innerText || dateNode.textContent || '') : '').slice(0, 80),
+                        snippet: getSnippet(node, title),
+                    });
+                    if (cards.length >= Math.max(limit * 4, 12)) break;
+                }
+                return cards;
+            }""",
+            max_results,
+        )
+        cards = result.data if result.success and isinstance(result.data, list) else []
+        filtered: List[Dict[str, Any]] = []
+        seen_links: Set[str] = set()
+        for item in cards:
+            if not isinstance(item, dict):
+                continue
+            link = self._decode_redirect_url(str(item.get("link", "") or "").strip())
+            if not link or not link.startswith("http"):
+                continue
+            if self._is_search_engine_domain(link):
+                continue
+            if link in seen_links:
+                continue
+            seen_links.add(link)
+            title = str(item.get("title", "") or "").strip()
+            if not title:
+                continue
+            filtered.append(
+                {
+                    "title": title,
+                    "link": link,
+                    "source": str(item.get("source", "") or "").strip(),
+                    "date": str(item.get("date", "") or "").strip(),
+                    "snippet": str(item.get("snippet", "") or "").strip(),
+                }
+            )
+        ranked, _ = self._rerank_search_results(query, query, filtered, max_results=max_results)
+        return ranked
+
+    async def _wait_for_search_results_ready(self, tk: BrowserToolkit, search_url: str) -> bool:
+        selectors_by_host = {
+            "bing.com": "#b_results, li.b_algo, .b_ans, .b_algo",
+            "google.com": "#search, div.g, .tF2Cxc, [data-sokoban-container]",
+            "duckduckgo.com": ".results, .result, .result__body, .result__a",
+        }
+        host = str(urlparse(search_url).netloc or "").lower()
+        selector = "#b_results, #search, .results, [role='main']"
+        for domain, value in selectors_by_host.items():
+            if domain in host:
+                selector = value
+                break
+
+        for _ in range(4):
+            await tk.wait_for_load("domcontentloaded", timeout=8000)
+            await tk.wait_for_load("networkidle", timeout=3000)
+            wait_result = await tk.wait_for_selector(selector, timeout=3000)
+            if wait_result.success:
+                summary = await tk.evaluate_js(
+                    """(sel) => {
+                        const nodes = Array.from(document.querySelectorAll(sel));
+                        const visible = nodes.filter((node) => {
+                            const style = window.getComputedStyle(node);
+                            return style && style.visibility !== 'hidden' && style.display !== 'none';
+                        });
+                        return {
+                            matches: visible.length,
+                            textLength: (document.body && document.body.innerText ? document.body.innerText.length : 0),
+                        };
+                    }""",
+                    selector,
+                )
+                if summary.success and isinstance(summary.data, dict):
+                    if int(summary.data.get("matches", 0) or 0) > 0:
+                        return True
+                    if int(summary.data.get("textLength", 0) or 0) >= 300:
+                        return True
+            await tk.human_delay(400, 1200)
+        return False
+
+    async def search_for_result_cards(
+        self,
+        query: str,
+        *,
+        task_description: str = "",
+        max_results: int = 5,
+        headless: Optional[bool] = None,
+        tk: BrowserToolkit = None,
+    ) -> List[Dict[str, Any]]:
+        log_agent_action(self.name, "搜索候选网站", query[:60])
+        own_tk = tk is None
+        if own_tk:
+            tk = self._create_toolkit(headless=True if headless is None else headless)
+            await tk.create_page()
+        cards: List[Dict[str, Any]] = []
+        try:
+            encoded_query = quote_plus(query or "")
+            search_candidates = [
+                f"https://www.bing.com/search?q={encoded_query}",
+                f"https://www.google.com/search?q={encoded_query}&hl=en",
+                f"https://duckduckgo.com/html/?q={encoded_query}",
+            ]
+            for search_url in search_candidates:
+                goto_r = await tk.goto(search_url)
+                if not goto_r.success:
+                    continue
+                ready = await self._wait_for_search_results_ready(tk, search_url)
+                if not ready:
+                    await tk.human_delay(800, 1800)
+                raw_cards = await self._extract_search_result_cards(tk, query, max_results=max_results * 2)
+                if raw_cards:
+                    cards, _ = self._rerank_search_results(
+                        task_description or query,
+                        query,
+                        raw_cards,
+                        max_results=max_results,
+                    )
+                    if cards:
+                        break
+            if cards:
+                log_success(f"搜索到 {len(cards)} 个候选网站")
+            else:
+                log_warning("搜索未找到结果")
+        except Exception as e:
+            log_error(f"搜索失败: {e}")
+        finally:
+            if own_tk:
+                await tk.close()
+        return cards
+
     async def search_for_url(self, query: str) -> Optional[str]:
-        results = await self.search_for_urls(query, max_results=1)
-        return results[0] if results else None
+        cards = await self.search_for_result_cards(query, task_description=query, max_results=1)
+        if not cards:
+            return None
+        return str(cards[0].get("link", "") or "").strip() or None
 
     @staticmethod
     def _decode_redirect_url(href: str) -> str:
@@ -579,6 +1065,18 @@ class WebWorker:
         return urls
 
     async def search_for_urls(self, query: str, max_results: int = 5, tk: BrowserToolkit = None) -> List[str]:
+        cards = await self.search_for_result_cards(
+            query,
+            task_description=query,
+            max_results=max_results,
+            tk=tk,
+        )
+        if cards:
+            return [
+                str(card.get("link", "") or "").strip()
+                for card in cards
+                if str(card.get("link", "") or "").strip()
+            ]
         log_agent_action(self.name, "搜索候选网站", query[:60])
         own_tk = tk is None
         if own_tk:
@@ -609,6 +1107,77 @@ class WebWorker:
             if own_tk:
                 await tk.close()
         return urls
+
+    async def gather_search_candidates(
+        self,
+        task_description: str,
+        *,
+        base_query: str = "",
+        domain_hints: Optional[List[str]] = None,
+        max_results: int = 5,
+        headless: Optional[bool] = None,
+        tk: BrowserToolkit = None,
+    ) -> Dict[str, Any]:
+        queries = self.plan_search_queries(
+            task_description,
+            base_query=base_query,
+            domain_hints=domain_hints,
+            max_queries=min(4, max(1, max_results)),
+        )
+        aggregate_cards: List[Dict[str, Any]] = []
+        seen_links: Set[str] = set()
+        serp_sufficient = False
+        for query in queries:
+            cards = await self.search_for_result_cards(
+                query,
+                task_description=task_description,
+                max_results=max_results,
+                headless=headless,
+                tk=tk,
+            )
+            ranked_cards, ranked_serp_sufficient = self._rerank_search_results(
+                task_description,
+                query,
+                cards,
+                max_results=max_results,
+            )
+            serp_sufficient = serp_sufficient or ranked_serp_sufficient
+            for card in ranked_cards:
+                link = str(card.get("link", "") or "").strip()
+                if not link or link in seen_links:
+                    continue
+                seen_links.add(link)
+                aggregate_cards.append(card)
+
+        ranked_cards, _ = self._rerank_search_results(
+            task_description,
+            " ".join(queries),
+            aggregate_cards,
+            max_results=max_results,
+        )
+        if ranked_cards and not serp_sufficient:
+            try:
+                quality = self.validate_data_quality(
+                    ranked_cards[: min(3, len(ranked_cards))],
+                    task_description,
+                    min(max_results, max(1, len(ranked_cards))),
+                )
+                serp_sufficient = bool(
+                    quality.get("valid")
+                    and any(str(card.get("snippet", "") or "").strip() for card in ranked_cards[:2])
+                )
+            except Exception:
+                serp_sufficient = False
+        return {
+            "queries": queries,
+            "cards": ranked_cards,
+            "urls": [
+                str(card.get("link", "") or "").strip()
+                for card in ranked_cards
+                if str(card.get("link", "") or "").strip()
+            ],
+            "serp_sufficient": serp_sufficient,
+        }
 
     async def explore_for_data_page(self, tk: BrowserToolkit, task_description: str) -> Optional[str]:
         log_agent_action(self.name, "探索页面导航，寻找数据页面")
@@ -831,7 +1400,15 @@ class WebWorker:
 
     # ── smart_scrape (main entry, uses toolkit) ────────────────
 
-    async def smart_scrape(self, url: Optional[str], task_description: str, limit: int = 10) -> Dict[str, Any]:
+    async def smart_scrape(
+        self,
+        url: Optional[str],
+        task_description: str,
+        limit: int = 10,
+        *,
+        headless: Optional[bool] = None,
+        query: str = "",
+    ) -> Dict[str, Any]:
         log_agent_action(self.name, "开始智能爬取", task_description[:50])
 
         # Step 1: LLM 分析确定最佳目标 URL
@@ -842,6 +1419,54 @@ class WebWorker:
             for item in (url_info.get("backup_urls") or [])
             if str(item).strip().startswith("http")
         ]
+        search_base_query = str(query or url_info.get("search_query", "") or "").strip()
+        domain_hints = self._extract_domain_hints(task_description)
+        candidate_urls: List[str] = []
+        seen_candidate_urls: Set[str] = set()
+
+        def _append_candidate(candidate: str) -> None:
+            value = str(candidate or "").strip()
+            if not value or not value.startswith("http") or value in seen_candidate_urls:
+                return
+            seen_candidate_urls.add(value)
+            candidate_urls.append(value)
+        if url:
+            _append_candidate(url)
+        if best_url:
+            _append_candidate(best_url)
+        for backup in backup_urls:
+            _append_candidate(backup)
+
+        should_search_first = bool(
+            url_info.get("need_search")
+            or not candidate_urls
+            or any(not self._is_probably_detail_url(item) for item in candidate_urls[:1])
+        )
+        if should_search_first:
+            search_bundle = await self.gather_search_candidates(
+                task_description,
+                base_query=search_base_query or task_description,
+                domain_hints=domain_hints,
+                max_results=max(3, min(limit, 6)),
+                headless=headless if headless is not None else False,
+            )
+            for found_url in search_bundle.get("urls", []):
+                _append_candidate(found_url)
+            if search_bundle.get("serp_sufficient") and search_bundle.get("cards"):
+                cards = search_bundle["cards"][:limit]
+                return {
+                    "success": True,
+                    "data": cards,
+                    "count": len(cards),
+                    "source": "search_results",
+                    "mode": "search_results",
+                    "queries": search_bundle.get("queries", []),
+                }
+            search_urls = list(search_bundle.get("urls", []))
+            if search_urls:
+                url = str(search_urls[0]).strip()
+            elif candidate_urls and (not url or should_search_first):
+                url = candidate_urls[0]
         if not url and best_url:
             url = best_url
         elif not url and backup_urls:
@@ -854,11 +1479,18 @@ class WebWorker:
         if not url:
             return {"success": False, "error": "无法确定目标网站 URL", "data": []}
 
-        # Step 1.5: 纯读场景优先静态抓取
+        # Step 1.5: Prefer static fetch for readable pages before browser extraction.
         if self._can_use_static_fetch(task_description, url):
-            static_try_urls = [url] + [item for item in backup_urls if item != url]
+            static_try_urls = [url] + [
+                item
+                for item in candidate_urls
+                if item != url
+            ]
+            if not static_try_urls:
+                static_try_urls = [url] + [item for item in backup_urls if item != url]
+            static_try_urls = static_try_urls[:5]
             static_error = ""
-            for static_url in static_try_urls[:3]:
+            for static_url in static_try_urls:
                 static_result = self._static_fetch(static_url, task_description, limit)
                 if static_result.get("success"):
                     log_success(f"静态抓取成功，获取 {static_result.get('count', 0)} 条数据")
@@ -867,7 +1499,8 @@ class WebWorker:
                 log_warning(f"静态抓取失败，回退浏览器模式: {static_error[:80]}")
             # static fetch failed for all candidates; continue with browser mode
 
-        tk = self._create_toolkit()
+        effective_headless = headless if headless is not None else (False if should_search_first else True)
+        tk = self._create_toolkit(headless=effective_headless)
         await tk.create_page()
 
         # 用于捕获 SPA 页面的 API 响应数据
@@ -1068,7 +1701,14 @@ class WebWorker:
             else:
                 # 换源搜索（最多尝试 2 个替代来源，防止无限循环）
                 log_agent_action(self.name, "当前来源失败，尝试通过搜索引擎寻找替代来源")
-                alt_urls = await self.search_for_urls(task_description, max_results=3, tk=tk)
+                alt_bundle = await self.gather_search_candidates(
+                    task_description,
+                    base_query=search_base_query or task_description,
+                    domain_hints=domain_hints,
+                    max_results=3,
+                    tk=tk,
+                )
+                alt_urls = list(alt_bundle.get("urls", []))
                 original_domain = "/".join(url.split("/")[:3]) if url else ""
                 alt_urls = [u for u in alt_urls if original_domain not in u]
 
@@ -1164,7 +1804,9 @@ class WebWorker:
 
         params = task["params"]
         url = params.get("url", "")
+        query = params.get("query", "")
         limit = params.get("limit", 10)
+        headless = params.get("headless")
         task_description = task["description"]
         trace: List[Dict[str, Any]] = task.get("execution_trace", [])
         step_no = len(trace) + 1
@@ -1182,7 +1824,13 @@ class WebWorker:
                 log_warning(f"初始化任务专用模型失败: {e}，回退默认模型")
                 runner = self
 
-        result = await runner.smart_scrape(url, task_description, limit)
+        result = await runner.smart_scrape(
+            url,
+            task_description,
+            limit,
+            headless=headless,
+            query=query,
+        )
         trace[-1]["observation"] = f"success={result.get('success')}, count={result.get('count', 0)}"
 
         criteria = task.get("success_criteria", [])
@@ -1210,10 +1858,18 @@ class WebWorker:
             patch = fb.get("param_patch", {})
             patched_params = {**params, **patch}
             retry_url = patched_params.get("url", url)
+            retry_query = patched_params.get("query", query)
             retry_limit = patched_params.get("limit", limit)
-            trace.append(make_trace_step(step_no, f"retry #{fb_index}", f"url={retry_url}, patch={patch}", "", ""))
+            retry_headless = patched_params.get("headless", headless)
+            trace.append(make_trace_step(step_no, f"retry #{fb_index}", f"url={retry_url}, query={retry_query}, patch={patch}", "", ""))
 
-            result = await runner.smart_scrape(retry_url, task_description, retry_limit)
+            result = await runner.smart_scrape(
+                retry_url,
+                task_description,
+                retry_limit,
+                headless=retry_headless,
+                query=retry_query,
+            )
             trace[-1]["observation"] = f"success={result.get('success')}, count={result.get('count', 0)}"
 
             if result.get("success") and evaluate_success_criteria(criteria, result):

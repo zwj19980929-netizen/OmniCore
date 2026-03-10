@@ -145,13 +145,23 @@ class BrowserToolkit:
             import os
             context_kwargs = {
                 "viewport": {"width": 1366, "height": 768},
+                "screen": {"width": 1366, "height": 768},
+                "device_scale_factor": 1.0,
+                "is_mobile": False,
+                "has_touch": False,
                 "locale": "zh-CN",
                 "timezone_id": "Asia/Shanghai",
+                "color_scheme": "light",
+                "reduced_motion": "no-preference",
                 "user_agent": (
                     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
                     "AppleWebKit/537.36 (KHTML, like Gecko) "
                     "Chrome/122.0.0.0 Safari/537.36"
                 ),
+                "extra_http_headers": {
+                    "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
+                    "Upgrade-Insecure-Requests": "1",
+                },
             }
 
             storage_path = self._get_storage_state_path()
@@ -179,10 +189,114 @@ class BrowserToolkit:
 
             # 注入反检测脚本（合并两处最优）
             await self._page.add_init_script("""
-                Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
-                Object.defineProperty(navigator, 'plugins', { get: () => [1, 2, 3, 4, 5] });
-                Object.defineProperty(navigator, 'languages', { get: () => ['zh-CN', 'zh', 'en'] });
-                window.chrome = { runtime: {} };
+                (() => {
+                    const overrideGetter = (obj, key, value) => {
+                        try {
+                            Object.defineProperty(obj, key, {
+                                get: () => value,
+                                configurable: true,
+                            });
+                        } catch (e) {}
+                    };
+
+                    overrideGetter(navigator, 'webdriver', undefined);
+                    overrideGetter(navigator, 'plugins', [1, 2, 3, 4, 5]);
+                    overrideGetter(navigator, 'languages', ['zh-CN', 'zh', 'en']);
+                    overrideGetter(navigator, 'platform', 'Win32');
+                    overrideGetter(navigator, 'vendor', 'Google Inc.');
+                    overrideGetter(navigator, 'hardwareConcurrency', 8);
+                    overrideGetter(navigator, 'deviceMemory', 8);
+                    overrideGetter(navigator, 'maxTouchPoints', 0);
+                    overrideGetter(screen, 'colorDepth', 24);
+                    overrideGetter(window, 'outerWidth', 1366);
+                    overrideGetter(window, 'outerHeight', 768);
+
+                    window.chrome = window.chrome || {};
+                    window.chrome.runtime = window.chrome.runtime || {};
+                    window.chrome.app = window.chrome.app || {
+                        InstallState: 'installed',
+                        RunningState: 'running',
+                        getDetails: () => null,
+                        getIsInstalled: () => false,
+                    };
+                    window.chrome.csi = window.chrome.csi || (() => ({ onloadT: Date.now(), startE: Date.now() - 150 }));
+                    window.chrome.loadTimes = window.chrome.loadTimes || (() => ({
+                        commitLoadTime: Date.now() / 1000,
+                        finishDocumentLoadTime: Date.now() / 1000,
+                        finishLoadTime: Date.now() / 1000,
+                        firstPaintAfterLoadTime: 0,
+                        firstPaintTime: Date.now() / 1000,
+                        navigationType: 'Other',
+                        npnNegotiatedProtocol: 'h2',
+                        requestTime: (Date.now() - 1200) / 1000,
+                        startLoadTime: (Date.now() - 1000) / 1000,
+                        wasAlternateProtocolAvailable: false,
+                        wasFetchedViaSpdy: true,
+                        wasNpnNegotiated: true,
+                    }));
+
+                    if (navigator.permissions && navigator.permissions.query) {
+                        const originalQuery = navigator.permissions.query.bind(navigator.permissions);
+                        navigator.permissions.query = (parameters) => (
+                            parameters && parameters.name === 'notifications'
+                                ? Promise.resolve({ state: Notification.permission })
+                                : originalQuery(parameters)
+                        );
+                    }
+
+                    const uaData = {
+                        brands: [
+                            { brand: 'Chromium', version: '122' },
+                            { brand: 'Google Chrome', version: '122' },
+                            { brand: 'Not A;Brand', version: '99' },
+                        ],
+                        mobile: false,
+                        platform: 'Windows',
+                        getHighEntropyValues: async (hints) => {
+                            const supported = {
+                                architecture: 'x86',
+                                bitness: '64',
+                                model: '',
+                                platform: 'Windows',
+                                platformVersion: '10.0.0',
+                                uaFullVersion: '122.0.0.0',
+                                fullVersionList: [
+                                    { brand: 'Chromium', version: '122.0.0.0' },
+                                    { brand: 'Google Chrome', version: '122.0.0.0' },
+                                    { brand: 'Not A;Brand', version: '99.0.0.0' },
+                                ],
+                            };
+                            const out = {};
+                            for (const hint of (hints || [])) {
+                                if (hint in supported) out[hint] = supported[hint];
+                            }
+                            return out;
+                        },
+                        toJSON: function() {
+                            return {
+                                brands: this.brands,
+                                mobile: this.mobile,
+                                platform: this.platform,
+                            };
+                        },
+                    };
+                    overrideGetter(navigator, 'userAgentData', uaData);
+
+                    const originalGetParameter = WebGLRenderingContext.prototype.getParameter;
+                    WebGLRenderingContext.prototype.getParameter = function(parameter) {
+                        if (parameter === 37445) return 'Intel Inc.';
+                        if (parameter === 37446) return 'Intel Iris OpenGL Engine';
+                        return originalGetParameter.call(this, parameter);
+                    };
+                    if (window.WebGL2RenderingContext) {
+                        const originalGetParameter2 = WebGL2RenderingContext.prototype.getParameter;
+                        WebGL2RenderingContext.prototype.getParameter = function(parameter) {
+                            if (parameter === 37445) return 'Intel Inc.';
+                            if (parameter === 37446) return 'Intel Iris OpenGL Engine';
+                            return originalGetParameter2.call(this, parameter);
+                        };
+                    }
+                })();
             """)
 
             self._current_frame = None

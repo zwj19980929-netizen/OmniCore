@@ -137,3 +137,52 @@ def test_determine_target_url_builds_site_constrained_weather_query_without_llm(
     assert result["url"] == ""
     assert result["need_search"] is True
     assert result["search_query"] == "site:weather.com.cn 合肥 明天 天气"
+
+
+def test_smart_scrape_prefers_search_candidates_over_section_urls(monkeypatch):
+    worker = WebWorker()
+    attempted_urls = []
+
+    async def _fake_determine_target_url(_task_description):
+        return {
+            "url": "https://www.reuters.com/world/middle-east/",
+            "backup_urls": [],
+            "need_search": True,
+            "search_query": "US Iran strikes Reuters",
+        }
+
+    async def _fake_gather_search_candidates(*_args, **_kwargs):
+        return {
+            "queries": ["US Iran strikes Reuters"],
+            "cards": [
+                {
+                    "title": "US strikes in Iran raise tensions",
+                    "link": "https://www.reuters.com/world/article-123",
+                    "source": "Reuters",
+                    "snippet": "Direct military action was reported.",
+                }
+            ],
+            "urls": ["https://www.reuters.com/world/article-123"],
+            "serp_sufficient": False,
+        }
+
+    def _fake_static_fetch(url, _task_description, _limit):
+        attempted_urls.append(url)
+        if url.endswith("article-123"):
+            return {
+                "success": True,
+                "data": [{"title": "US strikes in Iran raise tensions"}],
+                "count": 1,
+                "source": url,
+                "mode": "static_fetch",
+            }
+        return {"success": False, "error": "section page", "data": [], "url": url}
+
+    monkeypatch.setattr(worker, "determine_target_url", _fake_determine_target_url)
+    monkeypatch.setattr(worker, "gather_search_candidates", _fake_gather_search_candidates)
+    monkeypatch.setattr(worker, "_static_fetch", _fake_static_fetch)
+
+    result = asyncio.run(worker.smart_scrape("", "核实近期美国与伊朗之间军事行动", limit=3))
+
+    assert result["success"] is True
+    assert attempted_urls[0] == "https://www.reuters.com/world/article-123"

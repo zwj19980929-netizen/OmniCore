@@ -238,6 +238,7 @@ def _register_builtin_tools(registry: ToolRegistry) -> None:
                         "url": {"type": "string"},
                         "query": {"type": "string"},
                         "limit": {"type": "integer"},
+                        "headless": {"type": "boolean"},
                         "selectors": {"type": "array"},
                         "output_file": {"type": "string"},
                     },

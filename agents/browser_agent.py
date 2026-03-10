@@ -1179,13 +1179,21 @@ class BrowserAgent:
     async def _bootstrap_search_results(self, query: str) -> bool:
         if not query:
             return False
-        search_url = f"https://www.bing.com/search?q={quote_plus(query)}"
-        result = await self.toolkit.goto(search_url, timeout=30000)
-        if not result.success:
-            return False
-        await self._wait_for_page_ready()
-        log_agent_action(self.name, "bootstrap_search", query[:120])
-        return True
+        search_candidates = [
+            f"https://www.bing.com/search?q={quote_plus(query)}",
+            f"https://www.google.com/search?q={quote_plus(query)}&hl=en",
+            f"https://duckduckgo.com/?q={quote_plus(query)}",
+        ]
+        for search_url in search_candidates:
+            result = await self.toolkit.goto(search_url, timeout=30000)
+            if not result.success:
+                continue
+            await self._wait_for_page_ready()
+            ready = await self._wait_for_search_results_ready(search_url)
+            if ready:
+                log_agent_action(self.name, "bootstrap_search", query[:120])
+                return True
+        return False
 
     def _search_input_matches_query(self, elements: List[PageElement], query: str) -> bool:
         if not query:
@@ -2067,6 +2075,38 @@ class BrowserAgent:
         if not tk.fast_mode:
             await tk.wait_for_load("networkidle", timeout=3000)
         await tk.human_delay(40, 80)
+
+    async def _wait_for_search_results_ready(self, search_url: str) -> bool:
+        selectors_by_host = {
+            "bing.com": "li.b_algo, .b_ans, #b_results",
+            "google.com": "div.g, .tF2Cxc, #search, [data-sokoban-container]",
+            "duckduckgo.com": ".result, .results, .result__body",
+        }
+        host = str(urlparse(search_url).netloc or "").lower()
+        selector = "#search, #b_results, .results, [role='main']"
+        for domain, candidate in selectors_by_host.items():
+            if domain in host:
+                selector = candidate
+                break
+
+        for _ in range(4):
+            wait_result = await self.toolkit.wait_for_selector(selector, timeout=3000)
+            if wait_result.success:
+                summary = await self.toolkit.evaluate_js(
+                    """(sel) => {
+                        const matches = document.querySelectorAll(sel).length;
+                        const textLength = document.body && document.body.innerText ? document.body.innerText.length : 0;
+                        return { matches, textLength };
+                    }""",
+                    selector,
+                )
+                if summary.success and isinstance(summary.data, dict):
+                    if int(summary.data.get("matches", 0) or 0) > 0:
+                        return True
+                    if int(summary.data.get("textLength", 0) or 0) >= 300:
+                        return True
+            await self.toolkit.human_delay(300, 900)
+        return False
 
     # ── main run loop ────────────────────────────────────────
 

@@ -181,6 +181,27 @@ def test_browser_toolkit_uses_pool_and_releases_leases(monkeypatch):
     asyncio.run(_run())
 
 
+def test_browser_toolkit_injects_extended_stealth_script(monkeypatch):
+    async def _run():
+        fake_pool = FakePool()
+        monkeypatch.setattr(settings, "BROWSER_POOL_ENABLED", True)
+        monkeypatch.setattr("utils.browser_toolkit.get_browser_runtime_pool", lambda: fake_pool)
+
+        toolkit = BrowserToolkit(headless=False, block_heavy_resources=False)
+        result = await toolkit.create_page()
+
+        assert result.success is True
+        page = fake_pool.browser.contexts[0].page
+        combined = "\n".join(page.init_scripts)
+        assert "userAgentData" in combined
+        assert "hardwareConcurrency" in combined
+        assert "WebGLRenderingContext.prototype.getParameter" in combined
+
+        await toolkit.close()
+
+    asyncio.run(_run())
+
+
 def test_browser_toolkit_falls_back_to_direct_launch_when_pool_is_open(monkeypatch):
     async def _run():
         fake_browser = FakeBrowser()
