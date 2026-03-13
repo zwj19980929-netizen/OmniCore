@@ -210,8 +210,8 @@ async def analyze_page_structure_with_singleflight(
         log_debug_metrics("llm_cache.page_analysis", self.cache.snapshot_stats())
         return cached
 
-    if len(html) > 15000:
-        html = html[:15000] + "\n... (truncated)"
+    if len(html) > 100000:
+        html = html[:100000] + "\n... (truncated)"
 
     async def _compute_page_analysis() -> Dict[str, Any]:
         try:
@@ -224,7 +224,6 @@ async def analyze_page_structure_with_singleflight(
                 ),
                 user_message="Please analyze the page structure and return selectors",
                 temperature=0.2,
-                max_tokens=4096,
                 json_mode=True,
             )
             config = self.llm.parse_json_response(response)

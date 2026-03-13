@@ -182,7 +182,6 @@ class AIPUACoach:
             response = self.llm.chat(
                 messages=[{"role": "user", "content": prompt}],
                 temperature=0.8,  # 高温度，增加创造性
-                max_tokens=2048
             )
 
             # 🔥 修复：从 LLMResponse 对象中提取 content
@@ -257,7 +256,6 @@ class AIPUACoach:
             response = self.llm.chat(
                 messages=[{"role": "user", "content": prompt}],
                 temperature=0.7,
-                max_tokens=512
             )
             # 🔥 修复：从 LLMResponse 对象中提取 content
             evaluation = response.content if hasattr(response, 'content') else str(response)

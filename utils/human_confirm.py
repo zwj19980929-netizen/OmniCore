@@ -5,12 +5,13 @@ OmniCore 人类确认中断机制
 from typing import Optional, List
 from rich.console import Console
 from rich.panel import Panel
-from rich.prompt import Confirm
 from rich.table import Table
 
 from config.settings import settings
+from utils.enhanced_input import EnhancedInput
 
 console = Console()
+_enhanced_input = EnhancedInput()
 
 
 class HumanConfirm:
@@ -67,14 +68,19 @@ class HumanConfirm:
 
         console.print()
 
-        # 请求确认
+        # 请求确认 - 使用 EnhancedInput 支持命令历史
         try:
-            confirmed = Confirm.ask(
-                "[bold red]是否确认执行此操作?[/bold red]",
-                default=False,
-            )
+            response = _enhanced_input.input(
+                "[bold red]是否确认执行此操作? [y/n] (n): [/bold red]"
+            ).strip().lower()
+
+            confirmed = response in ['y', 'yes', '是']
+
+            if not confirmed:
+                console.print("[yellow]操作已取消[/yellow]")
+
             return confirmed
-        except KeyboardInterrupt:
+        except (KeyboardInterrupt, EOFError):
             console.print("\n[yellow]操作已取消[/yellow]")
             return False
 
@@ -119,4 +125,23 @@ class HumanConfirm:
         return HumanConfirm.request_confirmation(
             operation="执行系统命令",
             details=f"命令: {command}\n工作目录: {working_dir}",
+        )
+
+    @staticmethod
+    def request_browser_action_confirmation(
+        action: str,
+        target: str,
+        value: str = "",
+        description: str = "",
+    ) -> bool:
+        """浏览器操作确认"""
+        details = f"操作类型: {action}\n目标元素: {target}"
+        if value:
+            details += f"\n输入值: {value}"
+        if description:
+            details += f"\n描述: {description}"
+
+        return HumanConfirm.request_confirmation(
+            operation="浏览器操作",
+            details=details,
         )

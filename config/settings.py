@@ -137,6 +137,15 @@ class Settings:
     COST_PREFERENCE = os.getenv("COST_PREFERENCE", "low")  # low/medium/high
     MODELS_CONFIG_PATH = os.getenv("MODELS_CONFIG_PATH", "config/models.yaml")
 
+    # === LLM 调用配置 ===
+    # 默认 max_tokens，可通过环境变量 LLM_MAX_TOKENS 配置
+    # 建议值：65535（最大），32768（平衡），16000（默认）
+    LLM_MAX_TOKENS = _env_int("LLM_MAX_TOKENS", 65535)
+    # Router 专用 max_tokens（路由分析通常需要更多 tokens）
+    LLM_ROUTER_MAX_TOKENS = _env_int("LLM_ROUTER_MAX_TOKENS", 65535)
+    # 普通对话 max_tokens
+    LLM_CHAT_MAX_TOKENS = _env_int("LLM_CHAT_MAX_TOKENS", 32768)
+
     # === 本地路径 ===
     USER_DESKTOP_PATH = Path(
         os.getenv("USER_DESKTOP_PATH", Path.home() / "Desktop")

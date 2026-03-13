@@ -131,7 +131,6 @@ class EnhancedWebWorker:
             system_prompt=prompt,
             user_message="请分析这个页面并返回 JSON 格式的理解结果",
             temperature=0.2,
-            max_tokens=2048,
             json_mode=True
         )
 
@@ -172,7 +171,6 @@ class EnhancedWebWorker:
             system_prompt=prompt,
             user_message="请生成数据提取选择器配置",
             temperature=0.1,
-            max_tokens=3072,
             json_mode=True
         )
 
@@ -309,7 +307,6 @@ class EnhancedWebWorker:
             system_prompt=prompt,
             user_message="请规划下一步操作",
             temperature=0.3,
-            max_tokens=1536,
             json_mode=True
         )
 

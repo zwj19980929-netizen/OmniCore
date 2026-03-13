@@ -1,0 +1,162 @@
+{
+  "session_050db4117e4c": {
+    "created_at": "2026-03-12T23:46:41",
+    "job_count": 1,
+    "last_job_id": "job_2a7f3abe958b",
+    "last_user_input": "到cnnvd找到当天最新的漏洞，到官网网页上去抓，我想先看你操作网页的能力，不要用bing，用谷歌去搜",
+    "session_id": "session_050db4117e4c",
+    "source": "runtime",
+    "status": "active",
+    "updated_at": "2026-03-12T23:48:38"
+  },
+  "session_11f9aafba71f": {
+    "created_at": "2026-03-13T22:35:31",
+    "job_count": 1,
+    "last_job_id": "job_0c036245595f",
+    "last_user_input": "到cnnvd找到当天最新的漏洞，到官网网页上去抓，我想先看你操作网页的能力，不要用bing，用谷歌去搜",
+    "session_id": "session_11f9aafba71f",
+    "source": "runtime",
+    "status": "active",
+    "updated_at": "2026-03-13T22:43:13"
+  },
+  "session_1be341ac6b04": {
+    "created_at": "2026-03-12T22:47:29",
+    "job_count": 1,
+    "last_job_id": "job_f9a39cf44405",
+    "last_user_input": "到cnnvd找到当天最新的漏洞，到官网网页上去抓，我想先看你操作网页的能力，不要用bing，用谷歌去搜",
+    "session_id": "session_1be341ac6b04",
+    "source": "runtime",
+    "status": "active",
+    "updated_at": "2026-03-12T22:48:53"
+  },
+  "session_21c16577a3d8": {
+    "created_at": "2026-03-12T23:35:16",
+    "job_count": 1,
+    "last_job_id": "job_83214cf16485",
+    "last_user_input": "到cnnvd找到当天最新的漏洞，到官网网页上去抓，我想先看你操作网页的能力，不要用bing，用谷歌去搜",
+    "session_id": "session_21c16577a3d8",
+    "source": "runtime",
+    "status": "active",
+    "updated_at": "2026-03-12T23:38:04"
+  },
+  "session_534d562fb4b3": {
+    "created_at": "2026-03-13T23:22:36",
+    "job_count": 1,
+    "last_job_id": "job_1d405c11b7fa",
+    "last_user_input": "到cnnvd找到当天最新的漏洞，到官网网页上去抓，我想先看你操作网页的能力，不要用bing，用谷歌去搜",
+    "session_id": "session_534d562fb4b3",
+    "source": "runtime",
+    "status": "active",
+    "updated_at": "2026-03-13T23:27:25"
+  },
+  "session_5406af0bb802": {
+    "created_at": "2026-03-14T00:12:23",
+    "job_count": 1,
+    "last_job_id": "job_121b48a93449",
+    "last_user_input": "到cnnvd找到当天最新的漏洞，到官网网页上去抓，我想先看你操作网页的能力，不要用bing，用谷歌去搜",
+    "session_id": "session_5406af0bb802",
+    "source": "runtime",
+    "status": "active",
+    "updated_at": "2026-03-14T00:13:03"
+  },
+  "session_644cd7f3e18a": {
+    "created_at": "2026-03-13T22:43:23",
+    "job_count": 1,
+    "last_job_id": "job_59fe1fe6fd3d",
+    "last_user_input": "到cnnvd找到当天最新的漏洞，到官网网页上去抓，我想先看你操作网页的能力，不要用bing，用谷歌去搜",
+    "session_id": "session_644cd7f3e18a",
+    "source": "runtime",
+    "status": "active",
+    "updated_at": "2026-03-13T22:44:20"
+  },
+  "session_6571974e1219": {
+    "created_at": "2026-03-12T23:16:30",
+    "job_count": 1,
+    "last_job_id": "job_849131194f9e",
+    "last_user_input": "到cnnvd找到当天最新的漏洞，到官网网页上去抓，我想先看你操作网页的能力，不要用bing，用谷歌去搜",
+    "session_id": "session_6571974e1219",
+    "source": "runtime",
+    "status": "active",
+    "updated_at": "2026-03-12T23:25:18"
+  },
+  "session_8af65818edef": {
+    "created_at": "2026-03-12T23:44:04",
+    "job_count": 1,
+    "last_job_id": "job_81065b77a19a",
+    "last_user_input": "到cnnvd找到当天最新的漏洞，到官网网页上去抓，我想先看你操作网页的能力，不要用bing，用谷歌去搜",
+    "session_id": "session_8af65818edef",
+    "source": "runtime",
+    "status": "active",
+    "updated_at": "2026-03-12T23:45:24"
+  },
+  "session_9485d0bece34": {
+    "created_at": "2026-03-12T23:05:32",
+    "job_count": 1,
+    "last_job_id": "job_612a0a632410",
+    "last_user_input": "到cnnvd找到当天最新的漏洞，到官网网页上去抓，我想先看你操作网页的能力，不要用bing，用谷歌去搜",
+    "session_id": "session_9485d0bece34",
+    "source": "runtime",
+    "status": "active",
+    "updated_at": "2026-03-12T23:07:20"
+  },
+  "session_aefe83ef4cad": {
+    "created_at": "2026-03-13T23:58:38",
+    "job_count": 1,
+    "last_job_id": "job_a03caca21b67",
+    "last_user_input": "到cnnvd找到当天最新的漏洞，到官网网页上去抓，我想先看你操作网页的能力，不要用bing，用谷歌去搜",
+    "session_id": "session_aefe83ef4cad",
+    "source": "runtime",
+    "status": "active",
+    "updated_at": "2026-03-14T00:06:44"
+  },
+  "session_c48f7e1e6859": {
+    "created_at": "2026-03-12T22:25:39",
+    "job_count": 1,
+    "last_job_id": "job_b09c361364be",
+    "last_user_input": "到cnnvd找到当天最新的漏洞",
+    "session_id": "session_c48f7e1e6859",
+    "source": "runtime",
+    "status": "active",
+    "updated_at": "2026-03-12T22:25:55"
+  },
+  "session_c729334db568": {
+    "created_at": "2026-03-12T22:39:25",
+    "job_count": 1,
+    "last_job_id": "job_7fde59bb2079",
+    "last_user_input": "到cnnvd找到当天最新的漏洞，到官网网页上去抓，我想先看你操作网页的能力，不要用bing，用谷歌去搜",
+    "session_id": "session_c729334db568",
+    "source": "runtime",
+    "status": "active",
+    "updated_at": "2026-03-12T22:41:47"
+  },
+  "session_de916584121e": {
+    "created_at": "2026-03-12T22:37:20",
+    "job_count": 1,
+    "last_job_id": "job_85c5b72d2e2f",
+    "last_user_input": "到cnnvd找到当天最新的漏洞，到官网网页上去抓，我想先看你操作网页的能力",
+    "session_id": "session_de916584121e",
+    "source": "runtime",
+    "status": "active",
+    "updated_at": "2026-03-12T22:38:29"
+  },
+  "session_f5841d317fda": {
+    "created_at": "2026-03-13T22:44:29",
+    "job_count": 3,
+    "last_job_id": "job_1e22a9d4212e",
+    "last_user_input": "多等一会网页页面能刷出来的",
+    "session_id": "session_f5841d317fda",
+    "source": "runtime",
+    "status": "active",
+    "updated_at": "2026-03-13T23:04:36"
+  },
+  "session_f8918df5ec7a": {
+    "created_at": "2026-03-12T22:36:04",
+    "job_count": 1,
+    "last_job_id": "job_bedeb6d0a8c3",
+    "last_user_input": "到cnnvd找到当天最新的漏洞",
+    "session_id": "session_f8918df5ec7a",
+    "source": "runtime",
+    "status": "active",
+    "updated_at": "2026-03-12T22:36:36"
+  }
+}

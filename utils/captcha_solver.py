@@ -137,7 +137,6 @@ class CaptchaSolver:
                         {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{screenshot_base64}"}},
                     ],
                 }],
-                max_tokens=500,
             )
 
             result_text = response.choices[0].message.content

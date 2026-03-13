@@ -606,7 +606,7 @@ class ApiWorkerAdapter(BaseToolAdapter):
                         "status_code": getattr(response, "status", 200),
                         "headers": dict(response.headers.items()),
                         "data": parsed,
-                        "content": raw_text[:2000],
+                        "content": raw_text[:20000],
                         "url": url,
                         "method": method,
                     }
@@ -616,7 +616,7 @@ class ApiWorkerAdapter(BaseToolAdapter):
                     "success": False,
                     "error": f"HTTP {exc.code}: {exc.reason}",
                     "status_code": int(exc.code),
-                    "content": body[:2000],
+                    "content": body[:20000],
                     "url": url,
                     "method": method,
                 }

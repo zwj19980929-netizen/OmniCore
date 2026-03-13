@@ -327,7 +327,7 @@ class RouterAgent:
             ),
             user_message=user_input,
             temperature=0.1,
-            max_tokens=800,
+            max_tokens=2048,
             json_mode=True,
         )
         return self.llm.parse_json_response(response)
@@ -1206,11 +1206,14 @@ class RouterAgent:
 
         user_message += f"请分析以下用户指令并拆解任务：\n\n{user_input}"
 
+        # 使用配置的 Router 专用 max_tokens
+        from config.settings import settings
+
         response = self.llm.chat_with_system(
             system_prompt=self._build_router_system_prompt(),
             user_message=user_message,
             temperature=0.3,
-            max_tokens=16000,
+            max_tokens=settings.LLM_ROUTER_MAX_TOKENS,
             json_mode=True,
         )
 

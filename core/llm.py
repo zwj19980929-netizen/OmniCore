@@ -426,12 +426,24 @@ class LLMClient:
         self,
         messages: List[Dict[str, str]],
         temperature: float = 0.7,
-        max_tokens: int = 16000,
+        max_tokens: int = None,
         json_mode: bool = False,
     ) -> LLMResponse:
         """
         同步聊天接口（支持所有厂家）
+
+        Args:
+            messages: 消息列表
+            temperature: 温度参数
+            max_tokens: 最大 tokens 数，None 时使用配置的默认值
+            json_mode: 是否启用 JSON 模式
         """
+        from config.settings import settings
+
+        # 如果没有指定 max_tokens，使用配置的默认值
+        if max_tokens is None:
+            max_tokens = settings.LLM_MAX_TOKENS
+
         try:
             clean_messages = sanitize_value(messages)
 
@@ -551,12 +563,24 @@ class LLMClient:
         self,
         messages: List[Dict[str, str]],
         temperature: float = 0.7,
-        max_tokens: int = 16000,
+        max_tokens: int = None,
         json_mode: bool = False,
     ) -> LLMResponse:
         """
         异步聊天接口（支持所有厂家）
+
+        Args:
+            messages: 消息列表
+            temperature: 温度参数
+            max_tokens: 最大 tokens 数，None 时使用配置的默认值
+            json_mode: 是否启用 JSON 模式
         """
+        from config.settings import settings
+
+        # 如果没有指定 max_tokens，使用配置的默认值
+        if max_tokens is None:
+            max_tokens = settings.LLM_MAX_TOKENS
+
         try:
             clean_messages = sanitize_value(messages)
 
@@ -666,11 +690,18 @@ class LLMClient:
         system_prompt: str,
         user_message: str,
         temperature: float = 0.7,
-        max_tokens: int = 16000,
+        max_tokens: int = None,
         json_mode: bool = False,
     ) -> LLMResponse:
         """
         带系统提示的聊天（便捷方法）
+
+        Args:
+            system_prompt: 系统提示
+            user_message: 用户消息
+            temperature: 温度参数
+            max_tokens: 最大 tokens 数，None 时使用配置的默认值
+            json_mode: 是否启用 JSON 模式
         """
         messages = [
             {"role": "system", "content": sanitize_text(system_prompt or "")},

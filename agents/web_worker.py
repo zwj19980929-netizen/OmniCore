@@ -1358,8 +1358,8 @@ class WebWorker:
             log_agent_action(self.name, "命中页面结构分析缓存", normalized_url[:80])
             log_debug_metrics("llm_cache.page_analysis", self.cache.snapshot_stats())
             return cached
-        if len(html) > 15000:
-            html = html[:15000] + "\n... (truncated)"
+        if len(html) > 100000:
+            html = html[:100000] + "\n... (truncated)"
 
         response = self.llm.chat_with_system(
             system_prompt=PAGE_ANALYSIS_PROMPT.format(
@@ -1368,7 +1368,7 @@ class WebWorker:
                 current_url=url_r.data or "",
             ),
             user_message="请分析页面结构并返回选择器配置",
-            temperature=0.2, max_tokens=4096, json_mode=True,
+            temperature=0.2, json_mode=True,
         )
         try:
             config = self.llm.parse_json_response(response)

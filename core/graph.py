@@ -1430,7 +1430,6 @@ def _synthesize_user_facing_answer(
                 f"{_build_finalize_location_hint(current_location_context)}"
             ),
             temperature=0.4,
-            max_tokens=1200,
         )
         synthesized = str(getattr(response, "content", "") or "").strip()
         if synthesized:
@@ -1764,7 +1763,6 @@ def _synthesize_user_facing_answer(
                 f"{_build_finalize_location_hint(current_location_context)}"
             ),
             temperature=0.4,
-            max_tokens=1200,
         )
         synthesized = _normalize_text_value(getattr(response, "content", ""))
         if synthesized:

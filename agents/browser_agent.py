@@ -696,7 +696,6 @@ class BrowserAgent:
                     },
                 ],
                 temperature=0.1,
-                max_tokens=1200,
                 json_mode=True,
             )
             payload = llm.parse_json_response(response)
@@ -2226,8 +2225,19 @@ class BrowserAgent:
                             "expected_url": expected_url, "steps": steps, "data": _accumulated_data or data}
 
                 if action.requires_confirmation and settings.REQUIRE_HUMAN_CONFIRM:
-                    return {"success": False, "message": "action requires human confirmation",
-                            "requires_confirmation": True, "steps": steps}
+                    # 🔥 修复：不要直接退出，而是询问用户
+                    from utils.human_confirm import HumanConfirm
+                    confirmed = await asyncio.to_thread(
+                        HumanConfirm.request_browser_action_confirmation,
+                        action=action.action_type.value,
+                        target=action.target_selector[:80],
+                        value=action.value[:80],
+                        description=action.description
+                    )
+                    if not confirmed:
+                        return {"success": False, "message": "user declined action confirmation",
+                                "requires_confirmation": True, "steps": steps}
+                    # 用户确认了，继续执行
 
                 if self._is_action_looping(action):
                     url_r = await tk.get_current_url()

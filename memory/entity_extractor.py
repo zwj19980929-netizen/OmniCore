@@ -64,9 +64,8 @@ class EntityExtractor:
         try:
             response = self.llm.chat_with_system(
                 system_prompt=ENTITY_EXTRACTION_PROMPT,
-                user_message=f"请从以下文本中提取实体：\n\n{text[:2000]}",
+                user_message=f"请从以下文本中提取实体：\n\n{text[:10000]}",
                 temperature=0.2,
-                max_tokens=1000,
                 json_mode=True,
             )
 
