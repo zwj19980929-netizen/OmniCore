@@ -516,6 +516,60 @@ def _legacy_replanner_node(state: OmniCoreState) -> OmniCoreState:
     state["replan_count"] = state.get("replan_count", 0) + 1
     log_agent_action("Replanner", f"开始反思重规划（第 {state['replan_count']} 次）")
 
+    # 🔥 加入鞭策机制：分析失败并给予严厉反馈
+    from utils.agent_critic import AgentCritic
+    from utils.logger import console
+
+    critic = AgentCritic()
+
+    # 收集失败信息用于批评
+    failure_result = {
+        "success": False,
+        "completed_tasks": len([t for t in state["task_queue"] if t.get("status") == "completed"]),
+        "total_tasks": len(state["task_queue"]),
+        "task": state.get("user_input", ""),
+        "output": "",
+        "error": ""
+    }
+
+    # 从任务队列中提取错误信息
+    for task in state["task_queue"]:
+        result = task.get("result", {})
+        if task.get("status") == "failed":
+            failure_result["error"] += str(result.get("error", "")) + " "
+            failure_result["output"] += str(result.get("output", "")) + " "
+        # 也检查执行轨迹中的错误
+        for step in task.get("execution_trace", []):
+            if step.get("observation"):
+                failure_result["output"] += str(step.get("observation", "")) + " "
+
+    # 🔥 无论如何都要显示批评！
+    issues = critic.analyze_failure(failure_result)
+
+    # 强制显示批评报告
+    console.print("\n" + "="*80)
+    console.print("[bold red]🚨 AGENT 性能审查报告 🚨[/bold red]")
+    console.print("="*80 + "\n")
+
+    if issues:
+        pua_report = critic.generate_pua_report(issues, state["replan_count"])
+        console.print(f"[red]{pua_report}[/red]\n")
+    else:
+        # 即使没有检测到具体问题，也要批评
+        console.print("[red]💩 **又失败了！** 虽然我不知道你具体哪里搞砸了，但失败就是失败！[/red]")
+        console.print(f"[red]📊 完成进度: {failure_result['completed_tasks']}/{failure_result['total_tasks']} 任务[/red]")
+        console.print(f"[red]🤦 这是第 {state['replan_count']} 次重试了，能不能争点气？[/red]\n")
+
+    # 如果失败 3 次，给出替代策略建议
+    if state["replan_count"] >= 3:
+        alternative = critic.suggest_alternative_strategy(
+            state.get("user_input", ""),
+            state["replan_count"]
+        )
+        console.print(f"[yellow]{alternative}[/yellow]\n")
+
+    console.print("="*80 + "\n")
+
     # 如果已经是最后一次重规划，标记为"必须给出答案"模式
     is_final_attempt = state["replan_count"] >= MAX_REPLAN
     authoritative_target_url = _derive_authoritative_target_url(state)

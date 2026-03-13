@@ -2152,14 +2152,16 @@ class BrowserAgent:
                     "steps": steps,
                 }
             if expected_url and current_url and not self._urls_look_related(expected_url, current_url):
-                return {
-                    "success": False,
-                    "message": f"navigation landed on unexpected page: expected {expected_url}, got {current_url}",
-                    "url": current_url,
-                    "expected_url": expected_url,
-                    "title": page_title,
-                    "steps": steps,
-                }
+                # 不要立即退出，记录警告但继续执行
+                log_warning(f"URL 不匹配: 期望 {expected_url}, 实际 {current_url}, 但继续尝试执行")
+                # return {
+                #     "success": False,
+                #     "message": f"navigation landed on unexpected page: expected {expected_url}, got {current_url}",
+                #     "url": current_url,
+                #     "expected_url": expected_url,
+                #     "title": page_title,
+                #     "steps": steps,
+                # }
             task_intent = await self._infer_task_intent(task)
             task_intent = self._coerce_intent_for_direct_page(task, task_intent, expected_url)
             if (
@@ -2173,17 +2175,21 @@ class BrowserAgent:
 
             initial_data = await self._extract_data_for_intent(task_intent)
             if self._is_read_only_task(task, task_intent):
-                if initial_data and self._page_data_satisfies_goal(
+                if initial_data and len(initial_data) >= 3 and self._page_data_satisfies_goal(
                     task,
                     current_url or "",
                     task_intent,
                     initial_data,
                 ):
+                    # 只有在数据足够多（至少3条）且确实满足目标时才提前返回
                     title_r = await tk.get_title()
                     url_r = await tk.get_current_url()
                     return {"success": True, "message": "read-only task satisfied from initial page",
                             "url": url_r.data or "", "title": title_r.data or "",
                             "expected_url": expected_url, "steps": steps, "data": initial_data}
+                else:
+                    # 数据不够或不满足，继续执行步骤
+                    log_warning(f"初始数据不足（{len(initial_data)} 条），继续执行步骤")
 
             # 累积数据容器
             _accumulated_data: List[Dict[str, str]] = []

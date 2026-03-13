@@ -56,22 +56,26 @@ capability_overrides:
       cost_tier: medium
 
   openai:
-    gpt-4o:
-      capabilities: [text_chat, vision, code]
-      max_tokens: 128000
+    gpt-5.4:
+      capabilities: [text_chat, text_long, vision, code, reasoning]
+      max_tokens: 200000
       cost_tier: high
+    gpt-4o:
+      capabilities: [text_chat, text_long, vision, code]
+      max_tokens: 128000
+      cost_tier: medium
     gpt-4o-mini:
-      capabilities: [text_chat, vision]
+      capabilities: [text_chat, text_long, vision]
       max_tokens: 128000
       cost_tier: low
     gpt-4-turbo:
-      capabilities: [text_chat, vision, code]
+      capabilities: [text_chat, text_long, vision, code]
       max_tokens: 128000
-      cost_tier: high
+      cost_tier: medium
     o1:
       capabilities: [text_chat, code, reasoning]
       max_tokens: 200000
-      cost_tier: high
+      cost_tier: medium
     o1-mini:
       capabilities: [text_chat, code, reasoning]
       max_tokens: 128000
@@ -136,14 +140,14 @@ capability_overrides:
 
 # 能力到模型的全局优先级（用户未指定厂家时的默认选择）
 capability_defaults:
-  text_chat: ["minimax/MiniMax-M2.5", "deepseek/deepseek-chat", "kimi/moonshot-v1-32k", "gemini/gemini-2.0-flash"]
-  text_long: ["minimax/MiniMax-M2.5", "gemini/gemini-2.5-pro", "kimi/moonshot-v1-128k", "deepseek/deepseek-chat"]
-  vision: ["gemini/gemini-2.5-pro", "openai/gpt-4o", "kimi/kimi-latest"]
+  text_chat: ["openai/gpt-5.4", "minimax/MiniMax-M2.5", "deepseek/deepseek-chat", "kimi/moonshot-v1-32k", "gemini/gemini-2.0-flash"]
+  text_long: ["openai/gpt-5.4", "minimax/MiniMax-M2.5", "gemini/gemini-2.5-pro", "kimi/moonshot-v1-128k", "deepseek/deepseek-chat"]
+  vision: ["openai/gpt-5.4", "gemini/gemini-2.5-pro", "openai/gpt-4o", "kimi/kimi-latest"]
   image_gen: ["openai/dall-e-3", "gemini/imagen-3.0-generate"]
   stt: ["openai/whisper-1"]
   tts: ["openai/tts-1", "openai/tts-1-hd"]
-  code: ["minimax/MiniMax-M2.5", "deepseek/deepseek-coder", "openai/o1-mini", "gemini/gemini-2.5-pro"]
-  reasoning: ["minimax/MiniMax-M2.5", "openai/o1", "openai/o1-mini", "deepseek/deepseek-reasoner"]
+  code: ["openai/gpt-5.4", "minimax/MiniMax-M2.5", "deepseek/deepseek-coder", "openai/o1-mini", "gemini/gemini-2.5-pro"]
+  reasoning: ["openai/gpt-5.4", "minimax/MiniMax-M2.5", "openai/o1", "openai/o1-mini", "deepseek/deepseek-reasoner"]
 
 # 厂家 API 配置
 provider_config:

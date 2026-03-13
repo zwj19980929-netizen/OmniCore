@@ -423,6 +423,11 @@ class WebWorkerAdapter(BaseToolAdapter):
         pool = await WorkerPool.get_instance()
         result = await pool.web_worker.execute_async(task, shared_memory_snapshot)
 
+        # 🔥 键盘侠教练评估
+        from utils.tool_evaluation_hook import evaluate_tool_result
+        step_no = len(task.get("execution_trace", [])) + 1
+        evaluate_tool_result("web_worker", task, result, step_no)
+
         clean_params = copy.deepcopy(task.get("params", {}))
         clean_params.pop("_resolved_model", None)
 
@@ -486,6 +491,12 @@ class ExecutorBackedAdapter(BaseToolAdapter):
             task,
             shared_memory_snapshot,
         )
+
+        # 🔥 键盘侠教练评估
+        from utils.tool_evaluation_hook import evaluate_tool_result
+        step_no = len(task.get("execution_trace", [])) + 1
+        evaluate_tool_result(self.worker_attr, task, result, step_no)
+
         status = str(TaskStatus.COMPLETED) if result.get("success") else str(TaskStatus.FAILED)
         return _base_outcome(
             task,
@@ -709,6 +720,19 @@ class BrowserAgentAdapter(BaseToolAdapter):
                         )
 
         if result is not None:
+            # 🔥 诊断提前退出问题
+            from utils.browser_diagnostics import diagnose_early_exit
+            steps = result.get("steps", [])
+            if len(steps) == 0 and not result.get("success"):
+                diagnosis = diagnose_early_exit(result, task.get("description", ""))
+                from utils.logger import console
+                console.print(f"\n[red]{diagnosis}[/red]\n")
+
+            # 🔥 键盘侠教练评估
+            from utils.tool_evaluation_hook import evaluate_tool_result
+            step_no = len(result.get("steps", [])) + 1
+            evaluate_tool_result("browser_agent", task, result, step_no)
+
             trace = []
             for step_no, step in enumerate(result.get("steps", []), 1):
                 trace.append(

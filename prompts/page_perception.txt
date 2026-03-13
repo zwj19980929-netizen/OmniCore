@@ -1,0 +1,166 @@
+"""
+智能页面分析 Prompt - 让 LLM 真正理解网页
+"""
+
+# 第一阶段：页面理解
+PAGE_UNDERSTANDING_PROMPT = """你是一个网页分析专家。请分析这个页面的功能和内容。
+
+## 任务目标
+{task_description}
+
+## 页面结构信息
+{page_structure}
+
+## 你的分析任务
+请回答以下问题：
+
+1. **页面类型**：这是什么类型的页面？（搜索结果页/列表页/详情页/表单页/首页/其他）
+
+2. **主要功能**：这个页面的主要功能是什么？用户可以在这里做什么？
+
+3. **目标数据位置**：根据任务目标"{task_description}"，目标数据最可能在页面的哪个区域？
+
+4. **数据结构**：目标数据是以什么形式组织的？（列表/表格/卡片/段落/其他）
+
+5. **交互需求**：要获取目标数据，是否需要先进行交互操作？（如点击按钮、滚动加载、切换标签页等）
+
+6. **提取策略**：建议使用什么策略提取数据？
+   - 直接提取：页面已显示所有需要的数据
+   - 需要点击：需要点击某个元素才能看到数据
+   - 需要滚动：需要滚动触发懒加载
+   - 需要翻页：数据分布在多个页面
+   - 需要搜索：需要先在搜索框输入关键词
+
+## 返回格式（JSON）
+```json
+{{
+    "page_type": "列表页",
+    "main_function": "展示新闻列表",
+    "target_data_location": "主内容区域的列表结构",
+    "data_structure": "列表",
+    "interaction_needed": true,
+    "interaction_type": "scroll",
+    "extraction_strategy": "需要滚动",
+    "confidence": 0.9,
+    "reasoning": "你的分析推理过程"
+}}
+```
+"""
+
+# 第二阶段：选择器生成
+SELECTOR_GENERATION_PROMPT = """你是一个 CSS 选择器专家。根据页面理解，生成精确的数据提取选择器。
+
+## 任务目标
+{task_description}
+
+## 页面理解结果
+{page_understanding}
+
+## 页面结构信息
+{page_structure}
+
+## 你的任务
+根据上面的页面理解，生成用于提取目标数据的 CSS 选择器配置。
+
+### 选择器编写原则
+1. **item_selector**：选择重复出现的数据项容器（如 li、tr、div.item、article 等）
+2. **fields**：相对于每个 item 的字段选择器
+3. **优先使用语义化标签**：article、section、header 等
+4. **避免过于具体的类名**：类名可能会变化
+5. **使用结构关系**：父子关系、兄弟关系等
+
+### 返回格式（JSON）
+```json
+{{
+    "success": true,
+    "item_selector": "article.news-item",
+    "fields": {{
+        "title": "h2.title",
+        "link": "a.title-link",
+        "date": "span.publish-date",
+        "summary": "p.summary",
+        "author": "span.author"
+    }},
+    "pagination": {{
+        "has_pagination": true,
+        "next_button_selector": "a.next-page",
+        "page_number_selector": "span.current-page"
+    }},
+    "lazy_load": {{
+        "enabled": false,
+        "trigger_selector": "",
+        "scroll_distance": 0
+    }},
+    "pre_actions": [
+        {{
+            "action": "click",
+            "selector": "button.show-all",
+            "description": "点击'显示全部'按钮"
+        }}
+    ],
+    "validation": {{
+        "expected_min_items": 5,
+        "required_fields": ["title", "link"]
+    }},
+    "notes": "其他注意事项"
+}}
+```
+
+## 重要提示
+- 只填写你在页面结构中确实看到的选择器
+- 如果某个字段在页面中不存在，留空字符串
+- 如果需要预操作（如点击按钮），在 pre_actions 中说明
+- 如果有分页，在 pagination 中配置
+"""
+
+# 第三阶段：操作规划
+ACTION_PLANNING_PROMPT = """你是一个浏览器操作规划专家。根据页面理解和任务目标，规划具体的操作步骤。
+
+## 任务目标
+{task_description}
+
+## 页面理解
+{page_understanding}
+
+## 当前状态
+- 当前 URL: {current_url}
+- 页面标题: {page_title}
+- 已收集数据: {collected_count} 条
+- 目标数据量: {target_count} 条
+
+## 可用操作
+- navigate: 导航到新 URL
+- click: 点击元素
+- input: 输入文本
+- scroll: 滚动页面
+- wait: 等待加载
+- extract: 提取数据
+- done: 任务完成
+
+## 你的任务
+规划接下来应该执行的操作步骤，确保能够完成任务目标。
+
+### 返回格式（JSON）
+```json
+{{
+    "next_action": "extract",
+    "reasoning": "页面已经显示了目标数据，可以直接提取",
+    "action_details": {{
+        "type": "extract",
+        "selector": "article.news-item",
+        "fields": ["title", "link", "date"]
+    }},
+    "expected_result": "提取到 10-20 条新闻数据",
+    "fallback_plan": "如果提取失败，尝试滚动页面触发懒加载",
+    "confidence": 0.95
+}}
+```
+
+## 决策规则
+1. 如果页面已显示目标数据 → extract
+2. 如果需要搜索 → input + click
+3. 如果需要翻页 → click (下一页)
+4. 如果需要滚动加载 → scroll
+5. 如果数据已足够 → done
+6. 如果页面不对 → navigate
+"""

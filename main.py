@@ -18,6 +18,7 @@ from core.runtime import (
 from memory.chroma_store import ChromaMemory
 from utils.cli_result_view import build_cli_result_view
 from utils.logger import console, log_error
+from utils.enhanced_input import EnhancedInput
 
 from rich.panel import Panel
 
@@ -37,7 +38,7 @@ def print_banner():
 
 
 def interactive_mode():
-    """交互式命令行模式"""
+    """交互式命令行模式 - 支持历史记录和优雅退出"""
     print_banner()
 
     # 初始化记忆系统
@@ -49,20 +50,45 @@ def interactive_mode():
         console.print(f"[yellow]记忆系统初始化失败: {e}[/yellow]\n")
         memory = None
 
-    console.print("[green]输入你的指令，输入 'quit' 或 'exit' 退出[/green]\n")
+    console.print("[green]输入你的指令，按 Ctrl+C 或 Ctrl+D 退出[/green]")
+    console.print("[dim]提示：使用上下方向键浏览历史命令[/dim]\n")
 
     # 对话上下文：保留最近 5 轮的交互记录
     conversation_history: List[Dict] = []
     MAX_HISTORY = 5
     session_id = None
 
+    # 初始化增强输入
+    enhanced_input = EnhancedInput()
+
+    if not enhanced_input.has_readline:
+        console.print("[dim]提示：安装 gnureadline 可获得更好的命令行体验[/dim]")
+        console.print("[dim]  macOS: pip install gnureadline[/dim]\n")
+
     while True:
         try:
-            user_input = input("\n🎯 OmniCore > ").strip()
+            user_input = enhanced_input.input("\n🎯 OmniCore > ")
 
             if user_input.lower() in ["quit", "exit", "q"]:
                 console.print("\n[yellow]再见！👋[/yellow]")
                 break
+
+            # 内置命令：查看历史
+            if user_input.lower() == "history":
+                history = enhanced_input.get_history(20)
+                if history:
+                    console.print("\n[cyan]最近的命令：[/cyan]")
+                    for i, cmd in enumerate(history, 1):
+                        console.print(f"  [dim]{i}.[/dim] {cmd}")
+                else:
+                    console.print("[dim]暂无历史记录[/dim]")
+                continue
+
+            # 内置命令：清除历史
+            if user_input.lower() == "clear history":
+                enhanced_input.clear_history()
+                console.print("[green]历史记录已清除[/green]")
+                continue
 
             if not user_input.strip():
                 continue
@@ -97,13 +123,21 @@ def interactive_mode():
             ))
 
         except KeyboardInterrupt:
-            console.print("\n[yellow]操作已中断[/yellow]")
-            continue
+            # Ctrl+C 优雅退出
+            console.print("\n[yellow]再见！👋[/yellow]")
+            break
+        except EOFError:
+            # Ctrl+D 优雅退出
+            console.print("\n[yellow]再见！👋[/yellow]")
+            break
         except Exception as e:
             error_detail = traceback.format_exc()
             log_error(f"发生错误: {e}")
             console.print(f"[dim]{error_detail}[/dim]")
             continue
+
+    # 保存历史记录
+    enhanced_input.save_history()
 
 
 def worker_mode():
