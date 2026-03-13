@@ -566,22 +566,10 @@ class WebWorker:
             return {"valid": False, "reason": "数据为空", "suggestion": "换页面或换选择器"}
         sample = data[:3]
         sample_str = json.dumps(sample, ensure_ascii=False, default=str)[:1500]
+        from utils.prompt_manager import get_prompt
+        validation_prompt = get_prompt("web_worker_data_validation")
         response = self.llm.chat_with_system(
-            system_prompt="""你是一个数据质量审查专家。判断抓取到的数据是否符合用户的任务要求。
-
-请根据用户的任务描述，自主判断：
-1. 抓到的数据和用户想要的是同一类东西吗？
-2. 数据的关键信息是否足够？
-3. 如果数据不对，你觉得应该去哪里找才对？
-
-返回 JSON：
-```json
-{
-    "valid": true,
-    "reason": "判断理由",
-    "suggestion": "如果数据不对，建议下一步怎么做"
-}
-```""",
+            system_prompt=validation_prompt,
             user_message=f"任务：{task_description}\n\n抓到的数据样本（前3条）：\n{sample_str}\n\n共抓到 {len(data)} 条，要求 {limit} 条",
             temperature=0.2, json_mode=True,
         )
@@ -846,6 +834,56 @@ class WebWorker:
             await tk.human_delay(400, 1200)
         return False
 
+    async def _perform_native_search(
+        self,
+        tk: BrowserToolkit,
+        homepage: str,
+        search_input_selectors: List[str],
+        query: str,
+    ) -> bool:
+        """
+        模拟真实用户在搜索引擎首页输入关键词并搜索
+        返回是否成功执行搜索
+        """
+        # 1. 访问搜索引擎首页
+        goto_r = await tk.goto(homepage)
+        if not goto_r.success:
+            log_warning(f"无法访问 {homepage}")
+            return False
+
+        await tk.human_delay(500, 1200)
+
+        # 2. 尝试找到搜索框并输入
+        search_selector = None
+        for selector in search_input_selectors:
+            # 检查元素是否存在
+            exists_r = await tk.element_exists(selector)
+            if exists_r.success and exists_r.data:
+                search_selector = selector
+                break
+
+        if not search_selector:
+            log_warning(f"未找到搜索框: {homepage}")
+            return False
+
+        # 3. 输入搜索关键词
+        type_r = await tk.type_text(search_selector, query, delay=80)
+        if not type_r.success:
+            log_warning(f"无法输入搜索词: {query}")
+            return False
+
+        await tk.human_delay(300, 800)
+
+        # 4. 按回车提交搜索（在整个页面上按键，因为输入框已经聚焦）
+        press_r = await tk.press_key("Enter")
+        if not press_r.success:
+            log_warning("按回车失败")
+            return False
+
+        # 5. 等待搜索结果加载
+        await tk.human_delay(1000, 2000)
+        return True
+
     async def search_for_result_cards(
         self,
         query: str,
@@ -862,19 +900,46 @@ class WebWorker:
             await tk.create_page()
         cards: List[Dict[str, Any]] = []
         try:
-            encoded_query = quote_plus(query or "")
-            search_candidates = [
-                f"https://www.bing.com/search?q={encoded_query}",
-                f"https://www.google.com/search?q={encoded_query}&hl=en",
-                f"https://duckduckgo.com/html/?q={encoded_query}",
+            # 定义搜索引擎配置：首页 + 搜索框选择器
+            search_engines = [
+                {
+                    "name": "Google",
+                    "homepage": "https://www.google.com",
+                    "selectors": ["input[name='q']", "textarea[name='q']", "#APjFqb"],
+                },
+                {
+                    "name": "Bing",
+                    "homepage": "https://www.bing.com",
+                    "selectors": ["input[name='q']", "#sb_form_q"],
+                },
+                {
+                    "name": "Baidu",
+                    "homepage": "https://www.baidu.com",
+                    "selectors": ["input[name='wd']", "#kw"],
+                },
             ]
-            for search_url in search_candidates:
-                goto_r = await tk.goto(search_url)
-                if not goto_r.success:
+
+            for engine in search_engines:
+                log_agent_action(self.name, f"尝试 {engine['name']} 原生搜索", query[:40])
+
+                # 使用原生搜索框输入
+                success = await self._perform_native_search(
+                    tk,
+                    engine["homepage"],
+                    engine["selectors"],
+                    query,
+                )
+
+                if not success:
                     continue
-                ready = await self._wait_for_search_results_ready(tk, search_url)
+
+                # 等待结果加载
+                current_url = (await tk.get_url()).data or ""
+                ready = await self._wait_for_search_results_ready(tk, current_url)
                 if not ready:
                     await tk.human_delay(800, 1800)
+
+                # 提取搜索结果
                 raw_cards = await self._extract_search_result_cards(tk, query, max_results=max_results * 2)
                 if raw_cards:
                     cards, _ = self._rerank_search_results(
@@ -884,11 +949,11 @@ class WebWorker:
                         max_results=max_results,
                     )
                     if cards:
+                        log_success(f"{engine['name']} 搜索成功，找到 {len(cards)} 个结果")
                         break
-            if cards:
-                log_success(f"搜索到 {len(cards)} 个候选网站")
-            else:
-                log_warning("搜索未找到结果")
+
+            if not cards:
+                log_warning("所有搜索引擎均未找到结果")
         except Exception as e:
             log_error(f"搜索失败: {e}")
         finally:
@@ -1077,36 +1142,7 @@ class WebWorker:
                 for card in cards
                 if str(card.get("link", "") or "").strip()
             ]
-        log_agent_action(self.name, "搜索候选网站", query[:60])
-        own_tk = tk is None
-        if own_tk:
-            tk = self._create_toolkit()
-            await tk.create_page()
-        urls = []
-        try:
-            encoded_query = quote_plus(query or "")
-            search_candidates = [
-                f"https://www.bing.com/search?q={encoded_query}",
-                f"https://duckduckgo.com/html/?q={encoded_query}",
-            ]
-            for search_url in search_candidates:
-                goto_r = await tk.goto(search_url)
-                if not goto_r.success:
-                    continue
-                await tk.human_delay(300, 1200)
-                urls = await self._collect_search_links(tk, query, max_results=max_results)
-                if urls:
-                    break
-            if urls:
-                log_success(f"搜索到 {len(urls)} 个候选网站")
-            else:
-                log_warning("搜索未找到结果")
-        except Exception as e:
-            log_error(f"搜索失败: {e}")
-        finally:
-            if own_tk:
-                await tk.close()
-        return urls
+        return []
 
     async def gather_search_candidates(
         self,
@@ -1408,8 +1444,22 @@ class WebWorker:
         *,
         headless: Optional[bool] = None,
         query: str = "",
+        shared_memory: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
         log_agent_action(self.name, "开始智能爬取", task_description[:50])
+
+        # 🔥 读取之前的失败历史，避免重复错误
+        shared_memory = shared_memory or {}
+        replan_history = shared_memory.get("_replan_history", [])
+        tried_urls_set: Set[str] = set()
+
+        if replan_history:
+            log_agent_action(self.name, f"检测到 {len(replan_history)} 轮重规划历史", "")
+            for h in replan_history:
+                for tried_url in h.get("urls", []):
+                    tried_urls_set.add(tried_url.strip())
+            if tried_urls_set:
+                log_warning(f"已尝试过的URL（将避免重复访问）: {', '.join(list(tried_urls_set)[:3])}")
 
         # Step 1: LLM 分析确定最佳目标 URL
         url_info = await self.determine_target_url(task_description)
@@ -1427,6 +1477,10 @@ class WebWorker:
         def _append_candidate(candidate: str) -> None:
             value = str(candidate or "").strip()
             if not value or not value.startswith("http") or value in seen_candidate_urls:
+                return
+            # 🔥 跳过已经尝试过且失败的 URL
+            if value in tried_urls_set:
+                log_warning(f"跳过已尝试过的URL: {value}")
                 return
             seen_candidate_urls.add(value)
             candidate_urls.append(value)
@@ -1493,10 +1547,22 @@ class WebWorker:
             for static_url in static_try_urls:
                 static_result = self._static_fetch(static_url, task_description, limit)
                 if static_result.get("success"):
-                    log_success(f"静态抓取成功，获取 {static_result.get('count', 0)} 条数据")
-                    return static_result
+                    # 🔥 静态抓取也需要进行数据质量验证
+                    static_data = static_result.get("data", [])
+                    if static_data:
+                        quality = self.validate_data_quality(static_data, task_description, limit)
+                        if quality.get("valid"):
+                            log_success(f"静态抓取成功，获取 {static_result.get('count', 0)} 条数据，质量验证通过")
+                            return static_result
+                        else:
+                            log_warning(f"静态抓取数据质量不符合要求: {quality.get('reason', '')[:80]}")
+                            log_warning(f"建议: {quality.get('suggestion', '')[:80]}")
+                            # 继续尝试下一个 URL 或回退到浏览器模式
+                    else:
+                        log_warning("静态抓取返回空数据")
                 static_error = str(static_result.get("error", "") or "")
-                log_warning(f"静态抓取失败，回退浏览器模式: {static_error[:80]}")
+                if static_error:
+                    log_warning(f"静态抓取失败: {static_error[:80]}")
             # static fetch failed for all candidates; continue with browser mode
 
         effective_headless = headless if headless is not None else (False if should_search_first else True)
@@ -1845,6 +1911,7 @@ class WebWorker:
             limit,
             headless=headless,
             query=query,
+            shared_memory=shared_memory,
         )
         trace[-1]["observation"] = f"success={result.get('success')}, count={result.get('count', 0)}"
 

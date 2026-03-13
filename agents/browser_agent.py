@@ -114,53 +114,10 @@ _FACT_QUERY_HINTS = (
     "声明",
 )
 
-ACTION_DECISION_PROMPT = """You are a browser control planner. Return JSON only.
-Task: {task}
-URL: {url}
-Title: {title}
-{data_progress}
-Elements:
-{elements}
-
-Important decision rules:
-- If data_collected < data_target and you see pagination controls (下一页/Next/page numbers/arrows), CLICK the next page button.
-- If data_collected < data_target and no pagination is visible, use SCROLL (value="800") to trigger lazy loading, then EXTRACT.
-- If data_collected < data_target and you see "加载更多"/"Load More"/"查看更多" buttons, CLICK them.
-- If data_collected >= data_target or no more data can be loaded, use DONE.
-- SCROLL value should be pixels to scroll down (e.g. "800" for one screen).
-
-Return keys: thinking, action, confidence, requires_human_confirm. The action object must contain: type, element_index, value, description, fallback_selector, use_keyboard, keyboard_key."""
-
-PAGE_ASSESSMENT_PROMPT = """You are evaluating whether the current browser page already advances the task.
-Return JSON only with keys:
-- page_relevant: boolean
-- goal_satisfied: boolean
-- reason: string
-- evidence_indexes: array of integers
-- confidence: number
-- action: object with keys type, element_index, target_selector, value, description, fallback_selector, use_keyboard, keyboard_key
-
-Task: {task}
-Intent: {intent}
-Query: {query}
-Current URL: {url}
-Page title: {title}
-Last action: {last_action}
-Visible data:
-{data}
-
-Candidate elements:
-{elements}
-
-Rules:
-- Use only the visible data and candidate elements provided above.
-- If the visible data already likely answers the task, choose action.type="extract".
-- If the task is already complete without further extraction, choose action.type="done".
-- If the page is a search results page and the snippets are relevant enough to answer the task, prefer "extract" over clicking through.
-- If the current page is relevant but incomplete and a candidate likely leads to the best source or detail page, choose "click" and reference the element_index.
-- Choose "input" only if the current page is not already showing relevant results or the search box clearly needs a different query.
-- If you cannot justify a meaningful action from the evidence, choose "wait".
-"""
+# Load prompts from files
+from utils.prompt_manager import get_prompt
+ACTION_DECISION_PROMPT = get_prompt("browser_action_decision")
+PAGE_ASSESSMENT_PROMPT = get_prompt("browser_page_assessment")
 
 
 class BrowserAgent:

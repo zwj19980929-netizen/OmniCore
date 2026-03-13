@@ -454,31 +454,73 @@ class LLMClient:
             if json_mode:
                 kwargs["response_format"] = {"type": "json_object"}
 
-            try:
-                response = completion(**kwargs)
-            except Exception as first_error:
-                retry_kwargs = self._maybe_get_reduced_max_tokens_kwargs(kwargs, first_error)
-                if retry_kwargs is not None:
-                    logger.warning(
-                        "LLM max_tokens 超出模型限制，自动降级重试: "
-                        f"{kwargs.get('max_tokens')} -> {retry_kwargs['max_tokens']}"
-                    )
-                    response = completion(**retry_kwargs)
-                else:
+            # 🔥 添加调用开始日志
+            logger.info(f"LLM 调用开始: model={kwargs['model']}, max_tokens={kwargs['max_tokens']}, timeout=120s")
+
+            # 🔥 添加网络错误重试机制（最多重试 3 次）
+            max_retries = 3
+            last_error = None
+
+            for attempt in range(max_retries):
+                try:
+                    if attempt > 0:
+                        logger.info(f"LLM 调用重试 {attempt}/{max_retries}...")
+                    response = completion(**kwargs)
+                    break  # 成功则跳出重试循环
+                except Exception as first_error:
+                    last_error = first_error
+                    error_str = str(first_error).lower()
+
+                    # 检查是否为网络连接错误
+                    is_network_error = any(keyword in error_str for keyword in [
+                        "peer closed connection",
+                        "incomplete chunked read",
+                        "connection reset",
+                        "connection aborted",
+                        "timeout",
+                        "timed out",
+                    ])
+
+                    if is_network_error and attempt < max_retries - 1:
+                        import time
+                        wait_time = (attempt + 1) * 2  # 2s, 4s, 6s
+                        logger.warning(
+                            f"LLM 网络连接错误，{wait_time}秒后重试 ({attempt + 1}/{max_retries}): {error_str[:100]}"
+                        )
+                        time.sleep(wait_time)
+                        continue
+
+                    # 尝试 max_tokens 降级
+                    retry_kwargs = self._maybe_get_reduced_max_tokens_kwargs(kwargs, first_error)
+                    if retry_kwargs is not None:
+                        logger.warning(
+                            "LLM max_tokens 超出模型限制，自动降级重试: "
+                            f"{kwargs.get('max_tokens')} -> {retry_kwargs['max_tokens']}"
+                        )
+                        response = completion(**retry_kwargs)
+                        break
+
+                    # 尝试 MiniMax fallback
                     fallback_base = self._maybe_get_minimax_fallback_base(
                         provider=self._get_provider_from_model(),
                         api_base=str(kwargs.get("api_base", "") or ""),
                         error=first_error,
                     )
-                    if not fallback_base:
-                        raise
-                    retry_kwargs = dict(kwargs)
-                    retry_kwargs["api_base"] = fallback_base
-                    logger.warning(
-                        "MiniMax 鉴权失败，自动切换备用官方域名重试: "
-                        f"{kwargs.get('api_base')} -> {fallback_base}"
-                    )
-                    response = completion(**retry_kwargs)
+                    if fallback_base:
+                        retry_kwargs = dict(kwargs)
+                        retry_kwargs["api_base"] = fallback_base
+                        logger.warning(
+                            "MiniMax 鉴权失败，自动切换备用官方域名重试: "
+                            f"{kwargs.get('api_base')} -> {fallback_base}"
+                        )
+                        response = completion(**retry_kwargs)
+                        break
+
+                    # 如果不是网络错误或已达最大重试次数，抛出异常
+                    raise
+            else:
+                # 所有重试都失败
+                raise last_error if last_error else Exception("LLM 调用失败")
 
             content = sanitize_text(response.choices[0].message.content or "")
             if not content:
@@ -539,31 +581,70 @@ class LLMClient:
             if json_mode:
                 kwargs["response_format"] = {"type": "json_object"}
 
-            try:
-                response = await acompletion(**kwargs)
-            except Exception as first_error:
-                retry_kwargs = self._maybe_get_reduced_max_tokens_kwargs(kwargs, first_error)
-                if retry_kwargs is not None:
-                    logger.warning(
-                        "LLM max_tokens 超出模型限制，自动降级重试: "
-                        f"{kwargs.get('max_tokens')} -> {retry_kwargs['max_tokens']}"
-                    )
-                    response = await acompletion(**retry_kwargs)
-                else:
+            # 🔥 添加调用开始日志
+            logger.info(f"LLM 异步调用开始: model={kwargs['model']}, max_tokens={kwargs['max_tokens']}, timeout=120s")
+
+            # 🔥 添加网络错误重试机制（最多重试 3 次）
+            max_retries = 3
+            last_error = None
+
+            for attempt in range(max_retries):
+                try:
+                    response = await acompletion(**kwargs)
+                    break  # 成功则跳出重试循环
+                except Exception as first_error:
+                    last_error = first_error
+                    error_str = str(first_error).lower()
+
+                    # 检查是否为网络连接错误
+                    is_network_error = any(keyword in error_str for keyword in [
+                        "peer closed connection",
+                        "incomplete chunked read",
+                        "connection reset",
+                        "connection aborted",
+                        "timeout",
+                        "timed out",
+                    ])
+
+                    if is_network_error and attempt < max_retries - 1:
+                        wait_time = (attempt + 1) * 2  # 2s, 4s, 6s
+                        logger.warning(
+                            f"LLM 网络连接错误，{wait_time}秒后重试 ({attempt + 1}/{max_retries}): {error_str[:100]}"
+                        )
+                        await asyncio.sleep(wait_time)
+                        continue
+
+                    # 尝试 max_tokens 降级
+                    retry_kwargs = self._maybe_get_reduced_max_tokens_kwargs(kwargs, first_error)
+                    if retry_kwargs is not None:
+                        logger.warning(
+                            "LLM max_tokens 超出模型限制，自动降级重试: "
+                            f"{kwargs.get('max_tokens')} -> {retry_kwargs['max_tokens']}"
+                        )
+                        response = await acompletion(**retry_kwargs)
+                        break
+
+                    # 尝试 MiniMax fallback
                     fallback_base = self._maybe_get_minimax_fallback_base(
                         provider=self._get_provider_from_model(),
                         api_base=str(kwargs.get("api_base", "") or ""),
                         error=first_error,
                     )
-                    if not fallback_base:
-                        raise
-                    retry_kwargs = dict(kwargs)
-                    retry_kwargs["api_base"] = fallback_base
-                    logger.warning(
-                        "MiniMax 异步鉴权失败，自动切换备用官方域名重试: "
-                        f"{kwargs.get('api_base')} -> {fallback_base}"
-                    )
-                    response = await acompletion(**retry_kwargs)
+                    if fallback_base:
+                        retry_kwargs = dict(kwargs)
+                        retry_kwargs["api_base"] = fallback_base
+                        logger.warning(
+                            "MiniMax 鉴权失败，自动切换备用官方域名重试: "
+                            f"{kwargs.get('api_base')} -> {fallback_base}"
+                        )
+                        response = await acompletion(**retry_kwargs)
+                        break
+
+                    # 如果不是网络错误或已达最大重试次数，抛出异常
+                    raise
+            else:
+                # 所有重试都失败
+                raise last_error if last_error else Exception("LLM 调用失败")
 
             return LLMResponse(
                 content=sanitize_text(response.choices[0].message.content or ""),

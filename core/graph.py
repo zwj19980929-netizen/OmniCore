@@ -20,6 +20,7 @@ from core.llm import LLMClient
 from core.task_executor import collect_ready_task_indexes, run_ready_batch
 from utils.logger import log_agent_action, log_success, log_error, log_warning
 from utils.human_confirm import HumanConfirm
+from utils.prompt_manager import get_prompt
 
 
 # 初始化所有 Agent
@@ -640,51 +641,56 @@ def _legacy_replanner_node(state: OmniCoreState) -> OmniCoreState:
             if h["urls"]:
                 history_summary += f"  访问过的URL: {', '.join(h['urls'])}\n"
 
+    # 🔥 先让 AI PUA Coach 喷一顿，指出问题
+    from utils.ai_pua_coach import get_ai_coach
+    from utils.logger import console
+
+    coach = get_ai_coach()
+
+    # 构建失败任务的描述
+    failed_task_description = f"重规划第 {state['replan_count']} 次"
+    failed_action = "执行任务并尝试访问网页"
+    expected_result = "成功获取数据并完成用户需求"
+
+    # 构建实际结果
+    actual_result = {
+        "success": False,
+        "error": failure_summary,
+        "output": f"失败次数: {len(failures)}, 尝试过的URL: {', '.join(tried_urls) if tried_urls else '无'}"
+    }
+
+    # 让 PUA Coach 评估并生成批评
+    pua_comment = coach.evaluate_step(
+        step_no=state['replan_count'],
+        action=failed_action,
+        expected=expected_result,
+        actual_result=actual_result,
+        task_context=state.get('user_input', '')
+    )
+
+    # 显示 PUA 批评
+    console.print(f"\n{pua_comment}\n")
+
     # 让 LLM 分析失败原因并重新规划
+    from utils.prompt_manager import get_prompt
     llm = LLMClient()
+    replanner_prompt = get_prompt("replanner_system")
+
+    # 🔥 将 PUA Coach 的批评传递给 Replanner，让它知道问题所在
+    user_message_with_pua = f"""用户原始需求：{state['user_input']}
+
+失败的任务：
+{failure_summary}{history_summary}
+
+## AI PUA Coach 的失败分析：
+{pua_comment}
+
+这是第 {state['replan_count']} 次重规划（{'最后一次，必须给出明确答案' if is_final_attempt else '请提出和之前所有尝试都不同的新策略'}）。
+请根据 PUA Coach 指出的问题，制定新的策略。"""
+
     response = llm.chat_with_system(
-        system_prompt="""你是 OmniCore 的重规划专家。之前的任务执行失败了，你需要分析原因并制定新的执行策略。
-
-## 思考层次（由浅入深）
-先判断失败属于哪个层次，再决定对策：
-
-1. 执行层失败（选择器错了、超时、参数不对）→ 可以换参数重试
-2. 路径层失败（目标网站需要登录、被反爬封锁、数据根本不在这个页面）→ 必须换一条路
-3. 方向层失败（整个思路就不对，比如这类信息根本不适合从网页获取）→ 必须重新审视目标
-
-## 核心原则
-- 不要在一条死路上反复尝试。如果一个信息源本身就有访问壁垒，换再多参数也没用，应该换信息源。
-- 想想一个真实的人遇到同样的障碍会怎么做——他会打开搜索引擎，找一条能走通的路。
-- 新策略必须和之前失败的方案有本质区别，不能只是"换个参数再来一次"。
-- 如果不确定该去哪，就先安排一个搜索任务，让 Worker 通过搜索引擎找到可行的信息来源。
-- **重要**：不要基于你自己的知识判断"某个产品是否存在"。你的知识可能过时。应该让 Worker 去实际搜索，基于搜索结果判断。
-- **保持用户的原始意图**：如果用户要"价格对比"，就应该一直尝试找价格对比，而不是改成找"爆料"或"预测"。只有在确认产品完全不存在时才考虑替代方案。
-
-返回 JSON：
-```json
-{
-    "analysis": "失败原因分析（属于哪个层次的失败）",
-    "failed_approach": "之前走的路为什么本质上走不通",
-    "new_strategy": "新策略描述（必须和之前有本质区别，但要保持用户的原始意图）",
-    "should_give_up": false,
-    "give_up_reason": "如果 should_give_up 为 true，说明为什么应该放弃并直接回答用户",
-    "direct_answer": "如果 should_give_up 为 true，这里填写给用户的直接回答",
-    "tasks": [
-        {
-            "task_id": "replan_task_1",
-            "task_type": "worker类型",
-            "description": "新任务描述",
-            "params": {},
-            "priority": 10,
-            "depends_on": []
-        }
-    ]
-}
-```
-
-可用的 worker 类型：web_worker, browser_agent, file_worker, system_worker
-""",
-        user_message=f"用户原始需求：{state['user_input']}\n\n失败的任务：\n{failure_summary}{history_summary}\n\n这是第 {state['replan_count']} 次重规划（{'最后一次，必须给出明确答案' if is_final_attempt else '请提出和之前所有尝试都不同的新策略'}）。",
+        system_prompt=replanner_prompt,
+        user_message=user_message_with_pua,
         temperature=0.3,
         json_mode=True,
     )
@@ -843,41 +849,9 @@ def replanner_node(state: OmniCoreState) -> OmniCoreState:
                 history_summary += f"Visited URLs: {', '.join(item['urls'])}\n"
 
     llm = LLMClient()
+    replanner_en_prompt = get_prompt("replanner_system_en")
     response = llm.chat_with_system(
-        system_prompt="""You are OmniCore's replanning specialist.
-
-Return JSON only.
-
-Requirements:
-- Preserve the user's original goal.
-- Do not repeat the same failing path.
-- If there is an authoritative target URL, prefer keeping that URL and changing extraction/waiting strategy before switching sites.
-- If some tasks already succeeded and were critic-approved, do not recreate them.
-- If the task should be abandoned, set should_give_up=true and provide a direct_answer.
-- Do not create system_worker tasks for summarization, calculation, or final answer writing.
-- Use system_worker only for real executable system actions with explicit command/application/args.
-
-Return:
-```json
-{
-  "analysis": "why the previous attempt failed",
-  "failed_approach": "what was fundamentally wrong",
-  "new_strategy": "the new strategy",
-  "should_give_up": false,
-  "give_up_reason": "",
-  "direct_answer": "",
-  "tasks": [
-    {
-      "task_id": "replan_task_1",
-      "task_type": "web_worker|browser_agent|file_worker|system_worker",
-      "description": "new task description",
-      "params": {},
-      "priority": 10,
-      "depends_on": []
-    }
-  ]
-}
-```""",
+        system_prompt=replanner_en_prompt,
         user_message=(
             f"User request: {state['user_input']}\n\n"
             f"Failure summary:\n{failure_summary}{history_summary}\n\n"
@@ -1444,13 +1418,7 @@ def _synthesize_user_facing_answer(
     try:
         llm = LLMClient()
         response = llm.chat_with_system(
-            system_prompt=(
-                "你是 OmniCore 智能助手。请基于已经执行出的结果，直接回答用户原始问题。"
-                "回答必须面向用户，不要描述内部执行过程，不要提 Router、Worker、Critic、Validator、"
-                "任务队列、delivery package 等内部术语。"
-                "如果证据只支持部分结论，要明确说“根据当前抓取到的信息”或“目前结果显示”。"
-                "如果有生成文件或可交付产物，简短说明在哪里。"
-            ),
+            system_prompt=get_prompt("finalize_answer_detailed"),
             user_message=(
                 f"用户原始问题：{state.get('user_input', '')}\n\n"
                 f"执行结果概览：{package.get('headline', '')}\n\n"
@@ -1513,7 +1481,7 @@ def _legacy_finalize_node(state: OmniCoreState) -> OmniCoreState:
         if False:
             llm = LLMClient()
             response = llm.chat_with_system(
-                system_prompt="你是 OmniCore 智能助手。请根据分析结果，用简洁友好的语言直接回答用户的问题。不要提及内部系统、Router、Worker 等技术细节。",
+                system_prompt=get_prompt("finalize_answer"),
                 user_message=(
                     f"用户问题：{state['user_input']}\n\n"
                     f"分析结果：{router_reasoning}"
@@ -1899,41 +1867,9 @@ def replanner_node(state: OmniCoreState) -> OmniCoreState:
                 history_summary += f"Visited URLs: {', '.join(item['urls'])}\n"
 
     llm = LLMClient()
+    replanner_en_prompt = get_prompt("replanner_system_en")
     response = llm.chat_with_system(
-        system_prompt="""You are OmniCore's replanning specialist.
-
-Return JSON only.
-
-Requirements:
-- Preserve the user's original goal.
-- Do not repeat the same failing path.
-- If there is an authoritative target URL, prefer keeping that URL and changing extraction/waiting strategy before switching sites.
-- If some tasks already succeeded and were critic-approved, do not recreate them.
-- If the task should be abandoned, set should_give_up=true and provide a direct_answer.
-- Do not create system_worker tasks for summarization, calculation, or final answer writing.
-- Use system_worker only for real executable system actions with explicit command/application/args.
-
-Return:
-```json
-{
-  "analysis": "why the previous attempt failed",
-  "failed_approach": "what was fundamentally wrong",
-  "new_strategy": "the new strategy",
-  "should_give_up": false,
-  "give_up_reason": "",
-  "direct_answer": "",
-  "tasks": [
-    {
-      "task_id": "replan_task_1",
-      "task_type": "web_worker|browser_agent|file_worker|system_worker",
-      "description": "new task description",
-      "params": {},
-      "priority": 10,
-      "depends_on": []
-    }
-  ]
-}
-```""",
+        system_prompt=replanner_en_prompt,
         user_message=(
             f"User request: {state['user_input']}\n\n"
             f"Failure summary:\n{failure_summary}{history_summary}\n\n"

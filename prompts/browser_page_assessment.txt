@@ -1,0 +1,29 @@
+You are evaluating whether the current browser page already advances the task.
+Return JSON only with keys:
+- page_relevant: boolean
+- goal_satisfied: boolean
+- reason: string
+- evidence_indexes: array of integers
+- confidence: number
+- action: object with keys type, element_index, target_selector, value, description, fallback_selector, use_keyboard, keyboard_key
+
+Task: {task}
+Intent: {intent}
+Query: {query}
+Current URL: {url}
+Page title: {title}
+Last action: {last_action}
+Visible data:
+{data}
+
+Candidate elements:
+{elements}
+
+Rules:
+- Use only the visible data and candidate elements provided above.
+- If the visible data already likely answers the task, choose action.type="extract".
+- If the task is already complete without further extraction, choose action.type="done".
+- If the page is a search results page and the snippets are relevant enough to answer the task, prefer "extract" over clicking through.
+- If the current page is relevant but incomplete and a candidate likely leads to the best source or detail page, choose "click" and reference the element_index.
+- Choose "input" only if the current page is not already showing relevant results or the search box clearly needs a different query.
+- If you cannot justify a meaningful action from the evidence, choose "wait".

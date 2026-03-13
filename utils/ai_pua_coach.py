@@ -103,6 +103,22 @@ class AIPUACoach:
         actual = str(actual_result.get("output", "") or actual_result.get("error", ""))
         error = str(actual_result.get("error", ""))
 
+        # 🔥 检查数据相关性：即使 success=True，也要验证数据是否真的回答了问题
+        data = actual_result.get("data", [])
+        if success and data:
+            # 如果有数据，检查数据是否相关
+            # 简单启发式：检查数据样本是否包含任务关键词
+            task_keywords = set(task_context.lower().split())
+            data_sample_str = str(data[:3]).lower()
+
+            # 如果数据样本中几乎没有任务关键词，可能是不相关的数据
+            keyword_matches = sum(1 for kw in task_keywords if len(kw) > 2 and kw in data_sample_str)
+            if keyword_matches < 2:
+                # 数据可能不相关，标记为失败
+                success = False
+                error = f"数据质量可疑：抓取到 {len(data)} 条数据，但内容可能与任务不相关"
+                actual = f"获取了 {len(data)} 条数据，但质量存疑"
+
         step = TaskStep(
             step_no=step_no,
             action=action,
@@ -162,8 +178,9 @@ class AIPUACoach:
         )
 
         try:
+            # 🔥 修复：chat() 方法需要消息列表，不是字符串
             response = self.llm.chat(
-                prompt,
+                messages=[{"role": "user", "content": prompt}],
                 temperature=0.8,  # 高温度，增加创造性
                 max_tokens=2048
             )
@@ -236,7 +253,12 @@ class AIPUACoach:
 """
 
         try:
-            response = self.llm.chat(prompt, temperature=0.7, max_tokens=512)
+            # 🔥 修复：chat() 方法需要消息列表，不是字符串
+            response = self.llm.chat(
+                messages=[{"role": "user", "content": prompt}],
+                temperature=0.7,
+                max_tokens=512
+            )
             # 🔥 修复：从 LLMResponse 对象中提取 content
             evaluation = response.content if hasattr(response, 'content') else str(response)
         except Exception:
