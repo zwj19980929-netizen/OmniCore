@@ -201,6 +201,64 @@ class WebWorker:
             block_heavy_resources=self.block_heavy_resources,
         )
 
+    def _clean_html_for_llm(self, html: str) -> str:
+        """
+        清洗HTML，移除噪音，只保留有效信息
+
+        目标：
+        - 移除 <script>, <style> 标签
+        - 移除冗余属性（class, style, data-*）
+        - 保留关键属性（id, name, href, type, role, placeholder, value, aria-label）
+        - 压缩空白字符
+
+        预期效果：降低 90% 的 Token 噪音
+        """
+        if not html:
+            return ""
+
+        # 1. 移除 script 和 style 标签
+        html = RE_SCRIPT_TAG.sub('', html)
+        html = RE_STYLE_TAG.sub('', html)
+        html = RE_HTML_COMMENT.sub('', html)
+
+        # 2. 移除冗余属性（保留关键属性）
+        # 匹配模式：属性名="属性值"
+        # 保留：id, name, href, type, role, placeholder, value, aria-label, aria-*, for, action, method
+        # 移除：class, style, data-*, onclick, onload, 等
+        def clean_attributes(match):
+            tag = match.group(0)
+            # 保留的属性列表
+            keep_attrs = ['id', 'name', 'href', 'type', 'role', 'placeholder', 'value',
+                         'aria-label', 'aria-describedby', 'for', 'action', 'method', 'src', 'alt']
+
+            # 移除 class 属性
+            tag = re.sub(r'\sclass="[^"]*"', '', tag)
+            tag = re.sub(r"\sclass='[^']*'", '', tag)
+
+            # 移除 style 属性
+            tag = re.sub(r'\sstyle="[^"]*"', '', tag)
+            tag = re.sub(r"\sstyle='[^']*'", '', tag)
+
+            # 移除 data-* 属性
+            tag = re.sub(r'\sdata-[a-z0-9-]+="[^"]*"', '', tag, flags=re.IGNORECASE)
+            tag = re.sub(r"\sdata-[a-z0-9-]+='[^']*'", '', tag, flags=re.IGNORECASE)
+
+            # 移除事件处理器（on*）
+            tag = re.sub(r'\son[a-z]+="[^"]*"', '', tag, flags=re.IGNORECASE)
+            tag = re.sub(r"\son[a-z]+='[^']*'", '', tag, flags=re.IGNORECASE)
+
+            return tag
+
+        html = re.sub(r'<[^>]+>', clean_attributes, html)
+
+        # 3. 压缩连续空白字符
+        html = RE_WHITESPACE.sub(' ', html)
+
+        # 4. 移除标签之间的多余空白
+        html = re.sub(r'>\s+<', '><', html)
+
+        return html.strip()
+
     def _extract_direct_urls(self, text: str) -> List[str]:
         urls: List[str] = []
         seen: Set[str] = set()
@@ -1338,10 +1396,12 @@ class WebWorker:
         html_r = await tk.get_page_html()
         html = html_r.data or ""
 
+        # 先清洗HTML（移除script/style/注释/空白）
         html = RE_SCRIPT_TAG.sub('', html)
         html = RE_STYLE_TAG.sub('', html)
         html = RE_HTML_COMMENT.sub('', html)
         html = RE_WHITESPACE.sub(' ', html)
+
         normalized_url = self.cache.normalize_url(url_r.data or "")
         task_signature = self.cache.build_task_signature(task_description)
         page_fingerprint = self.cache.build_page_fingerprint(html)
@@ -1350,7 +1410,7 @@ class WebWorker:
             normalized_url=normalized_url,
             task_signature=task_signature,
             page_fingerprint=page_fingerprint,
-            prompt_version="page_analysis_prompt_v1",
+            prompt_version="page_analysis_prompt_v2",  # 版本升级：使用新的清洗逻辑
             model_name=getattr(self.llm, "model", ""),
         )
         cached = self.cache.get(cache_key)
@@ -1358,13 +1418,26 @@ class WebWorker:
             log_agent_action(self.name, "命中页面结构分析缓存", normalized_url[:80])
             log_debug_metrics("llm_cache.page_analysis", self.cache.snapshot_stats())
             return cached
+
+        # 截断前先深度清洗（移除冗余属性）
         if len(html) > 100000:
             html = html[:100000] + "\n... (truncated)"
+
+        # 🔥 新增：深度清洗HTML，移除class/style/data-*等噪音属性
+        html_cleaned = self._clean_html_for_llm(html)
+        original_len = len(html)
+        cleaned_len = len(html_cleaned)
+        reduction_pct = (1 - cleaned_len / original_len) * 100 if original_len > 0 else 0
+        log_agent_action(
+            self.name,
+            "HTML清洗完成",
+            f"原始: {original_len} 字符, 清洗后: {cleaned_len} 字符, 减少: {reduction_pct:.1f}%"
+        )
 
         response = self.llm.chat_with_system(
             system_prompt=PAGE_ANALYSIS_PROMPT.format(
                 task_description=task_description,
-                html_content=html,
+                html_content=html_cleaned,  # 使用清洗后的HTML
                 current_url=url_r.data or "",
             ),
             user_message="请分析页面结构并返回选择器配置",

@@ -189,10 +189,12 @@ async def analyze_page_structure_with_singleflight(
     html_result = await tk.get_page_html()
     html = html_result.data or ""
 
+    # 先清洗HTML（移除script/style/注释/空白）
     html = RE_SCRIPT_TAG.sub("", html)
     html = RE_STYLE_TAG.sub("", html)
     html = RE_HTML_COMMENT.sub("", html)
     html = RE_WHITESPACE.sub(" ", html)
+
     normalized_url = self.cache.normalize_url(url_result.data or "")
     task_signature = self.cache.build_task_signature(task_description)
     page_fingerprint = self.cache.build_page_fingerprint(html)
@@ -201,7 +203,7 @@ async def analyze_page_structure_with_singleflight(
         normalized_url=normalized_url,
         task_signature=task_signature,
         page_fingerprint=page_fingerprint,
-        prompt_version="page_analysis_prompt_v1",
+        prompt_version="page_analysis_prompt_v2",  # 版本升级：使用新的清洗逻辑
         model_name=getattr(self.llm, "model", ""),
     )
     cached = self.cache.get(cache_key)
@@ -210,8 +212,20 @@ async def analyze_page_structure_with_singleflight(
         log_debug_metrics("llm_cache.page_analysis", self.cache.snapshot_stats())
         return cached
 
+    # 截断前先深度清洗（移除冗余属性）
     if len(html) > 100000:
         html = html[:100000] + "\n... (truncated)"
+
+    # 🔥 新增：深度清洗HTML，移除class/style/data-*等噪音属性
+    html_cleaned = self._clean_html_for_llm(html)
+    original_len = len(html)
+    cleaned_len = len(html_cleaned)
+    reduction_pct = (1 - cleaned_len / original_len) * 100 if original_len > 0 else 0
+    log_agent_action(
+        self.name,
+        "HTML清洗完成",
+        f"原始: {original_len} 字符, 清洗后: {cleaned_len} 字符, 减少: {reduction_pct:.1f}%"
+    )
 
     async def _compute_page_analysis() -> Dict[str, Any]:
         try:
@@ -219,7 +233,7 @@ async def analyze_page_structure_with_singleflight(
                 self.llm.chat_with_system,
                 system_prompt=PAGE_ANALYSIS_PROMPT.format(
                     task_description=task_description,
-                    html_content=html,
+                    html_content=html_cleaned,  # 使用清洗后的HTML
                     current_url=url_result.data or "",
                 ),
                 user_message="Please analyze the page structure and return selectors",
@@ -237,7 +251,7 @@ async def analyze_page_structure_with_singleflight(
                         "normalized_url": normalized_url,
                         "task_signature": task_signature,
                         "page_fingerprint": page_fingerprint,
-                        "prompt_version": "page_analysis_prompt_v1",
+                        "prompt_version": "page_analysis_prompt_v2",
                         "model_name": getattr(self.llm, "model", ""),
                     },
                 )

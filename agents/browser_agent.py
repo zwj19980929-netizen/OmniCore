@@ -51,6 +51,8 @@ class PageElement:
     attributes: Dict[str, str] = field(default_factory=dict)
     is_visible: bool = True
     is_clickable: bool = True
+    context_before: str = ""  # 🔥 新增：元素前面的上下文文本
+    context_after: str = ""   # 🔥 新增：元素后面的上下文文本
 
 
 @dataclass
@@ -562,9 +564,21 @@ class BrowserAgent:
                     attrs.get("href", "")[:100],
                 ] if part
             )
-            lines.append(
-                f"[{element.index}] type={element.element_type} selector={element.selector[:72]} info={details}"
-            )
+
+            # 🔥 新增：包含上下文信息
+            context_parts = []
+            if element.context_before:
+                context_parts.append(f"before: {element.context_before[:80]}")
+            if element.context_after:
+                context_parts.append(f"after: {element.context_after[:80]}")
+
+            context_str = " | ".join(context_parts) if context_parts else ""
+
+            line = f"[{element.index}] type={element.element_type} selector={element.selector[:72]} info={details}"
+            if context_str:
+                line += f" | context: {context_str}"
+
+            lines.append(line)
             if len(lines) >= max_items:
                 break
         return "\n".join(lines) or "(no actionable elements)"
@@ -736,7 +750,9 @@ class BrowserAgent:
         r = await self.toolkit.evaluate_js(
             r"""
             () => {
-              const nodes = Array.from(document.querySelectorAll('a, button, input, textarea, select, [role="button"], [role="link"], [contenteditable="true"]'));
+              // 🔥 扩展选择器：同时提取交互元素和内容元素
+              const interactiveNodes = Array.from(document.querySelectorAll('a, button, input, textarea, select, [role="button"], [role="link"], [contenteditable="true"]'));
+
               function textOf(el) {
                 return (el.innerText || el.textContent || '').replace(/\s+/g, ' ').trim();
               }
@@ -787,30 +803,105 @@ class BrowserAgent:
                 if (tag === 'input' && inputType) return inputType;
                 return (inputType || tag);
               }
-              return nodes
+
+              // 🔥 新增：提取元素周围的上下文文本
+              function extractContext(el) {
+                const contextBefore = [];
+                const contextAfter = [];
+
+                // 向前查找文本节点（最多3个兄弟节点）
+                let prev = el.previousSibling;
+                let count = 0;
+                while (prev && count < 3) {
+                  if (prev.nodeType === Node.TEXT_NODE) {
+                    const text = textOf(prev);
+                    if (text.length > 0) {
+                      contextBefore.unshift(text);
+                      count++;
+                    }
+                  } else if (prev.nodeType === Node.ELEMENT_NODE) {
+                    const text = textOf(prev);
+                    if (text.length > 0 && text.length < 200) {
+                      contextBefore.unshift(text);
+                      count++;
+                    }
+                  }
+                  prev = prev.previousSibling;
+                }
+
+                // 向后查找文本节点（最多3个兄弟节点）
+                let next = el.nextSibling;
+                count = 0;
+                while (next && count < 3) {
+                  if (next.nodeType === Node.TEXT_NODE) {
+                    const text = textOf(next);
+                    if (text.length > 0) {
+                      contextAfter.push(text);
+                      count++;
+                    }
+                  } else if (next.nodeType === Node.ELEMENT_NODE) {
+                    const text = textOf(next);
+                    if (text.length > 0 && text.length < 200) {
+                      contextAfter.push(text);
+                      count++;
+                    }
+                  }
+                  next = next.nextSibling;
+                }
+
+                // 如果兄弟节点没有上下文，尝试从父元素提取
+                if (contextBefore.length === 0 && contextAfter.length === 0) {
+                  const parent = el.parentElement;
+                  if (parent) {
+                    const parentText = textOf(parent);
+                    const elementText = textOf(el);
+                    // 提取父元素中不属于当前元素的文本
+                    const beforeText = parentText.split(elementText)[0];
+                    const afterText = parentText.split(elementText)[1];
+                    if (beforeText && beforeText.length > 0) {
+                      contextBefore.push(beforeText.slice(-100));
+                    }
+                    if (afterText && afterText.length > 0) {
+                      contextAfter.push(afterText.slice(0, 100));
+                    }
+                  }
+                }
+
+                return {
+                  before: contextBefore.join(' ').slice(0, 150),
+                  after: contextAfter.join(' ').slice(0, 150)
+                };
+              }
+
+              return interactiveNodes
                 .filter(el => isVisible(el))
                 .slice(0, 60)
-                .map((el, idx) => ({
-                index: idx,
-                tag: el.tagName.toLowerCase(),
-                text: textOf(el).slice(0, 160),
-                element_type: normalizedType(el),
-                selector: selectorOf(el),
-                attributes: {
-                  id: el.getAttribute('id') || '',
-                  name: el.getAttribute('name') || '',
-                  type: el.getAttribute('type') || '',
-                  role: el.getAttribute('role') || '',
-                  href: el.getAttribute('href') || '',
-                  value: (typeof el.value === 'string' ? el.value : '') || '',
-                  placeholder: el.getAttribute('placeholder') || '',
-                  ariaLabel: el.getAttribute('aria-label') || '',
-                  title: el.getAttribute('title') || '',
-                  labelText: labelOf(el).slice(0, 120),
-                },
-                is_visible: true,
-                is_clickable: !el.disabled,
-              }));
+                .map((el, idx) => {
+                  const context = extractContext(el);
+                  return {
+                    index: idx,
+                    tag: el.tagName.toLowerCase(),
+                    text: textOf(el).slice(0, 160),
+                    element_type: normalizedType(el),
+                    selector: selectorOf(el),
+                    attributes: {
+                      id: el.getAttribute('id') || '',
+                      name: el.getAttribute('name') || '',
+                      type: el.getAttribute('type') || '',
+                      role: el.getAttribute('role') || '',
+                      href: el.getAttribute('href') || '',
+                      value: (typeof el.value === 'string' ? el.value : '') || '',
+                      placeholder: el.getAttribute('placeholder') || '',
+                      ariaLabel: el.getAttribute('aria-label') || '',
+                      title: el.getAttribute('title') || '',
+                      labelText: labelOf(el).slice(0, 120),
+                    },
+                    is_visible: true,
+                    is_clickable: !el.disabled,
+                    context_before: context.before,
+                    context_after: context.after,
+                  };
+                });
             }
             """
         )
