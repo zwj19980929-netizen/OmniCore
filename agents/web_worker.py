@@ -25,6 +25,7 @@ from utils.logger import (
 )
 from utils.browser_toolkit import BrowserToolkit, ToolkitResult
 from utils.retry import async_retry, is_retryable
+from utils.page_perceiver import PagePerceiver
 from config.settings import settings
 
 # ==================== 预编译正则表达式 ====================
@@ -54,6 +55,15 @@ RE_CONTENT_BLOCK = re.compile(
 # 分词相关
 RE_TOKEN_SPLIT = re.compile(r"[\s,.;:|/\\]+")
 RE_DIRECT_URL = re.compile(r"https?://[^\s)>\]\"']+", re.IGNORECASE)
+
+# ==================== HTML 处理常量 ====================
+# HTML 截断长度配置
+HTML_MAX_LENGTH_WITH_STRUCTURE = 5000  # 有页面结构时，HTML 最大长度
+HTML_MAX_LENGTH_WITHOUT_STRUCTURE = 100000  # 无页面结构时，HTML 最大长度
+HTML_PRE_CLEAN_LENGTH = 20000  # 清洗前预截断长度
+
+# 页面结构提取失败的标记
+PAGE_STRUCTURE_FAILED_MARKER = "(页面结构提取失败，仅使用HTML分析)"
 RE_DOMAIN_HINT = re.compile(r"\b(?:[a-zA-Z0-9-]+\.)+[a-zA-Z]{2,}\b")
 RE_WORD_TOKEN = re.compile(r"[A-Za-z0-9][A-Za-z0-9_-]*|[\u4e00-\u9fff]{1,}")
 
@@ -140,7 +150,10 @@ PAGE_ANALYSIS_PROMPT = """你是一个网页结构分析专家。请分析以下
 ## 任务目标
 {task_description}
 
-## 页面 HTML (已截取关键部分)
+## 页面结构概览（由页面感知器提取）
+{page_structure}
+
+## 页面 HTML (已清洗，移除了噪音)
 ```html
 {html_content}
 ```
@@ -149,10 +162,11 @@ PAGE_ANALYSIS_PROMPT = """你是一个网页结构分析专家。请分析以下
 {current_url}
 
 ## 你的工作方式
-1. 仔细阅读 HTML 结构，理解页面布局
-2. 找出包含目标数据的重复元素（列表项、表格行等）
-3. 为每个需要提取的字段确定精确的 CSS 选择器
-4. 如果页面结构不明确，给出你最有把握的选择器
+1. **先看页面结构概览**：理解页面的整体布局和内容组织方式（标题、列表、表格、段落等）
+2. **再看 HTML 细节**：找出包含目标数据的重复元素（列表项、表格行等）
+3. **为每个需要提取的字段确定精确的 CSS 选择器**
+4. **优先使用页面结构概览中提到的选择器**，这些选择器经过验证更可靠
+5. 如果页面结构不明确，给出你最有把握的选择器
 
 返回 JSON 格式：
 ```json
@@ -175,7 +189,8 @@ PAGE_ANALYSIS_PROMPT = """你是一个网页结构分析专家。请分析以下
 注意：
 - item_selector 应该能选中多个重复的数据项
 - fields 中的选择器是相对于每个 item 的
-- 只填你在 HTML 中确实看到的选择器，看不到的字段留空字符串
+- 只填你在 HTML 或页面结构中确实看到的选择器，看不到的字段留空字符串
+- 优先使用页面结构概览中提到的选择器，它们经过可见性验证
 """
 
 
@@ -192,6 +207,7 @@ class WebWorker:
         self.cache = get_llm_cache()
         self.fast_mode = settings.BROWSER_FAST_MODE
         self.block_heavy_resources = settings.BLOCK_HEAVY_RESOURCES
+        self.page_perceiver = PagePerceiver()  # 页面感知器实例
         self.static_fetch_enabled = settings.STATIC_FETCH_ENABLED
 
     def _create_toolkit(self, headless: bool = True) -> BrowserToolkit:
@@ -992,7 +1008,11 @@ class WebWorker:
                     continue
 
                 # 等待结果加载
-                current_url = (await tk.get_url()).data or ""
+                url_result = await tk.get_current_url()
+                if not url_result.success:
+                    log_warning(f"获取当前URL失败: {url_result.error}")
+                    continue
+                current_url = url_result.data or ""
                 ready = await self._wait_for_search_results_ready(tk, current_url)
                 if not ready:
                     await tk.human_delay(800, 1800)
@@ -1402,6 +1422,20 @@ class WebWorker:
         html = RE_HTML_COMMENT.sub('', html)
         html = RE_WHITESPACE.sub(' ', html)
 
+        # 🔥 新增：获取页面结构化描述
+        page_structure_text = ""
+        try:
+            page_structure = await self.page_perceiver.perceive_page(tk, task_description)
+            page_structure_text = page_structure.to_llm_prompt()
+            log_agent_action(
+                self.name,
+                "页面结构提取完成",
+                f"{len(page_structure.main_content_blocks)} 个内容块, {len(page_structure.interactive_elements)} 个交互元素"
+            )
+        except Exception as e:
+            log_error(f"页面结构提取失败，降级为纯HTML分析: {e}", exc_info=True)
+            page_structure_text = PAGE_STRUCTURE_FAILED_MARKER
+
         normalized_url = self.cache.normalize_url(url_r.data or "")
         task_signature = self.cache.build_task_signature(task_description)
         page_fingerprint = self.cache.build_page_fingerprint(html)
@@ -1410,7 +1444,7 @@ class WebWorker:
             normalized_url=normalized_url,
             task_signature=task_signature,
             page_fingerprint=page_fingerprint,
-            prompt_version="page_analysis_prompt_v2",  # 版本升级：使用新的清洗逻辑
+            prompt_version="page_analysis_prompt_v3",  # 🔥 版本升级：加入页面结构感知
             model_name=getattr(self.llm, "model", ""),
         )
         cached = self.cache.get(cache_key)
@@ -1419,25 +1453,45 @@ class WebWorker:
             log_debug_metrics("llm_cache.page_analysis", self.cache.snapshot_stats())
             return cached
 
-        # 截断前先深度清洗（移除冗余属性）
-        if len(html) > 100000:
-            html = html[:100000] + "\n... (truncated)"
-
-        # 🔥 新增：深度清洗HTML，移除class/style/data-*等噪音属性
-        html_cleaned = self._clean_html_for_llm(html)
-        original_len = len(html)
-        cleaned_len = len(html_cleaned)
-        reduction_pct = (1 - cleaned_len / original_len) * 100 if original_len > 0 else 0
-        log_agent_action(
-            self.name,
-            "HTML清洗完成",
-            f"原始: {original_len} 字符, 清洗后: {cleaned_len} 字符, 减少: {reduction_pct:.1f}%"
+        # 🔥 优化：如果有页面结构，大幅缩减HTML（只保留关键片段）
+        html_for_llm = ""
+        has_valid_structure = (
+            page_structure_text
+            and page_structure_text != PAGE_STRUCTURE_FAILED_MARKER
         )
 
+        if has_valid_structure:
+            # 有页面结构时，只传精简的HTML片段
+            html_cleaned = self._clean_html_for_llm(html[:HTML_PRE_CLEAN_LENGTH])
+            html_for_llm = html_cleaned[:HTML_MAX_LENGTH_WITH_STRUCTURE]
+            if len(html_cleaned) > HTML_MAX_LENGTH_WITH_STRUCTURE:
+                html_for_llm += "\n... (已省略，请优先使用页面结构概览)"
+            log_agent_action(
+                self.name,
+                "HTML精简完成（有页面结构）",
+                f"原始: {len(html)} 字符 → 传给LLM: {len(html_for_llm)} 字符"
+            )
+        else:
+            # 没有页面结构时，传完整的清洗后HTML（降级模式）
+            if len(html) > HTML_MAX_LENGTH_WITHOUT_STRUCTURE:
+                html = html[:HTML_MAX_LENGTH_WITHOUT_STRUCTURE] + "\n... (truncated)"
+            html_cleaned = self._clean_html_for_llm(html)
+            html_for_llm = html_cleaned
+            original_len = len(html)
+            cleaned_len = len(html_cleaned)
+            reduction_pct = (1 - cleaned_len / original_len) * 100 if original_len > 0 else 0
+            log_agent_action(
+                self.name,
+                "HTML清洗完成（降级模式）",
+                f"原始: {original_len} 字符, 清洗后: {cleaned_len} 字符, 减少: {reduction_pct:.1f}%"
+            )
+
+        # 🔥 修改：传入页面结构 + 精简HTML
         response = self.llm.chat_with_system(
             system_prompt=PAGE_ANALYSIS_PROMPT.format(
                 task_description=task_description,
-                html_content=html_cleaned,  # 使用清洗后的HTML
+                html_content=html_for_llm,
+                page_structure=page_structure_text,  # 🔥 页面结构（主要依据）
                 current_url=url_r.data or "",
             ),
             user_message="请分析页面结构并返回选择器配置",
