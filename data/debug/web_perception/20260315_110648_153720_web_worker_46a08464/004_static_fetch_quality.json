@@ -1,0 +1,28 @@
+{
+  "url": "https://news.ycombinator.com/",
+  "quality": {
+    "valid": true,
+    "reason": "标题和链接已满足列表抓取任务",
+    "suggestion": ""
+  },
+  "sample": [
+    {
+      "rank": 1,
+      "id": "47386116",
+      "title": "A Visual Introduction to Machine Learning",
+      "link": "https://r2d3.us/visual-intro-to-machine-learning-part-1/"
+    },
+    {
+      "rank": 2,
+      "id": "47385272",
+      "title": "The Appalling Stupidity of Spotify&#x27;s AI DJ",
+      "link": "https://www.charlespetzold.com/blog/2026/02/The-Appalling-Stupidity-of-Spotifys-AI-DJ.html"
+    },
+    {
+      "rank": 3,
+      "id": "47384352",
+      "title": "Rack-mount hydroponics",
+      "link": "https://sa.lj.am/rack-mount-hydroponics/"
+    }
+  ]
+}

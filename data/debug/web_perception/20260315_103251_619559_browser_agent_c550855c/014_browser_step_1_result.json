@@ -1,0 +1,13 @@
+{
+  "step": 1,
+  "plan": "等待页面完全加载，搜索结果通常在页面加载后渲染",
+  "action": "wait",
+  "observation": "success",
+  "decision": "continue",
+  "action_type": "wait",
+  "selector": "",
+  "value": "",
+  "description": "等待页面完全加载，搜索结果通常在页面加载后渲染",
+  "result": "success",
+  "url": "https://www.bing.com/search?q=openai+api&rdr=1&rdrig=7ED9165F62574AEE8348214A123B998C"
+}

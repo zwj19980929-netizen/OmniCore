@@ -1,0 +1,9 @@
+{
+  "url": "https://huggingface.co/models",
+  "result": {
+    "success": false,
+    "error": "static fetch returned navigation links instead of usable detail data",
+    "data": [],
+    "url": "https://huggingface.co/models"
+  }
+}

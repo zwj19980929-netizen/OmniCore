@@ -1,0 +1,8 @@
+# 页面：Example List
+URL: https://example.com/list
+
+## 页面结构概览
+
+### 主要内容区域
+1. [article] item
+   选择器: article

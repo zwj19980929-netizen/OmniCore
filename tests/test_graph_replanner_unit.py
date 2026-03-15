@@ -151,6 +151,28 @@ def test_replanner_can_reuse_target_url_from_failed_task_when_user_input_has_no_
     assert repaired_task["params"]["start_url"] == target_url
 
 
+def test_replanner_sanitizes_polluted_target_url_before_reuse(monkeypatch):
+    fake_llm = _FakeLLM()
+    monkeypatch.setattr(graph_module, "LLMClient", lambda: fake_llm)
+
+    polluted_url = "https://news.ycombinator.com），抓取前 3 条新闻"
+    state = _make_state(
+        user_input="重新打开原来的页面并继续抓取",
+        failed_params={"task": "open and read page", "start_url": polluted_url},
+        failed_result={
+            "success": False,
+            "message": "navigation failed",
+            "url": "chrome-error://chromewebdata/",
+            "expected_url": polluted_url,
+        },
+    )
+
+    result = replanner_node(state)
+
+    repaired_task = result["task_queue"][0]
+    assert repaired_task["params"]["start_url"] == "https://news.ycombinator.com"
+
+
 def test_replanner_preserves_critic_approved_completed_tasks(monkeypatch):
     fake_llm = _FakeLLM()
     monkeypatch.setattr(graph_module, "LLMClient", lambda: fake_llm)

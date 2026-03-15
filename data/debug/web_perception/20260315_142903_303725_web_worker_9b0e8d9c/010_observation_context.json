@@ -1,0 +1,6 @@
+{
+  "url": "",
+  "raw_html_length": 0,
+  "cleaned_html_length": 0,
+  "task": "Obtain 合肥的明天（2026-03-16）天气 from a relevant city weather detail or forecast page. Prefer detail pages over news pages and navigation pages. Extract temperature, weather condition, humidity, wind, and air quality (AQI). Reject unrelated cities and generic weather news."
+}

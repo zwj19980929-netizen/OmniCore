@@ -1,0 +1,30 @@
+{
+  "url": "https://www.bing.com/search?q=openai+api&rdr=1&rdrig=7ED9165F62574AEE8348214A123B998C",
+  "title": "openai api - 搜索",
+  "page_type": "serp",
+  "elements": [],
+  "cards": [],
+  "collections": [],
+  "controls": [],
+  "affordances": {
+    "has_search_box": false,
+    "search_input_ref": "",
+    "search_input_selector": "",
+    "has_pagination": false,
+    "next_page_ref": "",
+    "next_page_selector": "",
+    "has_load_more": false,
+    "load_more_ref": "",
+    "load_more_selector": "",
+    "has_modal": false,
+    "modal_primary_ref": "",
+    "modal_primary_selector": "",
+    "modal_secondary_ref": "",
+    "modal_secondary_selector": "",
+    "modal_close_ref": "",
+    "modal_close_selector": "",
+    "has_login_form": false,
+    "has_results": false,
+    "collection_item_count": 0
+  }
+}

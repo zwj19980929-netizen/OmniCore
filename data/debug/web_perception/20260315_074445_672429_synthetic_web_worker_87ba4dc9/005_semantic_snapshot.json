@@ -1,0 +1,310 @@
+{
+  "page_type": "list",
+  "url": "https://github.com/trending",
+  "title": "Trending repositories on GitHub today",
+  "cards": [],
+  "collections": [
+    {
+      "ref": "collection_1",
+      "kind": "list",
+      "item_count": 25,
+      "sample_items": [
+        "owner/repo1",
+        "owner/repo2",
+        "owner/repo3",
+        "owner/repo4",
+        "owner/repo5"
+      ]
+    }
+  ],
+  "controls": [
+    {
+      "kind": "filter",
+      "ref": "el_filter",
+      "text": "Today",
+      "selector": "details summary"
+    }
+  ],
+  "elements": [
+    {
+      "ref": "el_1",
+      "type": "link",
+      "role": "link",
+      "text": "owner / repo1",
+      "label": "",
+      "selector": "article.Box-row:nth-of-type(1) h2 a",
+      "href": "https://github.com/owner/repo1",
+      "visible": true,
+      "enabled": true
+    },
+    {
+      "ref": "el_2",
+      "type": "link",
+      "role": "link",
+      "text": "owner / repo2",
+      "label": "",
+      "selector": "article.Box-row:nth-of-type(2) h2 a",
+      "href": "https://github.com/owner/repo2",
+      "visible": true,
+      "enabled": true
+    },
+    {
+      "ref": "el_3",
+      "type": "link",
+      "role": "link",
+      "text": "owner / repo3",
+      "label": "",
+      "selector": "article.Box-row:nth-of-type(3) h2 a",
+      "href": "https://github.com/owner/repo3",
+      "visible": true,
+      "enabled": true
+    },
+    {
+      "ref": "el_4",
+      "type": "link",
+      "role": "link",
+      "text": "owner / repo4",
+      "label": "",
+      "selector": "article.Box-row:nth-of-type(4) h2 a",
+      "href": "https://github.com/owner/repo4",
+      "visible": true,
+      "enabled": true
+    },
+    {
+      "ref": "el_5",
+      "type": "link",
+      "role": "link",
+      "text": "owner / repo5",
+      "label": "",
+      "selector": "article.Box-row:nth-of-type(5) h2 a",
+      "href": "https://github.com/owner/repo5",
+      "visible": true,
+      "enabled": true
+    },
+    {
+      "ref": "el_6",
+      "type": "link",
+      "role": "link",
+      "text": "owner / repo6",
+      "label": "",
+      "selector": "article.Box-row:nth-of-type(6) h2 a",
+      "href": "https://github.com/owner/repo6",
+      "visible": true,
+      "enabled": true
+    },
+    {
+      "ref": "el_7",
+      "type": "link",
+      "role": "link",
+      "text": "owner / repo7",
+      "label": "",
+      "selector": "article.Box-row:nth-of-type(7) h2 a",
+      "href": "https://github.com/owner/repo7",
+      "visible": true,
+      "enabled": true
+    },
+    {
+      "ref": "el_8",
+      "type": "link",
+      "role": "link",
+      "text": "owner / repo8",
+      "label": "",
+      "selector": "article.Box-row:nth-of-type(8) h2 a",
+      "href": "https://github.com/owner/repo8",
+      "visible": true,
+      "enabled": true
+    },
+    {
+      "ref": "el_9",
+      "type": "link",
+      "role": "link",
+      "text": "owner / repo9",
+      "label": "",
+      "selector": "article.Box-row:nth-of-type(9) h2 a",
+      "href": "https://github.com/owner/repo9",
+      "visible": true,
+      "enabled": true
+    },
+    {
+      "ref": "el_10",
+      "type": "link",
+      "role": "link",
+      "text": "owner / repo10",
+      "label": "",
+      "selector": "article.Box-row:nth-of-type(10) h2 a",
+      "href": "https://github.com/owner/repo10",
+      "visible": true,
+      "enabled": true
+    },
+    {
+      "ref": "el_11",
+      "type": "link",
+      "role": "link",
+      "text": "owner / repo11",
+      "label": "",
+      "selector": "article.Box-row:nth-of-type(11) h2 a",
+      "href": "https://github.com/owner/repo11",
+      "visible": true,
+      "enabled": true
+    },
+    {
+      "ref": "el_12",
+      "type": "link",
+      "role": "link",
+      "text": "owner / repo12",
+      "label": "",
+      "selector": "article.Box-row:nth-of-type(12) h2 a",
+      "href": "https://github.com/owner/repo12",
+      "visible": true,
+      "enabled": true
+    },
+    {
+      "ref": "el_13",
+      "type": "link",
+      "role": "link",
+      "text": "owner / repo13",
+      "label": "",
+      "selector": "article.Box-row:nth-of-type(13) h2 a",
+      "href": "https://github.com/owner/repo13",
+      "visible": true,
+      "enabled": true
+    },
+    {
+      "ref": "el_14",
+      "type": "link",
+      "role": "link",
+      "text": "owner / repo14",
+      "label": "",
+      "selector": "article.Box-row:nth-of-type(14) h2 a",
+      "href": "https://github.com/owner/repo14",
+      "visible": true,
+      "enabled": true
+    },
+    {
+      "ref": "el_15",
+      "type": "link",
+      "role": "link",
+      "text": "owner / repo15",
+      "label": "",
+      "selector": "article.Box-row:nth-of-type(15) h2 a",
+      "href": "https://github.com/owner/repo15",
+      "visible": true,
+      "enabled": true
+    },
+    {
+      "ref": "el_16",
+      "type": "link",
+      "role": "link",
+      "text": "owner / repo16",
+      "label": "",
+      "selector": "article.Box-row:nth-of-type(16) h2 a",
+      "href": "https://github.com/owner/repo16",
+      "visible": true,
+      "enabled": true
+    },
+    {
+      "ref": "el_17",
+      "type": "link",
+      "role": "link",
+      "text": "owner / repo17",
+      "label": "",
+      "selector": "article.Box-row:nth-of-type(17) h2 a",
+      "href": "https://github.com/owner/repo17",
+      "visible": true,
+      "enabled": true
+    },
+    {
+      "ref": "el_18",
+      "type": "link",
+      "role": "link",
+      "text": "owner / repo18",
+      "label": "",
+      "selector": "article.Box-row:nth-of-type(18) h2 a",
+      "href": "https://github.com/owner/repo18",
+      "visible": true,
+      "enabled": true
+    },
+    {
+      "ref": "el_19",
+      "type": "link",
+      "role": "link",
+      "text": "owner / repo19",
+      "label": "",
+      "selector": "article.Box-row:nth-of-type(19) h2 a",
+      "href": "https://github.com/owner/repo19",
+      "visible": true,
+      "enabled": true
+    },
+    {
+      "ref": "el_20",
+      "type": "link",
+      "role": "link",
+      "text": "owner / repo20",
+      "label": "",
+      "selector": "article.Box-row:nth-of-type(20) h2 a",
+      "href": "https://github.com/owner/repo20",
+      "visible": true,
+      "enabled": true
+    },
+    {
+      "ref": "el_21",
+      "type": "link",
+      "role": "link",
+      "text": "owner / repo21",
+      "label": "",
+      "selector": "article.Box-row:nth-of-type(21) h2 a",
+      "href": "https://github.com/owner/repo21",
+      "visible": true,
+      "enabled": true
+    },
+    {
+      "ref": "el_22",
+      "type": "link",
+      "role": "link",
+      "text": "owner / repo22",
+      "label": "",
+      "selector": "article.Box-row:nth-of-type(22) h2 a",
+      "href": "https://github.com/owner/repo22",
+      "visible": true,
+      "enabled": true
+    },
+    {
+      "ref": "el_23",
+      "type": "link",
+      "role": "link",
+      "text": "owner / repo23",
+      "label": "",
+      "selector": "article.Box-row:nth-of-type(23) h2 a",
+      "href": "https://github.com/owner/repo23",
+      "visible": true,
+      "enabled": true
+    },
+    {
+      "ref": "el_24",
+      "type": "link",
+      "role": "link",
+      "text": "owner / repo24",
+      "label": "",
+      "selector": "article.Box-row:nth-of-type(24) h2 a",
+      "href": "https://github.com/owner/repo24",
+      "visible": true,
+      "enabled": true
+    },
+    {
+      "ref": "el_25",
+      "type": "link",
+      "role": "link",
+      "text": "owner / repo25",
+      "label": "",
+      "selector": "article.Box-row:nth-of-type(25) h2 a",
+      "href": "https://github.com/owner/repo25",
+      "visible": true,
+      "enabled": true
+    }
+  ],
+  "affordances": {
+    "has_search_box": false,
+    "has_pagination": false,
+    "has_load_more": false
+  }
+}

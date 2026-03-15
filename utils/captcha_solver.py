@@ -1,6 +1,6 @@
 """
 OmniCore 验证码自动处理模块
-使用多模态 LLM (GPT-4V) 识别并自动完成验证码
+使用多模态 LLM 识别并自动完成验证码
 通过 BrowserToolkit 执行所有浏览器操作
 """
 import base64
@@ -27,6 +27,18 @@ class CaptchaSolver:
         self.client = OpenAI(api_key=settings.OPENAI_API_KEY)
         self.vision_model = settings.VISION_MODEL
         self.toolkit = toolkit  # BrowserToolkit instance
+
+    def _vision_model_candidates(self) -> List[str]:
+        candidates = [self.vision_model, "gpt-4o", "gpt-4o-mini"]
+        ordered: List[str] = []
+        seen: set[str] = set()
+        for item in candidates:
+            value = str(item or "").strip()
+            if not value or value in seen:
+                continue
+            seen.add(value)
+            ordered.append(value)
+        return ordered
 
     async def detect_captcha(self, page=None) -> Dict[str, Any]:
         """
@@ -82,20 +94,24 @@ class CaptchaSolver:
     async def screenshot_captcha(self, page=None) -> Tuple[bytes, Optional[Dict[str, int]]]:
         """截取验证码区域截图"""
         tk = self.toolkit
-        shot_r = await tk.screenshot()
-        screenshot = shot_r.data if shot_r.success else b""
-
         captcha_selectors = [
             "#cap-img", ".captcha-img", "img[alt*='验证码']", ".verify-img", "#captcha",
         ]
+        screenshot = b""
         bounds = None
         for selector in captcha_selectors:
             box_r = await tk.get_bounding_box(selector)
             if box_r.success and box_r.data:
                 log_agent_action(self.name, "找到验证码元素", selector)
                 bounds = box_r.data
+                shot_r = await tk.screenshot_element(selector)
+                if shot_r.success and shot_r.data:
+                    screenshot = shot_r.data
                 break
 
+        if not screenshot:
+            shot_r = await tk.screenshot()
+            screenshot = shot_r.data if shot_r.success else b""
         return screenshot, bounds
 
     def analyze_captcha_with_vision(
@@ -103,8 +119,8 @@ class CaptchaSolver:
         screenshot_base64: str,
         captcha_type: str = "unknown",
     ) -> Dict[str, Any]:
-        """使用 GPT-4V 分析验证码（纯 API 调用，不碰浏览器）"""
-        log_agent_action(self.name, "调用 GPT-4V 识别验证码")
+        """使用多模态模型分析验证码（纯 API 调用，不碰浏览器）"""
+        log_agent_action(self.name, "调用视觉模型识别验证码")
 
         prompt = """请识别这张图片中显示的文字或数字。
 
@@ -127,58 +143,72 @@ class CaptchaSolver:
 - 如果是数学算式，写出计算结果
 - confidence 表示识别把握度"""
 
-        try:
-            response = self.client.chat.completions.create(
-                model=self.vision_model,
-                messages=[{
-                    "role": "user",
-                    "content": [
-                        {"type": "text", "text": prompt},
-                        {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{screenshot_base64}"}},
-                    ],
-                }],
-            )
+        last_error = ""
+        for model_name in self._vision_model_candidates():
+            try:
+                if model_name != self.vision_model:
+                    log_warning(f"验证码视觉模型回退: {self.vision_model} -> {model_name}")
+                response = self.client.chat.completions.create(
+                    model=model_name,
+                    messages=[{
+                        "role": "user",
+                        "content": [
+                            {"type": "text", "text": prompt},
+                            {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{screenshot_base64}"}},
+                        ],
+                    }],
+                )
 
-            result_text = response.choices[0].message.content
-            import json
-            import re
+                result_text = response.choices[0].message.content
+                import json
+                import re
 
-            result = None
-            json_match = re.search(r'```json\s*(.*?)\s*```', result_text, re.DOTALL)
-            if json_match:
-                try:
-                    result = json.loads(json_match.group(1))
-                except Exception:
-                    pass
-            if not result:
-                json_match = re.search(r'\{[^{}]*\}', result_text, re.DOTALL)
+                result = None
+                json_match = re.search(r'```json\s*(.*?)\s*```', result_text, re.DOTALL)
                 if json_match:
                     try:
-                        result = json.loads(json_match.group(0))
+                        result = json.loads(json_match.group(1))
                     except Exception:
                         pass
-            if not result:
-                try:
-                    result = json.loads(result_text)
-                except Exception:
-                    pass
-            if not result:
-                solution_match = re.search(r'solution["\s:]+(["\']?)([^"\'}\n,]+)\1', result_text, re.IGNORECASE)
-                if solution_match:
-                    result = {
-                        "captcha_type": "text",
-                        "solution": solution_match.group(2).strip(),
-                        "confidence": 0.7,
-                        "instructions": "从文本提取",
-                    }
-            if not result:
-                raise ValueError(f"无法解析响应: {result_text[:200]}")
+                if not result:
+                    json_match = re.search(r'\{[^{}]*\}', result_text, re.DOTALL)
+                    if json_match:
+                        try:
+                            result = json.loads(json_match.group(0))
+                        except Exception:
+                            pass
+                if not result:
+                    try:
+                        result = json.loads(result_text)
+                    except Exception:
+                        pass
+                if not result:
+                    solution_match = re.search(r'solution["\s:]+(["\']?)([^"\'}\n,]+)\1', result_text, re.IGNORECASE)
+                    if solution_match:
+                        result = {
+                            "captcha_type": "text",
+                            "solution": solution_match.group(2).strip(),
+                            "confidence": 0.7,
+                            "instructions": "从文本提取",
+                        }
+                if not result:
+                    raise ValueError(f"无法解析响应: {result_text[:200]}")
 
-            log_agent_action(self.name, f"识别结果: {result.get('captcha_type')}", f"solution: {result.get('solution')}")
-            return result
-        except Exception as e:
-            log_error(f"GPT-4V 识别失败: {e}")
-            return {"captcha_type": "unknown", "solution": None, "confidence": 0, "instructions": f"识别失败: {str(e)}"}
+                log_agent_action(self.name, f"识别结果: {result.get('captcha_type')}", f"solution: {result.get('solution')}")
+                return result
+            except Exception as exc:
+                last_error = str(exc)
+                log_warning(f"验证码视觉识别失败(model={model_name}): {last_error}")
+                continue
+
+        log_error(f"验证码视觉识别最终失败: {last_error}")
+        return {
+            "captcha_type": "unknown",
+            "solution": None,
+            "confidence": 0,
+            "instructions": f"识别失败: {last_error}",
+            "fatal": "invalid model" in last_error.lower() or "unsupported" in last_error.lower(),
+        }
 
     async def solve_text_captcha(self, solution: str, page=None) -> bool:
         """解决文字验证码"""
@@ -290,6 +320,9 @@ class CaptchaSolver:
                 screenshot_base64, detection.get("captcha_type", "unknown")
             )
 
+            if analysis.get("fatal"):
+                log_error(f"验证码识别器不可用，停止自动重试: {analysis.get('instructions', '')}")
+                return False
             if analysis["confidence"] < 0.5:
                 log_warning(f"识别置信度过低: {analysis['confidence']}")
                 await self._try_refresh_captcha()

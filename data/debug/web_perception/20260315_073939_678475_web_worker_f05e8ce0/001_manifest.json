@@ -1,0 +1,12 @@
+{
+  "trace_id": "20260315_073939_678475_web_worker_f05e8ce0",
+  "scope": "web_worker",
+  "created_at": "2026-03-15T07:39:39.678738Z",
+  "metadata": {
+    "task": "从 GitHub Trending 页面 (https://github.com/trending) 抓取前 5 个仓库的标题和链接。提取每个仓库的名称（标题）以及对应的仓库详情页 URL。返回格式应为包含 title 和 link 字段的结构化数据。",
+    "input_url": "https://github.com/trending",
+    "limit": 5,
+    "query": "",
+    "headless": null
+  }
+}

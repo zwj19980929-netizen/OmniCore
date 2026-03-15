@@ -236,3 +236,124 @@ def test_browser_agent_adapter_closes_toolkit_it_created(monkeypatch):
     assert outcome["result"]["success"] is True
     assert len(created_toolkits) == 1
     assert created_toolkits[0].closed is True
+
+
+def test_browser_agent_adapter_sanitizes_polluted_start_url(monkeypatch):
+    created_toolkits = []
+
+    class FakeToolkit:
+        def __init__(self, **_kwargs):
+            created_toolkits.append(self)
+
+        async def close(self):
+            return SimpleNamespace(success=True, error=None)
+
+    class FakeAgent:
+        def __init__(self, toolkit):
+            self.toolkit = toolkit
+
+        async def run(self, _task_desc, _start_url, max_steps=8):
+            assert _start_url == "https://news.ycombinator.com"
+            return {"success": True, "message": "ok", "steps": []}
+
+        async def close(self):
+            return None
+
+    class FakeWorkerPool:
+        def create_browser_agent(self, llm_client=None, headless=True, toolkit=None):
+            return FakeAgent(toolkit)
+
+    async def _fake_get_instance(_cls):
+        return FakeWorkerPool()
+
+    monkeypatch.setattr(browser_toolkit_module, "BrowserToolkit", FakeToolkit)
+    monkeypatch.setattr(tool_adapters_module, "resolve_model_for_task", lambda _task: None)
+    monkeypatch.setattr(tool_adapters_module.WorkerPool, "get_instance", classmethod(_fake_get_instance))
+
+    registry = build_tool_adapter_registry()
+    adapter = registry.get("browser_agent")
+    tool = get_builtin_tool_registry().get("browser.interact")
+
+    outcome = asyncio.run(
+        adapter.execute(
+            {
+                "task_id": "task_browser",
+                "task_type": "browser_agent",
+                "tool_name": "browser.interact",
+                "description": "打开 https://news.ycombinator.com），抓取前 3 条新闻",
+                "params": {
+                    "task": "打开 https://news.ycombinator.com），抓取前 3 条新闻",
+                    "start_url": "https://news.ycombinator.com），抓取前 3 条新闻",
+                    "headless": True,
+                },
+                "execution_trace": [],
+            },
+            {},
+            tool,
+        )
+    )
+
+    assert outcome["status"] == "completed"
+    assert outcome["result"]["success"] is True
+    assert len(created_toolkits) == 1
+
+
+def test_enhanced_web_worker_adapter_uses_description_when_task_param_missing(monkeypatch):
+    import agents.enhanced_web_worker as enhanced_web_worker_module
+
+    visited_urls = []
+
+    class FakeToolkit:
+        def __init__(self, **_kwargs):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc, tb):
+            return None
+
+        async def goto(self, url):
+            visited_urls.append(url)
+            return SimpleNamespace(success=True, data=url)
+
+        async def human_delay(self, *_args, **_kwargs):
+            return None
+
+    class FakeWorker:
+        def __init__(self, llm_client=None):
+            self.llm_client = llm_client
+
+        async def smart_extract(self, toolkit, task_description, limit):
+            assert task_description == "打开 https://news.ycombinator.com），抓取前 3 条新闻"
+            assert limit == 3
+            assert toolkit is not None
+            return {"success": True, "data": [{"title": "Story 1"}]}
+
+    monkeypatch.setattr(browser_toolkit_module, "BrowserToolkit", FakeToolkit)
+    monkeypatch.setattr(enhanced_web_worker_module, "EnhancedWebWorker", FakeWorker)
+    monkeypatch.setattr(tool_adapters_module, "LLMClient", lambda model=None: SimpleNamespace(model=model))
+    monkeypatch.setattr(tool_adapters_module, "resolve_model_for_task", lambda _task: None)
+
+    registry = build_tool_adapter_registry()
+    adapter = registry.get("enhanced_web_worker")
+    tool = get_builtin_tool_registry().get("web.smart_extract")
+
+    outcome = asyncio.run(
+        adapter.execute(
+            {
+                "task_id": "task_enhanced_web",
+                "task_type": "enhanced_web_worker",
+                "tool_name": "web.smart_extract",
+                "description": "打开 https://news.ycombinator.com），抓取前 3 条新闻",
+                "params": {"limit": 3, "headless": True},
+                "execution_trace": [],
+            },
+            {},
+            tool,
+        )
+    )
+
+    assert outcome["status"] == "completed"
+    assert outcome["result"]["success"] is True
+    assert visited_urls == ["https://news.ycombinator.com"]

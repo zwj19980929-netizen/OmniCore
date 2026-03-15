@@ -1,0 +1,31 @@
+{
+  "url": "https://github.com/trending",
+  "result": {
+    "success": true,
+    "data": [
+      {
+        "title": "volcengine / OpenViking",
+        "link": "https://github.com/volcengine/OpenViking"
+      },
+      {
+        "title": "anthropics / claude-plugins-official",
+        "link": "https://github.com/anthropics/claude-plugins-official"
+      },
+      {
+        "title": "dimensionalOS / dimos",
+        "link": "https://github.com/dimensionalOS/dimos"
+      },
+      {
+        "title": "p-e-w / heretic",
+        "link": "https://github.com/p-e-w/heretic"
+      },
+      {
+        "title": "langflow-ai / openrag",
+        "link": "https://github.com/langflow-ai/openrag"
+      }
+    ],
+    "count": 5,
+    "source": "https://github.com/trending",
+    "mode": "static_fetch"
+  }
+}

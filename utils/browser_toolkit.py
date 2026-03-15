@@ -65,6 +65,7 @@ class BrowserToolkit:
         )
         self.user_data_dir = user_data_dir
         self._captcha_solver = None  # lazy
+        self._semantic_ref_map: Dict[str, Dict[str, Any]] = {}
 
     # ── context manager support ──────────────────────────────
 
@@ -332,6 +333,7 @@ class BrowserToolkit:
             self._context = None
             self._current_frame = None
             self._in_iframe = False
+            self._semantic_ref_map = {}
             if lease is not None:
                 await lease.release()
                 log_debug_metrics(
@@ -1026,3 +1028,810 @@ class BrowserToolkit:
             return ToolkitResult(success=True)
         except Exception as e:
             return ToolkitResult(success=False, error=str(e))
+
+    # ── semantic snapshot / ref actions ─────────────────────
+
+    async def semantic_snapshot(
+        self,
+        max_elements: int = 80,
+        include_cards: bool = True,
+    ) -> ToolkitResult:
+        try:
+            surface = self.active_surface
+            payload = await surface.evaluate(
+                r"""
+                (args) => {
+                  const maxElements = Math.max(Number(args?.max_elements || 80), 20);
+                  const includeCards = !!args?.include_cards;
+                  const normalize = (value) => String(value || '').replace(/\s+/g, ' ').trim();
+                  const cleanHost = (value) => String(value || '').replace(/^www\./, '').toLowerCase();
+                  const currentHost = cleanHost(location.hostname || '');
+
+                  const isVisible = (element) => {
+                    if (!element) return false;
+                    const style = window.getComputedStyle(element);
+                    if (!style || style.visibility === 'hidden' || style.display === 'none') return false;
+                    const rect = element.getBoundingClientRect();
+                    return rect.width > 0 && rect.height > 0;
+                  };
+
+                  const labelOf = (el) => {
+                    if (!el) return '';
+                    if (el.labels && el.labels.length) {
+                      return normalize(Array.from(el.labels).map((item) => item.innerText || item.textContent || '').join(' '));
+                    }
+                    const id = el.getAttribute('id');
+                    if (id) {
+                      const explicit = document.querySelector(`label[for="${id}"]`);
+                      if (explicit) return normalize(explicit.innerText || explicit.textContent || '');
+                    }
+                    const parentLabel = el.closest('label');
+                    return parentLabel ? normalize(parentLabel.innerText || parentLabel.textContent || '') : '';
+                  };
+
+                  const selectorOf = (el) => {
+                    if (!el) return '';
+                    const stableDataAttrs = ['data-testid', 'data-id', 'data-cy', 'data-qa', 'data-test'];
+                    for (const attr of stableDataAttrs) {
+                      const value = el.getAttribute(attr);
+                      if (value) return `[${attr}="${CSS.escape(value)}"]`;
+                    }
+                    if (el.id) return `#${CSS.escape(el.id)}`;
+                    const name = el.getAttribute('name');
+                    if (name) return `${el.tagName.toLowerCase()}[name="${CSS.escape(name)}"]`;
+                    const placeholder = el.getAttribute('placeholder');
+                    if (placeholder) return `${el.tagName.toLowerCase()}[placeholder="${CSS.escape(placeholder)}"]`;
+                    const href = el.getAttribute('href');
+                    if (href && href.length <= 200) return `${el.tagName.toLowerCase()}[href="${CSS.escape(href)}"]`;
+                    const parts = [];
+                    let current = el;
+                    while (current && current.nodeType === 1 && parts.length < 5) {
+                      let part = current.tagName.toLowerCase();
+                      const parent = current.parentElement;
+                      if (parent) {
+                        const siblings = Array.from(parent.children).filter((item) => item.tagName === current.tagName);
+                        if (siblings.length > 1) {
+                          part += `:nth-of-type(${siblings.indexOf(current) + 1})`;
+                        }
+                      }
+                      parts.unshift(part);
+                      current = parent;
+                    }
+                    return parts.join(' > ');
+                  };
+
+                  const roleOf = (el) => {
+                    const explicitRole = normalize(el.getAttribute('role') || '').toLowerCase();
+                    if (explicitRole) return explicitRole;
+                    const tag = el.tagName.toLowerCase();
+                    const type = normalize(el.getAttribute('type') || '').toLowerCase();
+                    if (tag === 'a') return 'link';
+                    if (tag === 'button') return 'button';
+                    if (tag === 'select') return 'combobox';
+                    if (tag === 'textarea') return 'textbox';
+                    if (tag === 'input') {
+                      if (['submit', 'button', 'reset'].includes(type)) return 'button';
+                      if (type === 'search') return 'searchbox';
+                      if (type === 'checkbox') return 'checkbox';
+                      if (type === 'radio') return 'radio';
+                      return 'textbox';
+                    }
+                    return tag;
+                  };
+
+                  const elementTypeOf = (el) => {
+                    const tag = el.tagName.toLowerCase();
+                    const type = normalize(el.getAttribute('type') || '').toLowerCase();
+                    if (tag === 'a') return 'link';
+                    if (tag === 'button') return 'button';
+                    if (tag === 'select') return 'select';
+                    if (tag === 'textarea') return 'textarea';
+                    if (tag === 'input' && type) return type;
+                    return tag;
+                  };
+
+                  const regionOf = (el) => {
+                    if (!el) return 'body';
+                    const pairs = [
+                      ['main, [role="main"]', 'main'],
+                      ['header, [role="banner"]', 'header'],
+                      ['footer, [role="contentinfo"]', 'footer'],
+                      ['nav, [role="navigation"]', 'navigation'],
+                      ['aside, [role="complementary"]', 'aside'],
+                      ['dialog, [role="dialog"], [aria-modal="true"], .modal, .dialog', 'modal'],
+                      ['form', 'form'],
+                    ];
+                    for (const [selector, name] of pairs) {
+                      const region = el.closest(selector);
+                      if (region) return name;
+                    }
+                    return 'body';
+                  };
+
+                  const isDisabled = (element) => {
+                    if (!element) return true;
+                    const ariaDisabled = normalize(element.getAttribute('aria-disabled') || '').toLowerCase();
+                    return !!(
+                      element.disabled ||
+                      ariaDisabled === 'true' ||
+                      element.classList.contains('disabled') ||
+                      element.classList.contains('is-disabled')
+                    );
+                  };
+
+                  const findVisibleAction = (selectors, matcher = null) => {
+                    for (const selector of selectors) {
+                      for (const element of Array.from(document.querySelectorAll(selector))) {
+                        if (!isVisible(element) || isDisabled(element)) continue;
+                        if (typeof matcher === 'function' && !matcher(element)) continue;
+                        return element;
+                      }
+                    }
+                    return null;
+                  };
+
+                  const searchEngineHosts = ['google.com', 'bing.com', 'duckduckgo.com', 'baidu.com', 'sogou.com'];
+                  const isSearchHost = searchEngineHosts.some((host) => currentHost === host || currentHost.endsWith(`.${host}`));
+
+                  const nodes = Array.from(document.querySelectorAll(
+                    'a[href], button, input, textarea, select, [role="button"], [role="link"], [role="textbox"], [contenteditable="true"]'
+                  )).filter((element) => isVisible(element)).slice(0, maxElements);
+
+                  const entries = nodes.map((element, index) => {
+                    const rect = element.getBoundingClientRect();
+                    const text = normalize(
+                      element.innerText ||
+                      element.textContent ||
+                      element.value ||
+                      element.getAttribute('aria-label') ||
+                      element.getAttribute('title') ||
+                      element.getAttribute('placeholder') ||
+                      ''
+                    ).slice(0, 220);
+                    const payload = {
+                      ref: `el_${index + 1}`,
+                      role: roleOf(element),
+                      tag: element.tagName.toLowerCase(),
+                      type: elementTypeOf(element),
+                      text,
+                      href: element.href || element.getAttribute('href') || '',
+                      value: typeof element.value === 'string' ? String(element.value || '').slice(0, 220) : '',
+                      label: labelOf(element).slice(0, 220),
+                      placeholder: normalize(element.getAttribute('placeholder') || '').slice(0, 220),
+                      selector: selectorOf(element),
+                      visible: true,
+                      enabled: !element.disabled,
+                      region: regionOf(element),
+                      parent_ref: '',
+                      bbox: {
+                        x: Math.round(rect.x),
+                        y: Math.round(rect.y),
+                        width: Math.round(rect.width),
+                        height: Math.round(rect.height),
+                      },
+                    };
+                    return { node: element, payload };
+                  });
+
+                  const nodeToPayload = new Map(entries.map((entry) => [entry.node, entry.payload]));
+                  const nodeToRef = new Map(entries.map((entry) => [entry.node, entry.payload.ref]));
+
+                  const inferPageType = () => {
+                    if (document.querySelector('dialog[open], [role="dialog"], [aria-modal="true"], .modal.show, .dialog')) {
+                      return 'modal';
+                    }
+                    if (isSearchHost) return 'serp';
+                    if (document.querySelector('input[type="password"]')) return 'login';
+                    const forms = document.querySelectorAll('form');
+                    if (forms.length && document.querySelectorAll('input, textarea, select').length >= 2) return 'form';
+                    if (document.querySelector('article h1, main h1, article time, article [datetime]')) return 'detail';
+                    const listCandidates = document.querySelectorAll('main li, main article, [role="main"] li, [role="main"] article, table tbody tr');
+                    if (listCandidates.length >= 4) return 'list';
+                    if (document.querySelector('article, main, [role="main"]')) return 'detail';
+                    return 'unknown';
+                  };
+
+                  const cards = [];
+                  if (includeCards && isSearchHost) {
+                    const selectorMap = {
+                      'bing.com': ['li.b_algo', '.b_news li', '.b_ans'],
+                      'google.com': ['div.g', '.tF2Cxc', '[data-sokoban-container]'],
+                      'baidu.com': ['.result', '.c-container', '.result-op'],
+                      'duckduckgo.com': ['[data-testid="result"]', '.result'],
+                      'sogou.com': ['.vrwrap', '.rb', '.results .fb'],
+                    };
+                    let selectors = ['main a[href]'];
+                    for (const [host, values] of Object.entries(selectorMap)) {
+                      if (currentHost === host || currentHost.endsWith(`.${host}`)) {
+                        selectors = values;
+                        break;
+                      }
+                    }
+
+                    const seen = new Set();
+                    let rank = 0;
+                    const buildCard = (container, anchor) => {
+                      if (!container || !anchor || !isVisible(container) || !isVisible(anchor)) return false;
+                      const href = anchor.href || anchor.getAttribute('href') || '';
+                      if (!href || /^javascript:/i.test(href)) return false;
+
+                      let host = '';
+                      try {
+                        host = cleanHost(new URL(href, location.href).hostname);
+                      } catch (_error) {
+                        return false;
+                      }
+                      if (!host || host === currentHost) return false;
+
+                      const titleNode = container.querySelector('h1, h2, h3') || anchor;
+                      const title = normalize(
+                        titleNode?.innerText ||
+                        titleNode?.textContent ||
+                        anchor.getAttribute('aria-label') ||
+                        anchor.getAttribute('title') ||
+                        ''
+                      );
+                      if (title.length < 3) return false;
+
+                      const snippetNode = container.querySelector(
+                        '.b_caption p, .snippet, .st, .c-abstract, .compText, p, [data-testid="result-snippet"]'
+                      );
+                      const sourceNode = container.querySelector(
+                        'cite, .cite, .b_attribution, .source, .news-source, [data-testid="result-source"]'
+                      );
+                      const dateNode = container.querySelector('time, .news-date, .timestamp, .date');
+                      let snippet = normalize(snippetNode?.innerText || snippetNode?.textContent || '');
+                      if (!snippet) {
+                        snippet = normalize((container.innerText || container.textContent || '').replace(title, ''));
+                      }
+                      const source = normalize(sourceNode?.innerText || sourceNode?.textContent || '');
+                      const date = normalize(dateNode?.innerText || dateNode?.textContent || '');
+                      const key = `${title}|${href}`;
+                      if (seen.has(key)) return false;
+                      seen.add(key);
+
+                      rank += 1;
+                      const cardRef = `card_${rank}`;
+                      const targetPayload = nodeToPayload.get(anchor);
+                      if (targetPayload) {
+                        targetPayload.parent_ref = cardRef;
+                      }
+                      for (const entry of entries) {
+                        if (!entry.payload.parent_ref && container.contains(entry.node)) {
+                          entry.payload.parent_ref = cardRef;
+                        }
+                      }
+                      cards.push({
+                        ref: cardRef,
+                        card_type: 'search_result',
+                        title: title.slice(0, 240),
+                        source: source.slice(0, 120),
+                        snippet: snippet.slice(0, 400),
+                        date: date.slice(0, 80),
+                        host,
+                        link: href,
+                        rank,
+                        target_ref: targetPayload ? targetPayload.ref : '',
+                        target_selector: selectorOf(anchor),
+                      });
+                      return true;
+                    };
+
+                    const candidateContainers = Array.from(document.querySelectorAll(selectors.join(', ')));
+                    for (const container of candidateContainers) {
+                      if (!isVisible(container)) continue;
+                      const anchor = container.matches('a[href]')
+                        ? container
+                        : container.querySelector('h2 a, h3 a, a[href]');
+                      if (buildCard(container, anchor) && cards.length >= 10) break;
+                    }
+
+                    if (!cards.length) {
+                      const fallbackContainers = Array.from(document.querySelectorAll(
+                        'main li, main article, main section, main div, [role="main"] li, [role="main"] article, [role="main"] section, [role="main"] div'
+                      ));
+                      for (const container of fallbackContainers) {
+                        if (!isVisible(container)) continue;
+                        if (container.closest('nav, header, footer, aside, form, dialog, [role="dialog"], [aria-modal="true"]')) {
+                          continue;
+                        }
+                        const containerText = normalize(container.innerText || container.textContent || '');
+                        if (containerText.length < 12) continue;
+
+                        const anchor = Array.from(container.querySelectorAll('a[href]')).find((candidate) => {
+                          if (!isVisible(candidate)) return false;
+                          const candidateText = normalize(
+                            candidate.innerText ||
+                            candidate.textContent ||
+                            candidate.getAttribute('aria-label') ||
+                            candidate.getAttribute('title') ||
+                            ''
+                          );
+                          if (candidateText.length < 3) return false;
+                          const href = candidate.href || candidate.getAttribute('href') || '';
+                          if (!href || /^javascript:/i.test(href)) return false;
+                          try {
+                            const host = cleanHost(new URL(href, location.href).hostname);
+                            return !!host && host !== currentHost;
+                          } catch (_error) {
+                            return false;
+                          }
+                        });
+                        if (buildCard(container, anchor) && cards.length >= 10) break;
+                      }
+                    }
+                  }
+
+                  const buildCollection = (kind, nodes, prefix) => {
+                    const visibleNodes = nodes.filter((node) => isVisible(node));
+                    if (!visibleNodes.length) return null;
+                    const sampleTexts = [];
+                    for (const node of visibleNodes) {
+                      const text = normalize(node.innerText || node.textContent || '');
+                      if (text && !sampleTexts.includes(text)) {
+                        sampleTexts.push(text.slice(0, 200));
+                      }
+                      if (sampleTexts.length >= 5) break;
+                    }
+                    return {
+                      ref: `${prefix}_${kind}`,
+                      kind,
+                      item_count: visibleNodes.length,
+                      sample_items: sampleTexts,
+                    };
+                  };
+
+                  const inferRegionKind = (element) => {
+                    if (!element) return 'section';
+                    if (element.matches('dialog, [role="dialog"], [aria-modal="true"], .modal, .dialog')) return 'modal';
+                    if (element.matches('nav, [role="navigation"]')) return 'navigation';
+                    if (element.matches('form')) return 'form';
+                    const tableRows = element.querySelectorAll('table tbody tr, tbody tr, tr').length;
+                    if (element.matches('table') || tableRows >= 3) return 'table';
+                    const listItems = element.querySelectorAll('li, article, [role="listitem"], [data-testid*="result"], .result, .item').length;
+                    if (element.matches('ul, ol') || listItems >= 4) return 'list';
+                    if (element.matches('article') || element.querySelector('h1, h2, time, [datetime]')) return 'detail';
+                    if (element.matches('main, [role="main"]')) return 'main';
+                    if (element.matches('aside, [role="complementary"]')) return 'aside';
+                    if (element.matches('section')) return 'section';
+                    return regionOf(element);
+                  };
+
+                  const regionMetrics = (element) => {
+                    const rect = element.getBoundingClientRect();
+                    const text = normalize(element.innerText || element.textContent || '');
+                    const headingNode = element.querySelector('h1, h2, h3, legend, caption, th');
+                    const heading = normalize(
+                      headingNode?.innerText ||
+                      headingNode?.textContent ||
+                      element.getAttribute('aria-label') ||
+                      element.getAttribute('title') ||
+                      ''
+                    );
+                    const listItems = Array.from(
+                      element.querySelectorAll('li, article, [role="listitem"], table tbody tr, tbody tr')
+                    ).filter((node) => isVisible(node)).length;
+                    const links = Array.from(element.querySelectorAll('a[href]')).filter((node) => isVisible(node)).length;
+                    const controls = Array.from(
+                      element.querySelectorAll('input, textarea, select, button, [role="button"], [contenteditable="true"]')
+                    ).filter((node) => isVisible(node)).length;
+                    const samples = [];
+                    for (const sampleNode of Array.from(
+                      element.querySelectorAll('h1, h2, h3, li, article, p, table tbody tr, tbody tr, figcaption')
+                    )) {
+                      if (!isVisible(sampleNode)) continue;
+                      const sampleText = normalize(sampleNode.innerText || sampleNode.textContent || '');
+                      if (!sampleText || samples.includes(sampleText)) continue;
+                      samples.push(sampleText.slice(0, 160));
+                      if (samples.length >= 3) break;
+                    }
+                    const kind = inferRegionKind(element);
+                    let score = Math.min(Math.round((rect.width * rect.height) / 40000), 8);
+                    score += Math.min(Math.round(text.length / 120), 6);
+                    score += Math.min(listItems, 6);
+                    score += Math.min(links, 4);
+                    score += Math.min(controls, 3);
+                    if (heading) score += 2;
+                    if (kind === 'detail') score += 3;
+                    if (kind === 'table' || kind === 'list') score += 2;
+                    if (kind === 'main') score += 2;
+                    if (kind === 'navigation') score -= 2;
+                    return {
+                      node: element,
+                      score,
+                      kind,
+                      selector: selectorOf(element),
+                      text_sample: text.slice(0, 320),
+                      heading: heading.slice(0, 160),
+                      text_length: text.length,
+                      item_count: listItems,
+                      link_count: links,
+                      control_count: controls,
+                      region: regionOf(element),
+                      bbox: {
+                        x: Math.round(rect.x),
+                        y: Math.round(rect.y),
+                        width: Math.round(rect.width),
+                        height: Math.round(rect.height),
+                      },
+                      sample_items: samples,
+                    };
+                  };
+
+                  const rawRegions = Array.from(document.querySelectorAll(
+                    'main, [role="main"], article, section, form, table, ul, ol, nav, aside, dialog[open], [role="dialog"], [aria-modal="true"]'
+                  ))
+                    .filter((element) => {
+                      if (!isVisible(element)) return false;
+                      const metrics = regionMetrics(element);
+                      if (!metrics.text_sample && metrics.control_count === 0 && metrics.link_count === 0) return false;
+                      if (metrics.kind === 'navigation' && metrics.link_count < 3) return false;
+                      if (metrics.kind === 'section' && metrics.text_length < 80 && metrics.item_count < 2) return false;
+                      return true;
+                    })
+                    .map((element) => regionMetrics(element))
+                    .sort((left, right) => right.score - left.score);
+
+                  const regions = [];
+                  const regionEntries = [];
+                  for (const metrics of rawRegions) {
+                    const overlapsExisting = regionEntries.some((existing) => {
+                      if (!existing || !existing.node) return false;
+                      if (!existing.node.contains(metrics.node)) return false;
+                      if (existing.kind === metrics.kind) return true;
+                      const maxLength = Math.max(existing.text_length || 0, metrics.text_length || 0, 1);
+                      return Math.min(existing.text_length || 0, metrics.text_length || 0) / maxLength >= 0.75;
+                    });
+                    if (overlapsExisting) continue;
+                    regionEntries.push(metrics);
+                    regions.push({
+                      ref: `region_${regions.length + 1}`,
+                      kind: metrics.kind,
+                      selector: metrics.selector,
+                      heading: metrics.heading,
+                      text_sample: metrics.text_sample,
+                      sample_items: metrics.sample_items,
+                      item_count: metrics.item_count,
+                      link_count: metrics.link_count,
+                      control_count: metrics.control_count,
+                      region: metrics.region,
+                      bbox: metrics.bbox,
+                    });
+                    if (regions.length >= 8) break;
+                  }
+
+                  const collections = [];
+                  const tableRows = Array.from(
+                    document.querySelectorAll('main table tbody tr, [role="main"] table tbody tr, table tbody tr')
+                  ).filter((node) => isVisible(node));
+                  if (tableRows.length >= 2) {
+                    const tableCollection = buildCollection('table', tableRows, 'collection_1');
+                    if (tableCollection) collections.push(tableCollection);
+                  }
+
+                  const listItems = Array.from(
+                    document.querySelectorAll('main li, article li, [role="main"] li, section li, main article, [role="main"] article')
+                  ).filter((node) => isVisible(node));
+                  if (listItems.length >= 4) {
+                    const listCollection = buildCollection('list', listItems, 'collection_2');
+                    if (listCollection) collections.push(listCollection);
+                  }
+
+                  const nextPageElement = findVisibleAction(
+                    [
+                      'a[rel="next"]',
+                      'button[rel="next"]',
+                      'a[aria-label*="next" i]',
+                      'button[aria-label*="next" i]',
+                      'a[aria-label*="下一页"]',
+                      'button[aria-label*="下一页"]',
+                      '.pagination a',
+                      '.pagination button',
+                      '.pager a',
+                      '.pager button',
+                      '[class*="pagination"] a',
+                      '[class*="pagination"] button',
+                      '[class*="pager"] a',
+                      '[class*="pager"] button',
+                    ],
+                    (element) => /^(next|>|»|下一页|下页)$/i.test(normalize(element.innerText || element.textContent || element.getAttribute('aria-label') || ''))
+                      || /next|下一页|pager-next|pagination-next/i.test(
+                        `${normalize(element.className || '')} ${normalize(element.getAttribute('aria-label') || '')}`
+                      )
+                  );
+
+                  const loadMoreElement = findVisibleAction(
+                    [
+                      'button',
+                      'a',
+                      '[role="button"]',
+                    ],
+                    (element) => /(load more|show more|view more|more results|加载更多|查看更多|更多|展开更多)/i.test(
+                      normalize(element.innerText || element.textContent || element.getAttribute('aria-label') || '')
+                    )
+                  );
+
+                  const searchInputElement = findVisibleAction([
+                    'input[type="search"]',
+                    'input[name*="search" i]',
+                    'input[placeholder*="search" i]',
+                    'input[placeholder*="搜索"]',
+                  ]);
+
+                  const modalRoot = findVisibleAction([
+                    'dialog[open]',
+                    '[role="dialog"]',
+                    '[aria-modal="true"]',
+                    '.modal.show',
+                    '.dialog',
+                    '[class*="modal"]',
+                    '[class*="dialog"]',
+                  ]);
+
+                  const findModalAction = (patterns) => {
+                    if (!modalRoot) return null;
+                    const candidates = Array.from(modalRoot.querySelectorAll('button, a[href], [role="button"], input[type="button"], input[type="submit"]'));
+                    for (const element of candidates) {
+                      if (!isVisible(element) || isDisabled(element)) continue;
+                      const text = normalize(
+                        element.innerText ||
+                        element.textContent ||
+                        element.getAttribute('aria-label') ||
+                        element.getAttribute('title') ||
+                        element.getAttribute('value') ||
+                        ''
+                      );
+                      if (!text) continue;
+                      if (patterns.some((pattern) => pattern.test(text))) {
+                        return element;
+                      }
+                    }
+                    return null;
+                  };
+
+                  const modalPrimaryElement = findModalAction([
+                    /accept/i, /agree/i, /allow/i, /continue/i, /ok/i, /okay/i, /got it/i,
+                    /同意/, /接受/, /允许/, /继续/, /确定/, /好的/, /知道了/,
+                  ]);
+                  const modalSecondaryElement = findModalAction([
+                    /reject/i, /decline/i, /deny/i, /not now/i, /skip/i, /later/i,
+                    /拒绝/, /暂不/, /稍后/, /跳过/, /关闭/, /取消/,
+                  ]);
+                  const modalCloseElement = findModalAction([
+                    /^×$/, /^x$/i, /close/i, /dismiss/i, /cancel/i, /关闭/, /取消/, /知道了/,
+                  ]);
+
+                  const controls = [];
+                  const registerControl = (kind, element, defaultSelector) => {
+                    if (!element) return;
+                    controls.push({
+                      ref: nodeToRef.get(element) || `ctl_${kind}`,
+                      kind,
+                      text: normalize(
+                        element.innerText ||
+                        element.textContent ||
+                        element.getAttribute('aria-label') ||
+                        element.getAttribute('placeholder') ||
+                        ''
+                      ).slice(0, 120),
+                      selector: nodeToPayload.get(element)?.selector || defaultSelector || selectorOf(element),
+                    });
+                  };
+
+                  registerControl('next_page', nextPageElement, '.pagination .next');
+                  registerControl('load_more', loadMoreElement, 'button');
+                  registerControl('search_input', searchInputElement, 'input[type="search"]');
+                  registerControl('modal_primary', modalPrimaryElement, 'dialog button');
+                  registerControl('modal_secondary', modalSecondaryElement, 'dialog button');
+                  registerControl('modal_close', modalCloseElement, 'dialog button');
+
+                  return {
+                    url: location.href,
+                    title: document.title || '',
+                    page_type: inferPageType(),
+                    regions,
+                    elements: entries.map((entry) => entry.payload),
+                    cards,
+                    collections,
+                    controls,
+                    affordances: {
+                      has_search_box: !!searchInputElement,
+                      search_input_ref: searchInputElement ? (nodeToRef.get(searchInputElement) || 'ctl_search_input') : '',
+                      search_input_selector: searchInputElement ? (nodeToPayload.get(searchInputElement)?.selector || selectorOf(searchInputElement)) : '',
+                      has_pagination: !!nextPageElement || !!document.querySelector('.pagination, .pager, [class*="page-"], a[href*="page="]'),
+                      next_page_ref: nextPageElement ? (nodeToRef.get(nextPageElement) || 'ctl_next_page') : '',
+                      next_page_selector: nextPageElement ? (nodeToPayload.get(nextPageElement)?.selector || selectorOf(nextPageElement)) : '',
+                      has_load_more: !!loadMoreElement,
+                      load_more_ref: loadMoreElement ? (nodeToRef.get(loadMoreElement) || 'ctl_load_more') : '',
+                      load_more_selector: loadMoreElement ? (nodeToPayload.get(loadMoreElement)?.selector || selectorOf(loadMoreElement)) : '',
+                      has_modal: !!modalRoot,
+                      modal_primary_ref: modalPrimaryElement ? (nodeToRef.get(modalPrimaryElement) || 'ctl_modal_primary') : '',
+                      modal_primary_selector: modalPrimaryElement ? (nodeToPayload.get(modalPrimaryElement)?.selector || selectorOf(modalPrimaryElement)) : '',
+                      modal_secondary_ref: modalSecondaryElement ? (nodeToRef.get(modalSecondaryElement) || 'ctl_modal_secondary') : '',
+                      modal_secondary_selector: modalSecondaryElement ? (nodeToPayload.get(modalSecondaryElement)?.selector || selectorOf(modalSecondaryElement)) : '',
+                      modal_close_ref: modalCloseElement ? (nodeToRef.get(modalCloseElement) || 'ctl_modal_close') : '',
+                      modal_close_selector: modalCloseElement ? (nodeToPayload.get(modalCloseElement)?.selector || selectorOf(modalCloseElement)) : '',
+                      has_login_form: !!document.querySelector('input[type="password"]'),
+                      has_results: cards.length > 0,
+                      collection_item_count: collections.reduce((max, item) => Math.max(max, Number(item.item_count || 0)), cards.length),
+                    },
+                  };
+                }
+                """,
+                {"max_elements": max_elements, "include_cards": include_cards},
+            )
+            snapshot = payload if isinstance(payload, dict) else {}
+            ref_map: Dict[str, Dict[str, Any]] = {}
+            for item in snapshot.get("elements", []) or []:
+                ref = str(item.get("ref", "") or "").strip()
+                if ref:
+                    ref_map[ref] = {
+                        "selector": str(item.get("selector", "") or ""),
+                        "role": str(item.get("role", "") or ""),
+                        "text": str(item.get("text", "") or ""),
+                        "label": str(item.get("label", "") or ""),
+                        "placeholder": str(item.get("placeholder", "") or ""),
+                        "value": str(item.get("value", "") or ""),
+                        "href": str(item.get("href", "") or ""),
+                        "type": str(item.get("type", "") or ""),
+                    }
+            for card in snapshot.get("cards", []) or []:
+                ref = str(card.get("ref", "") or "").strip()
+                if ref:
+                    ref_map[ref] = {
+                        "selector": str(card.get("target_selector", "") or ""),
+                        "role": "link",
+                        "text": str(card.get("title", "") or ""),
+                        "label": str(card.get("title", "") or ""),
+                        "placeholder": "",
+                        "value": "",
+                        "href": str(card.get("link", "") or ""),
+                        "type": "card",
+                        "target_ref": str(card.get("target_ref", "") or ""),
+                    }
+            for control in snapshot.get("controls", []) or []:
+                ref = str(control.get("ref", "") or "").strip()
+                if not ref:
+                    continue
+                ref_map[ref] = {
+                    "selector": str(control.get("selector", "") or ""),
+                    "role": "textbox" if str(control.get("kind", "") or "") == "search_input" else "button",
+                    "text": str(control.get("text", "") or ""),
+                    "label": str(control.get("text", "") or ""),
+                    "placeholder": str(control.get("text", "") or ""),
+                    "value": "",
+                    "href": "",
+                    "type": str(control.get("kind", "") or "control"),
+                }
+            for region in snapshot.get("regions", []) or []:
+                ref = str(region.get("ref", "") or "").strip()
+                if not ref:
+                    continue
+                ref_map[ref] = {
+                    "selector": str(region.get("selector", "") or ""),
+                    "role": "region",
+                    "text": str(region.get("heading", "") or region.get("text_sample", "") or ""),
+                    "label": str(region.get("heading", "") or ""),
+                    "placeholder": "",
+                    "value": "",
+                    "href": "",
+                    "type": str(region.get("kind", "") or "region"),
+                }
+            self._semantic_ref_map = ref_map
+            return ToolkitResult(success=True, data=snapshot)
+        except Exception as e:
+            return ToolkitResult(success=False, error=str(e))
+
+    def resolve_ref(self, ref: str) -> Dict[str, Any]:
+        return dict(self._semantic_ref_map.get(str(ref or "").strip(), {}))
+
+    async def click_ref(self, ref: str, timeout: int = None) -> ToolkitResult:
+        info = self.resolve_ref(ref)
+        if not info:
+            return ToolkitResult(success=False, error=f"unknown ref: {ref}")
+
+        target_ref = str(info.get("target_ref", "") or "").strip()
+        if target_ref and target_ref != str(ref).strip():
+            nested = await self.click_ref(target_ref, timeout=timeout)
+            if nested.success:
+                return nested
+
+        selector = str(info.get("selector", "") or "")
+        if selector:
+            direct = await self.click(selector, timeout=timeout)
+            if direct.success:
+                return direct
+
+        role = str(info.get("role", "") or "")
+        for label in [info.get("label", ""), info.get("text", "")]:
+            label_value = str(label or "").strip()[:80]
+            if role and label_value:
+                by_role = await self.click_by_role(role, label_value, timeout=timeout)
+                if by_role.success:
+                    return by_role
+            if label_value:
+                by_label = await self.click_by_label(label_value, timeout=timeout)
+                if by_label.success:
+                    return by_label
+
+        if selector:
+            locator = await self.locator_click(selector, timeout=timeout)
+            if locator.success:
+                return locator
+            forced = await self.force_click(selector, timeout=timeout)
+            if forced.success:
+                return forced
+
+        return ToolkitResult(success=False, error=f"failed to click ref: {ref}")
+
+    async def input_ref(self, ref: str, value: str, timeout: int = None) -> ToolkitResult:
+        info = self.resolve_ref(ref)
+        if not info:
+            return ToolkitResult(success=False, error=f"unknown ref: {ref}")
+
+        selector = str(info.get("selector", "") or "")
+        if selector:
+            direct = await self.input_text(selector, value, timeout=timeout)
+            if direct.success:
+                return direct
+
+        for placeholder in [info.get("placeholder", ""), info.get("label", ""), info.get("text", "")]:
+            key = str(placeholder or "").strip()[:80]
+            if not key:
+                continue
+            by_placeholder = await self.fill_by_placeholder(key, value, timeout=timeout)
+            if by_placeholder.success:
+                return by_placeholder
+            by_label = await self.fill_by_label(key, value, timeout=timeout)
+            if by_label.success:
+                return by_label
+
+        if selector:
+            typed = await self.type_text(selector, value, timeout=timeout)
+            if typed.success:
+                return typed
+
+        return ToolkitResult(success=False, error=f"failed to input ref: {ref}")
+
+    async def select_ref(self, ref: str, value: str, timeout: int = None) -> ToolkitResult:
+        info = self.resolve_ref(ref)
+        selector = str(info.get("selector", "") or "")
+        if not selector:
+            return ToolkitResult(success=False, error=f"unknown ref: {ref}")
+        return await self.select_option(selector, value, timeout=timeout)
+
+    async def wait_for_url_change(self, previous_url: str, timeout: int = None) -> ToolkitResult:
+        try:
+            timeout_ms = timeout if timeout is not None else settings.BROWSER_NAVIGATION_TIMEOUT
+            await self._page.wait_for_function(
+                "(expected) => window.location.href !== expected",
+                previous_url,
+                timeout=self._timeout(timeout_ms),
+            )
+            return ToolkitResult(success=True, data=self._page.url)
+        except Exception as e:
+            return ToolkitResult(success=False, error=str(e))
+
+    async def wait_for_text_appear(self, text: str, timeout: int = None) -> ToolkitResult:
+        try:
+            timeout_ms = timeout if timeout is not None else settings.BROWSER_SELECTOR_TIMEOUT
+            await self._page.wait_for_function(
+                "(expected) => document.body && document.body.innerText && document.body.innerText.includes(expected)",
+                text,
+                timeout=self._timeout(timeout_ms),
+            )
+            return ToolkitResult(success=True)
+        except Exception as e:
+            return ToolkitResult(success=False, error=str(e))
+
+    async def wait_for_page_type_change(self, previous_page_type: str, timeout: int = None) -> ToolkitResult:
+        timeout_ms = timeout if timeout is not None else settings.BROWSER_NAVIGATION_TIMEOUT
+        deadline = asyncio.get_running_loop().time() + (self._timeout(timeout_ms) / 1000)
+        while asyncio.get_running_loop().time() < deadline:
+            snapshot = await self.semantic_snapshot()
+            if snapshot.success:
+                current_type = str((snapshot.data or {}).get("page_type", "") or "")
+                if current_type and current_type != previous_page_type:
+                    return ToolkitResult(success=True, data=current_type)
+            await asyncio.sleep(0.2)
+        return ToolkitResult(success=False, error="page type unchanged")

@@ -1,0 +1,41 @@
+{
+  "before": {
+    "url": "https://www.bing.com/search?q=openai+api&rdr=1&rdrig=168C945439C642609C327D42DFAED3BC",
+    "title": "openai api - 搜索",
+    "content_len": 183360,
+    "content_hash": "78ae5e2c31fac9327361046ad25b1de402224854",
+    "page_type": "modal",
+    "card_count": 0,
+    "item_count": 0,
+    "has_modal": false,
+    "has_pagination": false,
+    "has_load_more": true
+  },
+  "after": {
+    "url": "https://www.bing.com/search?q=openai+api&rdr=1&rdrig=168C945439C642609C327D42DFAED3BC",
+    "title": "openai api - 搜索",
+    "content_len": 186199,
+    "content_hash": "78ae5e2c31fac9327361046ad25b1de402224854",
+    "page_type": "modal",
+    "card_count": 0,
+    "item_count": 0,
+    "has_modal": false,
+    "has_pagination": false,
+    "has_load_more": true
+  },
+  "action": {
+    "action_type": "scroll",
+    "target_selector": "",
+    "target_ref": "",
+    "value": "800",
+    "description": "Scroll down 800 pixels to trigger lazy loading of search results",
+    "confidence": 0.85,
+    "requires_confirmation": false,
+    "fallback_selector": "",
+    "use_keyboard_fallback": false,
+    "keyboard_key": "",
+    "expected_page_type": "serp",
+    "expected_text": ""
+  },
+  "result": true
+}

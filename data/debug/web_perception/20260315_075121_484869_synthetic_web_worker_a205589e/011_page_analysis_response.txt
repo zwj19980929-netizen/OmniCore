@@ -1,0 +1,1 @@
+{"success": true, "item_selector": "article.Box-row", "fields": {"title": "h2 a", "link": "h2 a", "description": "p", "stars": "span"}}

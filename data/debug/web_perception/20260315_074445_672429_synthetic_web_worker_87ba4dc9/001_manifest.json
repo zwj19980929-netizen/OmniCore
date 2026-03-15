@@ -1,0 +1,8 @@
+{
+  "trace_id": "20260315_074445_672429_synthetic_web_worker_87ba4dc9",
+  "scope": "synthetic_web_worker",
+  "created_at": "2026-03-15T07:44:45.672773Z",
+  "metadata": {
+    "task": "提取今日热门仓库的名称、描述和星标数"
+  }
+}

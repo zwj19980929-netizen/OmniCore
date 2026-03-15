@@ -248,6 +248,29 @@ def _register_builtin_tools(registry: ToolRegistry) -> None:
             max_parallelism=4,
         )
     )
+    # 🔥 新增：增强版 Web Worker（三层感知架构）
+    registry.register(
+        RegisteredTool(
+            spec=ToolSpec(
+                name="web.smart_extract",
+                task_type="enhanced_web_worker",
+                description="Enhanced web extraction with three-layer perception (understand → generate selectors → extract). Better for complex pages.",
+                risk_level="low",
+                tags=["web", "scraping", "enhanced", "perception"],
+                input_schema={
+                    "type": "object",
+                    "properties": {
+                        "task": {"type": "string"},
+                        "url": {"type": "string"},
+                        "limit": {"type": "integer"},
+                        "headless": {"type": "boolean"},
+                    },
+                },
+            ),
+            adapter_name="enhanced_web_worker",
+            max_parallelism=2,
+        )
+    )
     registry.register(
         RegisteredTool(
             spec=ToolSpec(

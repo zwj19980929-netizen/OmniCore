@@ -1,0 +1,27 @@
+{
+  "queries": [
+    "合肥 明天 天气",
+    "合肥的明天 2026-03-16 天气 relevant city weather forecast page"
+  ],
+  "cards": [
+    {
+      "title": "Google Search",
+      "link": "https://www.google.com/search?q=合肥的明天 2026-03-16 天气 relevant city weather forecast page",
+      "url": "https://www.google.com/search?q=合肥的明天 2026-03-16 天气 relevant city weather forecast page",
+      "snippet": "Fallback to Google search",
+      "source": "google"
+    },
+    {
+      "title": "Google Search",
+      "link": "https://www.google.com/search?q=合肥 明天 天气",
+      "url": "https://www.google.com/search?q=合肥 明天 天气",
+      "snippet": "Fallback to Google search",
+      "source": "google"
+    }
+  ],
+  "urls": [
+    "https://www.google.com/search?q=合肥的明天 2026-03-16 天气 relevant city weather forecast page",
+    "https://www.google.com/search?q=合肥 明天 天气"
+  ],
+  "serp_sufficient": false
+}

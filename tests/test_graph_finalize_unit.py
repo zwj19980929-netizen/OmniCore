@@ -1,3 +1,7 @@
+import ast
+from collections import Counter
+from pathlib import Path
+
 from core.graph import _repair_mojibake_text, finalize_node
 import core.graph as graph_module
 
@@ -194,6 +198,75 @@ def test_finalize_node_prefers_user_facing_answer_for_completed_tasks(monkeypatc
     assert result["execution_status"] == "completed"
     assert result["final_output"].startswith("根据当前抓取到的最新信息")
     assert result["delivery_package"]["completed_task_count"] == 1
+
+
+def test_finalize_node_uses_deterministic_table_for_explicit_list_requests(monkeypatch):
+    class _ShouldNotCallLLM:
+        def __init__(self, *args, **kwargs):
+            raise AssertionError("LLMClient should not be called for explicit structured list output")
+
+    monkeypatch.setattr(graph_module, "LLMClient", _ShouldNotCallLLM)
+
+    state = {
+        "messages": [],
+        "user_input": "去 https://huggingface.co/models 抓取前 3 个模型的名称和链接",
+        "session_id": "session_list",
+        "job_id": "job_list",
+        "current_intent": "web_scraping",
+        "intent_confidence": 1.0,
+        "task_queue": [
+            {
+                "task_id": "task_1",
+                "task_type": "web_worker",
+                "tool_name": "web.fetch_and_extract",
+                "description": "从 Hugging Face 模型页面抓取前 3 个模型的名称和链接",
+                "params": {"limit": 3},
+                "status": "completed",
+                "result": {
+                    "success": True,
+                    "data": [
+                        {"title": "Model A", "url": "https://example.com/a"},
+                        {"name": "Model B", "link": "https://example.com/b"},
+                        {"title": "Model C", "url": "https://example.com/c"},
+                    ],
+                },
+                "priority": 10,
+            }
+        ],
+        "current_task_index": 0,
+        "shared_memory": {},
+        "artifacts": [],
+        "critic_feedback": "",
+        "critic_approved": True,
+        "human_approved": True,
+        "needs_human_confirm": False,
+        "error_trace": "",
+        "final_output": "",
+        "delivery_package": {},
+        "execution_status": "reviewing",
+        "replan_count": 0,
+        "validator_passed": True,
+    }
+
+    result = finalize_node(state)
+
+    assert result["execution_status"] == "completed"
+    assert "| 序号 | 标题 | 链接 |" in result["final_output"]
+    assert "| 1 | Model A | https://example.com/a |" in result["final_output"]
+    assert "| 2 | Model B | https://example.com/b |" in result["final_output"]
+    assert "| 3 | Model C | https://example.com/c |" in result["final_output"]
+
+
+def test_core_graph_has_no_duplicate_critical_top_level_functions():
+    tree = ast.parse(Path("core/graph.py").read_text(encoding="utf-8"))
+    counts = Counter(
+        node.name
+        for node in tree.body
+        if isinstance(node, ast.FunctionDef)
+    )
+
+    duplicates = {name: count for name, count in counts.items() if count > 1}
+    assert duplicates == {}
 
 
 def test_repair_mojibake_text_roundtrip_utf8_latin1():

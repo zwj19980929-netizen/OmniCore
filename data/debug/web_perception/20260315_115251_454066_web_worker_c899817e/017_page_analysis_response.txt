@@ -1,0 +1,23 @@
+
+
+Based on the page structure analysis, I can see this is a list page displaying models on Hugging Face. Let me extract the appropriate selectors:
+
+```json
+{
+    "success": true,
+    "page_type": "list",
+    "requires_navigation": false,
+    "navigation_reason": "",
+    "item_selector": "article, li, div[data-target*='model']",
+    "fields": {
+        "title": "h4.text-md.truncate",
+        "link": "a[href*='/models/']",
+        "date": "",
+        "severity": "",
+        "id": ""
+    },
+    "need_click_first": false,
+    "click_selector": "",
+    "notes": "Based on page structure overview, model names are in h4.text-md.truncate elements. The page shows 43 models in total. Each model entry should contain a link to its detail page via an anchor tag. The h4 elements contain the model names like 'Jackrong/Qwen3.5-27B-Claude-4.6-Opus-Reasoning-Distilled', 'fishaudio/s2-pro', etc."
+}
+```

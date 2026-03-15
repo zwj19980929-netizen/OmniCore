@@ -1,0 +1,3 @@
+
+
+{"page_relevant": true, "goal_satisfied": false, "reason": "页面是Bing搜索结果页面且URL正确包含openai+api查询，但页面显示无可见数据(No visible data)和无搜索结果卡片，说明搜索结果可能因懒加载或渲染延迟未被抓取。根据任务要求需要等待页面完全加载后滚动触发懒加载，然后使用多个选择器尝试提取结果。当前页面阶段为selecting_source，尚未完成提取任务。", "evidence_indexes": [], "confidence": 0.75, "action": {"type": "wait", "element_index": null, "target_ref": null, "target_selector": null, "value": null, "description": "等待搜索结果加载 - 页面显示无可见数据，需要等待Bing搜索结果完全渲染后进行提取", "fallback_selector": null, "use_keyboard": false, "keyboard_key": null, "expected_page_type": "serp", "expected_text": "搜索结果列表"}}

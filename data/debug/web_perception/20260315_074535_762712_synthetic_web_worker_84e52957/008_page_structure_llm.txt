@@ -1,0 +1,54 @@
+# 页面：Trending repositories on GitHub today
+URL: https://github.com/trending
+
+## 页面结构概览
+
+### 主要内容区域
+1. [article] repo 1 description and stars
+   选择器: article.Box-row:nth-of-type(1)
+2. [article] repo 2 description and stars
+   选择器: article.Box-row:nth-of-type(2)
+3. [article] repo 3 description and stars
+   选择器: article.Box-row:nth-of-type(3)
+4. [article] repo 4 description and stars
+   选择器: article.Box-row:nth-of-type(4)
+5. [article] repo 5 description and stars
+   选择器: article.Box-row:nth-of-type(5)
+6. [article] repo 6 description and stars
+   选择器: article.Box-row:nth-of-type(6)
+7. [article] repo 7 description and stars
+   选择器: article.Box-row:nth-of-type(7)
+8. [article] repo 8 description and stars
+   选择器: article.Box-row:nth-of-type(8)
+9. [article] repo 9 description and stars
+   选择器: article.Box-row:nth-of-type(9)
+10. [article] repo 10 description and stars
+   选择器: article.Box-row:nth-of-type(10)
+11. [article] repo 11 description and stars
+   选择器: article.Box-row:nth-of-type(11)
+12. [article] repo 12 description and stars
+   选择器: article.Box-row:nth-of-type(12)
+
+### 导航/菜单区域
+- Sign in Pricing Explore
+
+### 可交互元素
+- [link] repo 1 → article.Box-row:nth-of-type(1) h2 a
+- [link] repo 2 → article.Box-row:nth-of-type(2) h2 a
+- [link] repo 3 → article.Box-row:nth-of-type(3) h2 a
+- [link] repo 4 → article.Box-row:nth-of-type(4) h2 a
+- [link] repo 5 → article.Box-row:nth-of-type(5) h2 a
+- [link] repo 6 → article.Box-row:nth-of-type(6) h2 a
+- [link] repo 7 → article.Box-row:nth-of-type(7) h2 a
+- [link] repo 8 → article.Box-row:nth-of-type(8) h2 a
+- [link] repo 9 → article.Box-row:nth-of-type(9) h2 a
+- [link] repo 10 → article.Box-row:nth-of-type(10) h2 a
+- [link] repo 11 → article.Box-row:nth-of-type(11) h2 a
+- [link] repo 12 → article.Box-row:nth-of-type(12) h2 a
+- [link] repo 13 → article.Box-row:nth-of-type(13) h2 a
+- [link] repo 14 → article.Box-row:nth-of-type(14) h2 a
+- [link] repo 15 → article.Box-row:nth-of-type(15) h2 a
+- [link] repo 16 → article.Box-row:nth-of-type(16) h2 a
+- [link] repo 17 → article.Box-row:nth-of-type(17) h2 a
+- [link] repo 18 → article.Box-row:nth-of-type(18) h2 a
+- [link] repo 19 → article.Box-row:nth-of-type(19) h2 a

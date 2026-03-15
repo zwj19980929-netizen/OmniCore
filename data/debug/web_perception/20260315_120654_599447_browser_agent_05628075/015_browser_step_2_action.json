@@ -1,0 +1,14 @@
+{
+  "action_type": "click",
+  "target_selector": "div:nth-of-type(2) > label > div > div:nth-of-type(2) > button:nth-of-type(1)",
+  "target_ref": "",
+  "value": "",
+  "description": "click target 前10个模型的名称和链接",
+  "confidence": 0.82,
+  "requires_confirmation": false,
+  "fallback_selector": "",
+  "use_keyboard_fallback": false,
+  "keyboard_key": "",
+  "expected_page_type": "",
+  "expected_text": ""
+}

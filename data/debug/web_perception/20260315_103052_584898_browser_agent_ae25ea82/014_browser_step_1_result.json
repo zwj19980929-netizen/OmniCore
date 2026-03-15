@@ -1,0 +1,13 @@
+{
+  "step": 1,
+  "plan": "Scroll down 800 pixels to trigger lazy loading of search results",
+  "action": "scroll",
+  "observation": "success",
+  "decision": "continue",
+  "action_type": "scroll",
+  "selector": "",
+  "value": "800",
+  "description": "Scroll down 800 pixels to trigger lazy loading of search results",
+  "result": "success",
+  "url": "https://www.bing.com/search?q=openai+api&rdr=1&rdrig=168C945439C642609C327D42DFAED3BC"
+}

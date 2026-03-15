@@ -1,0 +1,199 @@
+{
+  "url": "https://github.com/trending",
+  "title": "Trending repositories on GitHub today",
+  "main_content_blocks": [
+    {
+      "block_type": "article",
+      "content": "repo 1 description and stars",
+      "selector": "article.Box-row:nth-of-type(1)",
+      "depth": 1,
+      "attributes": {}
+    },
+    {
+      "block_type": "article",
+      "content": "repo 2 description and stars",
+      "selector": "article.Box-row:nth-of-type(2)",
+      "depth": 1,
+      "attributes": {}
+    },
+    {
+      "block_type": "article",
+      "content": "repo 3 description and stars",
+      "selector": "article.Box-row:nth-of-type(3)",
+      "depth": 1,
+      "attributes": {}
+    },
+    {
+      "block_type": "article",
+      "content": "repo 4 description and stars",
+      "selector": "article.Box-row:nth-of-type(4)",
+      "depth": 1,
+      "attributes": {}
+    },
+    {
+      "block_type": "article",
+      "content": "repo 5 description and stars",
+      "selector": "article.Box-row:nth-of-type(5)",
+      "depth": 1,
+      "attributes": {}
+    },
+    {
+      "block_type": "article",
+      "content": "repo 6 description and stars",
+      "selector": "article.Box-row:nth-of-type(6)",
+      "depth": 1,
+      "attributes": {}
+    },
+    {
+      "block_type": "article",
+      "content": "repo 7 description and stars",
+      "selector": "article.Box-row:nth-of-type(7)",
+      "depth": 1,
+      "attributes": {}
+    },
+    {
+      "block_type": "article",
+      "content": "repo 8 description and stars",
+      "selector": "article.Box-row:nth-of-type(8)",
+      "depth": 1,
+      "attributes": {}
+    },
+    {
+      "block_type": "article",
+      "content": "repo 9 description and stars",
+      "selector": "article.Box-row:nth-of-type(9)",
+      "depth": 1,
+      "attributes": {}
+    },
+    {
+      "block_type": "article",
+      "content": "repo 10 description and stars",
+      "selector": "article.Box-row:nth-of-type(10)",
+      "depth": 1,
+      "attributes": {}
+    },
+    {
+      "block_type": "article",
+      "content": "repo 11 description and stars",
+      "selector": "article.Box-row:nth-of-type(11)",
+      "depth": 1,
+      "attributes": {}
+    },
+    {
+      "block_type": "article",
+      "content": "repo 12 description and stars",
+      "selector": "article.Box-row:nth-of-type(12)",
+      "depth": 1,
+      "attributes": {}
+    }
+  ],
+  "navigation_blocks": [
+    {
+      "block_type": "nav",
+      "content": "Sign in Pricing Explore",
+      "selector": "header nav",
+      "depth": 1,
+      "attributes": {}
+    }
+  ],
+  "interactive_elements": [
+    {
+      "type": "link",
+      "text": "repo 1",
+      "selector": "article.Box-row:nth-of-type(1) h2 a"
+    },
+    {
+      "type": "link",
+      "text": "repo 2",
+      "selector": "article.Box-row:nth-of-type(2) h2 a"
+    },
+    {
+      "type": "link",
+      "text": "repo 3",
+      "selector": "article.Box-row:nth-of-type(3) h2 a"
+    },
+    {
+      "type": "link",
+      "text": "repo 4",
+      "selector": "article.Box-row:nth-of-type(4) h2 a"
+    },
+    {
+      "type": "link",
+      "text": "repo 5",
+      "selector": "article.Box-row:nth-of-type(5) h2 a"
+    },
+    {
+      "type": "link",
+      "text": "repo 6",
+      "selector": "article.Box-row:nth-of-type(6) h2 a"
+    },
+    {
+      "type": "link",
+      "text": "repo 7",
+      "selector": "article.Box-row:nth-of-type(7) h2 a"
+    },
+    {
+      "type": "link",
+      "text": "repo 8",
+      "selector": "article.Box-row:nth-of-type(8) h2 a"
+    },
+    {
+      "type": "link",
+      "text": "repo 9",
+      "selector": "article.Box-row:nth-of-type(9) h2 a"
+    },
+    {
+      "type": "link",
+      "text": "repo 10",
+      "selector": "article.Box-row:nth-of-type(10) h2 a"
+    },
+    {
+      "type": "link",
+      "text": "repo 11",
+      "selector": "article.Box-row:nth-of-type(11) h2 a"
+    },
+    {
+      "type": "link",
+      "text": "repo 12",
+      "selector": "article.Box-row:nth-of-type(12) h2 a"
+    },
+    {
+      "type": "link",
+      "text": "repo 13",
+      "selector": "article.Box-row:nth-of-type(13) h2 a"
+    },
+    {
+      "type": "link",
+      "text": "repo 14",
+      "selector": "article.Box-row:nth-of-type(14) h2 a"
+    },
+    {
+      "type": "link",
+      "text": "repo 15",
+      "selector": "article.Box-row:nth-of-type(15) h2 a"
+    },
+    {
+      "type": "link",
+      "text": "repo 16",
+      "selector": "article.Box-row:nth-of-type(16) h2 a"
+    },
+    {
+      "type": "link",
+      "text": "repo 17",
+      "selector": "article.Box-row:nth-of-type(17) h2 a"
+    },
+    {
+      "type": "link",
+      "text": "repo 18",
+      "selector": "article.Box-row:nth-of-type(18) h2 a"
+    },
+    {
+      "type": "link",
+      "text": "repo 19",
+      "selector": "article.Box-row:nth-of-type(19) h2 a"
+    }
+  ],
+  "metadata": {
+    "source": "synthetic"
+  }
+}

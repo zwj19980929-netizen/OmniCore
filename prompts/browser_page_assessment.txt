@@ -5,25 +5,40 @@ Return JSON only with keys:
 - reason: string
 - evidence_indexes: array of integers
 - confidence: number
-- action: object with keys type, element_index, target_selector, value, description, fallback_selector, use_keyboard, keyboard_key
+- action: object with keys type, element_index, target_ref, target_selector, value, description, fallback_selector, use_keyboard, keyboard_key, expected_page_type, expected_text
 
 Task: {task}
 Intent: {intent}
 Query: {query}
 Current URL: {url}
 Page title: {title}
+Page type: {page_type}
+Page stage: {page_stage}
 Last action: {last_action}
+Context coverage: {context_coverage}
 Visible data:
 {data}
+
+Search result cards:
+{cards}
+
+Collections:
+{collections}
+
+Controls:
+{controls}
 
 Candidate elements:
 {elements}
 
 Rules:
-- Use only the visible data and candidate elements provided above.
+- The context below is a prioritized, partial view of the page. Do not assume omitted content is absent.
+- Use only the visible data, search result cards, and candidate elements provided above.
+- Use controls when pagination, load-more, or search-box actions are clearly relevant.
+- Prefer `target_ref` over `target_selector` whenever a relevant ref is available.
 - If the visible data already likely answers the task, choose action.type="extract".
 - If the task is already complete without further extraction, choose action.type="done".
 - If the page is a search results page and the snippets are relevant enough to answer the task, prefer "extract" over clicking through.
-- If the current page is relevant but incomplete and a candidate likely leads to the best source or detail page, choose "click" and reference the element_index.
+- If the current page is relevant but incomplete and a card or candidate likely leads to the best source or detail page, choose "click" and reference the card or element via `target_ref`.
 - Choose "input" only if the current page is not already showing relevant results or the search box clearly needs a different query.
 - If you cannot justify a meaningful action from the evidence, choose "wait".

@@ -1,0 +1,13 @@
+{
+  "step": 8,
+  "plan": "等待搜索结果渲染完成，页面当前为modal状态且无可见数据",
+  "action": "wait",
+  "observation": "success",
+  "decision": "continue",
+  "action_type": "wait",
+  "selector": "",
+  "value": "",
+  "description": "等待搜索结果渲染完成，页面当前为modal状态且无可见数据",
+  "result": "success",
+  "url": "https://www.bing.com/search?q=openai+api&rdr=1&rdrig=7ED9165F62574AEE8348214A123B998C"
+}

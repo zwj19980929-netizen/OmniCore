@@ -1,0 +1,211 @@
+{
+  "task": "到github官网给我找找openclaw的地址",
+  "url": "https://www.google.com/search?q=openclaw",
+  "title": "openclaw - Google Search",
+  "intent": {
+    "intent_type": "search",
+    "query": "openclaw github address",
+    "confidence": 0.9,
+    "fields": {},
+    "requires_interaction": false,
+    "target_text": ""
+  },
+  "page_state": {
+    "page_type": "serp",
+    "stage": "completing",
+    "confidence": 0.8,
+    "item_count": 10,
+    "target_count": 0,
+    "has_pagination": true,
+    "has_load_more": false,
+    "has_modal": false,
+    "goal_satisfied": true
+  },
+  "data": [
+    {
+      "title": "OpenClaw - GitHub",
+      "link": "https://github.com/openclaw",
+      "text": "General purpose web agent runtime"
+    }
+  ],
+  "cards": [
+    {
+      "ref": "card_1",
+      "title": "OpenClaw - GitHub",
+      "target_ref": "el_7",
+      "target_selector": "a[href=\"https://github.com/openclaw\"]",
+      "snippet": "General purpose web agent runtime",
+      "source": "GitHub",
+      "host": "github.com",
+      "date": "",
+      "rank": 1
+    },
+    {
+      "ref": "card_2",
+      "title": "OpenClaw Docs",
+      "target_ref": "el_8",
+      "target_selector": "a[href=\"https://docs.openclaw.ai\"]",
+      "snippet": "Documentation and guides",
+      "source": "OpenClaw",
+      "host": "docs.openclaw.ai",
+      "date": "",
+      "rank": 2
+    }
+  ],
+  "elements": [
+    {
+      "index": 0,
+      "tag": "input",
+      "text": "",
+      "element_type": "searchbox",
+      "selector": "textarea[name=\"q\"]",
+      "ref": "el_1",
+      "role": "searchbox",
+      "attributes": {
+        "href": "",
+        "value": "openclaw",
+        "placeholder": "Search",
+        "labelText": "",
+        "ariaLabel": ""
+      },
+      "is_visible": true,
+      "is_clickable": true,
+      "context_before": "",
+      "context_after": "",
+      "parent_ref": "",
+      "region": ""
+    },
+    {
+      "index": 1,
+      "tag": "a",
+      "text": "OpenClaw - GitHub",
+      "element_type": "link",
+      "selector": "div.g:nth-of-type(1) a",
+      "ref": "el_7",
+      "role": "link",
+      "attributes": {
+        "href": "https://github.com/openclaw",
+        "value": "",
+        "placeholder": "",
+        "labelText": "",
+        "ariaLabel": ""
+      },
+      "is_visible": true,
+      "is_clickable": true,
+      "context_before": "",
+      "context_after": "",
+      "parent_ref": "",
+      "region": ""
+    },
+    {
+      "index": 2,
+      "tag": "a",
+      "text": "OpenClaw Docs",
+      "element_type": "link",
+      "selector": "div.g:nth-of-type(2) a",
+      "ref": "el_8",
+      "role": "link",
+      "attributes": {
+        "href": "https://docs.openclaw.ai",
+        "value": "",
+        "placeholder": "",
+        "labelText": "",
+        "ariaLabel": ""
+      },
+      "is_visible": true,
+      "is_clickable": true,
+      "context_before": "",
+      "context_after": "",
+      "parent_ref": "",
+      "region": ""
+    }
+  ],
+  "snapshot": {
+    "page_type": "serp",
+    "url": "https://www.google.com/search?q=openclaw",
+    "title": "openclaw - Google Search",
+    "cards": [
+      {
+        "ref": "card_1",
+        "title": "OpenClaw - GitHub",
+        "target_ref": "el_7",
+        "target_selector": "a[href=\"https://github.com/openclaw\"]",
+        "snippet": "General purpose web agent runtime",
+        "source": "GitHub",
+        "host": "github.com",
+        "date": "",
+        "rank": 1
+      },
+      {
+        "ref": "card_2",
+        "title": "OpenClaw Docs",
+        "target_ref": "el_8",
+        "target_selector": "a[href=\"https://docs.openclaw.ai\"]",
+        "snippet": "Documentation and guides",
+        "source": "OpenClaw",
+        "host": "docs.openclaw.ai",
+        "date": "",
+        "rank": 2
+      }
+    ],
+    "collections": [
+      {
+        "ref": "collection_1",
+        "kind": "search_results",
+        "item_count": 10,
+        "sample_items": [
+          "OpenClaw - GitHub",
+          "OpenClaw Docs",
+          "OpenClaw examples"
+        ]
+      }
+    ],
+    "elements": [
+      {
+        "ref": "el_1",
+        "tag": "input",
+        "type": "searchbox",
+        "role": "searchbox",
+        "text": "",
+        "label": "",
+        "selector": "textarea[name=\"q\"]",
+        "href": "",
+        "value": "openclaw",
+        "placeholder": "Search",
+        "visible": true,
+        "enabled": true
+      },
+      {
+        "ref": "el_7",
+        "tag": "a",
+        "type": "link",
+        "role": "link",
+        "text": "OpenClaw - GitHub",
+        "label": "",
+        "selector": "div.g:nth-of-type(1) a",
+        "href": "https://github.com/openclaw",
+        "visible": true,
+        "enabled": true
+      },
+      {
+        "ref": "el_8",
+        "tag": "a",
+        "type": "link",
+        "role": "link",
+        "text": "OpenClaw Docs",
+        "label": "",
+        "selector": "div.g:nth-of-type(2) a",
+        "href": "https://docs.openclaw.ai",
+        "visible": true,
+        "enabled": true
+      }
+    ],
+    "affordances": {
+      "has_search_box": true,
+      "has_pagination": true,
+      "next_page_ref": "el_20",
+      "has_load_more": false
+    }
+  },
+  "last_action": {}
+}

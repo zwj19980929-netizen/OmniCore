@@ -2,6 +2,7 @@
 OmniCore Critic Agent - 独立审查官
 在最终结果返回或执行高危操作前进行逻辑校验
 """
+import re
 from typing import Dict, Any, Optional
 from pathlib import Path
 
@@ -10,6 +11,8 @@ from core.state import OmniCoreState
 from core.llm import LLMClient
 from utils.logger import log_agent_action, logger
 from utils.prompt_manager import get_prompt
+from utils.url_utils import extract_all_urls
+from utils.web_result_normalizer import looks_like_detail_list_item
 
 
 class CriticAgent:
@@ -22,6 +25,229 @@ class CriticAgent:
         self.llm = llm_client or LLMClient()
         self.name = "Critic"
         self.system_prompt = get_prompt("critic_system", "")
+
+    @staticmethod
+    def _task_has_direct_url(task_description: str) -> bool:
+        return bool(re.search(r"https?://\S+", str(task_description or "")))
+
+    @staticmethod
+    def _looks_like_weather_task(task_description: str) -> bool:
+        lowered = str(task_description or "").lower()
+        weather_tokens = (
+            "weather",
+            "forecast",
+            "temperature",
+            "humidity",
+            "wind",
+            "aqi",
+            "air quality",
+            "天气",
+            "气温",
+            "湿度",
+            "风力",
+            "空气质量",
+            "天气预报",
+        )
+        return any(token in lowered for token in weather_tokens)
+
+    @staticmethod
+    def _looks_like_list_extraction_task(task_description: str) -> bool:
+        lowered = str(task_description or "").lower()
+        list_tokens = (
+            "前",
+            "top",
+            "title",
+            "titles",
+            "link",
+            "links",
+            "headline",
+            "headlines",
+            "列表",
+            "标题",
+            "链接",
+            "仓库",
+            "新闻",
+            "抓取前",
+        )
+        return any(token in lowered for token in list_tokens) or bool(
+            re.search(r"\b\d+\s*(?:items?|results?)\b", lowered)
+        )
+
+    @staticmethod
+    def _extract_target_count(task_description: str) -> int:
+        text = str(task_description or "")
+        patterns = (
+            r"前\s*(\d+)\s*(?:条|个|项|篇)?",
+            r"top\s*(\d+)",
+            r"(\d+)\s*(?:items?|results?|links?|headlines?|stories|repositories|repos)\b",
+        )
+        for pattern in patterns:
+            match = re.search(pattern, text, flags=re.IGNORECASE)
+            if not match:
+                continue
+            try:
+                value = int(match.group(1))
+            except (TypeError, ValueError):
+                continue
+            if value > 0:
+                return value
+        return 0
+
+    @staticmethod
+    def _primary_task_url(task_description: str) -> str:
+        urls = extract_all_urls(task_description)
+        if urls:
+            return str(urls[0] or "").strip()
+        return ""
+
+    @classmethod
+    def _result_has_title_link_items(cls, task_description: str, task_result: Any) -> bool:
+        if not isinstance(task_result, dict):
+            return False
+        data = task_result.get("data")
+        if not isinstance(data, list) or not data:
+            return False
+        reference_url = cls._primary_task_url(task_description)
+        meaningful = 0
+        for item in data[:8]:
+            if not isinstance(item, dict):
+                continue
+            title = str(item.get("title") or item.get("name") or "").strip()
+            link = str(item.get("link", item.get("url", "")) or "").strip()
+            if title and link and looks_like_detail_list_item({"title": title, "url": link}, reference_url=reference_url):
+                meaningful += 1
+        return meaningful > 0
+
+    @classmethod
+    def _result_meets_target_count(cls, task_description: str, task_result: Any) -> bool:
+        if not isinstance(task_result, dict):
+            return False
+        target_count = cls._extract_target_count(task_description)
+        if target_count <= 0:
+            return True
+        data = task_result.get("data")
+        if not isinstance(data, list):
+            return False
+        return len(data) >= target_count
+
+    @staticmethod
+    def _result_has_weather_signals(task_result: Any) -> bool:
+        if not isinstance(task_result, dict):
+            return False
+        data = task_result.get("data")
+        if not isinstance(data, list) or not data:
+            return False
+        weather_tokens = (
+            "weather",
+            "forecast",
+            "temperature",
+            "humidity",
+            "wind",
+            "aqi",
+            "air quality",
+            "天气",
+            "气温",
+            "湿度",
+            "风力",
+            "空气质量",
+            "晴",
+            "阴",
+            "多云",
+            "雨",
+            "雪",
+            "℃",
+            "°c",
+        )
+        categories = set()
+        for item in data[:10]:
+            haystacks = []
+            if isinstance(item, dict):
+                haystacks.extend(str(value or "") for value in item.values())
+                keys = " ".join(str(key or "") for key in item.keys())
+                haystacks.append(keys)
+            else:
+                haystacks.append(str(item or ""))
+            for value in haystacks:
+                lowered = value.lower()
+                if any(token in lowered for token in ("temperature", "气温", "℃", "°c")):
+                    categories.add("temperature")
+                if any(token in lowered for token in ("humidity", "湿度")):
+                    categories.add("humidity")
+                if any(token in lowered for token in ("wind", "风力", "风向")):
+                    categories.add("wind")
+                if any(token in lowered for token in ("aqi", "air quality", "空气质量")):
+                    categories.add("aqi")
+                if any(token in lowered for token in weather_tokens):
+                    categories.add("condition")
+            if len(categories) >= 2:
+                return True
+        return False
+
+    def _deterministic_review_result(
+        self,
+        task_description: str,
+        task_result: Any,
+    ) -> Optional[Dict[str, Any]]:
+        if not isinstance(task_result, dict):
+            return None
+        if not bool(task_result.get("success", False)):
+            return None
+        if str(task_result.get("message", "") or "").lower().find("blocked page") >= 0:
+            return None
+
+        if self._looks_like_weather_task(task_description) and self._result_has_weather_signals(task_result):
+            return {
+                "approved": True,
+                "score": 0.95,
+                "issues": [],
+                "suggestions": [],
+                "summary": "天气任务已提取到足够的关键字段信号",
+            }
+
+        if (
+            self._task_has_direct_url(task_description)
+            and self._looks_like_list_extraction_task(task_description)
+            and not self._result_meets_target_count(task_description, task_result)
+        ):
+            target_count = self._extract_target_count(task_description)
+            actual_count = len(task_result.get("data") or []) if isinstance(task_result.get("data"), list) else 0
+            return {
+                "approved": False,
+                "score": 0.35,
+                "issues": [f"返回数量不足：期望至少 {target_count} 条，实际仅 {actual_count} 条"],
+                "suggestions": ["继续翻页、点击 more/next，或改用可跨页的提取路径"],
+                "summary": "显式 URL 列表抽取任务数量未达标",
+            }
+
+        if (
+            self._task_has_direct_url(task_description)
+            and self._looks_like_list_extraction_task(task_description)
+            and self._result_meets_target_count(task_description, task_result)
+            and not self._result_has_title_link_items(task_description, task_result)
+        ):
+            return {
+                "approved": False,
+                "score": 0.4,
+                "issues": ["返回的数据更像导航、筛选或翻页链接，而不是目标实体详情链接"],
+                "suggestions": ["改用更强的列表区域识别，或排除同页筛选/分页链接"],
+                "summary": "显式 URL 列表抽取任务提取到了错误的重复区域",
+            }
+
+        if (
+            self._task_has_direct_url(task_description)
+            and self._looks_like_list_extraction_task(task_description)
+            and self._result_meets_target_count(task_description, task_result)
+            and self._result_has_title_link_items(task_description, task_result)
+        ):
+            return {
+                "approved": True,
+                "score": 0.95,
+                "issues": [],
+                "suggestions": [],
+                "summary": "显式 URL 列表抽取任务已返回有效的标题和链接",
+            }
+
+        return None
 
     def review_task_result(
         self,
@@ -41,6 +267,15 @@ class CriticAgent:
             审查结果字典
         """
         log_agent_action(self.name, "开始审查任务结果", task_description[:50])
+
+        deterministic_result = self._deterministic_review_result(task_description, task_result)
+        if deterministic_result is not None:
+            log_agent_action(
+                self.name,
+                f"审查完成: {'通过' if deterministic_result.get('approved') else '未通过'}",
+                f"评分: {deterministic_result.get('score', 0):.2f} (deterministic)",
+            )
+            return deterministic_result
 
         review_prompt = f"""请审查以下任务的执行结果：
 

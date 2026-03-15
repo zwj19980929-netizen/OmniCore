@@ -1,0 +1,19 @@
+{
+  "page_type": "list",
+  "url": "https://example.com/list",
+  "title": "Example List",
+  "cards": [],
+  "elements": [
+    {
+      "ref": "el_1",
+      "type": "link",
+      "role": "link",
+      "text": "A",
+      "selector": "article h2 a",
+      "href": "https://example.com/a",
+      "visible": true,
+      "enabled": true
+    }
+  ],
+  "affordances": {}
+}

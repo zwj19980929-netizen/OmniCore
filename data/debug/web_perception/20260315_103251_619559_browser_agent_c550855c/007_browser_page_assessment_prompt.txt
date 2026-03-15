@@ -1,0 +1,54 @@
+You are evaluating whether the current browser page already advances the task.
+Return JSON only with keys:
+- page_relevant: boolean
+- goal_satisfied: boolean
+- reason: string
+- evidence_indexes: array of integers
+- confidence: number
+- action: object with keys type, element_index, target_ref, target_selector, value, description, fallback_selector, use_keyboard, keyboard_key, expected_page_type, expected_text
+
+Task: 访问 Bing 搜索 openai+api，使用多种选择器和等待策略抓取前3条结果。策略：1) 等待页面完全加载后滚动触发懒加载 2) 尝试多个选择器: '.b_algo', '#b_results li', 'li.b_algo', '[class*="algo"]' 3) 如果选择器失败，尝试提取所有可见链接并过滤 4) 返回JSON格式 [{title, url}, ...]
+Intent: search
+Query: openai api
+Current URL: https://www.bing.com/search?q=openai+api
+Page title: openai api - 搜索
+Page type: serp
+Page stage: selecting_source
+Last action: none
+Context coverage: data=17/17 chars; cards=10/10 chars; collections=25/25 chars; controls=146/146 chars; elements=1072/1728 chars
+Visible data:
+(no visible data)
+
+Search result cards:
+(no cards)
+
+Collections:
+controls: load_more=el_14
+
+Controls:
+[el_14] kind=load_more text=更多 selector=a[href="javascript\:void\(0\)\;"]
+[el_4] kind=search_input text=在此处输入你的搜索 — 输入时会显示搜索建议 selector=#sb_form_q
+
+Candidate elements:
+[3] type=search ref=el_4 selector=#sb_form_q info=openai api | openai api
+[13] type=link ref=el_14 selector=a[href="javascript\:void\(0\)\;"] info=更多 | javascript:void(0);
+[8] type=link ref=el_9 selector=a[href="\/copilotsearch\?q\=openai\+api\&FORM\=CSSCOP"] info=搜索 | https://www.bing.com/copilotsearch?q=openai+api&FORM=CSSCOP
+[2] type=submit ref=el_3 selector=#sb_form_go info=搜索 | 搜索
+[4] type=div ref=el_5 selector=#sb_sbi info=使用图像搜索
+[0] type=link ref=el_1 selector=#b_skip_to_content info=跳至内容 | https://www.bing.com/search?q=openai+api#
+[7] type=link ref=el_8 selector=a[href="\/\?scope\=web\&FORM\=HDRSC1"] info=全部 | https://www.bing.com/?scope=web&FORM=HDRSC1
+[9] type=link ref=el_10 selector=header > nav > ul > li:nth-of-type(3) > a info=图片 | https://www.bing.com/ck/a?!&&p=5cc28f21bd596152be62324d7e22fce4cabdf28e94de2e68b97d40b972087c4fJmltd
+[10] type=link ref=el_11 selector=header > nav > ul > li:nth-of-type(4) > a info=视频 | https://www.bing.com/ck/a?!&&p=df24410bd2eb0a48d09510e94c906dbca232469fa3f4ce3c6312bfb147e5aabaJmltd
+... (4 element lines omitted)
+
+Rules:
+- The context below is a prioritized, partial view of the page. Do not assume omitted content is absent.
+- Use only the visible data, search result cards, and candidate elements provided above.
+- Use controls when pagination, load-more, or search-box actions are clearly relevant.
+- Prefer `target_ref` over `target_selector` whenever a relevant ref is available.
+- If the visible data already likely answers the task, choose action.type="extract".
+- If the task is already complete without further extraction, choose action.type="done".
+- If the page is a search results page and the snippets are relevant enough to answer the task, prefer "extract" over clicking through.
+- If the current page is relevant but incomplete and a card or candidate likely leads to the best source or detail page, choose "click" and reference the card or element via `target_ref`.
+- Choose "input" only if the current page is not already showing relevant results or the search box clearly needs a different query.
+- If you cannot justify a meaningful action from the evidence, choose "wait".

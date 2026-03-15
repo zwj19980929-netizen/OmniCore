@@ -1,0 +1,18 @@
+{
+  "task": "从 GitHub Trending 页面抓取前 5 个仓库的标题和链接",
+  "input_url": "https://github.com/trending",
+  "explicit_input_url": true,
+  "explicit_task_urls": [],
+  "url_info": {
+    "url": "https://github.com/trending",
+    "backup_urls": [],
+    "need_search": false,
+    "search_query": ""
+  },
+  "candidate_urls": [
+    "https://github.com/trending"
+  ],
+  "should_search_first": false,
+  "domain_hints": [],
+  "replan_tried_urls": []
+}

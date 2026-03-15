@@ -64,6 +64,59 @@ def test_router_repairs_missing_browser_start_url_from_user_input():
     assert task["tool_args"]["start_url"] == "https://www.weather.com.cn/weather/101220101.shtml"
 
 
+def test_router_extract_first_url_strips_fullwidth_punctuation():
+    router = RouterAgent()
+
+    value = router._extract_first_url("打开这个页面：https://news.ycombinator.com），抓取前 3 条新闻")
+
+    assert value == "https://news.ycombinator.com"
+
+
+def test_router_repairs_missing_web_smart_extract_url_from_user_input():
+    router = RouterAgent()
+
+    result = router._repair_task_params_from_user_input(
+        "请处理 https://news.ycombinator.com），抓取前 3 条新闻",
+        {
+            "tasks": [
+                {
+                    "tool_name": "web.smart_extract",
+                    "params": {"task": "抓取前 3 条新闻"},
+                    "tool_args": {"task": "抓取前 3 条新闻"},
+                }
+            ]
+        },
+    )
+
+    task = result["tasks"][0]
+    assert task["params"]["url"] == "https://news.ycombinator.com"
+    assert task["tool_args"]["url"] == "https://news.ycombinator.com"
+
+
+def test_router_upgrades_search_results_url_to_web_smart_extract():
+    router = RouterAgent()
+
+    result = router._repair_task_params_from_user_input(
+        "去 https://www.bing.com/search?q=openai+api 抓取前 3 条结果的标题和链接",
+        {
+            "tasks": [
+                {
+                    "tool_name": "web.fetch_and_extract",
+                    "task_type": "web_worker",
+                    "params": {"limit": 3},
+                    "tool_args": {"limit": 3},
+                }
+            ]
+        },
+    )
+
+    task = result["tasks"][0]
+    assert task["tool_name"] == "web.smart_extract"
+    assert task["task_type"] == "enhanced_web_worker"
+    assert task["params"]["url"] == "https://www.bing.com/search?q=openai+api"
+    assert task["tool_args"]["url"] == "https://www.bing.com/search?q=openai+api"
+
+
 def test_router_guesses_browser_tool_when_plan_shape_is_ambiguous():
     router = RouterAgent()
 
@@ -242,12 +295,12 @@ def test_router_short_circuits_weather_query_to_deterministic_sources():
     )
 
     assert result["intent"] == "weather_query"
-    assert len(result["tasks"]) == 2
+    assert len(result["tasks"]) == 1
     assert result["tasks"][0]["tool_name"] == "web.fetch_and_extract"
-    assert "weather.com.cn" in result["tasks"][0]["description"]
+    assert result["tasks"][0]["params"]["query"] == "合肥 明天 天气"
+    assert "weather.com.cn" not in result["tasks"][0]["description"]
+    assert "moji.com" not in result["tasks"][0]["description"]
     assert "2026-03-07" in result["tasks"][0]["description"]
-    assert result["tasks"][1]["tool_name"] == "web.fetch_and_extract"
-    assert "moji.com" in result["tasks"][1]["description"]
 
 
 def test_router_uses_browser_route_for_weather_browser_demo():
@@ -259,8 +312,10 @@ def test_router_uses_browser_route_for_weather_browser_demo():
     assert len(result["tasks"]) == 2
     assert result["tasks"][0]["tool_name"] == "browser.interact"
     assert result["tasks"][0]["params"]["headless"] is False
+    assert result["tasks"][0]["params"]["query"] == "合肥 当前 天气"
     assert result["tasks"][0]["params"]["start_url"] == "https://www.bing.com/"
     assert "合肥" in result["tasks"][0]["description"]
+    assert "weather.com.cn" not in result["tasks"][0]["description"]
     assert result["tasks"][1]["tool_name"] == "web.fetch_and_extract"
 
 
@@ -274,6 +329,20 @@ def test_router_keeps_direct_weather_url_authoritative_in_deterministic_route():
     assert result["intent"] == "weather_query_with_browser_demo"
     assert result["tasks"][0]["params"]["start_url"] == "https://www.weather.com.cn/weather/101220101.shtml"
     assert result["tasks"][1]["params"]["url"] == "https://www.weather.com.cn/weather/101220101.shtml"
+
+
+def test_router_does_not_treat_action_phrase_as_weather_location_for_direct_url():
+    router = RouterAgent(llm_client=_FailIfCalledLLM())
+
+    result = router.analyze_intent(
+        "去 https://www.weather.com.cn/weather/101220101.shtml 抓取今天的天气详情",
+        current_time_context={"local_date": "2026-03-15"},
+    )
+
+    task = result["tasks"][0]
+    assert task["params"]["url"] == "https://www.weather.com.cn/weather/101220101.shtml"
+    assert "抓取今天的" not in task["description"]
+    assert "https://www.weather.com.cn/weather/101220101.shtml" in task["description"]
 
 
 def test_router_skips_current_location_context_for_non_geographic_task():

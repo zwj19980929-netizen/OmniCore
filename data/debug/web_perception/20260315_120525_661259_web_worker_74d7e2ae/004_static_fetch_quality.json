@@ -1,0 +1,28 @@
+{
+  "url": "https://huggingface.co/models",
+  "quality": {
+    "valid": true,
+    "reason": "标题和链接已满足列表抓取任务",
+    "suggestion": ""
+  },
+  "sample": [
+    {
+      "title": "Hugging Face",
+      "url": "https://huggingface.co/",
+      "link": "https://huggingface.co/",
+      "index": 1
+    },
+    {
+      "title": "Models",
+      "url": "https://huggingface.co/models",
+      "link": "https://huggingface.co/models",
+      "index": 2
+    },
+    {
+      "title": "Datasets",
+      "url": "https://huggingface.co/datasets",
+      "link": "https://huggingface.co/datasets",
+      "index": 3
+    }
+  ]
+}

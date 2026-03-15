@@ -1,0 +1,1 @@
+{"action_type": "click", "target_ref": "el_7", "description": "open result", "confidence": 0.82, "expected_page_type": "detail"}

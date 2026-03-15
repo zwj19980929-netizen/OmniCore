@@ -1,0 +1,8 @@
+{
+  "success": true,
+  "data": {
+    "has_captcha": false,
+    "captcha_type": null
+  },
+  "error": null
+}

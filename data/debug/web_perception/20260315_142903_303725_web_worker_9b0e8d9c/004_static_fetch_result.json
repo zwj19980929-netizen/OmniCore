@@ -1,0 +1,9 @@
+{
+  "url": "https://www.google.com/search?q=合肥的明天 2026-03-16 天气 relevant city weather forecast page",
+  "result": {
+    "success": false,
+    "error": "HTTPSConnectionPool(host='www.google.com', port=443): Max retries exceeded with url: /search?q=%E5%90%88%E8%82%A5%E7%9A%84%E6%98%8E%E5%A4%A9%202026-03-16%20%E5%A4%A9%E6%B0%94%20relevant%20city%20weather%20forecast%20page (Caused by ProxyError('Unable to connect to proxy', NewConnectionError(\"HTTPSConnection(host='127.0.0.1', port=8118): Failed to establish a new connection: [Errno 1] Operation not permitted\")))",
+    "data": [],
+    "url": "https://www.google.com/search?q=合肥的明天 2026-03-16 天气 relevant city weather forecast page"
+  }
+}

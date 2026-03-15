@@ -202,6 +202,8 @@ class FileWorker:
                 lines.append(f"   链接: {full_link}")
             elif item.get("link", "").startswith("http"):
                 lines.append(f"   链接: {item['link']}")
+            elif item.get("url", "").startswith("http"):
+                lines.append(f"   链接: {item['url']}")
 
             # 输出其他有意义的字段
             for key, value in item.items():

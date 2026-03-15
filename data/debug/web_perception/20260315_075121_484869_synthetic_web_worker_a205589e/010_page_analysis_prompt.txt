@@ -1,0 +1,127 @@
+你是一个网页结构分析专家。请分析以下 HTML，找出目标数据的 CSS 选择器。
+
+## 任务目标
+提取今日热门仓库的名称、描述、语言和星标数（调试3）
+
+## 页面语义快照（优先参考）
+页面类型: list
+URL: https://github.com/trending
+标题: Trending repositories on GitHub today
+页面特征: has_search_box=False, has_pagination=False, has_load_more=False
+页面集合结构:
+1. kind=list count=25 ref=collection_1 samples=owner/repo1 | owner/repo2 | owner/repo3
+关键控件:
+1. kind=filter ref=el_filter text=Today selector=details summary
+可见关键元素:
+1. link | owner / repo1 | article.Box-row:nth-of-type(1) h2 a | ref=el_1
+2. link | owner / repo2 | article.Box-row:nth-of-type(2) h2 a | ref=el_2
+3. link | owner / repo3 | article.Box-row:nth-of-type(3) h2 a | ref=el_3
+4. link | owner / repo4 | article.Box-row:nth-of-type(4) h2 a | ref=el_4
+5. link | owner / repo5 | article.Box-row:nth-of-type(5) h2 a | ref=el_5
+6. link | owner / repo6 | article.Box-row:nth-of-type(6) h2 a | ref=el_6
+7. link | owner / repo7 | article.Box-row:nth-of-type(7) h2 a | ref=el_7
+8. link | owner / repo8 | article.Box-row:nth-of-type(8) h2 a | ref=el_8
+9. link | owner / repo9 | article.Box-row:nth-of-type(9) h2 a | ref=el_9
+10. link | owner / repo10 | article.Box-row:nth-of-type(10) h2 a | ref=el_10
+11. link | owner / repo11 | article.Box-row:nth-of-type(11) h2 a | ref=el_11
+12. link | owner / repo12 | article.Box-row:nth-of-type(12) h2 a | ref=el_12
+
+## 页面结构概览（由页面感知器提取）
+# 页面：Trending repositories on GitHub today
+URL: https://github.com/trending
+
+## 页面结构概览
+
+### 主要内容区域
+1. [article] repo 1 description and stars
+   选择器: article.Box-row:nth-of-type(1)
+2. [article] repo 2 description and stars
+   选择器: article.Box-row:nth-of-type(2)
+3. [article] repo 3 description and stars
+   选择器: article.Box-row:nth-of-type(3)
+4. [article] repo 4 description and stars
+   选择器: article.Box-row:nth-of-type(4)
+5. [article] repo 5 description and stars
+   选择器: article.Box-row:nth-of-type(5)
+6. [article] repo 6 description and stars
+   选择器: article.Box-row:nth-of-type(6)
+7. [article] repo 7 description and stars
+   选择器: article.Box-row:nth-of-type(7)
+8. [article] repo 8 description and stars
+   选择器: article.Box-row:nth-of-type(8)
+9. [article] repo 9 description and stars
+   选择器: article.Box-row:nth-of-type(9)
+10. [article] repo 10 description and stars
+   选择器: article.Box-row:nth-of-type(10)
+11. [article] repo 11 description and stars
+   选择器: article.Box-row:nth-of-type(11)
+12. [article] repo 12 description and stars
+   选择器: article.Box-row:nth-of-type(12)
+
+### 导航/菜单区域
+- Sign in Pricing Explore
+
+### 可交互元素
+- [link] repo 1 → article.Box-row:nth-of-type(1) h2 a
+- [link] repo 2 → article.Box-row:nth-of-type(2) h2 a
+- [link] repo 3 → article.Box-row:nth-of-type(3) h2 a
+- [link] repo 4 → article.Box-row:nth-of-type(4) h2 a
+- [link] repo 5 → article.Box-row:nth-of-type(5) h2 a
+- [link] repo 6 → article.Box-row:nth-of-type(6) h2 a
+- [link] repo 7 → article.Box-row:nth-of-type(7) h2 a
+- [link] repo 8 → article.Box-row:nth-of-type(8) h2 a
+- [link] repo 9 → article.Box-row:nth-of-type(9) h2 a
+- [link] repo 10 → article.Box-row:nth-of-type(10) h2 a
+- [link] repo 11 → article.Box-row:nth-of-type(11) h2 a
+- [link] repo 12 → article.Box-row:nth-of-type(12) h2 a
+- [link] repo 13 → article.Box-row:nth-of-type(13) h2 a
+- [link] repo 14 → article.Box-row:nth-of-type(14) h2 a
+- [link] repo 15 → article.Box-row:nth-of-type(15) h2 a
+- [link] repo 16 → article.Box-row:nth-of-type(16) h2 a
+- [link] repo 17 → article.Box-row:nth-of-type(17) h2 a
+- [link] repo 18 → article.Box-row:nth-of-type(18) h2 a
+- [link] repo 19 → article.Box-row:nth-of-type(19) h2 a
+
+## 页面 HTML (已清洗，移除了噪音)
+```html
+<html><body><article><h2><a href='/owner/repo1'>owner / repo1</a></h2><p>Description 1</p><span>100 stars today</span></article><article><h2><a href='/owner/repo2'>owner / repo2</a></h2><p>Description 2</p><span>200 stars today</span></article><article><h2><a href='/owner/repo3'>owner / repo3</a></h2><p>Description 3</p><span>300 stars today</span></article><article><h2><a href='/owner/repo4'>owner / repo4</a></h2><p>Description 4</p><span>400 stars today</span></article><article><h2><a href='/owner/repo5'>owner / repo5</a></h2><p>Description 5</p><span>500 stars today</span></article><article><h2><a href='/owner/repo6'>owner / repo6</a></h2><p>Description 6</p><span>600 stars today</span></article><article><h2><a href='/owner/repo7'>owner / repo7</a></h2><p>Description 7</p><span>700 stars today</span></article><article><h2><a href='/owner/repo8'>owner / repo8</a></h2><p>Description 8</p><span>800 stars today</span></article><article><h2><a href='/owner/repo9'>owner / repo9</a></h2><p>Description 9</p><span>900 stars today</span></article><article><h2><a href='/owner/repo10'>owner / repo10</a></h2><p>Description 10</p><span>1000 stars today</span></article><article><h2><a href='/owner/repo11'>owner / repo11</a></h2><p>Description 11</p><span>1100 stars today</span></article><article><h2><a href='/owner/repo12'>owner / repo12</a></h2><p>Description 12</p><span>1200 stars today</span></article><article><h2><a href='/owner/repo13'>owner / repo13</a></h2><p>Description 13</p><span>1300 stars today</span></article><article><h2><a href='/owner/repo14'>owner / repo14</a></h2><p>Description 14</p><span>1400 stars today</span></article><article><h2><a href='/owner/repo15'>owner / repo15</a></h2><p>Description 15</p><span>1500 stars today</span></article><article><h2><a href='/owner/repo16'>owner / repo16</a></h2><p>Description 16</p><span>1600 stars today</span></article><article><h2><a href='/owner/repo17'>owner / repo17</a></h2><p>Description 17</p><span>1700 stars today</span></article><article><h2><a href='/owner/repo18'>owner / repo18</a></h2><p>Description 18</p><span>1800 stars today</span></article><article><h2><a href='/owner/repo19'>owner / repo19</a></h2><p>Description 19</p><span>1900 stars today</span></article><article><h2><a href='/owner/repo20'>owner / repo20</a></h2><p>Description 20</p><span>2000 stars today</span></article><article><h2><a href='/owner/repo21'>owner / repo21</a></h2><p>Description 21</p><span>2100 stars today</span></article><article><h2><a href='/owner/repo22'>owner / repo22</a></h2><p>Description 22</p><span>2200 stars today</span></article><article><h2><a href='/owner/repo23'>owner / repo23</a></h2><p>Description 23</p><span>2300 stars today</span></article><article><h2><a href='/owner/repo24'>owner / repo24</a></h2><p>Description 24</p><span>2400 stars today</span></article><article><h2><a href='/owner/repo25'>owner / repo25</a></h2><p>Description 25</p><span>2500 stars today</span></article></body></html>
+```
+
+## 页面当前 URL
+https://github.com/trending
+
+## 你的工作方式
+1. **先看页面结构概览**：理解页面的整体布局和内容组织方式（标题、列表、表格、段落等）
+2. **再看 HTML 细节**：找出包含目标数据的重复元素（列表项、表格行等）
+3. **为每个需要提取的字段确定精确的 CSS 选择器**
+4. **优先使用语义快照和页面结构概览中提到的选择器**，这些选择器经过可见性验证更可靠
+5. 如果页面是搜索结果页、跳转页、聚合页，而不是最终数据页，要明确说明当前页不适合直接抽取
+6. 如果页面结构不明确，给出你最有把握的选择器
+
+返回 JSON 格式：
+```json
+{
+    "success": true,
+    "page_type": "list/detail/serp/form/unknown",
+    "requires_navigation": false,
+    "navigation_reason": "",
+    "item_selector": "每一条数据项的选择器（如 tr, li, div.item 等）",
+    "fields": {
+        "title": "标题文本的选择器（相对于 item）",
+        "link": "链接的选择器（相对于 item，a 标签会自动提取 href）",
+        "date": "日期的选择器（可选）",
+        "severity": "严重程度/等级的选择器（可选）",
+        "id": "编号/ID 的选择器（可选）"
+    },
+    "need_click_first": false,
+    "click_selector": "如果需要先点击某元素才能看到数据，填写选择器",
+    "notes": "其他注意事项"
+}
+```
+
+注意：
+- item_selector 应该能选中多个重复的数据项
+- fields 中的选择器是相对于每个 item 的
+- 只填你在 HTML 或页面结构中确实看到的选择器，看不到的字段留空字符串
+- 优先使用语义快照和页面结构概览中提到的选择器，它们经过可见性验证
+- 如果当前页明显是搜索结果页且不应直接抽取，把 requires_navigation 设为 true

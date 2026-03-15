@@ -1,0 +1,14 @@
+{
+  "action_type": "failed",
+  "target_selector": "",
+  "target_ref": "",
+  "value": "",
+  "description": "",
+  "confidence": 0.82,
+  "requires_confirmation": false,
+  "fallback_selector": "",
+  "use_keyboard_fallback": false,
+  "keyboard_key": "",
+  "expected_page_type": "",
+  "expected_text": ""
+}

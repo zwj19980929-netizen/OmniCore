@@ -4,6 +4,7 @@ OmniCore LangGraph DAG 编排
 支持 Worker 失败后反思重规划
 """
 import json
+import re
 from pathlib import Path
 from datetime import datetime
 from urllib.parse import urlparse
@@ -21,6 +22,8 @@ from core.task_executor import collect_ready_task_indexes, run_ready_batch
 from utils.logger import log_agent_action, log_success, log_error, log_warning
 from utils.human_confirm import HumanConfirm
 from utils.prompt_manager import get_prompt
+from utils.url_utils import sanitize_extracted_url
+from utils.web_result_normalizer import canonicalize_item, infer_requested_fields
 
 
 # 初始化所有 Agent
@@ -237,6 +240,162 @@ def _extract_structured_findings(state: OmniCoreState, max_items: int = 5) -> st
     return "\n".join(lines)
 
 
+def _extract_requested_item_count(text: str) -> int:
+    source = str(text or "")
+    patterns = (
+        r"前\s*(\d+)\s*(?:条|个|项|篇)?",
+        r"top\s*(\d+)",
+        r"(\d+)\s*(?:items?|results?|links?|headlines?|stories|repositories|repos|models?)\b",
+    )
+    for pattern in patterns:
+        match = re.search(pattern, source, flags=re.IGNORECASE)
+        if not match:
+            continue
+        try:
+            value = int(match.group(1))
+        except (TypeError, ValueError):
+            continue
+        if value > 0:
+            return value
+    return 0
+
+
+def _looks_like_explicit_list_output_request(text: str) -> bool:
+    lowered = str(text or "").lower()
+    list_tokens = (
+        "抓取前",
+        "列出",
+        "列表",
+        "清单",
+        "名称和链接",
+        "标题和链接",
+        "前 ",
+        "前",
+        "top",
+        "list",
+        "links",
+        "titles",
+        "headlines",
+        "models",
+        "repositories",
+        "repos",
+    )
+    return any(token in lowered for token in list_tokens) or _extract_requested_item_count(text) > 1
+
+
+def _escape_markdown_cell(value: Any) -> str:
+    text = _normalize_text_value(value)
+    if not text:
+        return ""
+    return text.replace("|", "\\|").replace("\n", " ").strip()
+
+
+def _collect_best_completed_record_list(state: OmniCoreState) -> List[Dict[str, Any]]:
+    best_records: List[Dict[str, Any]] = []
+    for task in state.get("task_queue", []) or []:
+        if not isinstance(task, dict) or str(task.get("status", "") or "") != "completed":
+            continue
+        result = task.get("result")
+        if not isinstance(result, dict):
+            continue
+        for source_key in ("data", "items", "content"):
+            payload = result.get(source_key)
+            if not isinstance(payload, list):
+                continue
+            dict_records = [item for item in payload if isinstance(item, dict)]
+            if len(dict_records) > len(best_records):
+                best_records = dict_records
+    return best_records
+
+
+def _build_deterministic_list_answer(state: OmniCoreState, package: Dict[str, Any]) -> str:
+    if not bool(state.get("critic_approved", False)):
+        return ""
+    if str(package.get("review_status", "") or "") != "approved":
+        return ""
+    if package.get("issues"):
+        return ""
+
+    task_descriptions = [
+        str(task.get("description", "") or "")
+        for task in state.get("task_queue", []) or []
+        if isinstance(task, dict)
+    ]
+    request_context = "\n".join(
+        part for part in [str(state.get("user_input", "") or "").strip(), *task_descriptions] if part
+    )
+    if not _looks_like_explicit_list_output_request(request_context):
+        return ""
+
+    raw_records = _collect_best_completed_record_list(state)
+    if len(raw_records) < 2:
+        return ""
+
+    requested_fields = infer_requested_fields(request_context, {"page_type": "list"})
+    normalized_records: List[Dict[str, Any]] = []
+    for raw in raw_records:
+        item = canonicalize_item(raw, requested_fields)
+        if not item:
+            continue
+        if not item.get("title") and not item.get("url") and not item.get("link"):
+            continue
+        normalized_records.append(item)
+
+    if len(normalized_records) < 2:
+        return ""
+
+    requested_count = _extract_requested_item_count(request_context)
+    render_count = len(normalized_records)
+    if requested_count > 0:
+        if len(normalized_records) < requested_count:
+            return ""
+        render_count = min(len(normalized_records), requested_count)
+    render_count = min(render_count, 100)
+    rows = normalized_records[:render_count]
+    if not rows:
+        return ""
+
+    preferred_columns = ["title", "url", "date", "summary", "author", "source", "location"]
+    column_labels = {
+        "title": "标题",
+        "url": "链接",
+        "date": "日期",
+        "summary": "摘要",
+        "author": "作者",
+        "source": "来源",
+        "location": "地点",
+    }
+    requested_set = {field for field in requested_fields if field in column_labels}
+    if "title" not in requested_set:
+        requested_set.add("title")
+    if any(item.get("url") or item.get("link") for item in rows):
+        requested_set.add("url")
+
+    columns = [
+        field for field in preferred_columns
+        if field in requested_set and any(_escape_markdown_cell(item.get(field)) for item in rows)
+    ]
+    if not columns:
+        return ""
+
+    lines = [f"根据当前抓取到的信息，已提取 {render_count} 条结果：", ""]
+    header = "| 序号 | " + " | ".join(column_labels[field] for field in columns) + " |"
+    divider = "| --- | " + " | ".join("---" for _ in columns) + " |"
+    lines.append(header)
+    lines.append(divider)
+
+    for idx, item in enumerate(rows, 1):
+        cells: List[str] = []
+        for field in columns:
+            value = item.get(field, "")
+            if field == "url" and not value:
+                value = item.get("link", "")
+            cells.append(_escape_markdown_cell(value))
+        lines.append(f"| {idx} | " + " | ".join(cells) + " |")
+
+    return "\n".join(lines)
+
+
 def _save_runtime_checkpoint(state: OmniCoreState, stage: str, note: str = "") -> None:
     session_id = str(state.get("session_id", "") or "").strip()
     job_id = str(state.get("job_id", "") or "").strip()
@@ -274,7 +433,7 @@ def _derive_authoritative_target_url(state: OmniCoreState) -> str:
             return True
         if host in {"weather.com.cn", "moji.com", "tianqi.com"} and path in {"", "/index", "/index.html"}:
             return True
-        return not path
+        return False
 
     direct_url = RouterAgent._extract_first_url(str(state.get("user_input", "") or ""))
     if direct_url:
@@ -291,7 +450,7 @@ def _derive_authoritative_target_url(state: OmniCoreState) -> str:
             params.get("url"),
             result.get("url"),
         ):
-            value = str(candidate or "").strip()
+            value = sanitize_extracted_url(candidate)
             if value and not _is_generic_entry_url(value):
                 return value
     return ""
@@ -301,6 +460,7 @@ def _repair_replan_task_params(
     tasks: List[Dict[str, Any]],
     target_url: str,
 ) -> List[Dict[str, Any]]:
+    target_url = sanitize_extracted_url(target_url)
     if not target_url:
         return tasks
 
@@ -319,6 +479,13 @@ def _repair_replan_task_params(
         ):
             params = dict(params)
             params["start_url"] = target_url
+            task_data["params"] = params
+        elif (
+            tool_name in {"web.fetch_and_extract", "web.smart_extract"}
+            and not str(params.get("url", "") or "").strip()
+        ):
+            params = dict(params)
+            params["url"] = target_url
             task_data["params"] = params
 
         repaired.append(task_data)
@@ -390,9 +557,9 @@ def _build_replan_failure_record(task: Dict[str, Any]) -> Dict[str, Any]:
     params = task.get("params", {}) if isinstance(task.get("params"), dict) else {}
 
     expected_url = (
-        result.get("expected_url")
-        or params.get("start_url")
-        or params.get("url")
+        sanitize_extracted_url(result.get("expected_url"))
+        or sanitize_extracted_url(params.get("start_url"))
+        or sanitize_extracted_url(params.get("url"))
         or ""
     )
     visited_url = result.get("url") or ""
@@ -510,7 +677,7 @@ def parallel_executor_node(state: OmniCoreState) -> OmniCoreState:
     return state
 
 
-def _legacy_replanner_node(state: OmniCoreState) -> OmniCoreState:
+def _legacy_replanner_node_v2(state: OmniCoreState) -> OmniCoreState:
     """反思重规划节点：分析失败原因，制定新策略"""
     if _should_skip_for_resume(state, "replanner"):
         return state
@@ -763,7 +930,7 @@ def _legacy_replanner_node(state: OmniCoreState) -> OmniCoreState:
 
 
 # encoding-health: ignore-start
-def replanner_node(state: OmniCoreState) -> OmniCoreState:
+def _legacy_replanner_node(state: OmniCoreState) -> OmniCoreState:
     """Reflect on failed execution and produce a better next plan."""
     if _should_skip_for_resume(state, "replanner"):
         return state
@@ -955,6 +1122,7 @@ def human_confirm_node(state: OmniCoreState) -> OmniCoreState:
         if not confirmed:
             state["execution_status"] = "cancelled"
             state["error_trace"] = "用户取消执行"
+            state["final_output"] = "操作已取消，任务队列未执行。"
     else:
         state["human_approved"] = True
     return state
@@ -1033,6 +1201,7 @@ def human_confirm_node_v2(state: OmniCoreState) -> OmniCoreState:
         if not confirmed:
             state["execution_status"] = "cancelled"
             state["error_trace"] = "User cancelled execution"
+            state["final_output"] = "Execution cancelled before running the queued tasks."
     else:
         state["human_approved"] = True
     _save_runtime_checkpoint(state, "human_confirm", "Human confirmation handled")
@@ -1357,7 +1526,7 @@ def _build_execution_evidence_for_answer(state: OmniCoreState) -> str:
     return "\n\n".join(section for section in sections if section).strip()
 
 
-def _synthesize_user_facing_answer(
+def _legacy_synthesize_user_facing_answer(
     state: OmniCoreState,
     delivery_summary: str,
 ) -> str:
@@ -1366,6 +1535,10 @@ def _synthesize_user_facing_answer(
         package = {}
     if _should_keep_delivery_summary_as_final_output(state, package):
         return delivery_summary
+
+    deterministic_list_answer = _build_deterministic_list_answer(state, package)
+    if deterministic_list_answer:
+        return deterministic_list_answer
 
     evidence = _build_execution_evidence_for_answer(state)
     if not evidence:
@@ -1546,7 +1719,7 @@ def _legacy_finalize_node(state: OmniCoreState) -> OmniCoreState:
 # === 条件路由函数 ===
 
 # encoding-health: ignore-start
-def finalize_node(state: OmniCoreState) -> OmniCoreState:
+def _legacy_finalize_node_v2(state: OmniCoreState) -> OmniCoreState:
     """Build the final user-facing output from direct answers or executed tasks."""
     if _should_skip_for_resume(state, "finalize"):
         return state
@@ -1642,6 +1815,8 @@ def should_continue_after_route(state: OmniCoreState) -> Literal["human_confirm"
 
 
 def get_first_executor(state: OmniCoreState) -> Literal["parallel_executor", "validator", "end"]:
+    if str(state.get("execution_status", "") or "") == "cancelled":
+        return "end"
     if collect_ready_task_indexes(state):
         return "parallel_executor"
     if _has_waiting_tasks(state):
@@ -1690,6 +1865,10 @@ def _synthesize_user_facing_answer(
         package = {}
     if _should_keep_delivery_summary_as_final_output(state, package):
         return delivery_summary
+
+    deterministic_list_answer = _build_deterministic_list_answer(state, package)
+    if deterministic_list_answer:
+        return deterministic_list_answer
 
     evidence = _build_execution_evidence_for_answer(state)
     if not evidence:

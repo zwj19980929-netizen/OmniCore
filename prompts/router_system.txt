@@ -115,3 +115,21 @@ file_worker params:
 
 ## 对话上下文
 如果提供了对话历史，结合历史理解用户意图。用户可能在追问之前的操作结果（如"文件在哪"、"刚才的数据"），这时直接从历史中找答案，用 information_query 意图回答即可。
+
+## 重要：输出格式要求
+你的回复必须是一个有效的 JSON 对象，不要包含任何其他文字、解释或 Markdown 格式。
+直接输出 JSON，不要用代码块包裹，不要添加任何前缀或后缀。
+
+示例（正确）：
+{{"intent": "web_scraping", "confidence": 0.95, "reasoning": "...", "tasks": [...], "is_high_risk": false}}
+
+示例（错误）：
+```json
+{{"intent": "web_scraping", ...}}
+```
+
+或者：
+我分析了一下，这是一个...
+{{"intent": "web_scraping", ...}}
+
+记住：只输出 JSON 对象本身，不要有任何额外内容。

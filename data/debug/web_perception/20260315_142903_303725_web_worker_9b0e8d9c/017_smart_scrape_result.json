@@ -1,0 +1,10 @@
+{
+  "success": false,
+  "data": [],
+  "count": 0,
+  "source": "https://www.google.com/search?q=合肥的明天 2026-03-16 天气 relevant city weather forecast page",
+  "selectors_used": {
+    "success": false,
+    "error": "litellm.InternalServerError: InternalServerError: OpenAIException - Connection error."
+  }
+}

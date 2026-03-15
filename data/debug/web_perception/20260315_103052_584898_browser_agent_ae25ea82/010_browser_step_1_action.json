@@ -1,0 +1,14 @@
+{
+  "action_type": "scroll",
+  "target_selector": "",
+  "target_ref": "",
+  "value": "800",
+  "description": "Scroll down 800 pixels to trigger lazy loading of search results",
+  "confidence": 0.85,
+  "requires_confirmation": false,
+  "fallback_selector": "",
+  "use_keyboard_fallback": false,
+  "keyboard_key": "",
+  "expected_page_type": "serp",
+  "expected_text": ""
+}

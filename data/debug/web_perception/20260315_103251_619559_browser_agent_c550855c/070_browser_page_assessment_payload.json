@@ -1,0 +1,20 @@
+{
+  "page_relevant": true,
+  "goal_satisfied": false,
+  "reason": "页面是Bing搜索结果页面且URL正确(query=openai+api)，但当前无可见搜索结果数据。页面类型显示为modal且可见数据为空，说明动态内容尚未加载渲染完成。需要等待懒加载完成后才能提取前3条搜索结果。",
+  "evidence_indexes": [],
+  "confidence": 0.9,
+  "action": {
+    "type": "wait",
+    "element_index": null,
+    "target_ref": null,
+    "target_selector": null,
+    "value": null,
+    "description": "等待搜索结果懒加载渲染完成后提取数据",
+    "fallback_selector": null,
+    "use_keyboard": false,
+    "keyboard_key": null,
+    "expected_page_type": "search_results",
+    "expected_text": "搜索结果标题和链接"
+  }
+}

@@ -1,8 +1,11 @@
 """
-工具适配器钩子 - 在每个工具执行后调用 AI PUA 教练评估
+Tool execution diagnostics.
+
+Keep failure reporting concise and factual. This hook must never emit abusive
+or role-playing output into the runtime logs.
 """
 from typing import Dict, Any
-from utils.ai_pua_coach import get_ai_coach
+
 from utils.logger import console
 
 
@@ -13,7 +16,7 @@ def evaluate_tool_result(
     step_no: int
 ) -> None:
     """
-    评估工具执行结果并给出 AI PUA 教练的评论
+    Print a short diagnostic line for failed tool executions.
 
     Args:
         tool_name: 工具名称
@@ -21,28 +24,24 @@ def evaluate_tool_result(
         result: 执行结果
         step_no: 步骤编号
     """
-    coach = get_ai_coach()
+    if bool(result.get("success")):
+        return
 
-    # 构建动作描述
-    action = f"{tool_name}: {task.get('description', '')[:50]}"
-
-    # 构建期望结果
     expected = _build_expected_result(tool_name, task)
-
-    # 任务上下文
-    context = task.get("description", "")
-
-    # 评估结果
-    comment = coach.evaluate_step(
-        step_no=step_no,
-        action=action,
-        expected=expected,
-        actual_result=result,
-        task_context=context
+    description = str(task.get("description", "") or "").strip()
+    error = (
+        str(result.get("error", "") or "").strip()
+        or str(result.get("message", "") or "").strip()
+        or "unknown error"
     )
-
-    # 显示评论
-    console.print(f"\n[cyan]{comment}[/cyan]\n")
+    count = result.get("count")
+    count_suffix = f", count={count}" if count is not None else ""
+    console.print(
+        "\n"
+        f"[yellow][ToolFailure][/yellow] step={step_no} tool={tool_name} "
+        f"expected={expected} error={error[:240]}{count_suffix}\n"
+        f"[dim]{description[:240]}[/dim]\n"
+    )
 
 
 def _build_expected_result(tool_name: str, task: Dict[str, Any]) -> str:
@@ -62,7 +61,5 @@ def _build_expected_result(tool_name: str, task: Dict[str, Any]) -> str:
 
 
 def show_progress_report(task_description: str) -> None:
-    """显示任务进度报告"""
-    coach = get_ai_coach()
-    report = coach.generate_progress_report(task_description)
-    console.print(f"\n[yellow]{report}[/yellow]\n")
+    """Emit a concise task progress header."""
+    console.print(f"\n[yellow][Progress][/yellow] {str(task_description or '').strip()[:240]}\n")

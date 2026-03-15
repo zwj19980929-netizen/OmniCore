@@ -1,0 +1,85 @@
+{
+  "success": true,
+  "data": [
+    {
+      "index": 1,
+      "title": "Lightricks/LTX-2.3 Image-to-Video • Updated 10 days ago • 551k • 612",
+      "url": "https://huggingface.co/Lightricks/LTX-2.3",
+      "link": "https://huggingface.co/Lightricks/LTX-2.3"
+    },
+    {
+      "index": 2,
+      "title": "Qwen/Qwen3.5-9B Image-Text-to-Text • 10B • Updated 13 days ago • 1.96M • • 829",
+      "url": "https://huggingface.co/Qwen/Qwen3.5-9B",
+      "link": "https://huggingface.co/Qwen/Qwen3.5-9B"
+    },
+    {
+      "index": 3,
+      "title": "unsloth/Qwen3.5-35B-A3B-GGUF Image-Text-to-Text • 35B • Updated 10 days ago • 1.59M • 654",
+      "url": "https://huggingface.co/unsloth/Qwen3.5-35B-A3B-GGUF",
+      "link": "https://huggingface.co/unsloth/Qwen3.5-35B-A3B-GGUF"
+    },
+    {
+      "index": 4,
+      "title": "dx8152/Flux2-Klein-9B-Consistency Image-to-Image • Updated 4 days ago • 5.68k • 117",
+      "url": "https://huggingface.co/dx8152/Flux2-Klein-9B-Consistency",
+      "link": "https://huggingface.co/dx8152/Flux2-Klein-9B-Consistency"
+    },
+    {
+      "index": 5,
+      "title": "RekaAI/reka-edge-2603 Image-Text-to-Text • 7B • Updated 2 days ago • 186 • 74",
+      "url": "https://huggingface.co/RekaAI/reka-edge-2603",
+      "link": "https://huggingface.co/RekaAI/reka-edge-2603"
+    },
+    {
+      "index": 6,
+      "title": "Image-Text-to-Text",
+      "url": "https://huggingface.co/models?pipeline_tag=image-text-to-text",
+      "link": "https://huggingface.co/models?pipeline_tag=image-text-to-text"
+    },
+    {
+      "index": 7,
+      "title": "sentence-transformers",
+      "url": "https://huggingface.co/models?library=sentence-transformers",
+      "link": "https://huggingface.co/models?library=sentence-transformers"
+    },
+    {
+      "index": 8,
+      "title": "Jackrong/Qwen3.5-27B-Claude-4.6-Opus-Reasoning-Distilled Text Generation • 28B • Updated 8 days ago • 61.6k • 676",
+      "url": "https://huggingface.co/Jackrong/Qwen3.5-27B-Claude-4.6-Opus-Reasoning-Distilled",
+      "link": "https://huggingface.co/Jackrong/Qwen3.5-27B-Claude-4.6-Opus-Reasoning-Distilled"
+    },
+    {
+      "index": 9,
+      "title": "Tesslate/OmniCoder-9B Text Generation • Updated 2 days ago • 5.66k • 186",
+      "url": "https://huggingface.co/Tesslate/OmniCoder-9B",
+      "link": "https://huggingface.co/Tesslate/OmniCoder-9B"
+    },
+    {
+      "index": 10,
+      "title": "LocoreMind/LocoTrainer-4B Text Generation • 4B • Updated 1 day ago • 1.22k • 162",
+      "url": "https://huggingface.co/LocoreMind/LocoTrainer-4B",
+      "link": "https://huggingface.co/LocoreMind/LocoTrainer-4B"
+    }
+  ],
+  "count": 10,
+  "source": "https://huggingface.co/models",
+  "selectors_used": {
+    "success": true,
+    "page_type": "list",
+    "requires_navigation": false,
+    "navigation_reason": "",
+    "item_selector": "article, li, div[data-target*='model']",
+    "fields": {
+      "title": "h4.text-md.truncate",
+      "link": "a[href*='/models/']",
+      "date": "",
+      "severity": "",
+      "id": ""
+    },
+    "need_click_first": false,
+    "click_selector": "",
+    "notes": "Based on page structure overview, model names are in h4.text-md.truncate elements. The page shows 43 models in total. Each model entry should contain a link to its detail page via an anchor tag. The h4 elements contain the model names like 'Jackrong/Qwen3.5-27B-Claude-4.6-Opus-Reasoning-Distilled', 'fishaudio/s2-pro', etc.",
+    "observed_page_type": "detail"
+  }
+}

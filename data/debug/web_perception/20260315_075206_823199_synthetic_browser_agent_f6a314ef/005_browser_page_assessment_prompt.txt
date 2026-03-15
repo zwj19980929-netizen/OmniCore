@@ -1,0 +1,42 @@
+You are evaluating whether the current browser page already advances the task.
+Return JSON only with keys:
+- page_relevant: boolean
+- goal_satisfied: boolean
+- reason: string
+- evidence_indexes: array of integers
+- confidence: number
+- action: object with keys type, element_index, target_ref, target_selector, value, description, fallback_selector, use_keyboard, keyboard_key, expected_page_type, expected_text
+
+Task: 到github官网给我找找openclaw的地址
+Intent: search
+Query: openclaw github address
+Current URL: https://www.google.com/search?q=openclaw
+Page title: openclaw - Google Search
+Page type: serp
+Page stage: completing
+Last action: none
+Visible data:
+[0] OpenClaw - GitHub | General purpose web agent runtime | https://github.com/openclaw
+
+Search result cards:
+[el_7] OpenClaw - GitHub | GitHub | github.com | General purpose web agent runtime
+[el_8] OpenClaw Docs | OpenClaw | docs.openclaw.ai | Documentation and guides
+
+Collections:
+[collection_1] kind=search_results count=10 samples=OpenClaw - GitHub | OpenClaw Docs | OpenClaw examples
+controls: next_page=el_20
+
+Candidate elements:
+[1] type=link ref=el_7 selector=div.g:nth-of-type(1) a info=OpenClaw - GitHub | https://github.com/openclaw
+[2] type=link ref=el_8 selector=div.g:nth-of-type(2) a info=OpenClaw Docs | https://docs.openclaw.ai
+[0] type=searchbox ref=el_1 selector=textarea[name="q"] info=Search | openclaw
+
+Rules:
+- Use only the visible data, search result cards, and candidate elements provided above.
+- Prefer `target_ref` over `target_selector` whenever a relevant ref is available.
+- If the visible data already likely answers the task, choose action.type="extract".
+- If the task is already complete without further extraction, choose action.type="done".
+- If the page is a search results page and the snippets are relevant enough to answer the task, prefer "extract" over clicking through.
+- If the current page is relevant but incomplete and a card or candidate likely leads to the best source or detail page, choose "click" and reference the card or element via `target_ref`.
+- Choose "input" only if the current page is not already showing relevant results or the search box clearly needs a different query.
+- If you cannot justify a meaningful action from the evidence, choose "wait".

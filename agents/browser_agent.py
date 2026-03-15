@@ -18,6 +18,9 @@ from core.llm import LLMClient
 from utils.browser_toolkit import BrowserToolkit, ToolkitResult
 from utils.logger import log_agent_action, log_error, log_success, log_warning
 from utils.retry import async_retry, is_retryable
+from utils.url_utils import extract_first_url
+from utils.web_prompt_budget import BudgetSection, render_budgeted_sections
+import utils.web_debug_recorder as web_debug_recorder
 
 
 class ActionType(Enum):
@@ -48,17 +51,35 @@ class PageElement:
     text: str
     element_type: str
     selector: str
+    ref: str = ""
+    role: str = ""
     attributes: Dict[str, str] = field(default_factory=dict)
     is_visible: bool = True
     is_clickable: bool = True
     context_before: str = ""  # 🔥 新增：元素前面的上下文文本
     context_after: str = ""   # 🔥 新增：元素后面的上下文文本
+    parent_ref: str = ""
+    region: str = ""
+
+
+@dataclass
+class SearchResultCard:
+    ref: str
+    title: str
+    target_ref: str = ""
+    target_selector: str = ""
+    snippet: str = ""
+    source: str = ""
+    host: str = ""
+    date: str = ""
+    rank: int = 0
 
 
 @dataclass
 class BrowserAction:
     action_type: ActionType
     target_selector: str = ""
+    target_ref: str = ""
     value: str = ""
     description: str = ""
     confidence: float = 0.0
@@ -66,6 +87,8 @@ class BrowserAction:
     fallback_selector: str = ""
     use_keyboard_fallback: bool = False
     keyboard_key: str = ""
+    expected_page_type: str = ""
+    expected_text: str = ""
 
 
 @dataclass
@@ -76,6 +99,19 @@ class TaskIntent:
     fields: Dict[str, str] = field(default_factory=dict)
     requires_interaction: bool = False
     target_text: str = ""
+
+
+@dataclass
+class PageState:
+    page_type: str = "unknown"
+    stage: str = "unknown"
+    confidence: float = 0.0
+    item_count: int = 0
+    target_count: int = 0
+    has_pagination: bool = False
+    has_load_more: bool = False
+    has_modal: bool = False
+    goal_satisfied: bool = False
 
 
 _QUERY_STOP_TOKENS = frozenset(
@@ -91,9 +127,13 @@ _QUERY_STOP_TOKENS = frozenset(
         "latest", "recent", "today", "news", "article", "articles", "report", "reports",
         "search", "query", "result", "results", "page", "site", "website", "source", "sources",
         "open", "click", "input", "show", "extract", "read", "find", "look", "lookup", "retrieve",
+        "browser", "browsers", "task", "tasks", "wait", "waiting", "render", "rendering",
+        "load", "loading", "loaded", "fully", "complete", "completed", "display", "summary",
+        "summarize", "summarise", "report", "collect", "scrape",
         "current", "recently", "recentest", "verify", "verification", "rumor", "rumors",
         "最近", "最新", "当前", "今天", "新闻", "报道", "文章", "分析", "来源", "网页", "页面", "网站",
         "搜索", "查询", "结果", "打开", "点击", "输入", "提取", "读取", "显示", "获取", "核实", "传闻",
+        "浏览器", "任务", "等待", "渲染", "加载", "完成", "完整", "操作", "过程", "步骤", "总结", "收集",
     }
 )
 
@@ -120,6 +160,9 @@ _FACT_QUERY_HINTS = (
 from utils.prompt_manager import get_prompt
 ACTION_DECISION_PROMPT = get_prompt("browser_action_decision")
 PAGE_ASSESSMENT_PROMPT = get_prompt("browser_page_assessment")
+VISION_ACTION_PROMPT = get_prompt("browser_vision_decision")
+_PAGE_ASSESSMENT_CONTEXT_TOKENS = 1600
+_ACTION_DECISION_CONTEXT_TOKENS = 1400
 
 
 class BrowserAgent:
@@ -136,6 +179,10 @@ class BrowserAgent:
         self._action_history: List[str] = []
         self._intent_cache: Dict[str, TaskIntent] = {}
         self._page_assessment_cache: Dict[str, Optional[BrowserAction]] = {}
+        self._last_semantic_snapshot: Dict[str, Any] = {}
+        self._vision_llm: Optional[LLMClient] = None
+        self._vision_llm_attempted = False
+        self._vision_llm_unavailable_logged = False
 
         # 如果外部传入 toolkit 就用，否则自建
         if toolkit:
@@ -158,6 +205,45 @@ class BrowserAgent:
         if self.llm is None:
             self.llm = LLMClient()
         return self.llm
+
+    def _elements_to_debug_payload(self, elements: List[PageElement]) -> List[Dict[str, Any]]:
+        return [
+            {
+                "index": element.index,
+                "tag": element.tag,
+                "text": element.text,
+                "element_type": element.element_type,
+                "selector": element.selector,
+                "ref": element.ref,
+                "role": element.role,
+                "attributes": dict(element.attributes or {}),
+                "is_visible": element.is_visible,
+                "is_clickable": element.is_clickable,
+                "context_before": element.context_before,
+                "context_after": element.context_after,
+                "parent_ref": element.parent_ref,
+                "region": element.region,
+            }
+            for element in elements
+        ]
+
+    def _action_to_debug_payload(self, action: Optional[BrowserAction]) -> Dict[str, Any]:
+        if action is None:
+            return {}
+        return {
+            "action_type": action.action_type.value,
+            "target_selector": action.target_selector,
+            "target_ref": action.target_ref,
+            "value": action.value,
+            "description": action.description,
+            "confidence": action.confidence,
+            "requires_confirmation": action.requires_confirmation,
+            "fallback_selector": action.fallback_selector,
+            "use_keyboard_fallback": action.use_keyboard_fallback,
+            "keyboard_key": action.keyboard_key,
+            "expected_page_type": action.expected_page_type,
+            "expected_text": action.expected_text,
+        }
 
     # ── pure logic helpers (no browser) ──────────────────────
 
@@ -238,7 +324,6 @@ class BrowserAgent:
         normalized_url = (url or "").lower()
         normalized_title = (title or "").lower()
         blocked_url_tokens = (
-            "/ok.html",
             "/forbidden",
             "/denied",
             "/captcha",
@@ -246,6 +331,7 @@ class BrowserAgent:
             "/challenge",
             "/blocked",
             "/security-check",
+            "/sorry",
         )
         blocked_title_tokens = (
             "403",
@@ -255,14 +341,22 @@ class BrowserAgent:
             "robot check",
             "security check",
             "captcha",
+            "unusual traffic",
+            "异常流量",
+            "人机身份验证",
             "验证码",
             "安全验证",
             "访问受限",
             "拒绝访问",
         )
-        return any(token in normalized_url for token in blocked_url_tokens) or any(
-            token in normalized_title for token in blocked_title_tokens
-        )
+        title_blocked = any(token in normalized_title for token in blocked_title_tokens)
+        url_blocked = any(token in normalized_url for token in blocked_url_tokens)
+        # `/ok.html` is used by some sites as a generic holding/redirect path.
+        # Treat it as blocked only when the title or URL also carries denial signals.
+        ok_holding_page = "/ok.html" in normalized_url
+        if ok_holding_page and not title_blocked:
+            ok_holding_page = any(token in normalized_url for token in ("403", "forbidden", "denied", "blocked"))
+        return url_blocked or title_blocked or ok_holding_page
 
     def _is_read_only_task(self, task: str, intent: Optional[TaskIntent] = None) -> bool:
         normalized = self._normalize_text(task)
@@ -288,6 +382,7 @@ class BrowserAgent:
     def _action_signature(self, action: BrowserAction) -> str:
         return "|".join([
             action.action_type.value,
+            action.target_ref[:80],
             action.target_selector[:80],
             self._normalize_text(action.value)[:80],
             self._normalize_text(action.description)[:80],
@@ -313,6 +408,110 @@ class BrowserAgent:
     def _filter_noise_elements(self, elements: List[PageElement]) -> List[PageElement]:
         filtered = [e for e in elements if not self._is_noise_element(e)]
         return filtered or elements
+
+    async def _get_semantic_snapshot(self) -> Dict[str, Any]:
+        snapshot_r = await self.toolkit.semantic_snapshot(max_elements=80, include_cards=True)
+        if snapshot_r.success and isinstance(snapshot_r.data, dict):
+            self._last_semantic_snapshot = snapshot_r.data
+            web_debug_recorder.write_json("browser_semantic_snapshot", self._last_semantic_snapshot)
+            return self._last_semantic_snapshot
+        return self._last_semantic_snapshot or {}
+
+    def _elements_from_snapshot(self, snapshot: Dict[str, Any]) -> List[PageElement]:
+        elements: List[PageElement] = []
+        for index, item in enumerate((snapshot.get("elements", []) or [])[:60]):
+            if not isinstance(item, dict):
+                continue
+            elements.append(
+                PageElement(
+                    index=int(item.get("index", index)),
+                    tag=str(item.get("tag", "") or ""),
+                    text=str(item.get("text", "") or ""),
+                    element_type=str(item.get("type", item.get("role", "")) or ""),
+                    selector=str(item.get("selector", "") or ""),
+                    ref=str(item.get("ref", "") or ""),
+                    role=str(item.get("role", "") or ""),
+                    attributes={
+                        "href": str(item.get("href", "") or ""),
+                        "value": str(item.get("value", "") or ""),
+                        "placeholder": str(item.get("placeholder", "") or ""),
+                        "labelText": str(item.get("label", "") or ""),
+                        "ariaLabel": str(item.get("label", "") or ""),
+                    },
+                    is_visible=bool(item.get("visible", True)),
+                    is_clickable=bool(item.get("enabled", True)),
+                    parent_ref=str(item.get("parent_ref", "") or ""),
+                    region=str(item.get("region", "") or ""),
+                )
+            )
+        return elements
+
+    def _cards_from_snapshot(self, snapshot: Optional[Dict[str, Any]]) -> List[SearchResultCard]:
+        cards: List[SearchResultCard] = []
+        for item in (snapshot or {}).get("cards", []) or []:
+            if not isinstance(item, dict):
+                continue
+            cards.append(
+                SearchResultCard(
+                    ref=str(item.get("ref", "") or ""),
+                    title=str(item.get("title", "") or ""),
+                    target_ref=str(item.get("target_ref", "") or ""),
+                    target_selector=str(item.get("target_selector", "") or ""),
+                    snippet=str(item.get("snippet", "") or ""),
+                    source=str(item.get("source", "") or ""),
+                    host=str(item.get("host", "") or ""),
+                    date=str(item.get("date", "") or ""),
+                    rank=int(item.get("rank", 0) or 0),
+                )
+            )
+        return cards
+
+    def _collections_from_snapshot(self, snapshot: Optional[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        collections: List[Dict[str, Any]] = []
+        for item in (snapshot or {}).get("collections", []) or []:
+            if not isinstance(item, dict):
+                continue
+            collections.append(
+                {
+                    "ref": str(item.get("ref", "") or ""),
+                    "kind": str(item.get("kind", "") or ""),
+                    "item_count": int(item.get("item_count", 0) or 0),
+                    "sample_items": [
+                        str(sample or "")
+                        for sample in (item.get("sample_items", []) or [])[:5]
+                        if str(sample or "").strip()
+                    ],
+                }
+            )
+        return collections
+
+    def _get_snapshot_affordances(self, snapshot: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+        affordances = (snapshot or {}).get("affordances", {}) or {}
+        return affordances if isinstance(affordances, dict) else {}
+
+    def _extract_target_result_count(self, task: str) -> int:
+        match = re.search(
+            r'(\d+)\s*(?:个|条|款|项|条数据|items?|results?|records?|articles?|stories|news|vulnerabilities?|条漏洞)',
+            task or "",
+            flags=re.IGNORECASE,
+        )
+        if not match:
+            return 0
+        try:
+            return max(int(match.group(1)), 0)
+        except (TypeError, ValueError):
+            return 0
+
+    def _get_snapshot_item_count(self, snapshot: Optional[Dict[str, Any]]) -> int:
+        active_snapshot = snapshot or {}
+        card_count = len(active_snapshot.get("cards", []) or [])
+        collection_count = max(
+            (int(item.get("item_count", 0) or 0) for item in self._collections_from_snapshot(active_snapshot)),
+            default=0,
+        )
+        affordances = self._get_snapshot_affordances(active_snapshot)
+        affordance_count = int(affordances.get("collection_item_count", 0) or 0)
+        return max(card_count, collection_count, affordance_count)
 
     def _score_element_for_context(self, task: str, element: PageElement) -> float:
         attrs = element.attributes or {}
@@ -412,6 +611,33 @@ class BrowserAgent:
             score += 2.0
         return score
 
+    def _score_source_authority(self, task: str, host: str, source: str) -> float:
+        host_norm = self._normalize_text(host)
+        source_norm = self._normalize_text(source)
+        task_norm = self._normalize_text(task)
+        score = 0.0
+
+        if any(host_norm.endswith(suffix) for suffix in [".gov", ".edu", ".org"]):
+            score += 2.2
+        if any(token in host_norm for token in ["reuters", "apnews", "bloomberg", "wsj", "ft.com", "bbc", "nytimes"]):
+            score += 2.4
+        if any(token in source_norm for token in ["reuters", "associated press", "ap ", "bloomberg", "bbc"]):
+            score += 1.6
+        if any(token in task_norm for token in ["official", "announcement", "statement", "verify", "核实", "声明", "官方"]):
+            if any(token in host_norm for token in [".gov", ".edu", ".org", "official", "gov.cn", "state.gov"]):
+                score += 1.8
+        return score
+
+    def _score_search_result_card(self, task: str, query: str, card: SearchResultCard) -> float:
+        haystack = " ".join([card.title, card.snippet, card.source, card.host, card.date])
+        score = self._score_text_relevance(query, haystack)
+        score += self._score_source_authority(task, card.host, card.source)
+        if card.rank > 0:
+            score += max(1.2 - ((card.rank - 1) * 0.1), 0.0)
+        if any(token in self._normalize_text(card.title + " " + card.snippet) for token in ["官方", "official", "statement", "press release"]):
+            score += 1.0
+        return score
+
     def _data_has_substantive_text(self, data: List[Dict[str, str]]) -> bool:
         for item in data[:8]:
             if not isinstance(item, dict):
@@ -448,10 +674,57 @@ class BrowserAgent:
                 return True
         return False
 
+    def _strip_search_instruction_phrases(self, value: str) -> str:
+        cleaned = str(value or "").strip()
+        if not cleaned:
+            return ""
+
+        cleaned = re.sub(
+            r"^(?:browser|web|page)\s+task\s*[:：-]?\s*",
+            "",
+            cleaned,
+            flags=re.IGNORECASE,
+        )
+        cleaned = re.sub(
+            r"^(?:浏览器任务|网页任务|任务)\s*[:：-]?\s*",
+            "",
+            cleaned,
+            flags=re.IGNORECASE,
+        )
+
+        split_patterns = (
+            r"\s+(?=(?:wait(?:ing)?(?:\s+for)?|render(?:ing)?|load(?:ing|ed)?|open|visit|navigate|go\s+to|click|input|type|fill|submit|extract|show|display|return|report|summari[sz]e|collect|scrape)\b)",
+            r"[\s，,。；;]+(?=(?:等待|渲染|加载|打开|访问|进入|点击|输入|填写|提交|提取|展示|显示|返回|总结|收集|抓取))",
+            r"[\s，,。；;]+(?=(?:and then|then|next)\b)",
+        )
+        for pattern in split_patterns:
+            parts = re.split(pattern, cleaned, maxsplit=1, flags=re.IGNORECASE)
+            if parts and parts[0].strip():
+                cleaned = parts[0].strip()
+
+        return cleaned
+
     def _refine_search_query(self, task: str, candidate: str = "") -> str:
         raw = str(candidate or task or "")
         raw = re.sub(r"https?://\S+", " ", raw)
+        raw = re.sub(r"\bsite:\s*[^\s]+", " ", raw, flags=re.IGNORECASE)
+        raw = re.sub(r"\b(?:[a-zA-Z0-9-]+\.)+[a-zA-Z]{2,}\b", " ", raw)
+        raw = re.sub(
+            r"\b(?:from|use|using|via|prefer|preferred|primary|secondary)\b\s+[^\n,.;，。；]{0,120}\b(?:source|site|domain|url)\b",
+            " ",
+            raw,
+            flags=re.IGNORECASE,
+        )
+        raw = re.sub(
+            r"(?:作为|用作)?(?:主要|首选|次要|备用)?(?:来源|站点|域名)[^\n,.;，。；]{0,80}",
+            " ",
+            raw,
+            flags=re.IGNORECASE,
+        )
         normalized = re.sub(r"\s+", " ", raw).strip()
+        if not normalized:
+            return ""
+        normalized = self._strip_search_instruction_phrases(normalized)
         if not normalized:
             return ""
 
@@ -473,13 +746,15 @@ class BrowserAgent:
                 normalized = match.group(1)
                 break
 
-        normalized = re.split(r"(?:并|然后|并且|且|and then|then|click|点击|打开|访问|extract|提取|展示|show|向用户|给用户)", normalized, maxsplit=1, flags=re.IGNORECASE)[0]
+        normalized = self._strip_search_instruction_phrases(normalized)
         stop_tokens = {
             "打开", "浏览器", "访问", "页面", "网页", "网站", "点击", "输入", "搜索", "查询", "查找",
             "提取", "展示", "显示", "查看", "操作", "过程", "结果", "用户", "详细", "详情", "完整",
             "use", "open", "browser", "page", "website", "click", "input", "search", "query",
             "extract", "show", "display", "user", "details", "process", "result", "results", "visible",
-            "retrieve", "rendering", "after", "wait", "render", "data",
+            "retrieve", "rendering", "after", "wait", "render", "data", "task", "tasks",
+            "loading", "loaded", "load", "fully", "complete", "completed", "summary", "report",
+            "等待", "加载", "渲染", "完成", "任务", "步骤", "总结", "收集",
         }
         tokens: List[str] = []
         for token in re.findall(r"[\u4e00-\u9fff]{2,}|[A-Za-z0-9][A-Za-z0-9_+.-]{1,}", normalized):
@@ -511,7 +786,8 @@ class BrowserAgent:
                 ] if part
             )
             selector = element.selector[:72]
-            lines.append(f"[{element.index}] type={element.element_type} selector={selector} info={descriptor}")
+            ref_part = f" ref={element.ref}" if element.ref else ""
+            lines.append(f"[{element.index}] type={element.element_type}{ref_part} selector={selector} info={descriptor}")
         return "\n".join(lines)
 
     def _format_data_for_llm(self, data: List[Dict[str, str]], max_items: int = 8) -> str:
@@ -526,6 +802,61 @@ class BrowserAgent:
             if parts:
                 lines.append(f"[{index}] " + " | ".join(parts))
         return "\n".join(lines) or "(no visible data)"
+
+    def _format_cards_for_llm(self, cards: List[SearchResultCard], max_items: int = 8) -> str:
+        lines: List[str] = []
+        for card in cards[:max_items]:
+            parts = [
+                card.title[:100],
+                card.source[:48],
+                card.host[:48],
+                card.date[:40],
+                card.snippet[:160],
+            ]
+            payload = " | ".join(part for part in parts if part)
+            if payload:
+                target = card.target_ref or card.ref
+                lines.append(f"[{target}] {payload}")
+        if len(cards) > max_items:
+            lines.append(f"... {len(cards) - max_items} more cards omitted")
+        return "\n".join(lines) or "(no cards)"
+
+    def _format_collections_for_llm(self, snapshot: Optional[Dict[str, Any]], max_items: int = 4) -> str:
+        lines: List[str] = []
+        all_items = self._collections_from_snapshot(snapshot)
+        for item in all_items[:max_items]:
+            samples = " | ".join(sample[:120] for sample in item.get("sample_items", [])[:3] if sample)
+            lines.append(
+                f"[{item.get('ref', '') or 'collection'}] kind={item.get('kind', 'unknown')} "
+                f"count={item.get('item_count', 0)} samples={samples or '(none)'}"
+            )
+        affordances = self._get_snapshot_affordances(snapshot)
+        if affordances.get("has_load_more") or affordances.get("has_pagination"):
+            controls: List[str] = []
+            if affordances.get("has_load_more"):
+                controls.append(f"load_more={affordances.get('load_more_ref') or affordances.get('load_more_selector')}")
+            if affordances.get("has_pagination"):
+                controls.append(f"next_page={affordances.get('next_page_ref') or affordances.get('next_page_selector')}")
+            lines.append("controls: " + " | ".join(controls))
+        if len(all_items) > max_items:
+            lines.append(f"... {len(all_items) - max_items} more collections omitted")
+        return "\n".join(lines) or "(no collections)"
+
+    def _format_controls_for_llm(self, snapshot: Optional[Dict[str, Any]], max_items: int = 6) -> str:
+        lines: List[str] = []
+        controls = (snapshot or {}).get("controls", []) or []
+        for control in controls[:max_items]:
+            if not isinstance(control, dict):
+                continue
+            lines.append(
+                f"[{str(control.get('ref', '') or 'control')}] "
+                f"kind={str(control.get('kind', '') or '')} "
+                f"text={str(control.get('text', '') or '')[:96]} "
+                f"selector={str(control.get('selector', '') or '')[:72]}"
+            )
+        if len(controls) > max_items:
+            lines.append(f"... {len(controls) - max_items} more controls omitted")
+        return "\n".join(lines) or "(no controls)"
 
     def _format_assessment_elements_for_llm(
         self,
@@ -574,14 +905,101 @@ class BrowserAgent:
 
             context_str = " | ".join(context_parts) if context_parts else ""
 
-            line = f"[{element.index}] type={element.element_type} selector={element.selector[:72]} info={details}"
+            ref_part = f" ref={element.ref}" if element.ref else ""
+            line = f"[{element.index}] type={element.element_type}{ref_part} selector={element.selector[:72]} info={details}"
             if context_str:
                 line += f" | context: {context_str}"
 
             lines.append(line)
             if len(lines) >= max_items:
                 break
+        total_candidates = len(seen_selectors)
+        if len(ranked) > total_candidates:
+            lines.append(f"... {len(ranked) - total_candidates} more candidate elements omitted")
         return "\n".join(lines) or "(no actionable elements)"
+
+    def _build_budgeted_browser_prompt_context(
+        self,
+        *,
+        task: str,
+        current_url: str,
+        data: List[Dict[str, str]],
+        cards: List[SearchResultCard],
+        snapshot: Optional[Dict[str, Any]],
+        elements_text: str,
+        total_tokens: int,
+    ) -> Tuple[Dict[str, str], Dict[str, Dict[str, Any]]]:
+        data_text = self._format_data_for_llm(data, max_items=12)
+        cards_text = self._format_cards_for_llm(cards, max_items=14)
+        collections_text = self._format_collections_for_llm(snapshot, max_items=6)
+        controls_text = self._format_controls_for_llm(snapshot, max_items=6)
+        rendered, report = render_budgeted_sections(
+            [
+                BudgetSection(
+                    name="data",
+                    text=data_text,
+                    min_chars=240,
+                    max_chars=1100,
+                    weight=0.8,
+                    mode="lines",
+                    omission_label="data lines",
+                ),
+                BudgetSection(
+                    name="cards",
+                    text=cards_text,
+                    min_chars=480,
+                    max_chars=1700,
+                    weight=1.4,
+                    mode="lines",
+                    omission_label="card lines",
+                ),
+                BudgetSection(
+                    name="collections",
+                    text=collections_text,
+                    min_chars=260,
+                    max_chars=900,
+                    weight=0.9,
+                    mode="lines",
+                    omission_label="collection lines",
+                ),
+                BudgetSection(
+                    name="controls",
+                    text=controls_text,
+                    min_chars=180,
+                    max_chars=700,
+                    weight=0.8,
+                    mode="lines",
+                    omission_label="control lines",
+                ),
+                BudgetSection(
+                    name="elements",
+                    text=elements_text,
+                    min_chars=520,
+                    max_chars=1900,
+                    weight=1.5,
+                    mode="lines",
+                    omission_label="element lines",
+                ),
+            ],
+            total_tokens=total_tokens,
+            model=self._get_llm(),
+        )
+        report["context"] = {
+            "task": task[:160],
+            "current_url": current_url[:160],
+            "total_budget_tokens": total_tokens,
+        }
+        coverage_parts = []
+        for name in ("data", "cards", "collections", "controls", "elements"):
+            item = report.get(name, {})
+            requested = int(item.get("requested_chars", 0) or 0)
+            used = int(item.get("used_chars", 0) or 0)
+            if requested <= 0:
+                coverage_parts.append(f"{name}=none")
+                continue
+            coverage_parts.append(f"{name}={used}/{requested} chars")
+        rendered["context_coverage"] = "; ".join(coverage_parts)
+        return rendered, report
 
     def _clone_action(self, action: Optional[BrowserAction]) -> Optional[BrowserAction]:
         if action is None:
@@ -589,6 +1007,7 @@ class BrowserAgent:
         return BrowserAction(
             action_type=action.action_type,
             target_selector=action.target_selector,
+            target_ref=action.target_ref,
             value=action.value,
             description=action.description,
             confidence=action.confidence,
@@ -596,6 +1015,8 @@ class BrowserAgent:
             fallback_selector=action.fallback_selector,
             use_keyboard_fallback=action.use_keyboard_fallback,
             keyboard_key=action.keyboard_key,
+            expected_page_type=action.expected_page_type,
+            expected_text=action.expected_text,
         )
 
     def _page_assessment_cache_key(
@@ -609,10 +1030,13 @@ class BrowserAgent:
         last_action: Optional[BrowserAction] = None,
     ) -> str:
         active_intent = intent or TaskIntent(intent_type="read", query="", confidence=0.0)
+        cards = self._cards_from_snapshot(self._last_semantic_snapshot)
         payload = {
             "task": self._normalize_text(task)[:240],
             "url": current_url[:220],
             "title": title[:120],
+            "page_type": str((self._last_semantic_snapshot or {}).get("page_type", "") or ""),
+            "page_stage": self._infer_page_state(task, current_url, active_intent, data, self._last_semantic_snapshot).stage,
             "intent": active_intent.intent_type,
             "query": active_intent.query[:160],
             "last_action": self._action_signature(last_action) if last_action else "",
@@ -636,6 +1060,16 @@ class BrowserAgent:
                 }
                 for element in (elements or [])[:10]
             ],
+            "cards": [
+                {
+                    "ref": card.target_ref or card.ref,
+                    "title": card.title[:100],
+                    "source": card.source[:40],
+                    "host": card.host[:40],
+                }
+                for card in cards[:6]
+            ],
+            "collections": self._collections_from_snapshot(self._last_semantic_snapshot)[:4],
         }
         return hashlib.sha1(
             json.dumps(payload, ensure_ascii=False, sort_keys=True).encode("utf-8")
@@ -687,36 +1121,123 @@ class BrowserAgent:
             last_action,
         )
         if cache_key in self._page_assessment_cache:
+            web_debug_recorder.record_event(
+                "browser_page_assessment_cache_hit",
+                cache_key=cache_key,
+                url=current_url,
+            )
             return self._clone_action(self._page_assessment_cache[cache_key])
 
         try:
             active_intent = intent or TaskIntent(intent_type="read", query="", confidence=0.0)
+            snapshot = self._last_semantic_snapshot or await self._get_semantic_snapshot()
+            cards = self._cards_from_snapshot(snapshot)
+            page_state = self._infer_page_state(task, current_url, active_intent, data, snapshot)
+            elements_text = self._format_assessment_elements_for_llm(task, current_url, elements, max_items=18)
+            prompt_context, prompt_budget = self._build_budgeted_browser_prompt_context(
+                task=task,
+                current_url=current_url,
+                data=data,
+                cards=cards,
+                snapshot=snapshot,
+                elements_text=elements_text,
+                total_tokens=_PAGE_ASSESSMENT_CONTEXT_TOKENS,
+            )
             llm = self._get_llm()
+            prompt = PAGE_ASSESSMENT_PROMPT.format(
+                task=task or "",
+                intent=active_intent.intent_type,
+                query=active_intent.query or self._derive_primary_query(task),
+                url=current_url or "",
+                title=title or "",
+                page_type=page_state.page_type,
+                page_stage=page_state.stage,
+                last_action=(last_action.description or last_action.action_type.value) if last_action else "none",
+                context_coverage=prompt_context.get("context_coverage", ""),
+                data=prompt_context.get("data", "(no visible data)"),
+                cards=prompt_context.get("cards", "(no cards)"),
+                collections=prompt_context.get("collections", "(no collections)"),
+                controls=prompt_context.get("controls", "(no controls)"),
+                elements=prompt_context.get("elements", "(no actionable elements)"),
+            )
+            if web_debug_recorder.is_enabled():
+                html_r = await self.toolkit.get_page_html()
+                web_debug_recorder.write_text("browser_page_html", html_r.data or "", suffix=".html")
+            web_debug_recorder.write_json(
+                "browser_page_assessment_context",
+                {
+                    "task": task,
+                    "url": current_url,
+                    "title": title,
+                    "intent": {
+                        "intent_type": active_intent.intent_type,
+                        "query": active_intent.query,
+                        "confidence": active_intent.confidence,
+                        "fields": active_intent.fields,
+                        "requires_interaction": active_intent.requires_interaction,
+                        "target_text": active_intent.target_text,
+                    },
+                    "page_state": {
+                        "page_type": page_state.page_type,
+                        "stage": page_state.stage,
+                        "confidence": page_state.confidence,
+                        "item_count": page_state.item_count,
+                        "target_count": page_state.target_count,
+                        "has_pagination": page_state.has_pagination,
+                        "has_load_more": page_state.has_load_more,
+                        "has_modal": page_state.has_modal,
+                        "goal_satisfied": page_state.goal_satisfied,
+                    },
+                    "data": data,
+                    "cards": [card.__dict__ for card in cards],
+                    "elements": self._elements_to_debug_payload(elements),
+                    "snapshot": snapshot,
+                    "last_action": self._action_to_debug_payload(last_action),
+                    "prompt_budget": prompt_budget,
+                },
+            )
+            web_debug_recorder.write_text("browser_page_assessment_prompt", prompt)
+            web_debug_recorder.write_json("browser_page_assessment_budget", prompt_budget)
             response = await llm.achat(
                 messages=[
                     {"role": "system", "content": "Return JSON only."},
                     {
                         "role": "user",
-                        "content": PAGE_ASSESSMENT_PROMPT.format(
-                            task=task or "",
-                            intent=active_intent.intent_type,
-                            query=active_intent.query or self._derive_primary_query(task),
-                            url=current_url or "",
-                            title=title or "",
-                            last_action=(last_action.description or last_action.action_type.value) if last_action else "none",
-                            data=self._format_data_for_llm(data),
-                            elements=self._format_assessment_elements_for_llm(task, current_url, elements),
-                        ),
+                        "content": prompt,
                     },
                 ],
                 temperature=0.1,
                 json_mode=True,
             )
+            web_debug_recorder.write_text("browser_page_assessment_response", response.content)
             payload = llm.parse_json_response(response)
+            web_debug_recorder.write_json("browser_page_assessment_payload", payload)
             action = self._action_from_llm(payload, elements)
+            web_debug_recorder.write_json(
+                "browser_page_assessment_action",
+                self._action_to_debug_payload(action),
+            )
             if action.action_type == ActionType.FAILED:
                 self._page_assessment_cache[cache_key] = None
                 return None
+
+            if (
+                page_state.page_type == "list"
+                and page_state.target_count
+                and len(data or []) < page_state.target_count
+                and (page_state.has_pagination or page_state.has_load_more)
+            ):
+                if action.action_type in {ActionType.EXTRACT, ActionType.DONE, ActionType.WAIT}:
+                    state_action = self._choose_snapshot_navigation_action(
+                        task,
+                        current_url,
+                        elements,
+                        active_intent,
+                        data,
+                        snapshot,
+                    )
+                    if state_action is not None:
+                        action = state_action
 
             query = active_intent.query or self._derive_primary_query(task)
             if action.action_type == ActionType.INPUT and self._search_input_matches_query(elements, action.value or query):
@@ -747,6 +1268,13 @@ class BrowserAgent:
     # ── element extraction (Agent's "eyes", uses toolkit.evaluate_js) ──
 
     async def _extract_interactive_elements(self) -> List[PageElement]:
+        snapshot = await self._get_semantic_snapshot()
+        snapshot_elements = self._elements_from_snapshot(snapshot)
+        if snapshot_elements:
+            elements = self._filter_noise_elements(snapshot_elements)
+            self._element_cache = elements[:40]
+            return self._element_cache
+
         r = await self.toolkit.evaluate_js(
             r"""
             () => {
@@ -917,6 +1445,12 @@ class BrowserAgent:
                 return element
         return None
 
+    def _get_cached_element_by_ref(self, ref: str) -> Optional[PageElement]:
+        for element in self._element_cache:
+            if element.ref == ref:
+                return element
+        return None
+
     # ── element finding helpers ────────────────────────────────
 
     def _find_ranked_elements(self, task: str, elements: List[PageElement],
@@ -1003,10 +1537,7 @@ class BrowserAgent:
         return ""
 
     def _extract_url_from_task(self, task: str) -> Optional[str]:
-        match = re.search(r"https?://\S+", task or "")
-        if not match:
-            return None
-        return match.group(0).rstrip('.,);]')
+        return extract_first_url(task) or None
 
     def _extract_structured_pairs(self, task: str) -> Dict[str, str]:
         pairs: Dict[str, str] = {}
@@ -1228,8 +1759,9 @@ class BrowserAgent:
             return False
         search_candidates = [
             f"https://www.bing.com/search?q={quote_plus(query)}",
-            f"https://www.google.com/search?q={quote_plus(query)}&hl=en",
+            f"https://www.baidu.com/s?wd={quote_plus(query)}",
             f"https://duckduckgo.com/?q={quote_plus(query)}",
+            f"https://www.google.com/search?q={quote_plus(query)}&hl=en",
         ]
         for search_url in search_candidates:
             result = await self.toolkit.goto(search_url, timeout=30000)
@@ -1253,18 +1785,365 @@ class BrowserAgent:
             return False
         return self._normalize_text(current_value) == self._normalize_text(query)
 
+    def _build_snapshot_click_action(
+        self,
+        snapshot: Optional[Dict[str, Any]],
+        *,
+        ref_key: str,
+        selector_key: str,
+        description: str,
+        expected_page_type: str = "",
+        confidence: float = 0.72,
+    ) -> Optional[BrowserAction]:
+        affordances = self._get_snapshot_affordances(snapshot)
+        target_ref = str(affordances.get(ref_key, "") or "")
+        target_selector = str(affordances.get(selector_key, "") or "")
+        if not target_ref and not target_selector:
+            return None
+        return BrowserAction(
+            action_type=ActionType.CLICK,
+            target_ref=target_ref,
+            target_selector=target_selector,
+            description=description,
+            confidence=confidence,
+            expected_page_type=expected_page_type,
+        )
+
+    def _choose_modal_action(
+        self,
+        task: str,
+        elements: List[PageElement],
+        snapshot: Optional[Dict[str, Any]] = None,
+    ) -> Optional[BrowserAction]:
+        active_snapshot = snapshot or self._last_semantic_snapshot or {}
+        for ref_key, selector_key, description, confidence in (
+            ("modal_primary_ref", "modal_primary_selector", "accept or continue modal", 0.82),
+            ("modal_secondary_ref", "modal_secondary_selector", "dismiss modal secondary action", 0.78),
+            ("modal_close_ref", "modal_close_selector", "close blocking modal", 0.76),
+        ):
+            action = self._build_snapshot_click_action(
+                active_snapshot,
+                ref_key=ref_key,
+                selector_key=selector_key,
+                description=description,
+                confidence=confidence,
+            )
+            if action is not None:
+                return action
+
+        modal_elements = [
+            element
+            for element in elements
+            if element.region == "modal" and element.is_visible and element.is_clickable
+        ]
+        if not modal_elements:
+            return None
+
+        candidate = self._find_best_element(
+            task,
+            modal_elements,
+            kinds=["button", "submit", "link"],
+            keywords=[
+                "同意", "接受", "允许", "继续", "确定", "好的", "知道了",
+                "accept", "agree", "allow", "continue", "ok", "okay", "got it",
+                "关闭", "取消", "稍后", "拒绝", "跳过",
+                "close", "dismiss", "cancel", "not now", "later", "skip", "decline",
+                "×",
+            ],
+        )
+        if candidate is None:
+            return None
+        return BrowserAction(
+            action_type=ActionType.CLICK,
+            target_selector=candidate.selector,
+            target_ref=candidate.ref,
+            description="dismiss blocking modal",
+            confidence=0.74,
+        )
+
+    def _snapshot_has_actionable_modal(
+        self,
+        snapshot: Optional[Dict[str, Any]],
+        elements: Optional[List[PageElement]] = None,
+    ) -> bool:
+        active_snapshot = snapshot or {}
+        affordances = self._get_snapshot_affordances(active_snapshot)
+        controls = active_snapshot.get("controls") or []
+
+        if any(
+            affordances.get(key)
+            for key in (
+                "modal_primary_ref",
+                "modal_primary_selector",
+                "modal_secondary_ref",
+                "modal_secondary_selector",
+                "modal_close_ref",
+                "modal_close_selector",
+            )
+        ):
+            return True
+
+        if any(str(control.get("kind", "") or "") in {"modal_primary", "modal_secondary", "modal_close"} for control in controls):
+            return True
+
+        if any(
+            element.region == "modal" and element.is_visible and element.is_clickable
+            for element in (elements or [])
+        ):
+            return True
+
+        page_type = str(active_snapshot.get("page_type", "") or "")
+        return bool(affordances.get("has_modal")) and page_type == "modal"
+
+    def _infer_page_state(
+        self,
+        task: str,
+        current_url: str,
+        intent: Optional[TaskIntent],
+        data: List[Dict[str, str]],
+        snapshot: Optional[Dict[str, Any]] = None,
+        elements: Optional[List[PageElement]] = None,
+    ) -> PageState:
+        active_intent = intent or TaskIntent(intent_type="read", query="", confidence=0.0)
+        active_snapshot = snapshot or self._last_semantic_snapshot or {}
+        page_type = str(active_snapshot.get("page_type", "") or "")
+        if not page_type:
+            page_type = "serp" if self._is_search_engine_url(current_url) else "unknown"
+
+        affordances = self._get_snapshot_affordances(active_snapshot)
+        target_count = self._extract_target_result_count(task)
+        goal_satisfied = self._page_data_satisfies_goal(
+            task,
+            current_url,
+            active_intent,
+            data,
+            snapshot=active_snapshot,
+        )
+        item_count = max(self._get_snapshot_item_count(active_snapshot), len(data or []))
+        has_pagination = bool(affordances.get("has_pagination"))
+        has_load_more = bool(affordances.get("has_load_more"))
+        has_modal = self._snapshot_has_actionable_modal(active_snapshot, elements)
+
+        stage = "unknown"
+        if has_modal:
+            stage = "dismiss_modal"
+        elif page_type == "serp":
+            stage = "completing" if goal_satisfied else "selecting_source"
+        elif page_type == "list":
+            if target_count and len(data or []) < target_count and (has_pagination or has_load_more):
+                stage = "collecting_more"
+            elif goal_satisfied:
+                stage = "completing"
+            else:
+                stage = "extracting"
+        elif page_type == "detail":
+            stage = "completing" if goal_satisfied else "extracting"
+        elif page_type in {"form", "login"}:
+            stage = "interacting"
+        elif goal_satisfied:
+            stage = "completing"
+        elif item_count > 0:
+            stage = "extracting"
+
+        confidence = 0.45
+        if page_type in {"serp", "list", "detail", "form", "login", "modal"}:
+            confidence = 0.8
+        elif item_count > 0:
+            confidence = 0.65
+
+        return PageState(
+            page_type=page_type,
+            stage=stage,
+            confidence=confidence,
+            item_count=item_count,
+            target_count=target_count,
+            has_pagination=has_pagination,
+            has_load_more=has_load_more,
+            has_modal=has_modal,
+            goal_satisfied=goal_satisfied,
+        )
+
+    def _choose_snapshot_navigation_action(
+        self,
+        task: str,
+        current_url: str,
+        elements: List[PageElement],
+        intent: Optional[TaskIntent],
+        data: List[Dict[str, str]],
+        snapshot: Optional[Dict[str, Any]] = None,
+    ) -> Optional[BrowserAction]:
+        active_snapshot = snapshot or self._last_semantic_snapshot or {}
+        page_state = self._infer_page_state(task, current_url, intent, data, active_snapshot, elements=elements)
+        if page_state.goal_satisfied and data:
+            return BrowserAction(
+                action_type=ActionType.EXTRACT,
+                description="extract current structured content",
+                confidence=0.84,
+            )
+
+        if page_state.has_modal:
+            modal_action = self._choose_modal_action(task, elements, active_snapshot)
+            if modal_action is not None:
+                return modal_action
+
+        if page_state.page_type == "list":
+            if data and (page_state.target_count == 0 or len(data) >= min(page_state.target_count or len(data), page_state.item_count or len(data))):
+                return BrowserAction(
+                    action_type=ActionType.EXTRACT,
+                    description="extract visible list content",
+                    confidence=0.78,
+                )
+            if page_state.target_count and len(data) < page_state.target_count:
+                load_more_action = self._build_snapshot_click_action(
+                    active_snapshot,
+                    ref_key="load_more_ref",
+                    selector_key="load_more_selector",
+                    description="load more list items",
+                    confidence=0.74,
+                )
+                if load_more_action is not None:
+                    return load_more_action
+                next_page_action = self._build_snapshot_click_action(
+                    active_snapshot,
+                    ref_key="next_page_ref",
+                    selector_key="next_page_selector",
+                    description="open next results page",
+                    confidence=0.71,
+                )
+                if next_page_action is not None:
+                    return next_page_action
+                return BrowserAction(
+                    action_type=ActionType.SCROLL,
+                    value="900",
+                    description="scroll for lazy-loaded list items",
+                    confidence=0.52,
+                )
+            if data:
+                return BrowserAction(
+                    action_type=ActionType.EXTRACT,
+                    description="extract current list page",
+                    confidence=0.7,
+                )
+
+        if page_state.page_type in {"list", "unknown", "detail"} and not data:
+            query = (intent or TaskIntent(intent_type="navigate", query=self._derive_primary_query(task))).query
+            navigation_keywords = self._extract_query_tokens(query or task)[:5]
+            nav_candidate = self._find_best_element(
+                task,
+                elements,
+                kinds=["button", "submit", "link"],
+                keywords=navigation_keywords,
+            )
+            if nav_candidate and self._score_element_for_context(task, nav_candidate) >= 2.0:
+                return BrowserAction(
+                    action_type=ActionType.CLICK,
+                    target_selector=nav_candidate.selector,
+                    target_ref=nav_candidate.ref,
+                    description=f"open relevant page section {nav_candidate.text[:24]}".strip(),
+                    confidence=0.63,
+                )
+
+        if page_state.page_type == "detail" and data:
+            return BrowserAction(
+                action_type=ActionType.EXTRACT,
+                description="extract detail page content",
+                confidence=0.76,
+            )
+
+        return None
+
+    def _get_vision_llm(self) -> Optional[LLMClient]:
+        if self._vision_llm is not None:
+            return self._vision_llm
+        if self._vision_llm_attempted:
+            return None
+        self._vision_llm_attempted = True
+        try:
+            self._vision_llm = LLMClient.for_vision()
+            return self._vision_llm
+        except Exception as exc:
+            if not self._vision_llm_unavailable_logged:
+                log_warning(f"vision llm unavailable: {exc}")
+                self._vision_llm_unavailable_logged = True
+            return None
+
+    async def _decide_action_with_vision(
+        self,
+        task: str,
+        current_url: str,
+        title: str,
+        elements: List[PageElement],
+        intent: Optional[TaskIntent],
+        data: List[Dict[str, str]],
+        snapshot: Optional[Dict[str, Any]] = None,
+        last_action: Optional[BrowserAction] = None,
+    ) -> Optional[BrowserAction]:
+        vision_llm = self._get_vision_llm()
+        if vision_llm is None:
+            return None
+
+        screenshot_r = await self.toolkit.screenshot(full_page=False)
+        if not screenshot_r.success or not screenshot_r.data:
+            return None
+
+        active_snapshot = snapshot or self._last_semantic_snapshot or {}
+        page_state = self._infer_page_state(task, current_url, intent, data, active_snapshot)
+        prompt = VISION_ACTION_PROMPT.format(
+            task=task or "",
+            url=current_url or "",
+            title=title or "",
+            page_type=page_state.page_type,
+            page_stage=page_state.stage,
+            last_action=(last_action.description or last_action.action_type.value) if last_action else "none",
+            data=self._format_data_for_llm(data),
+            cards=self._format_cards_for_llm(self._cards_from_snapshot(active_snapshot)),
+            collections=self._format_collections_for_llm(active_snapshot),
+            elements=self._format_assessment_elements_for_llm(task, current_url, elements, max_items=14),
+        )
+
+        try:
+            response = await asyncio.to_thread(
+                vision_llm.chat_with_image,
+                prompt,
+                screenshot_r.data,
+                0.1,
+                1200,
+            )
+            web_debug_recorder.write_binary("browser_vision_screenshot", screenshot_r.data, ".png")
+            web_debug_recorder.write_text("browser_vision_prompt", prompt)
+            web_debug_recorder.write_text("browser_vision_response", response.content)
+            action = self._action_from_llm(vision_llm.parse_json_response(response), elements)
+            web_debug_recorder.write_json(
+                "browser_vision_action",
+                self._action_to_debug_payload(action),
+            )
+            if action.action_type in {ActionType.FAILED, ActionType.WAIT}:
+                return None
+            return action
+        except Exception as exc:
+            log_warning(f"vision fallback failed: {exc}")
+            return None
+
     def _page_data_satisfies_goal(
         self,
         task: str,
         current_url: str,
         intent: Optional[TaskIntent],
         data: List[Dict[str, str]],
+        snapshot: Optional[Dict[str, Any]] = None,
     ) -> bool:
         active_intent = intent or TaskIntent(intent_type="read", query="", confidence=0.0)
         query = active_intent.query or self._derive_primary_query(task)
         if query and not self._is_data_relevant(query, data):
             return False
+        target_count = self._extract_target_result_count(task)
+        active_snapshot = snapshot or self._last_semantic_snapshot or {}
+        page_type = str(active_snapshot.get("page_type", "") or "")
+        if target_count and len(data or []) < target_count and page_type in {"serp", "list"}:
+            return False
         if not self._is_search_engine_url(current_url):
+            if page_type == "list" and target_count and len(data or []) < target_count:
+                return False
             return bool(data)
         return self._search_results_have_answer_evidence(query, data)
 
@@ -1275,11 +2154,23 @@ class BrowserAgent:
         elements: List[PageElement],
         intent: Optional[TaskIntent],
         data: List[Dict[str, str]],
+        snapshot: Optional[Dict[str, Any]] = None,
     ) -> Optional[BrowserAction]:
         active_intent = intent or TaskIntent(intent_type="read", query="", confidence=0.0)
         query = active_intent.query or self._derive_primary_query(task)
 
-        if data and self._page_data_satisfies_goal(task, current_url, active_intent, data):
+        snapshot_action = self._choose_snapshot_navigation_action(
+            task,
+            current_url,
+            elements,
+            active_intent,
+            data,
+            snapshot=snapshot,
+        )
+        if snapshot_action is not None and snapshot_action.action_type != ActionType.EXTRACT:
+            return snapshot_action
+
+        if data and self._page_data_satisfies_goal(task, current_url, active_intent, data, snapshot=snapshot):
             return BrowserAction(
                 action_type=ActionType.EXTRACT,
                 description="use current page results",
@@ -1287,7 +2178,7 @@ class BrowserAgent:
             )
 
         if not self._is_search_engine_url(current_url):
-            return None
+            return snapshot_action
 
         if self._search_input_matches_query(elements, query):
             click_action = self._find_search_result_click_action(
@@ -1295,6 +2186,7 @@ class BrowserAgent:
                 current_url,
                 elements,
                 active_intent,
+                snapshot=snapshot,
             )
             if click_action is not None:
                 return click_action
@@ -1324,7 +2216,7 @@ class BrowserAgent:
                 confidence=0.35,
             )
 
-        return None
+        return snapshot_action
 
     def _is_data_relevant(self, query: str, data: List[Dict[str, str]]) -> bool:
         if not data:
@@ -1429,35 +2321,79 @@ class BrowserAgent:
     # ── Agent decision: LLM ────────────────────────────────────
 
     def _action_from_llm(self, payload: Dict[str, Any], elements: List[PageElement]) -> BrowserAction:
-        action_payload = payload.get("action", {}) if isinstance(payload, dict) else {}
-        action_type_raw = str(action_payload.get("type", "failed")).lower()
+        if not isinstance(payload, dict):
+            payload = {}
+        action_payload = payload.get("action", {}) if isinstance(payload.get("action", {}), dict) else {}
+        flat_action_payload = payload if not action_payload else {}
+        action_type_raw = str(
+            action_payload.get("type")
+            or flat_action_payload.get("action_type")
+            or flat_action_payload.get("type")
+            or "failed"
+        ).lower()
         try:
             action_type = ActionType(action_type_raw)
         except ValueError:
             action_type = ActionType.FAILED
 
-        selector = str(action_payload.get("target_selector", "") or "")
-        index = action_payload.get("element_index", -1)
+        selector = str(
+            action_payload.get("target_selector")
+            or flat_action_payload.get("target_selector")
+            or ""
+        )
+        target_ref = str(
+            action_payload.get("target_ref")
+            or flat_action_payload.get("target_ref")
+            or ""
+        )
+        index = action_payload.get("element_index", flat_action_payload.get("element_index", -1))
         if not isinstance(index, int):
             try:
                 index = int(index)
             except (TypeError, ValueError):
                 index = -1
-        if not selector and isinstance(index, int):
+        if not selector and not target_ref and isinstance(index, int):
             for element in elements:
                 if element.index == index:
                     selector = element.selector
+                    target_ref = element.ref
                     break
 
         return BrowserAction(
             action_type=action_type, target_selector=selector,
-            value=str(action_payload.get("value", "") or ""),
-            description=str(action_payload.get("description", "") or ""),
-            confidence=float(payload.get("confidence", 0.0) or 0.0),
-            requires_confirmation=bool(payload.get("requires_human_confirm", False)),
-            fallback_selector=str(action_payload.get("fallback_selector", "") or ""),
-            use_keyboard_fallback=bool(action_payload.get("use_keyboard", False)),
-            keyboard_key=str(action_payload.get("keyboard_key", "") or ""),
+            target_ref=target_ref,
+            value=str(action_payload.get("value") or flat_action_payload.get("value") or ""),
+            description=str(action_payload.get("description") or flat_action_payload.get("description") or ""),
+            confidence=float(payload.get("confidence", action_payload.get("confidence", flat_action_payload.get("confidence", 0.0))) or 0.0),
+            requires_confirmation=bool(
+                payload.get(
+                    "requires_human_confirm",
+                    action_payload.get("requires_human_confirm", flat_action_payload.get("requires_human_confirm", False)),
+                )
+            ),
+            fallback_selector=str(
+                action_payload.get("fallback_selector")
+                or flat_action_payload.get("fallback_selector")
+                or ""
+            ),
+            use_keyboard_fallback=bool(
+                action_payload.get("use_keyboard", flat_action_payload.get("use_keyboard", False))
+            ),
+            keyboard_key=str(
+                action_payload.get("keyboard_key")
+                or flat_action_payload.get("keyboard_key")
+                or ""
+            ),
+            expected_page_type=str(
+                action_payload.get("expected_page_type")
+                or flat_action_payload.get("expected_page_type")
+                or ""
+            ),
+            expected_text=str(
+                action_payload.get("expected_text")
+                or flat_action_payload.get("expected_text")
+                or ""
+            ),
         )
 
     async def _decide_action_with_llm(self, task: str, elements: List[PageElement]) -> BrowserAction:
@@ -1479,18 +2415,60 @@ class BrowserAgent:
             data_progress = f"Data progress: collected {data_collected} / target {data_target}"
             if data_collected >= data_target:
                 data_progress += " (ENOUGH - consider using DONE)"
+            snapshot = await self._get_semantic_snapshot()
+            cards = self._cards_from_snapshot(snapshot)
+            page_state = self._infer_page_state(task, url_r.data or "", None, current_data or [], snapshot)
+            elements_text = self._format_elements_for_llm(task, elements, max_items=18)
+            prompt_context, prompt_budget = self._build_budgeted_browser_prompt_context(
+                task=task,
+                current_url=url_r.data or "",
+                data=current_data or [],
+                cards=cards,
+                snapshot=snapshot,
+                elements_text=elements_text,
+                total_tokens=_ACTION_DECISION_CONTEXT_TOKENS,
+            )
 
             messages = [
                 {"role": "system", "content": "Return JSON only."},
                 {"role": "user", "content": ACTION_DECISION_PROMPT.format(
                     task=task, url=url_r.data or "", title=page_title,
                     data_progress=data_progress,
-                    elements=self._format_elements_for_llm(task, elements),
+                    page_type=page_state.page_type,
+                    page_stage=page_state.stage,
+                    context_coverage=prompt_context.get("context_coverage", ""),
+                    data=prompt_context.get("data", "(no visible data)"),
+                    cards=prompt_context.get("cards", "(no cards)"),
+                    collections=prompt_context.get("collections", "(no collections)"),
+                    controls=prompt_context.get("controls", "(no controls)"),
+                    elements=prompt_context.get("elements", "(no actionable elements)"),
                 )},
             ]
+            web_debug_recorder.write_json("browser_action_decision_budget", prompt_budget)
+            web_debug_recorder.write_text("browser_action_decision_prompt", messages[1]["content"])
             llm = self._get_llm()
             response = await llm.achat(messages, temperature=0.1, json_mode=True)
-            return self._action_from_llm(llm.parse_json_response(response), elements)
+            web_debug_recorder.write_text("browser_action_decision_response", response.content)
+            action = self._action_from_llm(llm.parse_json_response(response), elements)
+            web_debug_recorder.write_json("browser_action_decision_action", self._action_to_debug_payload(action))
+            if (
+                page_state.page_type == "list"
+                and page_state.target_count
+                and data_collected < page_state.target_count
+                and (page_state.has_pagination or page_state.has_load_more)
+                and action.action_type in {ActionType.EXTRACT, ActionType.DONE, ActionType.WAIT}
+            ):
+                state_action = self._choose_snapshot_navigation_action(
+                    task,
+                    url_r.data or "",
+                    elements,
+                    None,
+                    current_data or [],
+                    snapshot,
+                )
+                if state_action is not None:
+                    return state_action
+            return action
         except Exception as exc:
             log_warning(f"LLM action fallback failed: {exc}")
             return BrowserAction(action_type=ActionType.WAIT, value="1", description="fallback wait", confidence=0.1)
@@ -1512,6 +2490,7 @@ class BrowserAgent:
                                                   keywords=keywords, exclude_selectors=[action.target_selector])
             if alternative:
                 return BrowserAction(action_type=ActionType.CLICK, target_selector=alternative.selector,
+                                     target_ref=alternative.ref,
                                      description=f"recovery click {alternative.text[:24]}".strip(),
                                      confidence=max(action.confidence - 0.2, 0.35),
                                      use_keyboard_fallback=action.use_keyboard_fallback, keyboard_key=action.keyboard_key)
@@ -1521,6 +2500,7 @@ class BrowserAgent:
                                                   exclude_selectors=[action.target_selector])
             if alternative:
                 return BrowserAction(action_type=ActionType.INPUT, target_selector=alternative.selector,
+                                     target_ref=alternative.ref,
                                      value=action.value, description=f"recovery input {alternative.text[:24]}".strip(),
                                      confidence=max(action.confidence - 0.2, 0.35),
                                      use_keyboard_fallback=action.use_keyboard_fallback, keyboard_key=action.keyboard_key)
@@ -1531,10 +2511,14 @@ class BrowserAgent:
     async def _try_click_with_fallbacks(self, selector: str, action: Optional[BrowserAction] = None) -> bool:
         tk = self.toolkit
         strategies: List[Tuple[str, Any]] = []
+        if action and action.target_ref:
+            strategies.append((f"ref:{action.target_ref}", lambda r=action.target_ref: tk.click_ref(r)))
         if selector:
             strategies.append(("direct_click", lambda: tk.click(selector)))
         # semantic strategies from cache
-        element = self._get_cached_element_by_selector(selector)
+        element = self._get_cached_element_by_ref(action.target_ref) if action and action.target_ref else None
+        if element is None:
+            element = self._get_cached_element_by_selector(selector)
         if element:
             attrs = element.attributes or {}
             labels = [element.text, attrs.get("labelText", ""), attrs.get("ariaLabel", ""), attrs.get("title", "")]
@@ -1569,14 +2553,21 @@ class BrowserAgent:
                 continue
         return False
 
-    async def _try_input_with_fallbacks(self, selector: str, value: str) -> bool:
-        if not selector:
-            return False
+    async def _try_input_with_fallbacks(
+        self,
+        selector: str,
+        value: str,
+        action: Optional[BrowserAction] = None,
+    ) -> bool:
         tk = self.toolkit
-        strategies: List[Tuple[str, Any]] = [
-            ("direct_fill", lambda: tk.input_text(selector, value)),
-        ]
-        element = self._get_cached_element_by_selector(selector)
+        strategies: List[Tuple[str, Any]] = []
+        if action and action.target_ref:
+            strategies.append((f"ref:{action.target_ref}", lambda r=action.target_ref: tk.input_ref(r, value)))
+        if selector:
+            strategies.append(("direct_fill", lambda: tk.input_text(selector, value)))
+        element = self._get_cached_element_by_ref(action.target_ref) if action and action.target_ref else None
+        if element is None and selector:
+            element = self._get_cached_element_by_selector(selector)
         if element:
             attrs = element.attributes or {}
             if attrs.get("placeholder"):
@@ -1585,7 +2576,8 @@ class BrowserAgent:
             for label in [attrs.get("labelText", ""), attrs.get("ariaLabel", "")]:
                 if label and label.strip():
                     strategies.append((f"label:{label[:30]}", lambda l=label.strip()[:60]: tk.fill_by_label(l, value)))
-        strategies.append(("direct_type", lambda: tk.type_text(selector, value, delay=20)))
+        if selector:
+            strategies.append(("direct_type", lambda: tk.type_text(selector, value, delay=20)))
 
         for name, handler in strategies:
             try:
@@ -1647,7 +2639,7 @@ class BrowserAgent:
         if action.action_type == ActionType.CLICK:
             return await self._try_click_with_fallbacks(action.target_selector, action)
         if action.action_type == ActionType.INPUT:
-            success = await self._try_input_with_fallbacks(action.target_selector, action.value)
+            success = await self._try_input_with_fallbacks(action.target_selector, action.value, action)
             if success and action.use_keyboard_fallback and action.keyboard_key:
                 await tk.press_key(action.keyboard_key)
             return success
@@ -1706,38 +2698,76 @@ class BrowserAgent:
         title_r = await tk.get_title()
         html_r = await tk.get_page_html()
         html = str(html_r.data or "")
+        semantic_snapshot = await self._get_semantic_snapshot()
         return {
             "url": url_r.data or "",
             "title": title_r.data or "",
             "content_len": len(html),
             "content_hash": hashlib.sha1(html[:12000].encode("utf-8", errors="ignore")).hexdigest() if html else "",
+            "page_type": str(semantic_snapshot.get("page_type", "") or ""),
+            "card_count": len(semantic_snapshot.get("cards", []) or []),
+            "item_count": self._get_snapshot_item_count(semantic_snapshot),
+            "has_modal": self._snapshot_has_actionable_modal(semantic_snapshot),
+            "has_pagination": bool(self._get_snapshot_affordances(semantic_snapshot).get("has_pagination")),
+            "has_load_more": bool(self._get_snapshot_affordances(semantic_snapshot).get("has_load_more")),
         }
 
     def _action_must_change_state(self, action: BrowserAction) -> bool:
         return action.action_type in {
             ActionType.CLICK, ActionType.INPUT, ActionType.SELECT,
             ActionType.NAVIGATE, ActionType.PRESS_KEY, ActionType.FILL_FORM,
+            ActionType.SCROLL,
         }
 
     async def _verify_action_effect(self, before: Dict[str, Any], action: BrowserAction) -> bool:
         if not self._action_must_change_state(action):
             return True
         after = await self._snapshot_page_state()
-        if after["url"] != before["url"]:
-            return True
-        if after["title"] != before["title"]:
-            return True
-        if abs(after["content_len"] - before["content_len"]) > 80:
-            return True
-        if after.get("content_hash") and after.get("content_hash") != before.get("content_hash"):
-            return True
-        if action.action_type == ActionType.INPUT:
-            r = await self.toolkit.get_input_value(action.target_selector)
-            if r.success:
-                return self._normalize_text(r.data) == self._normalize_text(action.value)
-        if action.action_type == ActionType.FILL_FORM:
-            return await self._verify_form_values(action.value)
-        return False
+        result = False
+        if action.expected_page_type and after.get("page_type") == action.expected_page_type:
+            result = True
+        elif action.expected_text:
+            text_wait = await self.toolkit.wait_for_text_appear(action.expected_text, timeout=2500)
+            if text_wait.success:
+                result = True
+        elif after["url"] != before["url"]:
+            result = True
+        elif after["title"] != before["title"]:
+            result = True
+        elif before.get("page_type") and after.get("page_type") and before.get("page_type") != after.get("page_type"):
+            result = True
+        elif int(after.get("card_count", 0) or 0) > int(before.get("card_count", 0) or 0):
+            result = True
+        elif int(after.get("item_count", 0) or 0) > int(before.get("item_count", 0) or 0):
+            result = True
+        elif bool(before.get("has_modal")) and not bool(after.get("has_modal")):
+            result = True
+        elif abs(after["content_len"] - before["content_len"]) > 80:
+            result = True
+        elif after.get("content_hash") and after.get("content_hash") != before.get("content_hash"):
+            result = True
+        elif action.action_type == ActionType.INPUT:
+            if action.target_ref:
+                ref_info = self.toolkit.resolve_ref(action.target_ref)
+                selector = str(ref_info.get("selector", "") or "")
+            else:
+                selector = action.target_selector
+            if selector:
+                r = await self.toolkit.get_input_value(selector)
+                if r.success:
+                    result = self._normalize_text(r.data) == self._normalize_text(action.value)
+        elif action.action_type == ActionType.FILL_FORM:
+            result = await self._verify_form_values(action.value)
+        web_debug_recorder.write_json(
+            "browser_action_verification",
+            {
+                "before": before,
+                "after": after,
+                "action": self._action_to_debug_payload(action),
+                "result": result,
+            },
+        )
+        return result
 
     async def _verify_form_values(self, form_payload: str) -> bool:
         try:
@@ -2010,6 +3040,7 @@ class BrowserAgent:
         current_url: str,
         elements: List[PageElement],
         intent: Optional[TaskIntent] = None,
+        snapshot: Optional[Dict[str, Any]] = None,
     ) -> Optional[BrowserAction]:
         if not self._is_search_engine_url(current_url):
             return None
@@ -2017,6 +3048,26 @@ class BrowserAgent:
         active_intent = intent or TaskIntent(intent_type="search", query=self._derive_primary_query(task), confidence=0.0)
         if not self._task_requires_detail_page(task, active_intent):
             return None
+
+        cards = self._cards_from_snapshot(snapshot or self._last_semantic_snapshot)
+        if cards:
+            ranked_cards: List[Tuple[float, SearchResultCard]] = []
+            for card in cards:
+                score = self._score_search_result_card(task, active_intent.query, card)
+                if self._extract_query_tokens(active_intent.query) and score < 4.0:
+                    continue
+                ranked_cards.append((score, card))
+            ranked_cards.sort(key=lambda item: item[0], reverse=True)
+            if ranked_cards:
+                best_score, best_card = ranked_cards[0]
+                return BrowserAction(
+                    action_type=ActionType.CLICK,
+                    target_selector=best_card.target_selector,
+                    target_ref=best_card.target_ref or best_card.ref,
+                    description="open the strongest search result card",
+                    confidence=min(best_score / 10.0, 0.9),
+                    expected_page_type="detail",
+                )
 
         query_tokens = self._extract_query_tokens(active_intent.query)
         best_match: Optional[tuple[float, PageElement]] = None
@@ -2040,8 +3091,6 @@ class BrowserAgent:
                 href,
             ]))
             score = self._score_text_relevance(active_intent.query, haystack)
-            if "weather.com.cn" in haystack or "moji.com" in haystack or "tianqi.com" in haystack:
-                score += 3.0
             if "天气" in haystack or "weather" in haystack:
                 score += 2.0
             if query_tokens and score < 4.0:
@@ -2055,8 +3104,10 @@ class BrowserAgent:
         return BrowserAction(
             action_type=ActionType.CLICK,
             target_selector=best_match[1].selector,
+            target_ref=best_match[1].ref,
             description="open the most relevant detail result",
             confidence=min(best_match[0] / 10.0, 0.88),
+            expected_page_type="detail",
         )
 
     def _coerce_intent_for_direct_page(
@@ -2126,6 +3177,7 @@ class BrowserAgent:
     async def _wait_for_search_results_ready(self, search_url: str) -> bool:
         selectors_by_host = {
             "bing.com": "li.b_algo, .b_ans, #b_results",
+            "baidu.com": "#content_left .result, #content_left .c-container, #content_left",
             "google.com": "div.g, .tF2Cxc, #search, [data-sokoban-container]",
             "duckduckgo.com": ".result, .results, .result__body",
         }
@@ -2137,21 +3189,33 @@ class BrowserAgent:
                 break
 
         for _ in range(4):
+            current_url_result = await self.toolkit.get_current_url()
+            current_url = str(current_url_result.data or search_url) if current_url_result.success else search_url
+            title_result = await self.toolkit.get_title()
+            title = str(title_result.data or "") if title_result.success else ""
+            summary = await self.toolkit.evaluate_js(
+                """() => ({ textLength: document.body && document.body.innerText ? document.body.innerText.length : 0, bodyText: document.body && document.body.innerText ? document.body.innerText.slice(0, 4000) : '' })"""
+            )
+            body_text = ""
+            text_length = 0
+            if summary.success and isinstance(summary.data, dict):
+                body_text = str(summary.data.get("bodyText", "") or "")
+                text_length = int(summary.data.get("textLength", 0) or 0)
+            if self._looks_like_blocked_page(current_url, title) or any(token in body_text.lower() for token in ("unusual traffic", "人机身份验证", "异常流量", "验证码", "安全验证")):
+                return False
             wait_result = await self.toolkit.wait_for_selector(selector, timeout=3000)
             if wait_result.success:
-                summary = await self.toolkit.evaluate_js(
-                    """(sel) => {
-                        const matches = document.querySelectorAll(sel).length;
-                        const textLength = document.body && document.body.innerText ? document.body.innerText.length : 0;
-                        return { matches, textLength };
-                    }""",
+                matches_result = await self.toolkit.evaluate_js(
+                    """(sel) => ({ matches: document.querySelectorAll(sel).length })""",
                     selector,
                 )
-                if summary.success and isinstance(summary.data, dict):
-                    if int(summary.data.get("matches", 0) or 0) > 0:
-                        return True
-                    if int(summary.data.get("textLength", 0) or 0) >= 300:
-                        return True
+                matches = 0
+                if matches_result.success and isinstance(matches_result.data, dict):
+                    matches = int(matches_result.data.get("matches", 0) or 0)
+                if matches > 0:
+                    return True
+                if text_length >= 300:
+                    return True
             await self.toolkit.human_delay(300, 900)
         return False
 
@@ -2159,17 +3223,29 @@ class BrowserAgent:
 
     async def run(self, task: str, start_url: Optional[str] = None, max_steps: int = 8) -> Dict[str, Any]:
         tk = self.toolkit
-        r = await tk.create_page()
-        if not r.success:
-            return {"success": False, "message": f"浏览器启动失败: {r.error}", "steps": []}
-
         expected_url = start_url or self._extract_url_from_task(task) or ""
-        url = expected_url or "about:blank"
         steps: List[Dict[str, Any]] = []
-        self._action_history = []
-        self._page_assessment_cache.clear()
-
+        trace = web_debug_recorder.start_trace(
+            "browser_agent",
+            {
+                "task": task,
+                "start_url": start_url or "",
+                "max_steps": max_steps,
+            },
+        )
+        token = web_debug_recorder.activate_trace(trace)
+        if trace:
+            log_agent_action(self.name, "网页调试记录已开启", str(trace.root_dir))
         try:
+            r = await tk.create_page()
+            if not r.success:
+                web_debug_recorder.record_event("browser_create_page_failed", error=r.error)
+                return {"success": False, "message": f"浏览器启动失败: {r.error}", "steps": []}
+
+            url = expected_url or "about:blank"
+            self._action_history = []
+            self._page_assessment_cache.clear()
+
             # 初始导航
             async def _initial_goto():
                 page = tk.page
@@ -2189,6 +3265,12 @@ class BrowserAgent:
             current_url = current_url_r.data or ""
             title_r = await tk.get_title()
             page_title = title_r.data or ""
+            web_debug_recorder.record_event(
+                "browser_initial_navigation",
+                expected_url=expected_url,
+                current_url=current_url,
+                title=page_title,
+            )
             if self._looks_like_blocked_page(current_url, page_title):
                 return {
                     "success": False,
@@ -2227,6 +3309,7 @@ class BrowserAgent:
                     current_url or "",
                     task_intent,
                     initial_data,
+                    snapshot=self._last_semantic_snapshot,
                 ):
                     # 只有在数据足够多（至少3条）且确实满足目标时才提前返回
                     title_r = await tk.get_title()
@@ -2265,8 +3348,30 @@ class BrowserAgent:
                         "data": _accumulated_data,
                     }
                 elements = await self._extract_interactive_elements()
+                snapshot = self._last_semantic_snapshot or await self._get_semantic_snapshot()
                 observed_data = await self._extract_data_for_intent(task_intent)
                 _merge_new_data(observed_data)
+                web_debug_recorder.write_json(
+                    f"browser_step_{step_no}_context",
+                    {
+                        "step": step_no,
+                        "url": current_url_r.data or "",
+                        "title": title_r.data or "",
+                        "intent": {
+                            "intent_type": task_intent.intent_type,
+                            "query": task_intent.query,
+                            "confidence": task_intent.confidence,
+                            "fields": task_intent.fields,
+                            "requires_interaction": task_intent.requires_interaction,
+                            "target_text": task_intent.target_text,
+                        },
+                        "elements": self._elements_to_debug_payload(elements),
+                        "snapshot": snapshot,
+                        "observed_data": observed_data,
+                        "accumulated_data": list(_accumulated_data),
+                        "last_action": self._action_to_debug_payload(last_action),
+                    },
+                )
                 action = await self._assess_page_with_llm(
                     task,
                     current_url_r.data or "",
@@ -2283,6 +3388,7 @@ class BrowserAgent:
                         elements,
                         task_intent,
                         _accumulated_data or observed_data,
+                        snapshot=snapshot,
                     )
                 if action is None:
                     action = self._find_search_result_click_action(
@@ -2290,11 +3396,36 @@ class BrowserAgent:
                         current_url_r.data or "",
                         elements,
                         task_intent,
+                        snapshot=snapshot,
                     )
                 if action is None:
                     action = self._decide_action_locally(task, elements, task_intent)
                 if action is None:
                     action = await self._decide_action_with_llm(task, elements)
+                if action is None or action.action_type == ActionType.WAIT:
+                    visual_action = await self._decide_action_with_vision(
+                        task,
+                        current_url_r.data or "",
+                        title_r.data or "",
+                        elements,
+                        task_intent,
+                        _accumulated_data or observed_data,
+                        snapshot=snapshot,
+                        last_action=last_action,
+                    )
+                    if visual_action is not None:
+                        action = visual_action
+                if action is None:
+                    action = BrowserAction(
+                        action_type=ActionType.WAIT,
+                        value="1",
+                        description="no actionable elements",
+                        confidence=0.05,
+                    )
+                web_debug_recorder.write_json(
+                    f"browser_step_{step_no}_action",
+                    self._action_to_debug_payload(action),
+                )
 
                 if action.action_type == ActionType.DONE:
                     data = await self._extract_data_for_intent(task_intent)
@@ -2365,6 +3496,27 @@ class BrowserAgent:
                             action = recovery
                             self._record_action(action)
                             last_action = action
+                if not success:
+                    visual_recovery = await self._decide_action_with_vision(
+                        task,
+                        current_url_r.data or "",
+                        title_r.data or "",
+                        elements,
+                        task_intent,
+                        _accumulated_data or observed_data,
+                        snapshot=snapshot,
+                        last_action=action,
+                    )
+                    if visual_recovery and self._action_signature(visual_recovery) != self._action_signature(action):
+                        visual_before = await self._snapshot_page_state()
+                        success = await self._execute_action(visual_recovery)
+                        if success:
+                            await self._wait_for_page_ready()
+                            success = await self._verify_action_effect(visual_before, visual_recovery)
+                        if success:
+                            action = visual_recovery
+                            self._record_action(action)
+                            last_action = action
 
                 url_r = await tk.get_current_url()
                 steps.append({
@@ -2380,6 +3532,10 @@ class BrowserAgent:
                     "result": "success" if success else "failed",
                     "url": url_r.data or "",
                 })
+                web_debug_recorder.write_json(
+                    f"browser_step_{step_no}_result",
+                    steps[-1],
+                )
 
                 if not success:
                     if action.action_type == ActionType.WAIT:
@@ -2432,6 +3588,8 @@ class BrowserAgent:
             log_error(f"browser task failed: {exc}")
             url_r = await tk.get_current_url()
             return {"success": False, "message": str(exc), "url": url_r.data or "", "expected_url": expected_url, "steps": steps}
+        finally:
+            web_debug_recorder.deactivate_trace(token)
 
 
 async def _run_browser_task_async(task: str, start_url: Optional[str] = None, headless: bool = True) -> Dict[str, Any]:

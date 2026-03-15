@@ -1,0 +1,72 @@
+{
+  "data": {
+    "requested_chars": 17,
+    "requested_tokens": 4,
+    "allocated_chars": 16,
+    "allocated_tokens": 4,
+    "used_chars": 17,
+    "used_tokens": 4,
+    "truncated": false,
+    "mode": "lines",
+    "budget_metric": "tokens",
+    "tokenizer_model": "openai/MiniMax-M2.5",
+    "tokenizer_mode": "litellm"
+  },
+  "cards": {
+    "requested_chars": 10,
+    "requested_tokens": 3,
+    "allocated_chars": 12,
+    "allocated_tokens": 3,
+    "used_chars": 10,
+    "used_tokens": 3,
+    "truncated": false,
+    "mode": "lines",
+    "budget_metric": "tokens",
+    "tokenizer_model": "openai/MiniMax-M2.5",
+    "tokenizer_mode": "litellm"
+  },
+  "collections": {
+    "requested_chars": 457,
+    "requested_tokens": 196,
+    "allocated_chars": 784,
+    "allocated_tokens": 196,
+    "used_chars": 457,
+    "used_tokens": 196,
+    "truncated": false,
+    "mode": "lines",
+    "budget_metric": "tokens",
+    "tokenizer_model": "openai/MiniMax-M2.5",
+    "tokenizer_mode": "litellm"
+  },
+  "controls": {
+    "requested_chars": 260,
+    "requested_tokens": 111,
+    "allocated_chars": 444,
+    "allocated_tokens": 111,
+    "used_chars": 260,
+    "used_tokens": 111,
+    "truncated": false,
+    "mode": "lines",
+    "budget_metric": "tokens",
+    "tokenizer_model": "openai/MiniMax-M2.5",
+    "tokenizer_mode": "litellm"
+  },
+  "elements": {
+    "requested_chars": 2235,
+    "requested_tokens": 843,
+    "allocated_chars": 1900,
+    "allocated_tokens": 475,
+    "used_chars": 1205,
+    "used_tokens": 455,
+    "truncated": true,
+    "mode": "lines",
+    "budget_metric": "tokens",
+    "tokenizer_model": "openai/MiniMax-M2.5",
+    "tokenizer_mode": "litellm"
+  },
+  "context": {
+    "task": "访问 Bing 搜索页面 https://www.bing.com/search?q=openai+api，抓取前 3 条搜索结果的标题和链接，返回 JSON 数组格式，每项包含 title 和 link 字段",
+    "current_url": "https://www.bing.com/search?q=openai+api&rdr=1&rdrig=168C945439C642609C327D42DFAED3BC",
+    "total_budget_tokens": 1400
+  }
+}

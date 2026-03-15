@@ -1,0 +1,22 @@
+{
+  "task": "抓取 https://news.ycombinator.com/ 前 40 条新闻的标题和链接",
+  "input_url": "https://news.ycombinator.com/",
+  "explicit_input_url": true,
+  "explicit_task_urls": [
+    "https://news.ycombinator.com/"
+  ],
+  "url_info": {
+    "url": "https://news.ycombinator.com/",
+    "backup_urls": [],
+    "need_search": false,
+    "search_query": ""
+  },
+  "candidate_urls": [
+    "https://news.ycombinator.com/"
+  ],
+  "should_search_first": false,
+  "domain_hints": [
+    "news.ycombinator.com"
+  ],
+  "replan_tried_urls": []
+}

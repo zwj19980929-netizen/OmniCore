@@ -1,0 +1,9 @@
+{
+  "success": true,
+  "item_selector": "article",
+  "fields": {
+    "title": "a"
+  },
+  "page_type": "list",
+  "observed_page_type": "list"
+}

@@ -1,0 +1,394 @@
+{
+  "task": "访问 Bing 搜索 openai+api，使用多种选择器和等待策略抓取前3条结果。策略：1) 等待页面完全加载后滚动触发懒加载 2) 尝试多个选择器: '.b_algo', '#b_results li', 'li.b_algo', '[class*=\"algo\"]' 3) 如果选择器失败，尝试提取所有可见链接并过滤 4) 返回JSON格式 [{title, url}, ...]",
+  "url": "https://www.bing.com/search?q=openai+api&rdr=1&rdrig=7ED9165F62574AEE8348214A123B998C",
+  "title": "openai api - 搜索",
+  "intent": {
+    "intent_type": "search",
+    "query": "openai api",
+    "confidence": 0.95,
+    "fields": {},
+    "requires_interaction": true,
+    "target_text": "前3条搜索结果"
+  },
+  "page_state": {
+    "page_type": "modal",
+    "stage": "unknown",
+    "confidence": 0.8,
+    "item_count": 0,
+    "target_count": 3,
+    "has_pagination": false,
+    "has_load_more": false,
+    "has_modal": false,
+    "goal_satisfied": false
+  },
+  "data": [],
+  "cards": [],
+  "elements": [
+    {
+      "index": 0,
+      "tag": "a",
+      "text": "跳至内容",
+      "element_type": "link",
+      "selector": "#b_skip_to_content",
+      "ref": "el_1",
+      "role": "button",
+      "attributes": {
+        "href": "https://www.bing.com/search?q=openai+api&rdr=1&rdrig=7ED9165F62574AEE8348214A123B998C#",
+        "value": "",
+        "placeholder": "",
+        "labelText": "",
+        "ariaLabel": ""
+      },
+      "is_visible": true,
+      "is_clickable": true,
+      "context_before": "",
+      "context_after": "",
+      "parent_ref": "",
+      "region": "header"
+    },
+    {
+      "index": 2,
+      "tag": "input",
+      "text": "搜索",
+      "element_type": "submit",
+      "selector": "#sb_form_go",
+      "ref": "el_3",
+      "role": "button",
+      "attributes": {
+        "href": "",
+        "value": "搜索",
+        "placeholder": "",
+        "labelText": "",
+        "ariaLabel": ""
+      },
+      "is_visible": true,
+      "is_clickable": true,
+      "context_before": "",
+      "context_after": "",
+      "parent_ref": "",
+      "region": "header"
+    },
+    {
+      "index": 3,
+      "tag": "input",
+      "text": "openai api",
+      "element_type": "search",
+      "selector": "#sb_form_q",
+      "ref": "el_4",
+      "role": "searchbox",
+      "attributes": {
+        "href": "",
+        "value": "openai api",
+        "placeholder": "",
+        "labelText": "",
+        "ariaLabel": ""
+      },
+      "is_visible": true,
+      "is_clickable": true,
+      "context_before": "",
+      "context_after": "",
+      "parent_ref": "",
+      "region": "header"
+    },
+    {
+      "index": 4,
+      "tag": "div",
+      "text": "使用图像搜索",
+      "element_type": "div",
+      "selector": "#sb_sbi",
+      "ref": "el_5",
+      "role": "button",
+      "attributes": {
+        "href": "",
+        "value": "",
+        "placeholder": "",
+        "labelText": "",
+        "ariaLabel": ""
+      },
+      "is_visible": true,
+      "is_clickable": true,
+      "context_before": "",
+      "context_after": "",
+      "parent_ref": "",
+      "region": "header"
+    }
+  ],
+  "snapshot": {
+    "url": "https://www.bing.com/search?q=openai+api&rdr=1&rdrig=7ED9165F62574AEE8348214A123B998C",
+    "title": "openai api - 搜索",
+    "page_type": "modal",
+    "elements": [
+      {
+        "ref": "el_1",
+        "role": "button",
+        "tag": "a",
+        "type": "link",
+        "text": "跳至内容",
+        "href": "https://www.bing.com/search?q=openai+api&rdr=1&rdrig=7ED9165F62574AEE8348214A123B998C#",
+        "value": "",
+        "label": "",
+        "placeholder": "",
+        "selector": "#b_skip_to_content",
+        "visible": true,
+        "enabled": true,
+        "region": "header",
+        "parent_ref": "",
+        "bbox": {
+          "x": 0,
+          "y": 24,
+          "width": 86,
+          "height": 32
+        }
+      },
+      {
+        "ref": "el_2",
+        "role": "link",
+        "tag": "a",
+        "type": "link",
+        "text": "",
+        "href": "https://www.bing.com/?FORM=Z9FD1",
+        "value": "",
+        "label": "",
+        "placeholder": "",
+        "selector": "a[href=\"\\/\\?FORM\\=Z9FD1\"]",
+        "visible": true,
+        "enabled": true,
+        "region": "header",
+        "parent_ref": "",
+        "bbox": {
+          "x": 0,
+          "y": 22,
+          "width": 140,
+          "height": 40
+        }
+      },
+      {
+        "ref": "el_3",
+        "role": "button",
+        "tag": "input",
+        "type": "submit",
+        "text": "搜索",
+        "href": "",
+        "value": "搜索",
+        "label": "",
+        "placeholder": "",
+        "selector": "#sb_form_go",
+        "visible": true,
+        "enabled": true,
+        "region": "header",
+        "parent_ref": "",
+        "bbox": {
+          "x": 164,
+          "y": 26,
+          "width": 40,
+          "height": 40
+        }
+      },
+      {
+        "ref": "el_4",
+        "role": "searchbox",
+        "tag": "input",
+        "type": "search",
+        "text": "openai api",
+        "href": "",
+        "value": "openai api",
+        "label": "",
+        "placeholder": "",
+        "selector": "#sb_form_q",
+        "visible": true,
+        "enabled": true,
+        "region": "header",
+        "parent_ref": "",
+        "bbox": {
+          "x": 193,
+          "y": 24,
+          "width": 535,
+          "height": 44
+        }
+      },
+      {
+        "ref": "el_5",
+        "role": "button",
+        "tag": "div",
+        "type": "div",
+        "text": "使用图像搜索",
+        "href": "",
+        "value": "",
+        "label": "",
+        "placeholder": "",
+        "selector": "#sb_sbi",
+        "visible": true,
+        "enabled": true,
+        "region": "header",
+        "parent_ref": "",
+        "bbox": {
+          "x": 764,
+          "y": 26,
+          "width": 36,
+          "height": 40
+        }
+      },
+      {
+        "ref": "el_6",
+        "role": "button",
+        "tag": "a",
+        "type": "link",
+        "text": "Rewards",
+        "href": "javascript:void(0)",
+        "value": "",
+        "label": "",
+        "placeholder": "",
+        "selector": "#id_rh_w",
+        "visible": true,
+        "enabled": true,
+        "region": "header",
+        "parent_ref": "",
+        "bbox": {
+          "x": 1165,
+          "y": 22,
+          "width": 103,
+          "height": 50
+        }
+      },
+      {
+        "ref": "el_7",
+        "role": "link",
+        "tag": "a",
+        "type": "link",
+        "text": "",
+        "href": "javascript:void(0)",
+        "value": "",
+        "label": "",
+        "placeholder": "",
+        "selector": "#id_l",
+        "visible": true,
+        "enabled": true,
+        "region": "header",
+        "parent_ref": "",
+        "bbox": {
+          "x": 1284,
+          "y": 22,
+          "width": 50,
+          "height": 50
+        }
+      }
+    ],
+    "cards": [],
+    "collections": [],
+    "controls": [
+      {
+        "ref": "el_4",
+        "kind": "search_input",
+        "text": "在此处输入你的搜索 — 输入时会显示搜索建议",
+        "selector": "#sb_form_q"
+      }
+    ],
+    "affordances": {
+      "has_search_box": true,
+      "search_input_ref": "el_4",
+      "search_input_selector": "#sb_form_q",
+      "has_pagination": false,
+      "next_page_ref": "",
+      "next_page_selector": "",
+      "has_load_more": false,
+      "load_more_ref": "",
+      "load_more_selector": "",
+      "has_modal": false,
+      "modal_primary_ref": "",
+      "modal_primary_selector": "",
+      "modal_secondary_ref": "",
+      "modal_secondary_selector": "",
+      "modal_close_ref": "",
+      "modal_close_selector": "",
+      "has_login_form": false,
+      "has_results": false,
+      "collection_item_count": 0
+    }
+  },
+  "last_action": {
+    "action_type": "wait",
+    "target_selector": "",
+    "target_ref": "",
+    "value": "",
+    "description": "等待搜索结果懒加载渲染 - 当前页面无可见搜索结果数据，需要等待动态内容加载",
+    "confidence": 0.95,
+    "requires_confirmation": false,
+    "fallback_selector": "",
+    "use_keyboard_fallback": false,
+    "keyboard_key": "",
+    "expected_page_type": "search_results",
+    "expected_text": ""
+  },
+  "prompt_budget": {
+    "data": {
+      "requested_chars": 17,
+      "requested_tokens": 4,
+      "allocated_chars": 16,
+      "allocated_tokens": 4,
+      "used_chars": 17,
+      "used_tokens": 4,
+      "truncated": false,
+      "mode": "lines",
+      "budget_metric": "tokens",
+      "tokenizer_model": "openai/MiniMax-M2.5",
+      "tokenizer_mode": "litellm"
+    },
+    "cards": {
+      "requested_chars": 10,
+      "requested_tokens": 3,
+      "allocated_chars": 12,
+      "allocated_tokens": 3,
+      "used_chars": 10,
+      "used_tokens": 3,
+      "truncated": false,
+      "mode": "lines",
+      "budget_metric": "tokens",
+      "tokenizer_model": "openai/MiniMax-M2.5",
+      "tokenizer_mode": "litellm"
+    },
+    "collections": {
+      "requested_chars": 16,
+      "requested_tokens": 3,
+      "allocated_chars": 12,
+      "allocated_tokens": 3,
+      "used_chars": 16,
+      "used_tokens": 3,
+      "truncated": false,
+      "mode": "lines",
+      "budget_metric": "tokens",
+      "tokenizer_model": "openai/MiniMax-M2.5",
+      "tokenizer_mode": "litellm"
+    },
+    "controls": {
+      "requested_chars": 72,
+      "requested_tokens": 30,
+      "allocated_chars": 120,
+      "allocated_tokens": 30,
+      "used_chars": 72,
+      "used_tokens": 30,
+      "truncated": false,
+      "mode": "lines",
+      "budget_metric": "tokens",
+      "tokenizer_model": "openai/MiniMax-M2.5",
+      "tokenizer_mode": "litellm"
+    },
+    "elements": {
+      "requested_chars": 333,
+      "requested_tokens": 132,
+      "allocated_chars": 528,
+      "allocated_tokens": 132,
+      "used_chars": 333,
+      "used_tokens": 132,
+      "truncated": false,
+      "mode": "lines",
+      "budget_metric": "tokens",
+      "tokenizer_model": "openai/MiniMax-M2.5",
+      "tokenizer_mode": "litellm"
+    },
+    "context": {
+      "task": "访问 Bing 搜索 openai+api，使用多种选择器和等待策略抓取前3条结果。策略：1) 等待页面完全加载后滚动触发懒加载 2) 尝试多个选择器: '.b_algo', '#b_results li', 'li.b_algo', '[class*=\"algo\"]' 3) 如果选择器失败，尝试提取所有可见链接并过滤",
+      "current_url": "https://www.bing.com/search?q=openai+api&rdr=1&rdrig=7ED9165F62574AEE8348214A123B998C",
+      "total_budget_tokens": 1600
+    }
+  }
+}

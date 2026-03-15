@@ -1,0 +1,22 @@
+页面类型: detail
+URL: https://huggingface.co/models
+标题: Models – Hugging Face
+页面特征: has_search_box=True, search_input_ref=el_66, search_input_selector=input[placeholder="Filter\ by\ name"], has_pagination=False, next_page_ref=, next_page_selector=, has_load_more=False, load_more_ref=, load_more_selector=, has_modal=False, modal_primary_ref=, modal_primary_selector=, modal_secondary_ref=, modal_secondary_selector=, modal_close_ref=, modal_close_selector=, has_login_form=False, has_results=False, collection_item_count=43
+页面集合结构:
+1. kind=list count=43 ref=collection_2_list samples=Main | Tasks | Libraries
+关键控件:
+1. kind=search_input ref=el_66 text=Filter by name selector=input[placeholder="Filter\ by\ name"]
+可见关键元素:
+1. link | Hugging Face | a[href="\/"] | ref=el_1
+2. text | Search models, datasets, users... | input[placeholder="Search\ models\,\ datasets\,\ users\.\.\."] | ref=el_2
+3. link | Models | a[href="\/models"] | ref=el_3
+4. link | Datasets | a[href="\/datasets"] | ref=el_4
+5. link | Spaces | a[href="\/spaces"] | ref=el_5
+6. link | Buckets NEW | a[href="\/storage"] | ref=el_6
+7. link | Docs | a[href="\/docs"] | ref=el_7
+8. link | Pricing | a[href="\/pricing"] | ref=el_8
+9. button | nav > ul > li:nth-of-type(8) > div > button | ref=el_9
+10. link | Log In | a[href="\/login"] | ref=el_10
+11. link | Sign Up | a[href="\/join"] | ref=el_11
+12. button | Main | section:nth-of-type(1) > div:nth-of-type(2) > ul > li:nth-of-type(1) > button | ref=el_12
+... 还有 68 个可见元素未展示

@@ -7,12 +7,14 @@ import re
 from datetime import date, timedelta
 from pathlib import Path
 from typing import List, Dict, Any
+from urllib.parse import parse_qs, urlparse
 
 from core.state import OmniCoreState, TaskItem
 from core.task_planner import build_policy_decision_from_task, build_task_item_from_plan
 from core.llm import LLMClient
 from core.tool_registry import build_dynamic_tool_prompt_lines, get_builtin_tool_registry
 from utils.logger import log_agent_action, logger
+from utils.url_utils import extract_first_url
 
 
 # Router Agent 的系统提示词
@@ -209,11 +211,6 @@ _WEATHER_DOMAIN_HINTS = (
     "weather.com.cn",
     "moji.com",
     "tianqi.com",
-)
-
-_WEATHER_DEFAULT_SOURCE_URLS = (
-    "https://www.weather.com.cn/",
-    "https://www.moji.com/",
 )
 
 _FACT_FRESHNESS_CUE_TOKENS = (
@@ -413,10 +410,7 @@ class RouterAgent:
 
     @staticmethod
     def _extract_first_url(text: str) -> str:
-        match = re.search(r"https?://\S+", str(text or ""))
-        if not match:
-            return ""
-        return match.group(0).rstrip(".,);]")
+        return extract_first_url(text)
 
     @staticmethod
     def _contains_any(text: str, tokens: tuple[str, ...]) -> bool:
@@ -471,34 +465,42 @@ class RouterAgent:
             normalized = cls._normalize_preferred_site(item)
             if normalized and any(domain in normalized.lower() for domain in _WEATHER_DOMAIN_HINTS):
                 source_urls.append(normalized)
-
-        for default_url in _WEATHER_DEFAULT_SOURCE_URLS:
-            if default_url not in source_urls:
-                source_urls.append(default_url)
         return source_urls
 
     @staticmethod
     def _sanitize_weather_location(candidate: str) -> str:
         cleaned = str(candidate or "").strip()
         cleaned = re.sub(
-            r"^(?:给我|帮我|麻烦|请|我想看|我想知道|想知道|查查|查一下|查询|看看|看下|搜一下|搜索一下)+",
+            r"^(?:给我|帮我|麻烦|请|我想看|我想知道|想知道|查查|查一下|查询|看看|看下|搜一下|搜索一下|"
+            r"抓取|提取|获取|读取|查看|打开|访问|进入|使用|前往|去|显示|展示|渲染)+",
             "",
             cleaned,
             flags=re.IGNORECASE,
         )
         cleaned = re.sub(
-            r"^(?:show|tell me|find|get|check|what(?:'s| is)?|how is)\s+",
+            r"^(?:show|tell me|find|get|check|open|visit|read|extract|fetch|retrieve|"
+            r"what(?:'s| is)?|how is)\s+",
             "",
             cleaned,
             flags=re.IGNORECASE,
         )
         cleaned = re.sub(
-            r"(?:今天|明天|后天|现在|当前|本地|当地|附近|周末|本周|这周|未来几天|未来7天|一周|天气预报|天气情况|气温|空气质量)+$",
+            r"^(?:今天|明天|后天|现在|当前|本周|周末|这周|未来几天|未来7天|一周)+的?",
+            "",
+            cleaned,
+            flags=re.IGNORECASE,
+        )
+        cleaned = re.sub(
+            r"(?:今天|明天|后天|现在|当前|本地|当地|附近|周末|本周|这周|未来几天|未来7天|一周|"
+            r"天气详情|天气页面|天气数据|天气预报|天气情况|气温|空气质量|数据|页面|详情|信息)+$",
             "",
             cleaned,
             flags=re.IGNORECASE,
         )
         cleaned = cleaned.strip(" ,，。！？?：:;；")
+        cleaned = cleaned.rstrip("的")
+        if cleaned in {"今天", "明天", "后天", "当前", "现在", "本周", "周末", "本地", "当地", "附近"}:
+            return ""
         if len(cleaned) < 2 or len(cleaned) > 32:
             return ""
         return cleaned
@@ -511,6 +513,7 @@ class RouterAgent:
     ) -> str:
         raw_text = str(user_input or "").strip()
         normalized = raw_text.lower()
+        direct_url = cls._extract_first_url(raw_text)
 
         if cls._contains_any(normalized, _EXPLICIT_LOCATION_REQUEST_TOKENS):
             context_location = str((current_location_context or {}).get("location", "") or "").strip()
@@ -527,6 +530,9 @@ class RouterAgent:
                 candidate = cls._sanitize_weather_location(match.group(1))
                 if candidate:
                     return candidate
+
+        if direct_url:
+            return ""
 
         english_patterns = (
             r"\bweather in ([a-z][a-z .'\-]{1,40})",
@@ -602,13 +608,14 @@ class RouterAgent:
         direct_url = cls._extract_first_url(user_input)
         wants_browser = cls._wants_browser_weather_route(user_input)
         source_urls = cls._preferred_weather_source_urls(user_preferences)
-        primary_source_url = direct_url or source_urls[0]
-        backup_source_url = source_urls[1] if len(source_urls) > 1 else source_urls[0]
+        primary_source_url = direct_url or (source_urls[0] if source_urls else "")
+        backup_source_url = source_urls[1] if len(source_urls) > 1 else ""
         location_hint = cls._extract_weather_location(user_input, current_location_context)
         timeframe_hint = cls._describe_weather_timeframe(user_input, current_time_context)
         target_label = f"{location_hint}的{timeframe_hint}天气" if location_hint else f"{timeframe_hint}天气"
         field_text = "temperature, weather condition, humidity, wind, and air quality (AQI)"
-        browser_query = " ".join(part for part in [location_hint, timeframe_hint, "天气"] if part).strip() or "天气"
+        search_timeframe_hint = re.sub(r"（\d{4}-\d{2}-\d{2}）", "", timeframe_hint).strip()
+        browser_query = " ".join(part for part in [location_hint, search_timeframe_hint, "天气"] if part).strip() or "天气"
 
         tasks: list[dict[str, Any]] = []
         if wants_browser:
@@ -631,6 +638,7 @@ class RouterAgent:
                     "description": browser_description,
                     "params": {
                         "task": browser_description,
+                        "query": browser_query,
                         "start_url": browser_start_url,
                         "headless": False,
                         "max_steps": 10,
@@ -646,9 +654,13 @@ class RouterAgent:
             )
 
             backup_description = (
-                f"Use {cls._source_label(backup_source_url)} as a deterministic backup source for {target_label}. "
-                f"Prefer city weather detail pages over news pages and navigation pages. "
-                f"Extract {field_text} and reject unrelated cities."
+                (
+                    f"Use {cls._source_label(backup_source_url)} as a non-browser backup source for {target_label}. "
+                    if backup_source_url else
+                    f"Use a non-browser backup extraction path for {target_label}. "
+                )
+                + f"Prefer city weather detail pages over news pages and navigation pages. "
+                + f"Extract {field_text} and reject unrelated cities."
             )
             tasks.append(
                 {
@@ -656,7 +668,8 @@ class RouterAgent:
                     "tool_name": "web.fetch_and_extract",
                     "description": backup_description,
                     "params": {
-                        "url": direct_url if direct_url else "",
+                        "url": direct_url if direct_url else (backup_source_url or ""),
+                        "query": browser_query,
                         "limit": 8,
                     },
                     "priority": 9,
@@ -670,18 +683,32 @@ class RouterAgent:
                 }
             )
         else:
-            primary_description = (
-                f"Directly obtain {target_label} from {cls._source_label(primary_source_url)} as the primary weather source. "
-                f"Prefer city weather detail or forecast pages over news pages and navigation pages. "
-                f"Extract {field_text}. Reject unrelated cities and generic weather news."
-            )
+            if direct_url:
+                primary_description = (
+                    f"Directly obtain {target_label} from {direct_url} as the user-provided weather page. "
+                    f"Prefer city weather detail or forecast pages over news pages and navigation pages. "
+                    f"Extract {field_text}. Reject unrelated cities and generic weather news."
+                )
+            elif primary_source_url:
+                primary_description = (
+                    f"Use {cls._source_label(primary_source_url)} as the preferred weather source for {target_label}. "
+                    f"Prefer city weather detail or forecast pages over news pages and navigation pages. "
+                    f"Extract {field_text}. Reject unrelated cities and generic weather news."
+                )
+            else:
+                primary_description = (
+                    f"Obtain {target_label} from a relevant city weather detail or forecast page. "
+                    f"Prefer detail pages over news pages and navigation pages. "
+                    f"Extract {field_text}. Reject unrelated cities and generic weather news."
+                )
             tasks.append(
                 {
                     "task_id": "task_1",
                     "tool_name": "web.fetch_and_extract",
                     "description": primary_description,
                     "params": {
-                        "url": direct_url if direct_url else "",
+                        "url": direct_url if direct_url else (primary_source_url or ""),
+                        "query": browser_query,
                         "limit": 8,
                     },
                     "priority": 10,
@@ -695,7 +722,7 @@ class RouterAgent:
                 }
             )
 
-            if not direct_url:
+            if not direct_url and backup_source_url:
                 backup_description = (
                     f"Use {cls._source_label(backup_source_url)} as the secondary weather source for {target_label}. "
                     f"Extract {field_text}. Prefer weather detail pages and reject news, navigation pages, "
@@ -707,7 +734,8 @@ class RouterAgent:
                         "tool_name": "web.fetch_and_extract",
                         "description": backup_description,
                         "params": {
-                            "url": "",
+                            "url": backup_source_url,
+                            "query": browser_query,
                             "limit": 8,
                         },
                         "priority": 9,
@@ -723,7 +751,7 @@ class RouterAgent:
 
         route_reason = (
             "Structured weather query matched the deterministic weather route. "
-            "The router fixed the tool choice, source priority, and required weather fields before execution."
+            "The router fixed the tool choice and required weather fields before execution."
         )
         if location_hint:
             route_reason += f" Location resolved as {location_hint}."
@@ -917,6 +945,7 @@ class RouterAgent:
         if not direct_url:
             return result
 
+        search_results_url = cls._looks_like_search_results_url(direct_url)
         repaired_tasks = []
         for raw_task in result.get("tasks", []) or []:
             task_data = dict(raw_task)
@@ -930,10 +959,14 @@ class RouterAgent:
                 tool_args = dict(params)
 
             tool_name = str(task_data.get("tool_name", "") or "").strip()
+            if search_results_url and tool_name == "web.fetch_and_extract":
+                tool_name = "web.smart_extract"
+                task_data["tool_name"] = tool_name
+                task_data["task_type"] = "enhanced_web_worker"
             if tool_name == "browser.interact" and not str(params.get("start_url", "") or "").strip():
                 params["start_url"] = direct_url
                 tool_args["start_url"] = direct_url
-            elif tool_name == "web.fetch_and_extract" and not str(params.get("url", "") or "").strip():
+            elif tool_name in {"web.fetch_and_extract", "web.smart_extract"} and not str(params.get("url", "") or "").strip():
                 params["url"] = direct_url
                 tool_args["url"] = direct_url
 
@@ -943,6 +976,29 @@ class RouterAgent:
 
         result["tasks"] = repaired_tasks
         return result
+
+    @staticmethod
+    def _looks_like_search_results_url(url: str) -> bool:
+        normalized = str(url or "").strip()
+        if not normalized:
+            return False
+        try:
+            parsed = urlparse(normalized)
+        except Exception:
+            return False
+
+        path = str(parsed.path or "").lower()
+        query = {str(key or "").lower(): value for key, value in parse_qs(parsed.query or "").items()}
+        if not query:
+            return False
+
+        query_keys = {"q", "query", "wd", "word", "keyword", "search", "text", "p"}
+        has_query_term = any(key in query for key in query_keys)
+        if not has_query_term:
+            return False
+
+        path_hints = ("/search", "/s", "/find", "/query")
+        return any(hint in path for hint in path_hints) or "search" in str(parsed.netloc or "").lower()
 
     @staticmethod
     def _build_router_system_prompt() -> str:

@@ -1,0 +1,13 @@
+{
+  "step": 2,
+  "plan": "等待搜索结果加载 - 页面显示无可见数据，需要等待Bing搜索结果完全渲染后进行提取",
+  "action": "wait",
+  "observation": "success",
+  "decision": "continue",
+  "action_type": "wait",
+  "selector": "",
+  "value": "",
+  "description": "等待搜索结果加载 - 页面显示无可见数据，需要等待Bing搜索结果完全渲染后进行提取",
+  "result": "success",
+  "url": "https://www.bing.com/search?q=openai+api&rdr=1&rdrig=7ED9165F62574AEE8348214A123B998C"
+}

@@ -1,0 +1,12 @@
+{
+  "trace_id": "20260315_122013_277332_web_worker_a336d555",
+  "scope": "web_worker",
+  "created_at": "2026-03-15T12:20:13.277485Z",
+  "metadata": {
+    "task": "抓取 https://huggingface.co/models 页面的前 10 个模型名称和链接",
+    "input_url": "https://huggingface.co/models",
+    "limit": 10,
+    "query": "",
+    "headless": null
+  }
+}

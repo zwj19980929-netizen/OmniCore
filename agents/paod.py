@@ -104,6 +104,13 @@ class SafeExpressionEvaluator:
         "type": type,
     }
 
+    SAFE_METHODS = {
+        dict: {"get", "keys", "values", "items"},
+        str: {"startswith", "endswith", "lower", "upper", "strip"},
+        list: {"count", "index"},
+        tuple: {"count", "index"},
+    }
+
     # 允许的类型常量
     ALLOWED_TYPES = {
         "True": True,
@@ -192,7 +199,15 @@ class SafeExpressionEvaluator:
 
             # 安全地获取属性
             if isinstance(obj, dict):
+                if attr in self.SAFE_METHODS[dict]:
+                    return getattr(obj, attr)
                 return obj.get(attr)
+            if isinstance(obj, str) and attr in self.SAFE_METHODS[str]:
+                return getattr(obj, attr)
+            if isinstance(obj, list) and attr in self.SAFE_METHODS[list]:
+                return getattr(obj, attr)
+            if isinstance(obj, tuple) and attr in self.SAFE_METHODS[tuple]:
+                return getattr(obj, attr)
             return getattr(obj, attr, None)
 
         # 下标访问（如 result["data"]）
@@ -201,6 +216,13 @@ class SafeExpressionEvaluator:
 
             # Python 3.9+ 使用 node.slice 直接作为节点
             # Python 3.8 及以下使用 node.slice.value
+            if isinstance(node.slice, ast.Slice):
+                if isinstance(obj, (list, tuple, str)):
+                    lower = self._eval_node(node.slice.lower) if node.slice.lower else None
+                    upper = self._eval_node(node.slice.upper) if node.slice.upper else None
+                    step = self._eval_node(node.slice.step) if node.slice.step else None
+                    return obj[slice(lower, upper, step)]
+                return None
             if isinstance(node.slice, ast.Index):
                 key = self._eval_node(node.slice.value)
             else:
@@ -262,7 +284,7 @@ class SafeExpressionEvaluator:
             # 确保是允许的函数
             if func not in self.ALLOWED_BUILTINS.values():
                 # 检查是否是类型检查
-                if func not in (list, dict, str, int, float, bool, type):
+                if func not in (list, dict, str, int, float, bool, type) and not self._is_safe_bound_method(func):
                     raise ValueError(f"不允许的函数调用: {func}")
 
             args = [self._eval_node(arg) for arg in node.args]
@@ -291,7 +313,53 @@ class SafeExpressionEvaluator:
                 return self._eval_node(node.body)
             return self._eval_node(node.orelse)
 
+        if isinstance(node, ast.GeneratorExp):
+            return self._eval_comprehension(node)
+
+        if isinstance(node, ast.ListComp):
+            return self._eval_comprehension(node)
+
         raise ValueError(f"不支持的表达式类型: {type(node).__name__}")
+
+    def _is_safe_bound_method(self, func: Any) -> bool:
+        owner = getattr(func, "__self__", None)
+        method_name = getattr(func, "__name__", "")
+        if owner is None or not method_name:
+            return False
+        for owner_type, allowed_methods in self.SAFE_METHODS.items():
+            if isinstance(owner, owner_type) and method_name in allowed_methods:
+                return True
+        return False
+
+    def _eval_comprehension(self, node: Union[ast.GeneratorExp, ast.ListComp]) -> List[Any]:
+        if len(node.generators) != 1:
+            raise ValueError("暂不支持多重推导式")
+
+        generator = node.generators[0]
+        if generator.is_async:
+            raise ValueError("不支持异步推导式")
+        if not isinstance(generator.target, ast.Name):
+            raise ValueError("只支持简单变量推导式")
+
+        target_name = generator.target.id
+        iterable = self._eval_node(generator.iter)
+        if iterable is None:
+            return []
+
+        sentinel = object()
+        previous_value = self.context.get(target_name, sentinel)
+        results = []
+        try:
+            for item in iterable:
+                self.context[target_name] = item
+                if all(self._eval_node(condition) for condition in generator.ifs):
+                    results.append(self._eval_node(node.elt))
+        finally:
+            if previous_value is sentinel:
+                self.context.pop(target_name, None)
+            else:
+                self.context[target_name] = previous_value
+        return results
 
 
 class DotDict(dict):
@@ -310,6 +378,29 @@ class DotDict(dict):
         self[key] = value
 
 
+def _wrap_safe_value(value: Any) -> Any:
+    if isinstance(value, DotDict):
+        return value
+    if isinstance(value, dict):
+        wrapped = {key: _wrap_safe_value(item) for key, item in value.items()}
+        # Treat common web link/url fields as aliases so success criteria
+        # can stay stable across workers that emit either key.
+        if "link" in wrapped and "url" not in wrapped:
+            wrapped["url"] = wrapped["link"]
+        if "url" in wrapped and "link" not in wrapped:
+            wrapped["link"] = wrapped["url"]
+        if "title" in wrapped and "name" not in wrapped:
+            wrapped["name"] = wrapped["title"]
+        if "name" in wrapped and "title" not in wrapped:
+            wrapped["title"] = wrapped["name"]
+        return DotDict(wrapped)
+    if isinstance(value, list):
+        return [_wrap_safe_value(item) for item in value]
+    if isinstance(value, tuple):
+        return tuple(_wrap_safe_value(item) for item in value)
+    return value
+
+
 def evaluate_success_criteria(criteria: List[str], result: Any) -> bool:
     """
     安全评估 success_criteria 条件列表。
@@ -326,10 +417,7 @@ def evaluate_success_criteria(criteria: List[str], result: Any) -> bool:
         return True
 
     # 将 result 包装为 DotDict 以支持属性访问
-    if isinstance(result, dict):
-        safe_result = DotDict(result)
-    else:
-        safe_result = result
+    safe_result = _wrap_safe_value(result)
 
     # 创建求值器
     evaluator = SafeExpressionEvaluator(context={"result": safe_result})

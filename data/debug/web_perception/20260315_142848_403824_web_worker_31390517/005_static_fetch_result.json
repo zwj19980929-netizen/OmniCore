@@ -1,0 +1,9 @@
+{
+  "url": "https://www.google.com/search?q=合肥 明天 天气",
+  "result": {
+    "success": false,
+    "error": "HTTPSConnectionPool(host='www.google.com', port=443): Max retries exceeded with url: /search?q=%E5%90%88%E8%82%A5%20%E6%98%8E%E5%A4%A9%20%E5%A4%A9%E6%B0%94 (Caused by ProxyError('Unable to connect to proxy', NewConnectionError(\"HTTPSConnection(host='127.0.0.1', port=8118): Failed to establish a new connection: [Errno 1] Operation not permitted\")))",
+    "data": [],
+    "url": "https://www.google.com/search?q=合肥 明天 天气"
+  }
+}

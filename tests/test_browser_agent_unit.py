@@ -1,6 +1,6 @@
 import asyncio
 
-from agents.browser_agent import ActionType, BrowserAction, BrowserAgent, PageElement, TaskIntent
+from agents.browser_agent import ActionType, BrowserAction, BrowserAgent, PageElement, SearchResultCard, TaskIntent
 from utils.browser_toolkit import ToolkitResult
 
 
@@ -32,6 +32,23 @@ class SemanticAssessmentLLM:
     async def achat(self, *_args, **_kwargs):
         self.calls += 1
         return {"ok": True}
+
+    def parse_json_response(self, _response):
+        return self.payload
+
+
+class VisionDecisionLLM:
+    def __init__(self, payload):
+        self.payload = payload
+        self.calls = 0
+
+    def chat_with_image(self, *_args, **_kwargs):
+        self.calls += 1
+
+        class _Response:
+            content = '{"ok": true}'
+
+        return _Response()
 
     def parse_json_response(self, _response):
         return self.payload
@@ -611,6 +628,68 @@ class _SnapshotToolkit:
         return ToolkitResult(success=True, data=self.html)
 
 
+class _RefClickToolkit:
+    fast_mode = False
+    page = None
+
+    def __init__(self):
+        self.clicked_ref = ""
+
+    async def click_ref(self, ref: str):
+        self.clicked_ref = ref
+        return ToolkitResult(success=True)
+
+    async def click(self, _selector, timeout=None):
+        del timeout
+        return ToolkitResult(success=False, error="should not use selector click")
+
+    async def locator_click(self, _selector, timeout=None):
+        del timeout
+        return ToolkitResult(success=False, error="should not use locator click")
+
+    async def force_click(self, _selector, timeout=None):
+        del timeout
+        return ToolkitResult(success=False, error="should not use force click")
+
+
+class _SemanticSnapshotToolkit:
+    fast_mode = False
+    page = None
+
+    def __init__(self, snapshots, html: str = "<html><body></body></html>", url: str = "https://www.bing.com/search?q=test", title: str = "Search"):
+        self._snapshots = list(snapshots)
+        self._html = html
+        self._url = url
+        self._title = title
+
+    async def semantic_snapshot(self, max_elements=80, include_cards=True):
+        del max_elements, include_cards
+        current = self._snapshots[0]
+        if len(self._snapshots) > 1:
+            self._snapshots.pop(0)
+        return ToolkitResult(success=True, data=current)
+
+    async def get_current_url(self):
+        return ToolkitResult(success=True, data=self._url)
+
+    async def get_title(self):
+        return ToolkitResult(success=True, data=self._title)
+
+    async def get_page_html(self):
+        return ToolkitResult(success=True, data=self._html)
+
+    async def wait_for_text_appear(self, _text, timeout=None):
+        del timeout
+        return ToolkitResult(success=False, error="text not found")
+
+    def resolve_ref(self, _ref: str):
+        return {"selector": "a.result"}
+
+    async def screenshot(self, full_page=False):
+        del full_page
+        return ToolkitResult(success=True, data=b"fake-png")
+
+
 def test_infer_task_intent_treats_direct_url_as_read_only():
     agent = BrowserAgent(llm_client=FailingIntentLLM(), headless=True)
 
@@ -637,6 +716,39 @@ def test_refine_search_query_strips_instructional_sentence_into_short_query():
     )
 
     assert query == "death ali khamenei"
+
+
+def test_refine_search_query_strips_browser_instruction_tail_in_chinese():
+    agent = BrowserAgent(headless=True)
+
+    query = agent._refine_search_query(
+        "browser task",
+        "openai api 等待页面完全加载后提取前3条结果并展示给用户",
+    )
+
+    assert query == "openai api"
+
+
+def test_refine_search_query_strips_browser_task_prefix_and_render_steps():
+    agent = BrowserAgent(headless=True)
+
+    query = agent._refine_search_query(
+        "browser task",
+        "Browser task: OpenAI API pricing wait for rendering and extract top results",
+    )
+
+    assert query == "openai api pricing"
+
+def test_refine_search_query_ignores_internal_source_hints_in_weather_tasks():
+    agent = BrowserAgent(headless=True)
+
+    query = agent._derive_primary_query(
+        "Use weather.com.cn as the primary weather source for 合肥明天的天气详情. Extract temperature humidity wind and AQI."
+    )
+
+    assert query == "合肥 明天 天气"
+
+
 
 
 def test_extract_data_for_intent_prefers_structured_search_results():
@@ -782,6 +894,344 @@ def test_find_search_result_click_action_prefers_external_weather_detail_result(
     assert action.target_selector == "a.weather"
 
 
+def test_find_search_result_click_action_prefers_semantic_card_ref():
+    agent = BrowserAgent(headless=True)
+    intent = TaskIntent(intent_type="search", query="ali khamenei death", confidence=0.9)
+    snapshot = {
+        "page_type": "serp",
+        "cards": [
+            {
+                "ref": "card_1",
+                "title": "Reuters: Public appearances indicate Khamenei is alive",
+                "source": "Reuters",
+                "host": "reuters.com",
+                "snippet": "Recent public appearances indicate the reports are false.",
+                "target_ref": "el_7",
+                "target_selector": "a.result",
+                "rank": 1,
+            }
+        ],
+    }
+
+    action = agent._find_search_result_click_action(
+        "核实阿亚图拉阿里哈梅内伊是否在最近冲突中死亡",
+        "https://www.bing.com/search?q=ali+khamenei+death",
+        [],
+        intent,
+        snapshot=snapshot,
+    )
+
+    assert action is not None
+    assert action.action_type == ActionType.CLICK
+    assert action.target_ref == "el_7"
+    assert action.expected_page_type == "detail"
+
+
+def test_execute_action_prefers_click_ref_before_selector_click():
+    toolkit = _RefClickToolkit()
+    agent = BrowserAgent(headless=True, toolkit=toolkit)
+
+    success = asyncio.run(
+        agent._execute_action(
+            BrowserAction(
+                action_type=ActionType.CLICK,
+                target_ref="el_7",
+                target_selector="a.legacy",
+                description="click strongest result",
+            )
+        )
+    )
+
+    assert success is True
+    assert toolkit.clicked_ref == "el_7"
+
+
+def test_action_from_llm_accepts_flat_action_payload():
+    agent = BrowserAgent(headless=True)
+    elements = [
+        PageElement(
+            index=7,
+            tag="a",
+            text="OpenClaw - GitHub",
+            element_type="link",
+            selector="div.g:nth-of-type(1) a",
+            ref="el_7",
+            attributes={"href": "https://github.com/openclaw"},
+            is_visible=True,
+            is_clickable=True,
+        )
+    ]
+
+    action = agent._action_from_llm(
+        {
+            "action_type": "click",
+            "target_ref": "el_7",
+            "description": "open result",
+            "confidence": 0.82,
+            "expected_page_type": "detail",
+        },
+        elements,
+    )
+
+    assert action.action_type == ActionType.CLICK
+    assert action.target_ref == "el_7"
+    assert action.description == "open result"
+    assert action.expected_page_type == "detail"
+    assert action.confidence == 0.82
+
+
+def test_verify_action_effect_accepts_expected_page_type_change():
+    toolkit = _SemanticSnapshotToolkit(
+        snapshots=[
+            {"page_type": "serp", "cards": [{"ref": "card_1"}]},
+            {"page_type": "detail", "cards": []},
+        ]
+    )
+    agent = BrowserAgent(headless=True, toolkit=toolkit)
+
+    before = asyncio.run(agent._snapshot_page_state())
+    success = asyncio.run(
+        agent._verify_action_effect(
+            before,
+            BrowserAction(
+                action_type=ActionType.CLICK,
+                target_ref="el_7",
+                target_selector="a.result",
+                expected_page_type="detail",
+            ),
+        )
+    )
+
+    assert success is True
+
+
+def test_page_data_satisfies_goal_requires_target_count_on_list_page():
+    agent = BrowserAgent(headless=True)
+    snapshot = {
+        "page_type": "list",
+        "collections": [{"ref": "collection_1", "kind": "table", "item_count": 3}],
+        "affordances": {"has_pagination": True, "next_page_ref": "ctl_next_page"},
+    }
+
+    satisfied = agent._page_data_satisfies_goal(
+        "提取 10 条最新漏洞信息",
+        "https://www.cnnvd.org.cn/web/xxk/ldxqById.tag",
+        TaskIntent(intent_type="read", query="最新 漏洞", confidence=0.9),
+        [{"title": "漏洞 1"}, {"title": "漏洞 2"}, {"title": "漏洞 3"}],
+        snapshot=snapshot,
+    )
+
+    assert satisfied is False
+
+
+def test_choose_snapshot_navigation_action_prefers_load_more_for_list_pages():
+    agent = BrowserAgent(headless=True)
+    snapshot = {
+        "page_type": "list",
+        "collections": [{"ref": "collection_1", "kind": "list", "item_count": 5}],
+        "affordances": {
+            "has_load_more": True,
+            "load_more_ref": "ctl_load_more",
+            "load_more_selector": "button.load-more",
+        },
+    }
+
+    action = agent._choose_snapshot_navigation_action(
+        "提取 10 条最新文章",
+        "https://example.com/news",
+        [],
+        TaskIntent(intent_type="read", query="最新 文章", confidence=0.9),
+        [{"title": f"文章 {idx}"} for idx in range(1, 4)],
+        snapshot=snapshot,
+    )
+
+    assert action is not None
+    assert action.action_type == ActionType.CLICK
+    assert action.target_ref == "ctl_load_more"
+
+
+def test_choose_snapshot_navigation_action_prefers_modal_primary_control():
+    agent = BrowserAgent(headless=True)
+    snapshot = {
+        "page_type": "modal",
+        "controls": [
+            {"ref": "ctl_modal_primary", "kind": "modal_primary", "text": "Accept", "selector": "button.accept"},
+        ],
+        "affordances": {
+            "has_modal": True,
+            "modal_primary_ref": "ctl_modal_primary",
+            "modal_primary_selector": "button.accept",
+        },
+    }
+
+    action = agent._choose_snapshot_navigation_action(
+        "继续打开页面并提取结果",
+        "https://www.bing.com/search?q=openai+api",
+        [],
+        TaskIntent(intent_type="read", query="openai api", confidence=0.9),
+        [],
+        snapshot=snapshot,
+    )
+
+    assert action is not None
+    assert action.action_type == ActionType.CLICK
+    assert action.target_ref == "ctl_modal_primary"
+
+
+def test_choose_snapshot_navigation_action_can_use_modal_region_elements():
+    agent = BrowserAgent(headless=True)
+    snapshot = {
+        "page_type": "modal",
+        "affordances": {
+            "has_modal": True,
+        },
+    }
+    elements = [
+        PageElement(
+            index=0,
+            tag="button",
+            text="Accept",
+            element_type="button",
+            selector="button.accept",
+            ref="el_accept",
+            region="modal",
+            is_visible=True,
+            is_clickable=True,
+        )
+    ]
+
+    action = agent._choose_snapshot_navigation_action(
+        "继续打开页面并提取结果",
+        "https://www.bing.com/search?q=openai+api",
+        elements,
+        TaskIntent(intent_type="read", query="openai api", confidence=0.9),
+        [],
+        snapshot=snapshot,
+    )
+
+    assert action is not None
+    assert action.action_type == ActionType.CLICK
+    assert action.target_ref == "el_accept"
+
+
+def test_choose_snapshot_navigation_action_ignores_non_actionable_modal_flag():
+    agent = BrowserAgent(headless=True)
+    snapshot = {
+        "page_type": "list",
+        "affordances": {
+            "has_modal": True,
+            "has_load_more": True,
+            "load_more_ref": "ctl_load_more",
+            "load_more_selector": "button.more",
+        },
+        "collections": [{"ref": "collection_1", "kind": "list", "item_count": 3}],
+    }
+
+    action = agent._choose_snapshot_navigation_action(
+        "提取前 5 条结果",
+        "https://example.com/news",
+        [],
+        TaskIntent(intent_type="read", query="新闻", confidence=0.9),
+        [{"title": f"文章 {idx}"} for idx in range(1, 3)],
+        snapshot=snapshot,
+    )
+
+    assert action is not None
+    assert action.action_type == ActionType.CLICK
+    assert action.target_ref == "ctl_load_more"
+
+
+def test_verify_action_effect_accepts_item_count_growth_for_load_more():
+    toolkit = _SemanticSnapshotToolkit(
+        snapshots=[
+            {
+                "page_type": "list",
+                "cards": [],
+                "collections": [{"ref": "collection_1", "kind": "list", "item_count": 3}],
+                "affordances": {"has_load_more": True},
+            },
+            {
+                "page_type": "list",
+                "cards": [],
+                "collections": [{"ref": "collection_1", "kind": "list", "item_count": 8}],
+                "affordances": {"has_load_more": True},
+            },
+        ],
+        url="https://example.com/news",
+        title="News",
+    )
+    agent = BrowserAgent(headless=True, toolkit=toolkit)
+
+    before = asyncio.run(agent._snapshot_page_state())
+    success = asyncio.run(
+        agent._verify_action_effect(
+            before,
+            BrowserAction(
+                action_type=ActionType.CLICK,
+                target_ref="ctl_load_more",
+                target_selector="button.load-more",
+            ),
+        )
+    )
+
+    assert success is True
+
+
+def test_decide_action_with_vision_can_choose_semantic_ref():
+    toolkit = _SemanticSnapshotToolkit(
+        snapshots=[
+            {
+                "page_type": "unknown",
+                "cards": [],
+                "collections": [{"ref": "collection_1", "kind": "list", "item_count": 0}],
+                "affordances": {"has_modal": False},
+            }
+        ],
+        url="https://www.cnnvd.org.cn/",
+        title="国家信息安全漏洞库",
+    )
+    agent = BrowserAgent(headless=True, toolkit=toolkit)
+    agent._vision_llm = VisionDecisionLLM(
+        {
+            "confidence": 0.73,
+            "action": {
+                "type": "click",
+                "target_ref": "el_9",
+                "description": "open vulnerability list entry",
+            },
+        }
+    )
+    elements = [
+        PageElement(
+            index=0,
+            tag="a",
+            text="漏洞列表",
+            element_type="link",
+            selector="a.vuln-list",
+            ref="el_9",
+            attributes={"href": "https://www.cnnvd.org.cn/web/vulnerability/querylist.tag"},
+            is_visible=True,
+            is_clickable=True,
+        )
+    ]
+
+    action = asyncio.run(
+        agent._decide_action_with_vision(
+            "进入漏洞列表并提取 3 条最新漏洞",
+            "https://www.cnnvd.org.cn/",
+            "国家信息安全漏洞库",
+            elements,
+            TaskIntent(intent_type="navigate", query="漏洞 列表 最新 漏洞", confidence=0.9),
+            [],
+            snapshot=toolkit._snapshots[0],
+        )
+    )
+
+    assert action is not None
+    assert action.action_type == ActionType.CLICK
+    assert action.target_ref == "el_9"
+
+
 def test_run_with_start_url_and_read_description_stays_in_read_mode():
     toolkit = _ReadOnlyToolkit(
         landing_url="https://www.weather.com.cn/weather/101220101.shtml",
@@ -799,3 +1249,67 @@ def test_run_with_start_url_and_read_description_stays_in_read_mode():
     assert result["success"] is True
     assert result["expected_url"] == "https://www.weather.com.cn/weather/101220101.shtml"
     assert "Tomorrow" in result["data"][0]["text"]
+
+
+def test_build_budgeted_browser_prompt_context_respects_budget_and_controls():
+    agent = BrowserAgent(headless=True, toolkit=_SemanticSnapshotToolkit(snapshots=[{}]))
+    snapshot = {
+        "controls": [
+            {"ref": "ctl_next", "kind": "next_page", "text": "Next", "selector": ".pagination .next"},
+            {"ref": "ctl_more", "kind": "load_more", "text": "Load more results", "selector": "button.more"},
+        ],
+        "collections": [
+            {
+                "ref": "collection_1",
+                "kind": "list",
+                "item_count": 42,
+                "sample_items": ["alpha", "beta", "gamma"],
+            }
+        ],
+    }
+    cards = [
+        SearchResultCard(
+            ref=f"card_{index}",
+            title=f"Result {index} " + ("x" * 120),
+            source="Example Source",
+            host="example.com",
+            snippet="snippet " * 40,
+            target_ref=f"el_{index}",
+            rank=index,
+        )
+        for index in range(1, 9)
+    ]
+    rendered, report = agent._build_budgeted_browser_prompt_context(
+        task="extract 5 results and continue pagination if needed",
+        current_url="https://example.com/list",
+        data=[{"title": "Example title", "text": "body " * 80, "link": "https://example.com/a"}],
+        cards=cards,
+        snapshot=snapshot,
+        elements_text="\n".join(
+            f"[{index}] type=link ref=el_{index} selector=a.item-{index} info={'y' * 180}"
+            for index in range(1, 18)
+        ),
+        total_tokens=450,
+    )
+
+    total_used = sum(
+        int(report[name]["used_tokens"])
+        for name in ("data", "cards", "collections", "controls", "elements")
+    )
+    assert total_used <= 450
+    assert "ctl_next" in rendered["controls"]
+    assert rendered["context_coverage"]
+
+
+def test_looks_like_blocked_page_does_not_flag_plain_ok_html_without_denial_signals():
+    assert BrowserAgent._looks_like_blocked_page(
+        "https://example.com/ok.html",
+        "Normal landing page",
+    ) is False
+
+
+def test_looks_like_blocked_page_flags_ok_html_with_forbidden_title():
+    assert BrowserAgent._looks_like_blocked_page(
+        "https://www.weather.com.cn/ok.html",
+        "403 Forbidden",
+    ) is True

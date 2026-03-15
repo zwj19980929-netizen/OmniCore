@@ -1,0 +1,14 @@
+{
+  "action_type": "wait",
+  "target_selector": "",
+  "target_ref": "",
+  "value": "",
+  "description": "等待搜索结果加载完成，页面当前显示为modal且无可见数据，需要等待结果渲染",
+  "confidence": 0.85,
+  "requires_confirmation": false,
+  "fallback_selector": "",
+  "use_keyboard_fallback": false,
+  "keyboard_key": "",
+  "expected_page_type": "search_results",
+  "expected_text": "搜索结果"
+}

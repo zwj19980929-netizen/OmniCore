@@ -1,0 +1,56 @@
+你是一个网页结构分析专家。请分析以下 HTML，找出目标数据的 CSS 选择器。
+
+## 任务目标
+unique debug seq 4
+
+## 页面语义快照（优先参考）
+页面类型: list
+URL: https://example.com
+标题: T
+
+## 页面结构概览（由页面感知器提取）
+x
+
+## 页面 HTML (已清洗，移除了噪音)
+```html
+<html><body><article><a>A</a></article></body></html>
+```
+
+## 页面当前 URL
+https://example.com
+
+## 你的工作方式
+1. **先看页面结构概览**：理解页面的整体布局和内容组织方式（标题、列表、表格、段落等）
+2. **再看 HTML 细节**：找出包含目标数据的重复元素（列表项、表格行等）
+3. **为每个需要提取的字段确定精确的 CSS 选择器**
+4. **优先使用语义快照和页面结构概览中提到的选择器**，这些选择器经过可见性验证更可靠
+5. 如果页面是搜索结果页、跳转页、聚合页，而不是最终数据页，要明确说明当前页不适合直接抽取
+6. 如果页面结构不明确，给出你最有把握的选择器
+
+返回 JSON 格式：
+```json
+{
+    "success": true,
+    "page_type": "list/detail/serp/form/unknown",
+    "requires_navigation": false,
+    "navigation_reason": "",
+    "item_selector": "每一条数据项的选择器（如 tr, li, div.item 等）",
+    "fields": {
+        "title": "标题文本的选择器（相对于 item）",
+        "link": "链接的选择器（相对于 item，a 标签会自动提取 href）",
+        "date": "日期的选择器（可选）",
+        "severity": "严重程度/等级的选择器（可选）",
+        "id": "编号/ID 的选择器（可选）"
+    },
+    "need_click_first": false,
+    "click_selector": "如果需要先点击某元素才能看到数据，填写选择器",
+    "notes": "其他注意事项"
+}
+```
+
+注意：
+- item_selector 应该能选中多个重复的数据项
+- fields 中的选择器是相对于每个 item 的
+- 只填你在 HTML 或页面结构中确实看到的选择器，看不到的字段留空字符串
+- 优先使用语义快照和页面结构概览中提到的选择器，它们经过可见性验证
+- 如果当前页明显是搜索结果页且不应直接抽取，把 requires_navigation 设为 true

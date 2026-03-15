@@ -24,6 +24,7 @@ from core.model_registry import ModelCapability, get_registry
 from core.tool_registry import RegisteredTool, get_builtin_tool_registry
 from utils.logger import log_agent_action, log_error, log_warning
 from utils.retry import is_retryable
+from utils.url_utils import extract_first_url, sanitize_extracted_url
 
 _capability_detector = CapabilityDetector()
 
@@ -471,6 +472,78 @@ class WebWorkerAdapter(BaseToolAdapter):
         )
 
 
+# 🔥 新增：增强版 Web Worker Adapter（三层感知架构）
+class EnhancedWebWorkerAdapter(BaseToolAdapter):
+    async def execute(
+        self,
+        task: Dict[str, Any],
+        shared_memory_snapshot: Dict[str, Any],
+        registered_tool: RegisteredTool,
+    ) -> Dict[str, Any]:
+        from agents.enhanced_web_worker import EnhancedWebWorker
+        from utils.browser_toolkit import BrowserToolkit
+
+        params = task.get("params", {})
+        task_description = str(params.get("task") or task.get("description", "") or "").strip()
+        url = sanitize_extracted_url(params.get("url", "")) or extract_first_url(task_description)
+        limit = params.get("limit", 10)
+        headless = params.get("headless", True)
+
+        if not task_description:
+            return _base_outcome(
+                task,
+                registered_tool,
+                status=str(TaskStatus.FAILED),
+                result={"success": False, "error": "Missing task description"},
+                shared_memory=None,
+                error_trace="Missing task description",
+                failure_type=str(FailureType.INVALID_INPUT),
+            )
+
+        resolved_model = resolve_model_for_task(task)
+        llm_client = LLMClient(model=resolved_model) if resolved_model else LLMClient()
+
+        worker = EnhancedWebWorker(llm_client=llm_client)
+
+        try:
+            async with BrowserToolkit(headless=headless) as toolkit:
+                # 如果提供了 URL，先导航
+                if url:
+                    log_agent_action("EnhancedWebWorker", f"导航到 {url}")
+                    await toolkit.goto(url)
+                    await toolkit.human_delay(2000, 3000)
+
+                # 执行智能提取
+                result = await worker.smart_extract(toolkit, task_description, limit)
+
+                shared_memory_value = None
+                if result.get("success") and result.get("data"):
+                    shared_memory_value = result.get("data")
+
+                status = str(TaskStatus.COMPLETED) if result.get("success") else str(TaskStatus.FAILED)
+
+                return _base_outcome(
+                    task,
+                    registered_tool,
+                    status=status,
+                    result=result,
+                    shared_memory=shared_memory_value,
+                    error_trace="" if result.get("success") else result.get("error", "Unknown error"),
+                    failure_type=None if result.get("success") else str(FailureType.EXECUTION_ERROR),
+                )
+        except Exception as e:
+            log_error(f"EnhancedWebWorker 执行失败: {e}")
+            return _base_outcome(
+                task,
+                registered_tool,
+                status=str(TaskStatus.FAILED),
+                result={"success": False, "error": str(e)},
+                shared_memory=None,
+                error_trace=str(e),
+                failure_type=str(FailureType.EXECUTION_ERROR),
+            )
+
+
 class ExecutorBackedAdapter(BaseToolAdapter):
     """Base adapter for sync workers executed in a thread executor."""
 
@@ -662,7 +735,7 @@ class BrowserAgentAdapter(BaseToolAdapter):
 
         params = task.get("params", {})
         task_desc = params.get("task", task.get("description", ""))
-        start_url = params.get("start_url", "")
+        start_url = sanitize_extracted_url(params.get("start_url", "")) or extract_first_url(task_desc)
         headless = params.get("headless", settings.BROWSER_FAST_MODE)
         max_steps = params.get("max_steps", 8)
         if not isinstance(max_steps, int) or max_steps <= 0:
@@ -839,3 +912,12 @@ async def execute_tool_via_adapter(
             failure_type=str(FailureType.INVALID_INPUT),
         )
     return await adapter.execute(task, shared_memory_snapshot, registered_tool)
+
+
+# 🔥 注册内置 adapters
+register_tool_adapter_class("web_worker", WebWorkerAdapter)
+register_tool_adapter_class("enhanced_web_worker", EnhancedWebWorkerAdapter)
+register_tool_adapter_class("file_worker", FileWorkerAdapter)
+register_tool_adapter_class("api_worker", ApiWorkerAdapter)
+register_tool_adapter_class("system_worker", SystemWorkerAdapter)
+register_tool_adapter_class("browser_agent", BrowserAgentAdapter)

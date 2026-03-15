@@ -160,6 +160,10 @@ class Settings:
     # === 调试配置 ===
     DEBUG_MODE = os.getenv("DEBUG_MODE", "false").lower() == "true"
     LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO")
+    WEB_PERCEPTION_DEBUG = os.getenv("WEB_PERCEPTION_DEBUG", "false").lower() == "true"
+    WEB_PERCEPTION_DEBUG_DIR = Path(
+        os.getenv("WEB_PERCEPTION_DEBUG_DIR", DATA_DIR / "debug" / "web_perception")
+    )
 
     # === 浏览器执行配置 ===
     # 快速模式：减少随机延迟与不必要等待，优先吞吐

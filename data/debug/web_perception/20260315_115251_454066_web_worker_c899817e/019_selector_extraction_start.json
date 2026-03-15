@@ -1,0 +1,12 @@
+{
+  "item_selector": "article, li, div[data-target*='model']",
+  "field_selectors": {
+    "title": "h4.text-md.truncate",
+    "link": "a[href*='/models/']",
+    "date": "",
+    "severity": "",
+    "id": ""
+  },
+  "matched_items": 72,
+  "limit": 10
+}
