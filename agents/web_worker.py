@@ -43,6 +43,7 @@ from utils.web_result_normalizer import (
 )
 import utils.web_debug_recorder as web_debug_recorder
 from config.settings import settings
+from config.domain_keywords import SEARCH_STOPWORDS_SET
 
 # ==================== 预编译正则表达式 ====================
 # HTML 清理相关
@@ -63,14 +64,6 @@ RE_ANCHOR_TAG = re.compile(
 )
 RE_ANCHOR_WITH_ATTRS = re.compile(
     r"<a([^>]*)href=[\"']([^\"']+)[\"']([^>]*)>(.*?)</a>",
-    re.DOTALL | re.IGNORECASE,
-)
-RE_HN_ROW = re.compile(
-    r"<tr[^>]*class=[\"'][^\"']*athing[^\"']*[\"'][^>]*id=[\"']([^\"']+)[\"'][^>]*>(.*?)</tr>",
-    re.DOTALL | re.IGNORECASE,
-)
-RE_HN_TITLE_LINK = re.compile(
-    r"<span[^>]*class=[\"'][^\"']*titleline[^\"']*[\"'][^>]*>.*?<a[^>]*href=[\"']([^\"']+)[\"'][^>]*>(.*?)</a>",
     re.DOTALL | re.IGNORECASE,
 )
 RE_NEXT_PAGE_HINT = re.compile(r"(next|more|older|下一页|更多|后页)", re.IGNORECASE)
@@ -128,15 +121,7 @@ Rules:
 - Use the 1-based indexes from the provided result list.
 """
 
-GENERIC_SEARCH_STOPWORDS = {
-    "a", "an", "and", "are", "as", "at", "be", "by", "current", "detail", "details",
-    "extract", "find", "for", "from", "get", "give", "how", "in", "into", "latest",
-    "most", "news", "of", "on", "or", "recent", "report", "reports", "search",
-    "source", "sources", "statement", "statements", "that", "the", "their", "this",
-    "to", "using", "verify", "with", "directly", "primary", "secondary", "preferred",
-    "一下", "一些", "使用", "信息", "内容", "分析", "声明", "报道", "搜索", "提取", "搜集",
-    "最新", "最近", "材料", "核实", "来源", "请", "请你", "请帮我", "资料", "通过",
-}
+GENERIC_SEARCH_STOPWORDS = SEARCH_STOPWORDS_SET
 
 # ==================== 延迟导入 ====================
 def _import_paod():
@@ -1158,11 +1143,6 @@ class WebWorker:
                     return blocks
         return blocks
 
-    @staticmethod
-    def _looks_like_hackernews_source(url: str, task_description: str = "") -> bool:
-        target = f"{str(url or '')} {str(task_description or '')}".lower()
-        return "news.ycombinator.com" in target or "hacker news" in target
-
     def _backup_urls_for_explicit_url(self, url: str, task_description: str = "") -> List[str]:
         normalized = str(url or "").strip()
         if not normalized:
@@ -1178,31 +1158,6 @@ class WebWorker:
                 ]
                 return [item for item in candidates if item != normalized]
         return []
-
-    def _extract_hackernews_static_items(self, html: str, base_url: str, limit: int) -> List[Dict[str, Any]]:
-        results: List[Dict[str, Any]] = []
-        for row_match in RE_HN_ROW.finditer(str(html or "")):
-            item_id = str(row_match.group(1) or "").strip()
-            row_html = str(row_match.group(2) or "")
-            link_match = RE_HN_TITLE_LINK.search(row_html)
-            if not link_match:
-                continue
-            href = str(link_match.group(1) or "").strip()
-            title = self._strip_tags(link_match.group(2))
-            link = urljoin(base_url, href)
-            if not title or not link or self._is_noise_link(title, link):
-                continue
-            results.append(
-                {
-                    "rank": len(results) + 1,
-                    "id": item_id,
-                    "title": title[:200],
-                    "link": link,
-                }
-            )
-            if len(results) >= limit:
-                break
-        return results
 
     def _extract_static_next_page_url(self, html: str, base_url: str) -> str:
         best_url = ""
@@ -1298,19 +1253,15 @@ class WebWorker:
                 remaining = max(limit - len(collected_data), 0) or limit
                 page_data: List[Dict[str, Any]] = []
 
-                if self._looks_like_hackernews_source(current_url, task_description):
-                    page_data = self._extract_hackernews_static_items(html, current_url, remaining)
-                    if page_data:
-                        mode = "static_fetch_hackernews"
-                if not page_data:
-                    text_data = self._extract_static_text_blocks(html, max(3, min(remaining, 6)), task_description)
-                    link_data = self._extract_static_links(html, current_url, task_description, remaining)
-                    if self._prefers_static_text(task_description):
-                        page_data = text_data or link_data
-                    else:
-                        page_data = link_data or text_data
-                    if page_data and "text" in page_data[0]:
-                        mode = "static_fetch_text"
+                # 使用通用提取方法，不再针对特定网站硬编码
+                text_data = self._extract_static_text_blocks(html, max(3, min(remaining, 6)), task_description)
+                link_data = self._extract_static_links(html, current_url, task_description, remaining)
+                if self._prefers_static_text(task_description):
+                    page_data = text_data or link_data
+                else:
+                    page_data = link_data or text_data
+                if page_data and "text" in page_data[0]:
+                    mode = "static_fetch_text"
 
                 collected_data = self._merge_unique_items(collected_data, page_data)[:limit]
                 if len(collected_data) >= limit or not allow_pagination:
@@ -4034,19 +3985,6 @@ class WebWorker:
             if close_tk and tk is not None:
                 await tk.close()
             web_debug_recorder.deactivate_trace(token)
-
-    async def scrape_hackernews(self, limit: int = 5) -> Dict[str, Any]:
-        """兼容旧测试/旧调用方的 Hacker News 抓取入口。"""
-        result = await self.smart_scrape(
-            url="https://news.ycombinator.com",
-            task_description=f"抓取 Hacker News 首页前 {limit} 条新闻的标题和链接",
-            limit=limit,
-        )
-        if result.get("success"):
-            for idx, item in enumerate(result.get("data", []), 1):
-                if isinstance(item, dict):
-                    item.setdefault("rank", idx)
-        return result
 
     async def _try_next_page_via_toolkit(self, tk: BrowserToolkit) -> bool:
         """尝试点击分页控件翻到下一页"""

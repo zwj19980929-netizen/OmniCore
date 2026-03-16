@@ -13,6 +13,7 @@ from utils.logger import log_agent_action, logger
 from utils.prompt_manager import get_prompt
 from utils.url_utils import extract_all_urls
 from utils.web_result_normalizer import looks_like_detail_list_item
+from config.domain_keywords import WEATHER_KEYWORDS_TUPLE, WEATHER_CONDITIONS_TUPLE
 
 
 class CriticAgent:
@@ -33,22 +34,7 @@ class CriticAgent:
     @staticmethod
     def _looks_like_weather_task(task_description: str) -> bool:
         lowered = str(task_description or "").lower()
-        weather_tokens = (
-            "weather",
-            "forecast",
-            "temperature",
-            "humidity",
-            "wind",
-            "aqi",
-            "air quality",
-            "天气",
-            "气温",
-            "湿度",
-            "风力",
-            "空气质量",
-            "天气预报",
-        )
-        return any(token in lowered for token in weather_tokens)
+        return any(token in lowered for token in WEATHER_KEYWORDS_TUPLE)
 
     @staticmethod
     def _looks_like_list_extraction_task(task_description: str) -> bool:
@@ -137,27 +123,7 @@ class CriticAgent:
         data = task_result.get("data")
         if not isinstance(data, list) or not data:
             return False
-        weather_tokens = (
-            "weather",
-            "forecast",
-            "temperature",
-            "humidity",
-            "wind",
-            "aqi",
-            "air quality",
-            "天气",
-            "气温",
-            "湿度",
-            "风力",
-            "空气质量",
-            "晴",
-            "阴",
-            "多云",
-            "雨",
-            "雪",
-            "℃",
-            "°c",
-        )
+
         categories = set()
         for item in data[:10]:
             haystacks = []
@@ -177,7 +143,7 @@ class CriticAgent:
                     categories.add("wind")
                 if any(token in lowered for token in ("aqi", "air quality", "空气质量")):
                     categories.add("aqi")
-                if any(token in lowered for token in weather_tokens):
+                if any(token in lowered for token in WEATHER_KEYWORDS_TUPLE):
                     categories.add("condition")
             if len(categories) >= 2:
                 return True

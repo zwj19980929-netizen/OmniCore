@@ -15,6 +15,11 @@ from core.llm import LLMClient
 from core.tool_registry import build_dynamic_tool_prompt_lines, get_builtin_tool_registry
 from utils.logger import log_agent_action, logger
 from utils.url_utils import extract_first_url
+from config.domain_keywords import (
+    WEATHER_KEYWORDS_TUPLE,
+    WEATHER_DOMAINS_TUPLE,
+    get_all_keywords
+)
 
 
 # Router Agent 的系统提示词
@@ -140,24 +145,7 @@ _LOCATION_SENSITIVE_TOPIC_TOKENS = (
     "外卖",
 )
 
-_WEATHER_QUERY_TOKENS = (
-    "weather",
-    "forecast",
-    "temperature",
-    "humidity",
-    "air quality",
-    "aqi",
-    "wind",
-    "weather.com.cn",
-    "moji.com",
-    "/weather/",
-    "天气",
-    "天气预报",
-    "气温",
-    "空气质量",
-    "风力",
-    "湿度",
-)
+_WEATHER_QUERY_TOKENS = WEATHER_KEYWORDS_TUPLE
 
 _WEATHER_QUERY_CUE_TOKENS = (
     "帮我",
@@ -207,11 +195,7 @@ _WEATHER_RENDER_TOKENS = (
     "headful",
 )
 
-_WEATHER_DOMAIN_HINTS = (
-    "weather.com.cn",
-    "moji.com",
-    "tianqi.com",
-)
+_WEATHER_DOMAIN_HINTS = WEATHER_DOMAINS_TUPLE
 
 _FACT_FRESHNESS_CUE_TOKENS = (
     "latest",
@@ -942,10 +926,18 @@ class RouterAgent:
         result: Dict[str, Any],
     ) -> Dict[str, Any]:
         direct_url = cls._extract_first_url(user_input)
-        if not direct_url:
+
+        # 🔥 新增：检测用户是否要求有头模式（显示浏览器）
+        user_input_lower = str(user_input or "").strip().lower()
+        wants_headed = any(token in user_input_lower for token in [
+            "有头", "headful", "headed", "显示浏览器", "展示浏览器",
+            "show browser", "visible browser", "浏览器操作", "看操作"
+        ])
+
+        if not direct_url and not wants_headed:
             return result
 
-        search_results_url = cls._looks_like_search_results_url(direct_url)
+        search_results_url = cls._looks_like_search_results_url(direct_url) if direct_url else False
         repaired_tasks = []
         for raw_task in result.get("tasks", []) or []:
             task_data = dict(raw_task)
@@ -964,11 +956,38 @@ class RouterAgent:
                 task_data["tool_name"] = tool_name
                 task_data["task_type"] = "enhanced_web_worker"
             if tool_name == "browser.interact" and not str(params.get("start_url", "") or "").strip():
-                params["start_url"] = direct_url
-                tool_args["start_url"] = direct_url
+                if direct_url:
+                    params["start_url"] = direct_url
+                    tool_args["start_url"] = direct_url
             elif tool_name in {"web.fetch_and_extract", "web.smart_extract"} and not str(params.get("url", "") or "").strip():
-                params["url"] = direct_url
-                tool_args["url"] = direct_url
+                if direct_url:
+                    params["url"] = direct_url
+                    tool_args["url"] = direct_url
+
+            # 🔥 新增：如果用户要求有头模式，设置 headless=False
+            if wants_headed:
+                if tool_name == "browser.interact":
+                    params["headless"] = False
+                    tool_args["headless"] = False
+                elif tool_name in {"web.fetch_and_extract", "web.smart_extract"}:
+                    params["headless"] = False
+                    tool_args["headless"] = False
+
+                    # 🔥 新增：将GitHub API URL转换为网页URL（有头模式需要真实网页）
+                    current_url = str(params.get("url", "") or tool_args.get("url", "") or "").strip()
+                    if "api.github.com/repos/" in current_url:
+                        # 转换 https://api.github.com/repos/owner/repo/contents -> https://github.com/owner/repo
+                        import re
+                        match = re.search(r'api\.github\.com/repos/([^/]+/[^/]+)', current_url)
+                        if match:
+                            web_url = f"https://github.com/{match.group(1)}"
+                            params["url"] = web_url
+                            tool_args["url"] = web_url
+                            # 更新任务描述，说明使用网页而不是API
+                            if "description" in task_data:
+                                task_data["description"] = task_data["description"].replace("API", "网页")
+                            if "task" in params:
+                                params["task"] = str(params["task"]).replace("API", "网页")
 
             task_data["params"] = params
             task_data["tool_args"] = tool_args
@@ -1105,6 +1124,16 @@ class RouterAgent:
                 user_message += "## 相关历史记忆（可用于复用上下文或直接回答追问）：\n"
                 user_message += "\n".join(memory_lines)
                 user_message += "\n\n---\n"
+
+                # 🔥 新增：检测用户是否要求重新执行（有头操作、显示浏览器等）
+                user_input_lower = str(user_input or "").strip().lower()
+                wants_reexecution = any(token in user_input_lower for token in [
+                    "有头", "headful", "headed", "显示浏览器", "展示浏览器",
+                    "show browser", "visible browser", "浏览器操作", "看操作",
+                    "重新", "再次", "again", "重做"
+                ])
+                if wants_reexecution:
+                    user_message += "\n**重要提示**：用户明确要求重新执行或使用有头模式（显示浏览器），即使历史记忆中有答案，也必须创建新的web_scraping或browser.interact任务，不要使用information_query直接回答。\n\n---\n"
 
         if session_artifacts:
             artifact_lines = []

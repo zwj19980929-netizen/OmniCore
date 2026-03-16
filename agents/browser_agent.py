@@ -496,8 +496,34 @@ class BrowserAgent:
         self._action_history.append(self._action_signature(action))
         self._action_history = self._action_history[-6:]
 
-    def _is_action_looping(self, action: BrowserAction, threshold: int = 2) -> bool:
-        return self._action_history.count(self._action_signature(action)) >= threshold
+    def _is_action_looping(self, action: BrowserAction, threshold: int = 3) -> bool:
+        """
+        检测动作是否陷入循环
+
+        改进：
+        1. 提高阈值从2到3（允许重试一次）
+        2. 检查最近的动作序列，而不是整个历史
+        3. 只有连续重复才算循环
+        """
+        # 检查最近5个动作中的重复
+        recent_actions = self._action_history[-5:] if len(self._action_history) >= 5 else self._action_history
+        action_sig = self._action_signature(action)
+
+        # 统计最近动作中的重复次数
+        recent_count = recent_actions.count(action_sig)
+
+        # 如果最近5个动作中重复3次以上，才判定为循环
+        if recent_count >= threshold:
+            return True
+
+        # 检查是否连续重复（更严格的循环检测）
+        if len(self._action_history) >= 2:
+            last_two = self._action_history[-2:]
+            if all(sig == action_sig for sig in last_two):
+                # 连续3次相同动作才是真正的循环
+                return True
+
+        return False
 
     def _is_noise_element(self, element: PageElement) -> bool:
         attrs = element.attributes or {}
@@ -716,11 +742,33 @@ class BrowserAgent:
             if snapshot_r.success and isinstance(snapshot_r.data, dict):
                 self._last_semantic_snapshot = snapshot_r.data
                 web_debug_recorder.write_json("browser_semantic_snapshot", self._last_semantic_snapshot)
+
+                # 🔥 新增：输出语义快照摘要到控制台
+                if web_debug_recorder.is_enabled():
+                    log_warning(f"[DEBUG] ========== 语义快照 ==========")
+                    log_warning(f"[DEBUG] 页面类型: {self._last_semantic_snapshot.get('page_type', 'unknown')}")
+                    log_warning(f"[DEBUG] 页面阶段: {self._last_semantic_snapshot.get('page_stage', 'unknown')}")
+                    log_warning(f"[DEBUG] 元素数量: {len(self._last_semantic_snapshot.get('elements', []))}")
+                    log_warning(f"[DEBUG] 卡片数量: {len(self._last_semantic_snapshot.get('cards', []))}")
+                    log_warning(f"[DEBUG] 集合数量: {len(self._last_semantic_snapshot.get('collections', []))}")
+                    main_text = self._last_semantic_snapshot.get('main_text', '')
+                    if main_text:
+                        log_warning(f"[DEBUG] 主要文本 (前200字符): {main_text[:200]}...")
+                    log_warning(f"[DEBUG] ====================================")
+
                 return self._last_semantic_snapshot
         fallback_snapshot = await self._build_fallback_semantic_snapshot()
         self._last_semantic_snapshot = fallback_snapshot or {}
         if self._last_semantic_snapshot:
             web_debug_recorder.write_json("browser_semantic_snapshot", self._last_semantic_snapshot)
+
+            # 🔥 新增：fallback快照也输出到控制台
+            if web_debug_recorder.is_enabled():
+                log_warning(f"[DEBUG] ========== 语义快照 (fallback) ==========")
+                log_warning(f"[DEBUG] 页面类型: {self._last_semantic_snapshot.get('page_type', 'unknown')}")
+                log_warning(f"[DEBUG] 元素数量: {len(self._last_semantic_snapshot.get('elements', []))}")
+                log_warning(f"[DEBUG] ====================================")
+
         return self._last_semantic_snapshot
 
     def _elements_from_snapshot(self, snapshot: Dict[str, Any]) -> List[PageElement]:
@@ -1492,6 +1540,10 @@ class BrowserAgent:
             if web_debug_recorder.is_enabled():
                 page_html = await self._get_page_html_value()
                 web_debug_recorder.write_text("browser_page_html", page_html, suffix=".html")
+                # 🔥 新增：输出HTML摘要到控制台
+                html_preview = page_html[:1000] if page_html else "(empty)"
+                log_warning(f"[DEBUG] 页面HTML (前1000字符): {html_preview}...")
+                log_warning(f"[DEBUG] 页面HTML总长度: {len(page_html)} 字符")
             web_debug_recorder.write_json(
                 "browser_page_assessment_context",
                 {
@@ -1527,6 +1579,13 @@ class BrowserAgent:
             )
             web_debug_recorder.write_text("browser_page_assessment_prompt", prompt)
             web_debug_recorder.write_json("browser_page_assessment_budget", prompt_budget)
+
+            # 🔥 新增：输出prompt摘要到控制台
+            if web_debug_recorder.is_enabled():
+                log_warning(f"[DEBUG] 页面评估 Prompt (前800字符): {prompt[:800]}...")
+                log_warning(f"[DEBUG] 页面评估 Prompt总长度: {len(prompt)} 字符")
+                log_warning(f"[DEBUG] 元素数量: {len(elements)}, 数据条数: {len(data)}")
+
             response = await llm.achat(
                 messages=[
                     {"role": "system", "content": "Return JSON only."},
@@ -1541,6 +1600,12 @@ class BrowserAgent:
             web_debug_recorder.write_text("browser_page_assessment_response", self._stringify_llm_response(response))
             payload = llm.parse_json_response(response)
             web_debug_recorder.write_json("browser_page_assessment_payload", payload)
+
+            # 🔥 新增：输出到控制台，方便实时查看
+            if web_debug_recorder.is_enabled():
+                log_warning(f"[DEBUG] 页面评估 LLM 响应: {self._stringify_llm_response(response)[:500]}...")
+                log_warning(f"[DEBUG] 页面评估 payload: {json.dumps(payload, ensure_ascii=False)[:500]}...")
+
             action = self._action_from_llm(payload, elements)
             web_debug_recorder.write_json(
                 "browser_page_assessment_action",
@@ -1846,6 +1911,12 @@ class BrowserAgent:
             if score > 0:
                 matches.append((score, element))
         matches.sort(key=lambda item: item[0], reverse=True)
+        # Filter out very low-confidence matches (only task token hits, no keyword match)
+        if keywords:
+            min_score = 2.0
+            filtered = [item for item in matches if item[0] >= min_score]
+            if filtered:
+                return [item[1] for item in filtered]
         return [item[1] for item in matches]
 
     def _find_best_element(self, task: str, elements: List[PageElement],
@@ -2062,7 +2133,27 @@ class BrowserAgent:
             if intent_type not in {"search", "read", "form", "auth", "navigate", "unknown"}:
                 intent_type = fallback.intent_type
 
-            confidence = float(payload.get("confidence", 0.0) or 0.0)
+            confidence_raw = payload.get("confidence", 0.0) or 0.0
+            # 🔥 修复：处理LLM返回字符串confidence的情况
+            if isinstance(confidence_raw, str):
+                confidence_str = confidence_raw.lower().strip()
+                if confidence_str in {"high", "很高", "高"}:
+                    confidence = 0.9
+                elif confidence_str in {"medium", "中", "中等"}:
+                    confidence = 0.6
+                elif confidence_str in {"low", "低", "较低"}:
+                    confidence = 0.3
+                else:
+                    try:
+                        confidence = float(confidence_raw)
+                    except (ValueError, TypeError):
+                        confidence = 0.5  # 默认中等置信度
+            else:
+                try:
+                    confidence = float(confidence_raw)
+                except (ValueError, TypeError):
+                    confidence = 0.5
+
             llm_query = self._refine_search_query(task, str(payload.get("query", "") or "").strip()) or query
             llm_target = self._normalize_text(str(payload.get("target_text", "") or "").strip())
             llm_fields = payload.get("fields", {})
@@ -2778,6 +2869,40 @@ class BrowserAgent:
 
     # ── Agent decision: local heuristics ───────────────────────
 
+    def _find_search_element(self, elements: List[PageElement]) -> Optional[PageElement]:
+        """Find a search input or search-trigger button on the page."""
+        _SEARCH_KEYWORDS = {"search", "搜索", "搜", "查找", "find", "lookup", "查询"}
+        best: Optional[PageElement] = None
+        best_score = 0.0
+        for el in elements:
+            if not el.is_visible or not el.is_clickable:
+                continue
+            attrs = el.attributes or {}
+            haystack = " ".join([
+                el.text, attrs.get("placeholder", ""), attrs.get("ariaLabel", ""),
+                attrs.get("labelText", ""), attrs.get("name", ""), attrs.get("type", ""),
+            ]).lower()
+            score = 0.0
+            # Actual search input types
+            if el.element_type in {"search", "text"} and el.tag in {"input", "textarea"}:
+                score += 3.0
+            # Buttons/inputs with search-related text
+            for kw in _SEARCH_KEYWORDS:
+                if kw in haystack:
+                    score += 4.0
+                    break
+            if score <= 0:
+                continue
+            # Penalize auth-related fields
+            if any(auth_kw in haystack for auth_kw in {"email", "password", "sign up", "sign in", "login", "注册", "登录"}):
+                score -= 5.0
+            if el.element_type in {"email", "password"}:
+                score -= 5.0
+            if score > best_score:
+                best_score = score
+                best = el
+        return best
+
     def _decide_action_locally(
         self,
         task: str,
@@ -2801,12 +2926,23 @@ class BrowserAgent:
                 keywords=[click_target],
             )
             if explicit_target:
-                return BrowserAction(
-                    action_type=ActionType.CLICK,
-                    target_selector=explicit_target.selector,
-                    description=f"click target {click_target}",
-                    confidence=0.82,
-                )
+                # Ensure the match is actually relevant — require keyword match, not just task token
+                attrs = explicit_target.attributes or {}
+                haystack = " ".join([
+                    explicit_target.text, attrs.get("placeholder", ""),
+                    attrs.get("ariaLabel", ""), attrs.get("labelText", ""),
+                ]).lower()
+                target_lower = click_target.lower()
+                # Only return if the target text (or significant part of it) actually appears in the element
+                target_tokens = [t for t in target_lower.split() if len(t) >= 3]
+                matched_tokens = sum(1 for t in target_tokens if t in haystack)
+                if target_tokens and matched_tokens >= max(1, len(target_tokens) // 2):
+                    return BrowserAction(
+                        action_type=ActionType.CLICK,
+                        target_selector=explicit_target.selector,
+                        description=f"click target {click_target}",
+                        confidence=0.82,
+                    )
 
         if active_intent.intent_type in {"form", "auth"}:
             mapping = self._build_form_mapping_from_pairs(active_intent.fields, elements)
@@ -2846,6 +2982,28 @@ class BrowserAgent:
 
         if active_intent.intent_type == "search":
             query = active_intent.query or self._derive_primary_query(task)
+            search_el = self._find_search_element(elements)
+            if search_el and query:
+                # If it's an actual input field, type the query directly
+                if search_el.element_type in {"input", "text", "search", "textarea"} or search_el.tag in {"input", "textarea"}:
+                    return BrowserAction(
+                        action_type=ActionType.INPUT,
+                        target_selector=search_el.selector,
+                        value=query,
+                        description="fill search query",
+                        confidence=0.9,
+                        use_keyboard_fallback=True,
+                        keyboard_key="Enter",
+                    )
+                else:
+                    # It's a search-trigger button (e.g. GitHub's "Search or jump to...")
+                    return BrowserAction(
+                        action_type=ActionType.CLICK,
+                        target_selector=search_el.selector,
+                        description=f"open search to find {query}",
+                        confidence=0.85,
+                    )
+            # Fallback: try plain text input
             input_element = self._find_primary_text_input(elements)
             if input_element and query:
                 return BrowserAction(
@@ -3010,9 +3168,20 @@ class BrowserAgent:
             ]
             web_debug_recorder.write_json("browser_action_decision_budget", prompt_budget)
             web_debug_recorder.write_text("browser_action_decision_prompt", messages[1]["content"])
+
+            # 🔥 新增：输出action decision prompt到控制台
+            if web_debug_recorder.is_enabled():
+                log_warning(f"[DEBUG] 动作决策 Prompt (前800字符): {messages[1]['content'][:800]}...")
+                log_warning(f"[DEBUG] 动作决策 Prompt总长度: {len(messages[1]['content'])} 字符")
+
             llm = self._get_llm()
             response = await llm.achat(messages, temperature=0.1, json_mode=True)
             web_debug_recorder.write_text("browser_action_decision_response", self._stringify_llm_response(response))
+
+            # 🔥 新增：输出action decision response到控制台
+            if web_debug_recorder.is_enabled():
+                log_warning(f"[DEBUG] 动作决策 LLM 响应: {self._stringify_llm_response(response)[:500]}...")
+
             action = self._action_from_llm(llm.parse_json_response(response), elements)
             web_debug_recorder.write_json("browser_action_decision_action", self._action_to_debug_payload(action))
             if (
@@ -3947,6 +4116,9 @@ class BrowserAgent:
         token = web_debug_recorder.activate_trace(trace)
         if trace:
             log_agent_action(self.name, "网页调试记录已开启", str(trace.root_dir))
+            # 🔥 新增：明确告诉用户调试文件的位置
+            log_warning(f"[DEBUG] 调试文件保存在: {trace.root_dir}")
+            log_warning(f"[DEBUG] 你可以查看该目录下的HTML、prompt和response文件来分析感知差异")
         try:
             r = await tk.create_page()
             if not r.success:
@@ -3982,6 +4154,15 @@ class BrowserAgent:
                 current_url=current_url,
                 title=page_title,
             )
+
+            # 🔥 新增：输出初始页面信息到控制台
+            if web_debug_recorder.is_enabled():
+                log_warning(f"[DEBUG] ========== 初始导航完成 ==========")
+                log_warning(f"[DEBUG] 目标URL: {expected_url}")
+                log_warning(f"[DEBUG] 当前URL: {current_url}")
+                log_warning(f"[DEBUG] 页面标题: {page_title}")
+                log_warning(f"[DEBUG] ====================================")
+
             if self._looks_like_blocked_page(current_url, page_title):
                 return {
                     "success": False,
@@ -4092,6 +4273,16 @@ class BrowserAgent:
                         "last_action": self._action_to_debug_payload(last_action),
                     },
                 )
+
+                # 🔥 新增：输出每步的关键信息到控制台
+                if web_debug_recorder.is_enabled():
+                    log_warning(f"[DEBUG] ========== Step {step_no} 开始 ==========")
+                    log_warning(f"[DEBUG] 当前URL: {current_url_r.data or ''}")
+                    log_warning(f"[DEBUG] 页面标题: {title_r.data or ''}")
+                    log_warning(f"[DEBUG] 可交互元素数量: {len(elements)}")
+                    log_warning(f"[DEBUG] 已收集数据: {len(_accumulated_data)} 条")
+                    log_warning(f"[DEBUG] ====================================")
+
                 action = await self._assess_page_with_llm(
                     task,
                     current_url_r.data or "",
@@ -4146,6 +4337,14 @@ class BrowserAgent:
                     f"browser_step_{step_no}_action",
                     self._action_to_debug_payload(action),
                 )
+
+                # 🔥 新增：输出决策的动作到控制台
+                if web_debug_recorder.is_enabled():
+                    log_warning(f"[DEBUG] Step {step_no} 决策动作: {action.action_type.value}")
+                    log_warning(f"[DEBUG] 动作描述: {action.description}")
+                    log_warning(f"[DEBUG] 目标选择器: {action.target_selector[:100] if action.target_selector else 'N/A'}")
+                    log_warning(f"[DEBUG] 置信度: {action.confidence}")
+
 
                 if action.action_type == ActionType.DONE:
                     data = await self._extract_data_for_intent(task_intent)
@@ -4261,15 +4460,29 @@ class BrowserAgent:
                     if action.action_type == ActionType.WAIT:
                         continue
                     _consecutive_fails = sum(1 for s in reversed(steps) if s.get("result") == "failed")
-                    if _consecutive_fails < 2:
-                        log_warning(f"step {step_no} 失败，跳过继续尝试下一步")
+
+                    # 改进：不要立即跳过，先尝试恢复
+                    if _consecutive_fails == 1:
+                        # 第一次失败：记录警告，但继续尝试（可能是临时问题）
+                        log_warning(f"step {step_no} 失败，将在下一步重新评估页面状态")
+                        # 等待一下，让页面稳定
+                        await asyncio.sleep(1)
                         continue
-                    title_r = await tk.get_title()
-                    return {"success": False,
-                            "message": f"连续 {_consecutive_fails} 步失败，放弃执行 (最后在 step {step_no})",
-                            "url": url_r.data or "", "title": title_r.data or "",
-                            "expected_url": expected_url,
-                            "steps": steps, "data": _accumulated_data or await self._extract_data_for_intent(task_intent)}
+                    elif _consecutive_fails == 2:
+                        # 第二次失败：尝试刷新页面或回退
+                        log_warning(f"连续2步失败，尝试刷新页面恢复")
+                        await tk.refresh()
+                        await self._wait_for_page_ready()
+                        # 重新获取页面状态，让LLM重新决策
+                        continue
+                    else:
+                        # 连续3次失败：放弃
+                        title_r = await tk.get_title()
+                        return {"success": False,
+                                "message": f"连续 {_consecutive_fails} 步失败，已尝试恢复但仍失败 (最后在 step {step_no})",
+                                "url": url_r.data or "", "title": title_r.data or "",
+                                "expected_url": expected_url,
+                                "steps": steps, "data": _accumulated_data or await self._extract_data_for_intent(task_intent)}
 
                 if action.action_type in {ActionType.CLICK, ActionType.INPUT, ActionType.FILL_FORM, ActionType.PRESS_KEY}:
                     step_data = await self._extract_data_for_intent(task_intent)

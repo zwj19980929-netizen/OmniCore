@@ -730,9 +730,13 @@ def _legacy_replanner_node_v2(state: OmniCoreState) -> OmniCoreState:
 
     # 如果失败 3 次，给出替代策略建议
     if state["replan_count"] >= 3:
+        # 传入 LLM 客户端，让 critic 动态生成建议
+        from core.llm import LLMClient
+        llm_client = LLMClient()
         alternative = critic.suggest_alternative_strategy(
             state.get("user_input", ""),
-            state["replan_count"]
+            state["replan_count"],
+            llm_client=llm_client
         )
         console.print(f"[yellow]{alternative}[/yellow]\n")
 

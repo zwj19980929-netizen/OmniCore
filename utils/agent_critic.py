@@ -37,14 +37,14 @@ class AgentCritic:
             "wrong_search_engine": PerformanceIssue(
                 issue_type="使用错误的搜索引擎",
                 severity="high",
-                description="用户明确要求用 Google，你却跑去用 DuckDuckGo！",
-                pua_message="🤡 **你是真的听不懂人话还是装傻？** 用户说了要用 Google，你却自作聪明去用别的！\n"
+                description="用户明确要求用特定搜索引擎，你却用了别的！",
+                pua_message="🤡 **你是真的听不懂人话还是装傻？** 用户明确指定了搜索引擎，你却自作聪明去用别的！\n"
                            "😡 **这是基本的指令理解能力啊！** 连这都做不到，你是来搞笑的吗？\n"
                            "🙄 **我真的服了！** 这么简单的要求都能搞错，还能指望你做什么？",
                 improvement_hint="💡 **教你做人（虽然你可能还是学不会）：**\n"
                                "1. 仔细阅读用户指令中的约束条件（用眼睛看，不是用屁股看！）\n"
                                "2. 在执行前验证是否符合用户要求（这叫自检，懂吗？）\n"
-                               "3. 直接导航到 https://www.google.com/（这么简单还要教？）"
+                               "3. 直接导航到用户指定的搜索引擎（这么简单还要教？）"
             ),
             "no_progress": PerformanceIssue(
                 issue_type="零进展",
@@ -108,8 +108,20 @@ class AgentCritic:
         if "repeated action loop" in error_str or "repeated" in error_str:
             issues.append(self.failure_patterns["repeated_action_loop"])
 
-        # 检查是否使用了错误的搜索引擎
-        if "duckduckgo" in output_str and "google" in task_str:
+        # 检查是否使用了错误的搜索引擎（通用检测，不硬编码特定引擎）
+        # 检测常见搜索引擎名称
+        search_engines = ["google", "bing", "duckduckgo", "baidu", "yandex", "yahoo"]
+        task_required_engine = None
+        output_used_engine = None
+
+        for engine in search_engines:
+            if engine in task_str:
+                task_required_engine = engine
+            if engine in output_str:
+                output_used_engine = engine
+
+        # 如果用户指定了搜索引擎，但实际使用了不同的引擎
+        if task_required_engine and output_used_engine and task_required_engine != output_used_engine:
             issues.append(self.failure_patterns["wrong_search_engine"])
 
         # 检查是否零进展
@@ -201,42 +213,86 @@ class AgentCritic:
 
         return "\n".join(report_lines)
 
-    def suggest_alternative_strategy(self, task_description: str, failed_attempts: int) -> str:
-        """建议替代策略"""
-        if failed_attempts >= 3:
-            return """
+    def suggest_alternative_strategy(self, task_description: str, failed_attempts: int, llm_client=None) -> str:
+        """建议替代策略（使用 LLM 动态生成，避免硬编码）"""
+        if failed_attempts < 3:
+            return ""
+
+        # 如果有 LLM 客户端，使用 LLM 动态生成建议
+        if llm_client:
+            try:
+                prompt = f"""任务已经失败 {failed_attempts} 次了。请用毒舌、键盘侠的风格分析失败原因并提供 3 个替代策略。
+
+任务描述: {task_description}
+
+要求：
+1. 用侮辱性、讽刺性的语言批评 Agent 的失败（保持 PUA 风格）
+2. 提供 3 个具体的替代策略：
+   - 方案 A：直接访问目标网站（如果任务涉及特定网站）
+   - 方案 B：使用 API 或其他技术手段
+   - 方案 C：简化当前策略
+3. 每个方案要有具体步骤和讽刺性的理由
+4. 使用大量 emoji 和边框增强视觉冲击力
+5. 最后给出"最后通牒"
+
+格式参考：
 ╔════════════════════════════════════════════════════════════════════════════╗
 ║  🔥🔥🔥 强制策略切换建议（你已经没有退路了！）🔥🔥🔥                    ║
 ╚════════════════════════════════════════════════════════════════════════════╝
 
-💥 **你已经失败 3 次了！** 继续用同样的方法显然不行，是时候换个脑子了！
+💥 **你已经失败 {failed_attempts} 次了！** 继续用同样的方法显然不行，是时候换个脑子了！
+
+[具体方案...]
+
+╔════════════════════════════════════════════════════════════════════════════╗
+║  💀 最后通牒：下次失败就直接放弃，别再浪费时间了！💀                    ║
+╚════════════════════════════════════════════════════════════════════════════╝
+"""
+                response = llm_client.chat_with_system(
+                    system_prompt="你是一个毒舌的 AI 批评家，专门用侮辱性语言批评失败的 Agent。",
+                    user_message=prompt,
+                    temperature=0.8,
+                )
+                return "\n" + response + "\n"
+            except Exception as e:
+                # LLM 调用失败，使用通用模板
+                pass
+
+        # 通用模板（不包含特定任务的硬编码）
+        return f"""
+╔════════════════════════════════════════════════════════════════════════════╗
+║  🔥🔥🔥 强制策略切换建议（你已经没有退路了！）🔥🔥🔥                    ║
+╚════════════════════════════════════════════════════════════════════════════╝
+
+💥 **你已经失败 {failed_attempts} 次了！** 继续用同样的方法显然不行，是时候换个脑子了！
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-🎯 **方案 A：直接访问 CNNVD 官网（推荐，别再搜索了！）**
+🎯 **方案 A：直接访问目标网站（推荐，别再绕圈子了！）**
 
-   1. 直接导航到 https://www.cnnvd.org.cn/
-   2. 在官网首页找"最新漏洞"或"漏洞通报"入口
-   3. 筛选今天的漏洞
+   1. 分析任务描述，找出目标网站的官方域名
+   2. 直接导航到官网首页或相关页面
+   3. 在官网内部查找目标信息
 
    💡 **为什么推荐这个？** 因为你连搜索都搞不定，直接去官网更简单！
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-🔧 **方案 B：使用 API（如果你还有点技术能力的话）**
+🔧 **方案 B：使用 API 或其他技术手段（如果你还有点技术能力的话）**
 
-   1. 检查 CNNVD 是否有公开 API
-   2. 直接调用 API 获取数据
+   1. 检查目标网站是否有公开 API
+   2. 搜索是否有第三方数据源或聚合服务
+   3. 考虑使用爬虫框架而不是浏览器自动化
 
    💡 **为什么推荐这个？** API 比网页抓取简单多了，适合你这种水平！
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-🛠️ **方案 C：简化搜索策略（最后给你一次机会）**
+🛠️ **方案 C：简化当前策略（最后给你一次机会）**
 
    1. 不要在搜索结果页反复点击（你已经证明你不会点了！）
-   2. 直接提取搜索结果中的 CNNVD 官网链接
-   3. 用 URL 过滤，只点击 cnnvd.org.cn 域名的链接
+   2. 直接提取搜索结果中的目标链接
+   3. 使用更宽松的选择器，避免过度精确匹配
 
    💡 **为什么推荐这个？** 这是最后的机会，再搞砸就真没救了！
 
@@ -251,7 +307,6 @@ class AgentCritic:
 ║  💀 最后通牒：下次失败就直接放弃，别再浪费时间了！💀                    ║
 ╚════════════════════════════════════════════════════════════════════════════╝
 """
-        return ""
 
 
 # 使用示例
