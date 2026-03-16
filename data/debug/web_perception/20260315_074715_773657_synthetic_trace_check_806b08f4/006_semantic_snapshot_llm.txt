@@ -1,5 +1,0 @@
-页面类型: list
-URL: https://example.com/list
-标题: Example List
-可见关键元素:
-1. link | A | article h2 a | ref=el_1

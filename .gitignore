@@ -41,6 +41,7 @@ nul
 error.txt
 outputs/
 reports/
+data/
 
 # Pytest
 .pytest_cache/

@@ -1,6 +1,0 @@
-{
-  "url": "https://huggingface.co/models",
-  "raw_html_length": 289218,
-  "cleaned_html_length": 286182,
-  "task": "抓取 https://huggingface.co/models 页面的内容，提取前 10 个模型的名称和对应链接"
-}

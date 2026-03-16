@@ -1,6 +1,0 @@
-{
-  "url": "https://github.com/trending",
-  "raw_html_length": 3390,
-  "cleaned_html_length": 3390,
-  "task": "提取今日热门仓库的名称、描述和星标数"
-}

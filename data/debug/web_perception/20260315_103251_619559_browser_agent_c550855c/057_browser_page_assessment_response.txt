@@ -1,3 +1,0 @@
-
-
-{"page_relevant":true,"goal_satisfied":false,"reason":"页面是Bing搜索结果页，但当前上下文未捕获到任何可见的搜索结果数据。页面显示为modal类型，且可见数据、搜索结果卡片、集合均为空。需要等待懒加载内容渲染完成。","evidence_indexes":[],"confidence":0.95,"action":{"type":"wait","element_index":null,"target_ref":null,"target_selector":null,"value":null,"description":"等待搜索结果懒加载渲染 - 当前页面无可见搜索结果数据，需要等待动态内容加载","fallback_selector":null,"use_keyboard":false,"keyboard_key":null,"expected_page_type":"search_results","expected_text":null}}
