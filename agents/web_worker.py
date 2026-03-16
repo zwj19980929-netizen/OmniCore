@@ -4,12 +4,11 @@ OmniCore 智能 Web Worker Agent
 所有浏览器操作通过 BrowserToolkit 完成。
 """
 import asyncio
-import base64
 import json
 import random
 import re
 from typing import Dict, Any, List, Optional, Set, Tuple
-from urllib.parse import parse_qs, quote_plus, urljoin, urlparse
+from urllib.parse import urljoin, urlparse
 import requests
 
 from core.state import OmniCoreState, TaskItem
@@ -26,6 +25,14 @@ from utils.logger import (
 from utils.browser_toolkit import BrowserToolkit, ToolkitResult
 from utils.retry import async_retry, is_retryable
 from utils.page_perceiver import PagePerceiver
+from utils.search_engine_profiles import (
+    decode_search_redirect_url,
+    get_search_input_selectors,
+    get_search_result_selectors,
+    is_search_engine_domain,
+    iter_search_engine_profiles,
+    looks_like_search_results_url,
+)
 from utils.search_engine import SearchEngineManager, SearchStrategy
 from utils.url_utils import extract_all_urls
 from utils.web_result_normalizer import (
@@ -351,21 +358,90 @@ class WebWorker:
         for item in (snapshot.get("cards", []) or []):
             if not isinstance(item, dict):
                 continue
-            link = str(item.get("link", "") or "").strip()
+            raw_link = str(item.get("raw_link", "") or item.get("link", "") or "").strip()
+            target_url = str(item.get("target_url", "") or "").strip()
+            link = target_url or raw_link
             title = str(item.get("title", "") or "").strip()
             if not link or not title:
                 continue
-            cards.append(
-                {
-                    "title": title,
-                    "link": link,
-                    "source": str(item.get("source", "") or "").strip(),
-                    "date": str(item.get("date", "") or "").strip(),
-                    "snippet": str(item.get("snippet", "") or "").strip(),
-                    "target_ref": str(item.get("target_ref", "") or "").strip(),
-                    "target_selector": str(item.get("target_selector", "") or "").strip(),
-                }
-            )
+            payload = {
+                "title": title,
+                "link": link,
+                "source": str(item.get("source", "") or "").strip(),
+                "date": str(item.get("date", "") or "").strip(),
+                "snippet": str(item.get("snippet", "") or "").strip(),
+                "target_ref": str(item.get("target_ref", "") or "").strip(),
+                "target_selector": str(item.get("target_selector", "") or "").strip(),
+            }
+            if raw_link and raw_link != link:
+                payload["raw_link"] = raw_link
+            if target_url:
+                payload["target_url"] = target_url
+            cards.append(payload)
+        return cards
+
+    def _rank_snapshot_search_cards(
+        self,
+        snapshot: Dict[str, Any],
+        task_description: str,
+        query: str,
+        *,
+        max_results: int,
+    ) -> Tuple[List[Dict[str, Any]], bool]:
+        cards = self._snapshot_cards_to_search_cards(snapshot)
+        if not cards:
+            return [], False
+
+        normalized_cards = normalize_search_cards(
+            cards,
+            task_description,
+            limit=max_results,
+            understanding={"page_type": str(snapshot.get("page_type", "") or "serp")},
+        )
+        candidate_cards = normalized_cards or cards
+        ranked_cards, serp_sufficient = self._rerank_search_results(
+            task_description,
+            query,
+            candidate_cards,
+            max_results=max_results,
+        )
+        return ranked_cards or candidate_cards[:max_results], serp_sufficient
+
+    async def _extract_search_cards_from_semantic_snapshot(
+        self,
+        tk: BrowserToolkit,
+        task_description: str,
+        query: str,
+        *,
+        max_results: int,
+    ) -> List[Dict[str, Any]]:
+        if not hasattr(tk, "semantic_snapshot"):
+            return []
+
+        try:
+            snapshot_r = await tk.semantic_snapshot(max_elements=80, include_cards=True)
+        except Exception as exc:
+            log_warning(f"语义快照搜索结果提取失败: {exc}")
+            return []
+
+        snapshot = snapshot_r.data if snapshot_r.success and isinstance(snapshot_r.data, dict) else {}
+        if not snapshot:
+            return []
+
+        web_debug_recorder.write_json(
+            "search_results_semantic_snapshot",
+            {
+                "query": query,
+                "task_description": task_description,
+                "snapshot": snapshot,
+            },
+        )
+        cards, _ = self._rank_snapshot_search_cards(
+            snapshot,
+            task_description,
+            query,
+            max_results=max_results,
+        )
         return cards
 
     def _format_semantic_snapshot_for_llm(self, snapshot: Dict[str, Any]) -> str:
@@ -374,9 +450,31 @@ class WebWorker:
 
         lines = [
             f"页面类型: {str(snapshot.get('page_type', 'unknown') or 'unknown')}",
+            f"页面阶段: {str(snapshot.get('page_stage', 'unknown') or 'unknown')}",
             f"URL: {str(snapshot.get('url', '') or '')}",
             f"标题: {str(snapshot.get('title', '') or '')}",
         ]
+        blocked_signals = [
+            str(item or "").strip()
+            for item in (snapshot.get("blocked_signals", []) or [])[:6]
+            if str(item or "").strip()
+        ]
+        if blocked_signals:
+            lines.append("阻塞信号: " + " | ".join(blocked_signals))
+        main_text = str(snapshot.get("main_text", "") or "").strip()
+        if main_text:
+            lines.append(f"主体文本: {main_text[:500]}")
+        visible_text_blocks = snapshot.get("visible_text_blocks", []) or []
+        if visible_text_blocks:
+            lines.append("可见文本块:")
+            for idx, block in enumerate(visible_text_blocks[:8], 1):
+                if not isinstance(block, dict):
+                    continue
+                lines.append(
+                    f"{idx}. kind={str(block.get('kind', '') or '')} "
+                    f"text={str(block.get('text', '') or '')[:140]} "
+                    f"selector={str(block.get('selector', '') or '')[:80]}"
+                )
         affordances = snapshot.get("affordances", {}) or {}
         if affordances:
             affordance_text = ", ".join(
@@ -560,6 +658,61 @@ class WebWorker:
             return str(self._strip_search_query_noise(text) or "").strip()[:80]
         return " ".join(terms[:max_terms]).strip()
 
+    def _normalize_search_query_for_dedup(self, text: str) -> str:
+        normalized = self._strip_search_query_noise(text).lower()
+        replacements = {
+            "weather forecast": "weather",
+            "forecast": "weather",
+            "headlines": "headline",
+            "links": "link",
+            "sources": "source",
+            "results": "result",
+            "天气预报": "天气",
+            "气象预报": "天气",
+            "新闻头条": "头条",
+            "链接列表": "链接",
+            "来源列表": "来源",
+        }
+        for source, target in replacements.items():
+            normalized = normalized.replace(source, target)
+        normalized = re.sub(r"\s+", " ", normalized).strip()
+        return normalized
+
+    def _query_signature(self, text: str) -> Tuple[str, ...]:
+        normalized = self._normalize_search_query_for_dedup(text)
+        if not normalized:
+            return tuple()
+        return tuple(sorted(self._tokenize_query_terms(normalized)))
+
+    def _dedupe_search_queries(self, queries: List[str], *, max_queries: int) -> List[str]:
+        deduped: List[str] = []
+        seen_signatures: Set[Tuple[str, ...]] = set()
+        seen_normalized: Set[str] = set()
+        for query in queries:
+            value = re.sub(r"\s+", " ", str(query or "").strip())
+            if not value:
+                continue
+            normalized = self._normalize_search_query_for_dedup(value)
+            signature = self._query_signature(value)
+            if normalized in seen_normalized or (signature and signature in seen_signatures):
+                continue
+            seen_normalized.add(normalized)
+            if signature:
+                seen_signatures.add(signature)
+            deduped.append(value)
+            if len(deduped) >= max_queries:
+                break
+        return deduped[:max_queries]
+
+    def _search_query_budget(self, task_description: str, max_queries: int) -> int:
+        if max_queries <= 1:
+            return 1
+        if self._prefers_static_text(task_description):
+            return 1
+        if self._looks_like_list_page_task(task_description):
+            return min(max_queries, 3)
+        return min(max_queries, 2)
+
     def _build_natural_search_query(self, task_description: str, max_terms: int = 8) -> str:
         cleaned = self._strip_search_query_noise(task_description)
         if self._task_mentions_weather(task_description):
@@ -633,7 +786,7 @@ class WebWorker:
             queries.append(value)
             if len(queries) >= max_queries:
                 break
-        return queries
+        return self._dedupe_search_queries(queries, max_queries=max_queries)
 
     def _is_probably_detail_url(self, url: str) -> bool:
         try:
@@ -819,6 +972,29 @@ class WebWorker:
             "天气", "预报", "气温", "湿度", "空气质量", "风力",
         ]
         return any(keyword in desc for keyword in weather_keywords)
+
+    def _task_allows_serp_answer(self, task_description: str, limit: int = 0) -> bool:
+        if self._prefers_static_text(task_description):
+            return False
+
+        desc = str(task_description or "").lower()
+        if any(
+            keyword in desc
+            for keyword in [
+                "detail", "details", "full text", "full article", "official page",
+                "verify", "verified", "spec", "specs", "pricing", "parameter",
+                "详情", "正文", "原文", "参数", "价格", "核实", "官网",
+            ]
+        ):
+            return False
+
+        if self._looks_like_list_page_task(task_description):
+            return True
+
+        if limit and limit > 5:
+            return True
+
+        return False
 
     def _looks_like_weather_text(self, text: str) -> bool:
         value = (text or "").lower()
@@ -1344,29 +1520,17 @@ class WebWorker:
         if str(active_snapshot.get("page_type", "") or "") != "serp":
             return {"handled": False}
 
-        cards = self._snapshot_cards_to_search_cards(active_snapshot)
-        if not cards:
-            return {"handled": False}
-
-        normalized_cards = normalize_search_cards(
-            cards,
-            task_description,
-            limit=limit,
-            understanding={"page_type": str(active_snapshot.get("page_type", "") or "serp")},
-        )
-        if normalized_cards:
-            cards = normalized_cards
-
-        ranked_cards, serp_sufficient = self._rerank_search_results(
+        allow_serp_answer = self._task_allows_serp_answer(task_description, limit)
+        ranked_cards, serp_sufficient = self._rank_snapshot_search_cards(
+            active_snapshot,
             task_description,
             task_description,
-            cards,
             max_results=max(1, min(limit, 5)),
         )
         if not ranked_cards:
             return {"handled": False}
 
-        if serp_sufficient:
+        if serp_sufficient and allow_serp_answer:
             return {
                 "handled": True,
                 "return_data": True,
@@ -1380,7 +1544,7 @@ class WebWorker:
                 task_description,
                 min(limit, max(1, len(ranked_cards))),
             )
-            if quality.get("valid") and any(
+            if allow_serp_answer and quality.get("valid") and any(
                 str(card.get("snippet", card.get("summary", "")) or "").strip()
                 for card in ranked_cards[:2]
             ):
@@ -1437,12 +1601,13 @@ class WebWorker:
         domain_hints: Optional[List[str]] = None,
         max_queries: int = 3,
     ) -> List[str]:
+        query_budget = self._search_query_budget(task_description or base_query, max_queries)
         domain_hints = [item for item in (domain_hints or self._extract_domain_hints(task_description)) if item]
         fallback = self._fallback_search_queries(
             task_description,
             base_query=base_query,
             domain_hints=domain_hints,
-            max_queries=max_queries,
+            max_queries=query_budget,
         )
         payload = {
             "task": task_description,
@@ -1466,11 +1631,11 @@ class WebWorker:
                     continue
                 seen.add(value)
                 queries.append(value)
-                if len(queries) >= max_queries:
+                if len(queries) >= query_budget:
                     break
-            return queries or fallback
+            return self._dedupe_search_queries(queries or fallback, max_queries=query_budget)
         except Exception:
-            return fallback
+            return self._dedupe_search_queries(fallback, max_queries=query_budget)
 
     def _score_search_result_candidate(self, card: Dict[str, Any], task_description: str, query: str) -> int:
         haystack = " ".join(
@@ -1568,10 +1733,101 @@ class WebWorker:
     ) -> List[Dict[str, Any]]:
         current_url_result = await tk.get_current_url()
         current_url = str(current_url_result.data or "") if current_url_result.success else ""
-        del current_url  # host-agnostic selectors are passed explicitly below
+        selectors = get_search_result_selectors(current_url)
         result = await tk.evaluate_js(
             r"""(payload) => {
                 const compact = (text) => (text || '').replace(/\s+/g, ' ').trim();
+                const toAbsoluteUrl = (value) => {
+                    const text = compact(value);
+                    if (!text || /^javascript:/i.test(text)) return '';
+                    try {
+                        return new URL(text, location.href).toString();
+                    } catch (_error) {
+                        return '';
+                    }
+                };
+                const cleanHost = (value) => String(value || '').replace(/^www\./i, '').toLowerCase();
+                const hostOf = (value) => {
+                    try {
+                        return cleanHost(new URL(value, location.href).hostname);
+                    } catch (_error) {
+                        return '';
+                    }
+                };
+                const parseDataLog = (value) => {
+                    const text = compact(value);
+                    if (!text) return '';
+                    try {
+                        const parsed = JSON.parse(text);
+                        return compact(
+                            parsed.mu ||
+                            parsed.url ||
+                            parsed.target ||
+                            parsed.lmu ||
+                            parsed.land_url ||
+                            (parsed.data && (parsed.data.mu || parsed.data.url || parsed.data.target)) ||
+                            ''
+                        );
+                    } catch (_error) {
+                        return '';
+                    }
+                };
+                const decodeParamValue = (value) => {
+                    let text = compact(value);
+                    if (!text) return '';
+                    for (let i = 0; i < 2; i += 1) {
+                        try {
+                            const decoded = decodeURIComponent(text);
+                            if (decoded === text) break;
+                            text = decoded;
+                        } catch (_error) {
+                            break;
+                        }
+                    }
+                    return /^https?:/i.test(text) ? text : '';
+                };
+                const extractRedirectTarget = (value) => {
+                    const href = toAbsoluteUrl(value);
+                    if (!href) return '';
+                    try {
+                        const parsed = new URL(href, location.href);
+                        const candidates = ['uddg', 'u', 'url', 'q', 'target', 'redirect', 'imgurl']
+                            .flatMap((key) => parsed.searchParams.getAll(key))
+                            .map((candidate) => decodeParamValue(candidate))
+                            .filter(Boolean);
+                        return candidates[0] || '';
+                    } catch (_error) {
+                        return '';
+                    }
+                };
+                const resolveResultLink = (node, anchor) => {
+                    const rawHref = toAbsoluteUrl(anchor.href || anchor.getAttribute('href') || '');
+                    const currentHost = cleanHost(location.hostname || '');
+                    const candidates = [
+                        extractRedirectTarget(rawHref),
+                        anchor.getAttribute('mu'),
+                        anchor.getAttribute('data-landurl'),
+                        anchor.getAttribute('data-url'),
+                        anchor.getAttribute('data-target'),
+                        node.getAttribute('mu'),
+                        node.getAttribute('data-landurl'),
+                        node.getAttribute('data-url'),
+                        node.getAttribute('data-target'),
+                        parseDataLog(anchor.getAttribute('data-log') || ''),
+                        parseDataLog(node.getAttribute('data-log') || ''),
+                    ]
+                        .map((value) => toAbsoluteUrl(value))
+                        .filter(Boolean);
+                    const external = candidates.find((value) => {
+                        const candidateHost = hostOf(value);
+                        return candidateHost && candidateHost !== currentHost;
+                    }) || '';
+                    return {
+                        rawHref,
+                        targetUrl: external || candidates[0] || '',
+                        link: external || candidates[0] || rawHref,
+                    };
+                };
                 const selectors = Array.isArray(payload.selectors) ? payload.selectors : [];
                 const limit = Number(payload.limit || 10);
                 const seenNodes = new Set();
@@ -1609,7 +1865,8 @@ class WebWorker:
                     if (node.closest('header, nav, footer, form, aside')) continue;
                     const anchor = node.querySelector('h1 a[href], h2 a[href], h3 a[href], h4 a[href], a[href]');
                     if (!anchor) continue;
-                    const href = anchor.href || anchor.getAttribute('href') || '';
+                    const resolvedLink = resolveResultLink(node, anchor);
+                    const href = resolvedLink.link;
                     if (!href || !/^https?:/i.test(href)) continue;
                     if (seen.has(href)) continue;
                     const titleNode = node.querySelector('h1, h2, h3, h4') || anchor;
@@ -1623,6 +1880,8 @@ class WebWorker:
                     cards.push({
                         title,
                         link: href,
+                        raw_link: resolvedLink.rawHref,
+                        target_url: resolvedLink.targetUrl,
                         source: compact(sourceNode ? (sourceNode.innerText || sourceNode.textContent || '') : '').slice(0, 120),
                         date: compact(dateNode ? (dateNode.innerText || dateNode.textContent || '') : '').slice(0, 80),
                         snippet,
@@ -1633,28 +1892,37 @@ class WebWorker:
             }""",
             {
                 "limit": max_results,
-                "selectors": [
-                    "#b_results li.b_algo",
-                    "#b_results li.b_ans",
-                    "#content_left .result",
-                    "#content_left .c-container",
-                    "#search .tF2Cxc",
-                    "#search .g",
-                    ".results .result",
-                    ".result",
-                ],
+                "selectors": selectors,
             },
         )
         cards = result.data if result.success and isinstance(result.data, list) else []
+        web_debug_recorder.write_json(
+            "search_result_cards_raw",
+            {
+                "query": query,
+                "count": len(cards),
+                "items": cards[: max_results * 4],
+            },
+        )
         filtered: List[Dict[str, Any]] = []
         seen_links: Set[str] = set()
         for item in cards:
             if not isinstance(item, dict):
                 continue
-            link = self._decode_redirect_url(str(item.get("link", "") or "").strip())
+            candidate_links: List[str] = []
+            for candidate in (
+                item.get("target_url", ""),
+                item.get("link", ""),
+                item.get("raw_link", ""),
+            ):
+                resolved = self._decode_redirect_url(str(candidate or "").strip())
+                if resolved and resolved.startswith("http") and resolved not in candidate_links:
+                    candidate_links.append(resolved)
+            link = next(
+                (candidate for candidate in candidate_links if not self._is_search_engine_domain(candidate)),
+                "",
+            )
             if not link or not link.startswith("http"):
-                continue
-            if self._is_search_engine_domain(link):
                 continue
             if link in seen_links:
                 continue
@@ -1666,11 +1934,22 @@ class WebWorker:
                 {
                     "title": title,
                     "link": link,
+                    "url": link,
                     "source": str(item.get("source", "") or "").strip(),
                     "date": str(item.get("date", "") or "").strip(),
                     "snippet": str(item.get("snippet", "") or "").strip(),
+                    "target_ref": str(item.get("target_ref", "") or "").strip(),
+                    "target_selector": str(item.get("target_selector", "") or "").strip(),
                 }
             )
+        web_debug_recorder.write_json(
+            "search_result_cards_filtered",
+            {
+                "query": query,
+                "count": len(filtered),
+                "items": filtered[: max_results * 2],
+            },
+        )
         ranked, _ = self._rerank_search_results(query, query, filtered, max_results=max_results)
         return ranked
 
@@ -1685,44 +1964,22 @@ class WebWorker:
         )
 
     def _looks_like_search_results_url(self, url: str) -> bool:
-        try:
-            parsed = urlparse(str(url or ""))
-        except Exception:
-            return False
-        host = (parsed.netloc or "").lower()
-        path = (parsed.path or "").lower()
-        query_keys = {str(key or "").strip().lower() for key in parse_qs(parsed.query or "").keys() if str(key or "").strip()}
-        if "bing.com" in host:
-            return "/search" in path and "q" in query_keys
-        if "google.com" in host:
-            return "/search" in path and "q" in query_keys
-        if "baidu.com" in host:
-            return (path in {"/s", "/baidu"} or "/s" in path) and ("wd" in query_keys or "word" in query_keys)
-        if "duckduckgo.com" in host:
-            return (path in {"/", "/html/", "/lite/"} or "/html" in path or "/lite" in path) and "q" in query_keys
-        return "/search" in path or "q" in query_keys or "query" in query_keys
+        return looks_like_search_results_url(url or "")
 
     async def _wait_for_search_results_ready(self, tk: BrowserToolkit, search_url: str) -> bool:
-        selectors_by_host = {
-            "bing.com": "#b_results li.b_algo, #b_results li.b_ans, #b_results .b_algo",
-            "baidu.com": "#content_left .result, #content_left .c-container",
-            "google.com": "#search .g, #search .tF2Cxc, [data-sokoban-container]",
-            "duckduckgo.com": ".results .result, .result, .result__body",
-        }
-        host = str(urlparse(search_url).netloc or "").lower()
-        selector = "#b_results li.b_algo, #search .g, .results .result, [role='main'] article"
-        for domain, value in selectors_by_host.items():
-            if domain in host:
-                selector = value
-                break
+        selector = ", ".join(get_search_result_selectors(search_url))
 
+        last_probe: Dict[str, Any] = {}
+        last_snapshot: Dict[str, Any] = {}
         for _ in range(4):
-            await tk.wait_for_load("domcontentloaded", timeout=8000)
-            await tk.wait_for_load("networkidle", timeout=3000)
+            dom_ready = await tk.wait_for_load("domcontentloaded", timeout=8000)
+            network_idle = await tk.wait_for_load("networkidle", timeout=2500)
             current_url_result = await tk.get_current_url()
             current_url = str(current_url_result.data or search_url) if current_url_result.success else search_url
-            title_result = await tk.get_title()
-            title = str(title_result.data or "") if title_result.success else ""
+            title = ""
+            if hasattr(tk, "get_title"):
+                title_result = await tk.get_title()
+                title = str(title_result.data or "") if title_result.success else ""
             summary = await tk.evaluate_js(
                 """(sel) => {
                     const nodes = Array.from(document.querySelectorAll(sel));
@@ -1738,16 +1995,70 @@ class WebWorker:
                 }""",
                 selector,
             )
+            snapshot: Dict[str, Any] = {}
+            if hasattr(tk, "semantic_snapshot"):
+                try:
+                    snapshot_r = await tk.semantic_snapshot(max_elements=60, include_cards=True)
+                    if snapshot_r.success and isinstance(snapshot_r.data, dict):
+                        snapshot = snapshot_r.data
+                except Exception:
+                    snapshot = {}
             if summary.success and isinstance(summary.data, dict):
                 body_text = str(summary.data.get("bodyText", "") or "")
+                affordances = snapshot.get("affordances", {}) if isinstance(snapshot, dict) else {}
+                card_count = len(snapshot.get("cards", []) or []) if isinstance(snapshot, dict) else 0
+                collection_item_count = (
+                    int(affordances.get("collection_item_count", 0) or 0)
+                    if isinstance(affordances, dict)
+                    else 0
+                )
+                has_snapshot_results = bool(
+                    card_count > 0
+                    or collection_item_count >= 3
+                    or (isinstance(affordances, dict) and affordances.get("has_results"))
+                )
+                last_probe = {
+                    "search_url": search_url,
+                    "current_url": current_url,
+                    "title": title,
+                    "selector": selector,
+                    "dom_ready": bool(dom_ready.success),
+                    "network_idle": bool(network_idle.success),
+                    "matches": int(summary.data.get("matches", 0) or 0),
+                    "text_length": int(summary.data.get("textLength", 0) or 0),
+                    "looks_like_results_url": self._looks_like_search_results_url(current_url),
+                    "snapshot_page_type": str(snapshot.get("page_type", "") or ""),
+                    "snapshot_card_count": card_count,
+                    "snapshot_collection_item_count": collection_item_count,
+                    "snapshot_has_results": has_snapshot_results,
+                }
+                web_debug_recorder.write_json("search_ready_probe", last_probe)
+                if snapshot:
+                    last_snapshot = snapshot
                 if self._looks_like_search_blocked_page(current_url, title, body_text):
                     return False
                 matches = int(summary.data.get("matches", 0) or 0)
+                if has_snapshot_results and (
+                    self._looks_like_search_results_url(current_url)
+                    or int(summary.data.get("textLength", 0) or 0) >= 300
+                ):
+                    return True
                 if matches > 0 and self._looks_like_search_results_url(current_url):
                     return True
                 if matches >= 3:
                     return True
             await tk.human_delay(400, 1200)
+        if last_probe:
+            web_debug_recorder.record_event("search_ready_failed", **last_probe)
+        if last_snapshot:
+            web_debug_recorder.write_json("search_ready_last_snapshot", last_snapshot)
+        if hasattr(tk, "get_page_html"):
+            try:
+                html_r = await tk.get_page_html()
+                if html_r.success and html_r.data:
+                    web_debug_recorder.write_text("search_ready_page_html", html_r.data, suffix=".html")
+            except Exception:
+                pass
         return False
 
     async def _perform_native_search(
@@ -1843,43 +2154,34 @@ class WebWorker:
         cards: List[Dict[str, Any]] = []
         try:
             # 定义搜索引擎配置：首页 + 搜索框选择器
-            search_engines = [
-                {
-                    "name": "Bing",
-                    "homepage": "https://www.bing.com",
-                    "search_url_template": "https://www.bing.com/search?q={query}",
-                    "selectors": ["input[name='q']", "#sb_form_q"],
-                },
-                {
-                    "name": "Baidu",
-                    "homepage": "https://www.baidu.com",
-                    "search_url_template": "https://www.baidu.com/s?wd={query}",
-                    "selectors": ["input[name='wd']", "#kw"],
-                },
-                {
-                    "name": "DuckDuckGo",
-                    "homepage": "https://duckduckgo.com",
-                    "search_url_template": "https://duckduckgo.com/?q={query}",
-                    "selectors": ["input[name='q']", "input[name='search']", "#searchbox_input"],
-                },
-                {
-                    "name": "Google",
-                    "homepage": "https://www.google.com",
-                    "search_url_template": "https://www.google.com/search?q={query}",
-                    "selectors": ["input[name='q']", "textarea[name='q']", "#APjFqb"],
-                },
-            ]
+            search_engines = list(iter_search_engine_profiles())
 
             for engine in search_engines:
-                encoded_query = quote_plus(query)
-                direct_search_url = str(engine.get("search_url_template", "") or "").format(query=encoded_query)
+                direct_search_url = engine.build_search_url(query)
 
                 if direct_search_url:
-                    log_agent_action(self.name, f"尝试 {engine['name']} 直达搜索结果页", query[:40])
+                    web_debug_recorder.record_event(
+                        "search_engine_attempt",
+                        engine=engine.name,
+                        phase="direct",
+                        query=query,
+                        url=direct_search_url,
+                    )
+                    log_agent_action(self.name, f"尝试 {engine.name} 直达搜索结果页", query[:40])
                     goto_r = await tk.goto(direct_search_url)
                     if goto_r.success:
                         ready = await self._wait_for_search_results_ready(tk, direct_search_url)
                         if ready:
+                            semantic_cards = await self._extract_search_cards_from_semantic_snapshot(
+                                tk,
+                                task_description or query,
+                                query,
+                                max_results=max_results,
+                            )
+                            if semantic_cards:
+                                cards = semantic_cards
+                                log_success(f"{engine.name} 语义快照搜索成功，找到 {len(cards)} 个结果")
+                                break
                             raw_cards = await self._extract_search_result_cards(tk, query, max_results=max_results * 2)
                             if raw_cards:
                                 cards, _ = self._rerank_search_results(
@@ -1889,18 +2191,25 @@ class WebWorker:
                                     max_results=max_results,
                                 )
                                 if cards:
-                                    log_success(f"{engine['name']} 直达搜索成功，找到 {len(cards)} 个结果")
+                                    log_success(f"{engine.name} 直达搜索成功，找到 {len(cards)} 个结果")
                                     break
                     else:
                         log_warning(f"无法访问 {direct_search_url}")
 
-                log_agent_action(self.name, f"尝试 {engine['name']} 原生搜索", query[:40])
+                web_debug_recorder.record_event(
+                    "search_engine_attempt",
+                    engine=engine.name,
+                    phase="native",
+                    query=query,
+                    url=engine.homepage,
+                )
+                log_agent_action(self.name, f"尝试 {engine.name} 原生搜索", query[:40])
 
                 # 使用原生搜索框输入
                 success = await self._perform_native_search(
                     tk,
-                    engine["homepage"],
-                    engine["selectors"],
+                    engine.homepage,
+                    get_search_input_selectors(engine.homepage),
                     query,
                 )
 
@@ -1910,14 +2219,25 @@ class WebWorker:
                 # 等待结果加载
                 url_result = await tk.get_current_url()
                 if not url_result.success:
-                    log_warning(f"获取当前URL失败: {url_result.error}")
+                    log_warning(f"获取当前URL失败: {getattr(url_result, 'error', '')}")
                     continue
                 current_url = url_result.data or ""
                 ready = await self._wait_for_search_results_ready(tk, current_url)
                 if not ready:
-                    log_warning(f"{engine['name']} 未进入稳定结果页，跳过该搜索源")
+                    log_warning(f"{engine.name} 未进入稳定结果页，跳过该搜索源")
                     await tk.human_delay(800, 1800)
                     continue
+
+                semantic_cards = await self._extract_search_cards_from_semantic_snapshot(
+                    tk,
+                    task_description or query,
+                    query,
+                    max_results=max_results,
+                )
+                if semantic_cards:
+                    cards = semantic_cards
+                    log_success(f"{engine.name} 语义快照搜索成功，找到 {len(cards)} 个结果")
+                    break
 
                 # 提取搜索结果
                 raw_cards = await self._extract_search_result_cards(tk, query, max_results=max_results * 2)
@@ -1929,7 +2249,7 @@ class WebWorker:
                         max_results=max_results,
                     )
                     if cards:
-                        log_success(f"{engine['name']} 搜索成功，找到 {len(cards)} 个结果")
+                        log_success(f"{engine.name} 搜索成功，找到 {len(cards)} 个结果")
                         break
 
             if not cards:
@@ -1971,58 +2291,192 @@ class WebWorker:
 
     @staticmethod
     def _decode_redirect_url(href: str) -> str:
-        if not href:
-            return ""
-        try:
-            parsed = urlparse(href)
-        except Exception:
-            return href
-        host = (parsed.netloc or "").lower()
-        if "bing.com" not in host and "duckduckgo.com" not in host:
-            return href
-
-        qs = parse_qs(parsed.query or "")
-        candidate = (
-            (qs.get("uddg") or [None])[0]
-            or (qs.get("u") or [None])[0]
-            or (qs.get("url") or [None])[0]
-        )
-        if not candidate:
-            return href
-        if candidate.startswith("http"):
-            return candidate
-
-        # Bing sometimes uses u=a1<base64url(url)>
-        if candidate.startswith("a1"):
-            raw = candidate[2:]
-            padding = "=" * ((4 - len(raw) % 4) % 4)
-            try:
-                decoded = base64.urlsafe_b64decode((raw + padding).encode("ascii")).decode("utf-8", errors="ignore")
-                if decoded.startswith("http"):
-                    return decoded
-            except Exception:
-                pass
-        return href
+        return decode_search_redirect_url(href or "")
 
     @staticmethod
     def _is_search_engine_domain(url: str) -> bool:
+        return is_search_engine_domain(url or "")
+
+    @staticmethod
+    def _urls_match_for_navigation(current_url: str, target_url: str) -> bool:
+        current_value = str(current_url or "").strip()
+        target_value = str(target_url or "").strip()
+        if not current_value or not target_value:
+            return False
+        if current_value.rstrip("/") == target_value.rstrip("/"):
+            return True
         try:
-            host = (urlparse(url).netloc or "").lower()
+            current_parsed = urlparse(current_value)
+            target_parsed = urlparse(target_value)
         except Exception:
-            return True
-        if not host:
-            return True
-        search_hosts = (
-            "bing.com",
-            "baidu.com",
-            "google.com",
-            "duckduckgo.com",
-            "sogou.com",
-            "so.com",
-            "yahoo.com",
-            "yandex.com",
+            return False
+        same_origin = (
+            current_parsed.scheme == target_parsed.scheme
+            and current_parsed.netloc == target_parsed.netloc
         )
-        return any(host == domain or host.endswith(f".{domain}") for domain in search_hosts)
+        if not same_origin:
+            return False
+        current_path = (current_parsed.path or "").rstrip("/")
+        target_path = (target_parsed.path or "").rstrip("/")
+        if current_path != target_path:
+            return False
+        if not target_parsed.query or target_parsed.query == current_parsed.query:
+            return True
+        return target_parsed.query in (current_parsed.query or "")
+
+    async def _open_search_candidate_from_search_page(
+        self,
+        tk: BrowserToolkit,
+        candidate: Dict[str, Any],
+        *,
+        prefer_click: bool = True,
+    ) -> Dict[str, Any]:
+        current_url = ""
+        if hasattr(tk, "get_current_url"):
+            try:
+                current_url_r = await tk.get_current_url()
+                if current_url_r.success:
+                    current_url = str(current_url_r.data or "").strip()
+            except Exception:
+                current_url = ""
+
+        if not self._is_search_engine_domain(current_url):
+            return {"opened": False, "method": "", "target_url": ""}
+
+        target_ref = str(candidate.get("target_ref", "") or "").strip()
+        target_url = str(candidate.get("link", "") or candidate.get("url", "") or "").strip()
+        if prefer_click and target_ref and hasattr(tk, "click_ref"):
+            click_r = await tk.click_ref(target_ref)
+            if click_r.success:
+                await tk.human_delay(180, 600)
+                await tk.wait_for_load("domcontentloaded", timeout=10000)
+                if hasattr(tk, "wait_for_page_type_change"):
+                    await tk.wait_for_page_type_change("serp", timeout=4000)
+                if not self.fast_mode:
+                    await tk.wait_for_load("networkidle", timeout=5000)
+                current_after = ""
+                if hasattr(tk, "get_current_url"):
+                    try:
+                        current_after_r = await tk.get_current_url()
+                        if current_after_r.success:
+                            current_after = str(current_after_r.data or "").strip()
+                    except Exception:
+                        current_after = ""
+                if current_after and not self._is_search_engine_domain(current_after):
+                    web_debug_recorder.record_event(
+                        "search_target_opened_via_click_ref",
+                        search_url=current_url,
+                        target_ref=target_ref,
+                        target_url=current_after or target_url,
+                    )
+                    return {
+                        "opened": True,
+                        "method": "click_ref",
+                        "target_url": current_after or target_url,
+                    }
+
+        if target_url and hasattr(tk, "new_tab"):
+            new_tab_r = await tk.new_tab(target_url)
+            if not new_tab_r.success:
+                web_debug_recorder.record_event(
+                    "search_target_open_in_new_tab_failed",
+                    search_url=current_url,
+                    target_url=target_url,
+                    error=str(getattr(new_tab_r, "error", "") or ""),
+                )
+                return {"opened": False, "method": "", "target_url": target_url}
+
+            web_debug_recorder.record_event(
+                "search_target_opened_in_new_tab",
+                search_url=current_url,
+                target_url=target_url,
+            )
+            await tk.human_delay(180, 600)
+            await tk.wait_for_load("domcontentloaded", timeout=10000)
+            if not self.fast_mode:
+                await tk.wait_for_load("networkidle", timeout=5000)
+            return {"opened": True, "method": "new_tab", "target_url": target_url}
+
+        return {"opened": False, "method": "", "target_url": target_url}
+
+    async def _open_target_in_new_tab_from_search_page(
+        self,
+        tk: BrowserToolkit,
+        target_url: str,
+    ) -> bool:
+        result = await self._open_search_candidate_from_search_page(
+            tk,
+            {"link": str(target_url or "").strip()},
+            prefer_click=False,
+        )
+        return bool(result.get("opened"))
+
+    async def _return_to_search_results_tab(self, tk: BrowserToolkit, *, open_method: str = "") -> bool:
+        current_url = ""
+        if hasattr(tk, "get_current_url"):
+            try:
+                current_url_r = await tk.get_current_url()
+                if current_url_r.success:
+                    current_url = str(current_url_r.data or "").strip()
+            except Exception:
+                current_url = ""
+
+        if self._is_search_engine_domain(current_url):
+            return True
+
+        if open_method == "click_ref" and hasattr(tk, "go_back"):
+            back_r = await tk.go_back()
+            if back_r.success:
+                try:
+                    current_url_r = await tk.get_current_url()
+                    current_url = str(current_url_r.data or "").strip() if current_url_r.success else ""
+                except Exception:
+                    current_url = ""
+                if self._is_search_engine_domain(current_url):
+                    web_debug_recorder.record_event(
+                        "search_results_tab_restored",
+                        method="go_back",
+                        current_url=current_url,
+                    )
+                    return True
+
+        if hasattr(tk, "close_tab"):
+            close_r = await tk.close_tab()
+            if close_r.success:
+                try:
+                    current_url_r = await tk.get_current_url()
+                    current_url = str(current_url_r.data or "").strip() if current_url_r.success else ""
+                except Exception:
+                    current_url = ""
+                if self._is_search_engine_domain(current_url):
+                    web_debug_recorder.record_event(
+                        "search_results_tab_restored",
+                        method="close_tab",
+                        current_url=current_url,
+                    )
+                    return True
+
+        if hasattr(tk, "switch_tab"):
+            switch_r = await tk.switch_tab(0)
+            if switch_r.success:
+                try:
+                    current_url_r = await tk.get_current_url()
+                    current_url = str(current_url_r.data or "").strip() if current_url_r.success else ""
+                except Exception:
+                    current_url = ""
+                if self._is_search_engine_domain(current_url):
+                    web_debug_recorder.record_event(
+                        "search_results_tab_restored",
+                        method="switch_tab",
+                        current_url=current_url,
+                    )
+                    return True
+
+        web_debug_recorder.record_event(
+            "search_results_tab_restore_failed",
+            current_url=current_url,
+        )
+        return False
 
     async def _legacy_collect_search_links(self, tk: BrowserToolkit, query: str, max_results: int) -> List[str]:
         selectors = [
@@ -2157,6 +2611,7 @@ class WebWorker:
         tk: BrowserToolkit = None,
     ) -> Dict[str, Any]:
         search_context = str(base_query or "").strip() or task_description
+        allow_serp_answer = self._task_allows_serp_answer(search_context, max_results)
         queries = self.plan_search_queries(
             search_context,
             base_query=base_query,
@@ -2180,7 +2635,7 @@ class WebWorker:
                 cards,
                 max_results=max_results,
             )
-            serp_sufficient = serp_sufficient or ranked_serp_sufficient
+            serp_sufficient = serp_sufficient or (allow_serp_answer and ranked_serp_sufficient)
             for card in ranked_cards:
                 link = str(card.get("link", "") or "").strip()
                 if not link or link in seen_links:
@@ -2194,7 +2649,7 @@ class WebWorker:
             aggregate_cards,
             max_results=max_results,
         )
-        if ranked_cards and not serp_sufficient:
+        if ranked_cards and allow_serp_answer and not serp_sufficient:
             try:
                 quality = self.validate_data_quality(
                     ranked_cards[: min(3, len(ranked_cards))],
@@ -2550,6 +3005,8 @@ class WebWorker:
         snapshot = semantic_snapshot or {}
         config.setdefault("page_type", str(snapshot.get("page_type", "") or "unknown"))
         config.setdefault("observed_page_type", str(snapshot.get("page_type", "") or "unknown"))
+        config.setdefault("page_stage", str(snapshot.get("page_stage", "") or "unknown"))
+        config.setdefault("observed_page_stage", str(snapshot.get("page_stage", "") or "unknown"))
 
         host = str(urlparse(url).netloc or "").lower()
         item_selector = str(config.get("item_selector", "") or "").strip()
@@ -2790,6 +3247,11 @@ class WebWorker:
             },
         )
         token = web_debug_recorder.activate_trace(trace)
+        tk: Optional[BrowserToolkit] = None
+        close_tk = False
+        opened_from_search_page = False
+        opened_search_candidate_method = ""
+        active_search_candidate_link = ""
         if trace:
             log_agent_action(self.name, "网页调试记录已开启", str(trace.root_dir))
 
@@ -2829,6 +3291,8 @@ class WebWorker:
             domain_hints = self._extract_domain_hints(task_description)
             candidate_urls: List[str] = []
             seen_candidate_urls: Set[str] = set()
+            search_candidate_urls: List[str] = []
+            search_candidate_entries: List[Dict[str, Any]] = []
 
             def _append_candidate(candidate: str) -> None:
                 value = str(candidate or "").strip()
@@ -2872,17 +3336,43 @@ class WebWorker:
                 },
             )
             if should_search_first:
+                if tk is None:
+                    search_headless = headless if headless is not None else False
+                    tk = self._create_toolkit(headless=search_headless)
+                    await tk.create_page()
+                    close_tk = True
                 search_bundle = await self.gather_search_candidates(
                     task_description,
                     base_query=search_base_query or task_description,
                     domain_hints=domain_hints,
                     max_results=max(3, min(limit, 6)),
                     headless=headless if headless is not None else False,
+                    tk=tk,
                 )
                 web_debug_recorder.write_json("search_bundle", search_bundle)
+                for card in search_bundle.get("cards", []):
+                    if not isinstance(card, dict):
+                        continue
+                    link_value = str(card.get("link", "") or card.get("url", "") or "").strip()
+                    if not link_value:
+                        continue
+                    normalized_card = dict(card)
+                    normalized_card["link"] = link_value
+                    normalized_card["url"] = link_value
+                    search_candidate_entries.append(normalized_card)
                 for found_url in search_bundle.get("urls", []):
+                    found_value = str(found_url or "").strip()
+                    if found_value and found_value not in search_candidate_urls:
+                        search_candidate_urls.append(found_value)
                     _append_candidate(found_url)
-                if search_bundle.get("serp_sufficient") and search_bundle.get("cards"):
+                if not search_candidate_entries:
+                    for found_value in search_candidate_urls:
+                        search_candidate_entries.append({"link": found_value, "url": found_value})
+                if (
+                    search_bundle.get("serp_sufficient")
+                    and search_bundle.get("cards")
+                    and self._task_allows_serp_answer(task_description, limit)
+                ):
                     cards = search_bundle["cards"][:limit]
                     return {
                         "success": True,
@@ -2892,7 +3382,7 @@ class WebWorker:
                         "mode": "search_results",
                         "queries": search_bundle.get("queries", []),
                     }
-                search_urls = list(search_bundle.get("urls", []))
+                search_urls = list(search_candidate_urls)
                 if search_urls:
                     url = str(search_urls[0]).strip()
                 elif candidate_urls and (not url or should_search_first):
@@ -2957,8 +3447,30 @@ class WebWorker:
                 # static fetch failed for all candidates; continue with browser mode
 
             effective_headless = headless if headless is not None else (False if should_search_first else True)
-            tk = self._create_toolkit(headless=effective_headless)
-            await tk.create_page()
+            if tk is None:
+                tk = self._create_toolkit(headless=effective_headless)
+                await tk.create_page()
+                close_tk = True
+            if should_search_first and url:
+                initial_candidate = next(
+                    (
+                        candidate
+                        for candidate in search_candidate_entries
+                        if self._urls_match_for_navigation(
+                            str(candidate.get("link", "") or candidate.get("url", "") or ""),
+                            url,
+                        )
+                    ),
+                    {"link": url, "url": url},
+                )
+                open_result = await self._open_search_candidate_from_search_page(tk, initial_candidate)
+                opened_from_search_page = bool(open_result.get("opened"))
+                opened_search_candidate_method = str(open_result.get("method", "") or "")
+                active_search_candidate_link = str(
+                    initial_candidate.get("link", "") or initial_candidate.get("url", "") or ""
+                ).strip()
+                if open_result.get("target_url"):
+                    url = str(open_result.get("target_url", "") or url).strip() or url
 
             # 用于捕获 SPA 页面的 API 响应数据
             api_responses = []
@@ -2977,6 +3489,166 @@ class WebWorker:
                 except Exception:
                     pass
 
+            async def _try_remaining_search_candidates(
+                remaining_candidates: List[Dict[str, Any]],
+            ) -> Tuple[List[Dict[str, Any]], Dict[str, Any], str]:
+                nonlocal opened_search_candidate_method, active_search_candidate_link
+                total_candidates = len(remaining_candidates)
+                for idx, candidate in enumerate(remaining_candidates, 1):
+                    restored = await self._return_to_search_results_tab(
+                        tk,
+                        open_method=opened_search_candidate_method,
+                    )
+                    if not restored:
+                        break
+
+                    open_result = await self._open_search_candidate_from_search_page(tk, candidate)
+                    if not open_result.get("opened"):
+                        continue
+                    opened_search_candidate_method = str(open_result.get("method", "") or "")
+                    active_search_candidate_link = str(
+                        candidate.get("link", "") or candidate.get("url", "") or ""
+                    ).strip()
+                    next_url = str(
+                        open_result.get("target_url", "")
+                        or candidate.get("link", "")
+                        or candidate.get("url", "")
+                        or ""
+                    ).strip()
+
+                    if tk.page:
+                        try:
+                            tk.page.on("response", _capture_api_response)
+                        except Exception:
+                            pass
+
+                    api_responses.clear()
+                    log_agent_action(self.name, f"搜索候选重试 ({idx}/{total_candidates})", next_url[:80])
+
+                    try:
+                        await tk.human_delay(180, 3000)
+                        if self.fast_mode:
+                            await tk.wait_for_load("domcontentloaded", timeout=3000)
+                        else:
+                            await tk.wait_for_load("networkidle", timeout=15000)
+
+                        await tk.wait_for_selector(
+                            "table, .list, ul li, [class*='list'], [class*='item'], .el-table",
+                            timeout=4000 if self.fast_mode else 10000,
+                        )
+
+                        captcha_r = await tk.detect_captcha()
+                        if captcha_r.success and captcha_r.data and captcha_r.data.get("has_captcha"):
+                            solve_r = await tk.solve_captcha(max_retries=5)
+                            if not solve_r.success:
+                                log_warning(f"搜索候选重试验证码处理失败: {next_url[:80]}")
+                                continue
+                            await tk.human_delay(250, 3000)
+                            await tk.wait_for_load("domcontentloaded", timeout=10000)
+                            await tk.wait_for_load("networkidle", timeout=10000)
+
+                        for _ in range(random.randint(1, 2) if self.fast_mode else random.randint(2, 3)):
+                            await tk.scroll_down(random.randint(200, 500))
+                            await tk.human_delay(120, 800)
+
+                        retry_snapshot_r = await tk.semantic_snapshot(max_elements=80, include_cards=True)
+                        retry_snapshot = (
+                            retry_snapshot_r.data
+                            if retry_snapshot_r.success and isinstance(retry_snapshot_r.data, dict)
+                            else {}
+                        )
+                        semantic_serp = await self._maybe_handle_semantic_search_results(
+                            tk,
+                            task_description,
+                            limit,
+                            snapshot=retry_snapshot,
+                        )
+                        if semantic_serp.get("return_data"):
+                            cards = list(semantic_serp.get("data", []) or [])[:limit]
+                            web_debug_recorder.record_event(
+                                "search_candidate_retry_success",
+                                url=next_url,
+                                index=idx,
+                                mode=str(semantic_serp.get("mode", "semantic_search_results")),
+                            )
+                            return cards, {"page_type": "serp"}, next_url
+                        if semantic_serp.get("navigated"):
+                            retry_snapshot_r = await tk.semantic_snapshot(max_elements=80, include_cards=True)
+                            retry_snapshot = (
+                                retry_snapshot_r.data
+                                if retry_snapshot_r.success and isinstance(retry_snapshot_r.data, dict)
+                                else {}
+                            )
+
+                        retry_config = await self.analyze_page_structure(tk, task_description)
+                        retry_data: List[Dict[str, Any]] = []
+                        if retry_config.get("item_selector"):
+                            retry_data = await self.extract_data_with_selectors(tk, retry_config, limit)
+
+                        observed_page_type = str(
+                            retry_config.get("page_type", "")
+                            or retry_config.get("observed_page_type", "")
+                            or retry_snapshot.get("page_type", "")
+                            or ""
+                        ).strip().lower()
+
+                        if not retry_data and self._should_try_detail_text_fallback(task_description, observed_page_type):
+                            retry_data = await self.extract_detail_text_blocks(tk, task_description, limit=limit)
+
+                        if not retry_data and self._task_mentions_weather(task_description):
+                            retry_data = await self.extract_weather_text_blocks(tk, task_description, limit=limit)
+
+                        if not retry_data and api_responses:
+                            best_api = max(api_responses, key=lambda item: len(item["data"]))
+                            retry_data = best_api["data"][:limit]
+
+                        if not retry_data:
+                            retry_data = await self.extract_news_links_fallback(tk, task_description, limit=limit)
+
+                        if not retry_data:
+                            retry_data = await self.extract_table_links_fallback(tk, task_description, limit=limit)
+
+                        if retry_data:
+                            retry_data = normalize_web_results(
+                                retry_data,
+                                task_description,
+                                limit=limit,
+                                understanding={
+                                    "page_type": str(
+                                        retry_config.get("page_type", "")
+                                        or retry_config.get("observed_page_type", "")
+                                        or observed_page_type
+                                        or ""
+                                    )
+                                },
+                            )
+                            retry_quality = self.validate_data_quality(retry_data, task_description, limit)
+                            if retry_quality.get("valid"):
+                                web_debug_recorder.record_event(
+                                    "search_candidate_retry_success",
+                                    url=next_url,
+                                    index=idx,
+                                    count=len(retry_data),
+                                )
+                                return retry_data, retry_config, next_url
+
+                        web_debug_recorder.record_event(
+                            "search_candidate_retry_failed",
+                            url=next_url,
+                            index=idx,
+                        )
+                    except Exception as retry_err:
+                        log_warning(f"搜索候选重试失败: {str(retry_err)[:80]}")
+                        web_debug_recorder.record_event(
+                            "search_candidate_retry_exception",
+                            url=next_url,
+                            index=idx,
+                            error=str(retry_err),
+                        )
+                        continue
+
+                return [], {}, ""
+
             if tk.page:
                 tk.page.on("response", _capture_api_response)
 
@@ -2994,6 +3666,16 @@ class WebWorker:
                         await tk.create_page()
                         if tk.page:
                             tk.page.on("response", _capture_api_response)
+                    if opened_from_search_page and _goto_attempt == 1:
+                        current_url_r = await tk.get_current_url()
+                        current_open_url = str(current_url_r.data or "") if current_url_r.success else ""
+                        if self._urls_match_for_navigation(current_open_url, url):
+                            web_debug_recorder.record_event(
+                                "browser_navigation_reused_search_tab",
+                                current_url=current_open_url,
+                                target_url=url,
+                            )
+                            return ToolkitResult(success=True, data=current_open_url)
                     wait_strategy = "domcontentloaded" if _goto_attempt <= 2 else "commit"
                     return await tk.goto(url, wait_until=wait_strategy, timeout=45000)
 
@@ -3026,7 +3708,7 @@ class WebWorker:
                     {
                         "success": captcha_r.success,
                         "data": captcha_r.data,
-                        "error": captcha_r.error,
+                        "error": getattr(captcha_r, "error", ""),
                     },
                 )
                 if captcha_r.success and captcha_r.data and captcha_r.data.get("has_captcha"):
@@ -3037,7 +3719,7 @@ class WebWorker:
                         {
                             "success": solve_r.success,
                             "data": solve_r.data,
-                            "error": solve_r.error,
+                            "error": getattr(solve_r, "error", ""),
                         },
                     )
                     if solve_r.success:
@@ -3259,7 +3941,31 @@ class WebWorker:
                 if data:
                     log_success(f"最终成功提取 {len(data)} 条数据")
                 else:
-                    if explicit_input_url or explicit_task_urls:
+                    if opened_from_search_page and search_candidate_entries:
+                        remaining_search_candidates = [
+                            candidate
+                            for candidate in search_candidate_entries
+                            if str(candidate.get("link", "") or candidate.get("url", "") or "").strip()
+                            and str(candidate.get("link", "") or candidate.get("url", "") or "").strip() != active_search_candidate_link
+                        ]
+                        retry_data, retry_config, retry_url = await _try_remaining_search_candidates(
+                            remaining_search_candidates[:2]
+                        )
+                        if retry_data:
+                            data = retry_data
+                            config = retry_config or config
+                            url = retry_url
+                            result = {
+                                "success": True,
+                                "data": data,
+                                "count": len(data),
+                                "source": url,
+                                "selectors_used": config,
+                            }
+                            web_debug_recorder.write_json("smart_scrape_result", result)
+                            return result
+
+                    if not data and (explicit_input_url or explicit_task_urls):
                         log_warning("显式 URL 任务保持当前来源，不切换到替代来源")
                         return {
                             "success": False,
@@ -3321,8 +4027,12 @@ class WebWorker:
                 web_debug_recorder.record_event("smart_scrape_exception", error=str(e), url=url)
                 return {"success": False, "error": str(e), "data": [], "url": url}
             finally:
-                await tk.close()
+                if close_tk and tk is not None:
+                    await tk.close()
+                    close_tk = False
         finally:
+            if close_tk and tk is not None:
+                await tk.close()
             web_debug_recorder.deactivate_trace(token)
 
     async def scrape_hackernews(self, limit: int = 5) -> Dict[str, Any]:

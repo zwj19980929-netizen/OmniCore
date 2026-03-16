@@ -8,7 +8,7 @@ import json
 import os
 import random
 import re
-from urllib.parse import parse_qs, quote_plus, urlparse
+from urllib.parse import parse_qs, urlparse
 from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any, Dict, List, Optional, Tuple
@@ -18,6 +18,13 @@ from core.llm import LLMClient
 from utils.browser_toolkit import BrowserToolkit, ToolkitResult
 from utils.logger import log_agent_action, log_error, log_success, log_warning
 from utils.retry import async_retry, is_retryable
+from utils.search_engine_profiles import (
+    build_direct_search_urls,
+    decode_search_redirect_url,
+    get_search_result_selectors,
+    is_search_engine_domain,
+    looks_like_search_results_url,
+)
 from utils.url_utils import extract_first_url
 from utils.web_prompt_budget import BudgetSection, render_budgeted_sections
 import utils.web_debug_recorder as web_debug_recorder
@@ -68,6 +75,9 @@ class SearchResultCard:
     title: str
     target_ref: str = ""
     target_selector: str = ""
+    link: str = ""
+    raw_link: str = ""
+    target_url: str = ""
     snippet: str = ""
     source: str = ""
     host: str = ""
@@ -163,6 +173,74 @@ PAGE_ASSESSMENT_PROMPT = get_prompt("browser_page_assessment")
 VISION_ACTION_PROMPT = get_prompt("browser_vision_decision")
 _PAGE_ASSESSMENT_CONTEXT_TOKENS = 1600
 _ACTION_DECISION_CONTEXT_TOKENS = 1400
+_AUTH_USERNAME_ALIASES = (
+    "username",
+    "user name",
+    "login name",
+    "login account",
+    "account",
+    "account name",
+    "user id",
+    "userid",
+    "\u7528\u6237\u540d",
+    "\u767b\u5f55\u540d",
+    "\u767b\u5f55\u8d26\u53f7",
+    "\u8d26\u53f7",
+    "\u8d26\u6237",
+    "\u5e10\u53f7",
+)
+_AUTH_EMAIL_ALIASES = (
+    "email",
+    "e-mail",
+    "mail",
+    "\u90ae\u7bb1",
+    "\u7535\u5b50\u90ae\u7bb1",
+    "\u90ae\u4ef6",
+)
+_AUTH_PASSWORD_ALIASES = (
+    "password",
+    "passcode",
+    "passwd",
+    "pwd",
+    "\u5bc6\u7801",
+    "\u767b\u5f55\u5bc6\u7801",
+)
+_AUTH_SUBMIT_POSITIVE_TOKENS = (
+    "login",
+    "log in",
+    "sign in",
+    "signin",
+    "submit",
+    "continue",
+    "next",
+    "enter",
+    "\u767b\u5f55",
+    "\u767b\u5165",
+    "\u63d0\u4ea4",
+    "\u7ee7\u7eed",
+    "\u786e\u8ba4",
+    "\u8fdb\u5165",
+)
+_AUTH_SUBMIT_NEGATIVE_TOKENS = (
+    "register",
+    "sign up",
+    "signup",
+    "forgot",
+    "reset",
+    "help",
+    "cancel",
+    "close",
+    "back",
+    "guest",
+    "\u6ce8\u518c",
+    "\u5fd8\u8bb0",
+    "\u91cd\u7f6e",
+    "\u5e2e\u52a9",
+    "\u53d6\u6d88",
+    "\u5173\u95ed",
+    "\u8fd4\u56de",
+    "\u6e38\u5ba2",
+)
 
 
 class BrowserAgent:
@@ -250,8 +328,15 @@ class BrowserAgent:
     def _normalize_text(self, value: str) -> str:
         return re.sub(r"\s+", " ", (value or "").strip()).lower()
 
+    def _strip_urls_from_text(self, text: str) -> str:
+        return re.sub(
+            r"https?://[A-Za-z0-9._~:/?#\[\]@!$&'()*+,;=%-]+",
+            " ",
+            text or "",
+        )
+
     def _task_mentions_interaction(self, task: str) -> bool:
-        normalized = self._normalize_text(re.sub(r"https?://\S+", " ", task or ""))
+        normalized = self._normalize_text(self._strip_urls_from_text(task))
         if not normalized:
             return False
         interaction_tokens = (
@@ -283,15 +368,30 @@ class BrowserAgent:
         )
         return any(token in normalized for token in interaction_tokens)
 
+    def _task_mentions_auth(self, task: str) -> bool:
+        normalized = self._normalize_text(self._strip_urls_from_text(task))
+        if not normalized:
+            return False
+        auth_tokens = (
+            "login",
+            "log in",
+            "sign in",
+            "signin",
+            "password",
+            "username",
+            "account",
+            "\u767b\u5f55",
+            "\u767b\u5165",
+            "\u7528\u6237\u540d",
+            "\u8d26\u53f7",
+            "\u8d26\u6237",
+            "\u5bc6\u7801",
+        )
+        return any(token in normalized for token in auth_tokens)
+
     @staticmethod
     def _is_search_engine_url(url: str) -> bool:
-        host = urlparse(url or "").netloc.lower()
-        if host.startswith("www."):
-            host = host[4:]
-        return any(
-            host == domain or host.endswith(f".{domain}")
-            for domain in ("google.com", "bing.com", "baidu.com", "duckduckgo.com", "sogou.com")
-        )
+        return is_search_engine_domain(url or "")
 
     @staticmethod
     def _urls_look_related(expected_url: str, current_url: str) -> bool:
@@ -358,6 +458,10 @@ class BrowserAgent:
             ok_holding_page = any(token in normalized_url for token in ("403", "forbidden", "denied", "blocked"))
         return url_blocked or title_blocked or ok_holding_page
 
+    @staticmethod
+    def _looks_like_search_results_url(url: str) -> bool:
+        return looks_like_search_results_url(url or "")
+
     def _is_read_only_task(self, task: str, intent: Optional[TaskIntent] = None) -> bool:
         normalized = self._normalize_text(task)
         if not normalized:
@@ -409,13 +513,215 @@ class BrowserAgent:
         filtered = [e for e in elements if not self._is_noise_element(e)]
         return filtered or elements
 
+    async def _call_toolkit(self, method_name: str, *args: Any, **kwargs: Any) -> ToolkitResult:
+        method = getattr(self.toolkit, method_name, None)
+        if not callable(method):
+            return ToolkitResult(success=False, error=f"{method_name} unavailable")
+        try:
+            result = await method(*args, **kwargs)
+        except Exception as exc:
+            return ToolkitResult(success=False, error=str(exc))
+        if isinstance(result, ToolkitResult):
+            return result
+        return ToolkitResult(success=True, data=result)
+
+    async def _get_current_url_value(self, fallback: str = "") -> str:
+        result = await self._call_toolkit("get_current_url")
+        if result.success and result.data is not None:
+            value = str(result.data or "").strip()
+            if value:
+                return value
+        for attr_name in ("current_url", "_current_url", "_url"):
+            value = str(getattr(self.toolkit, attr_name, "") or "").strip()
+            if value:
+                return value
+        return str(fallback or "")
+
+    async def _get_title_value(self, fallback: str = "") -> str:
+        result = await self._call_toolkit("get_title")
+        if result.success and result.data is not None:
+            value = str(result.data or "").strip()
+            if value:
+                return value
+        for attr_name in ("title", "_title"):
+            value = str(getattr(self.toolkit, attr_name, "") or "").strip()
+            if value:
+                return value
+        return str(fallback or "")
+
+    async def _get_page_html_value(self) -> str:
+        result = await self._call_toolkit("get_page_html")
+        if result.success and result.data is not None:
+            return str(result.data or "")
+        for attr_name in ("html", "_html"):
+            value = getattr(self.toolkit, attr_name, None)
+            if value:
+                return str(value)
+        return ""
+
+    def _get_snapshot_blocked_signals(self, snapshot: Optional[Dict[str, Any]]) -> List[str]:
+        signals: List[str] = []
+        for item in (snapshot or {}).get("blocked_signals", []) or []:
+            text = ""
+            if isinstance(item, dict):
+                text = str(item.get("text", "") or item.get("signal", "") or "").strip()
+            else:
+                text = str(item or "").strip()
+            if text and text not in signals:
+                signals.append(text)
+        return signals
+
+    def _get_snapshot_visible_text_blocks(self, snapshot: Optional[Dict[str, Any]]) -> List[str]:
+        blocks: List[str] = []
+        for item in (snapshot or {}).get("visible_text_blocks", []) or []:
+            text = ""
+            if isinstance(item, dict):
+                text = str(item.get("text", "") or "").strip()
+            else:
+                text = str(item or "").strip()
+            if text:
+                blocks.append(text)
+        return blocks
+
+    def _get_snapshot_main_text(self, snapshot: Optional[Dict[str, Any]]) -> str:
+        return str((snapshot or {}).get("main_text", "") or "").strip()
+
+    def _format_snapshot_text_for_llm(self, snapshot: Optional[Dict[str, Any]], max_blocks: int = 6) -> str:
+        active_snapshot = snapshot or {}
+        lines: List[str] = []
+        page_type = str(active_snapshot.get("page_type", "") or "").strip()
+        page_stage = str(active_snapshot.get("page_stage", "") or "").strip()
+        if page_type or page_stage:
+            lines.append(
+                "Page snapshot: "
+                + ", ".join(
+                    part
+                    for part in (
+                        f"type={page_type}" if page_type else "",
+                        f"stage={page_stage}" if page_stage else "",
+                    )
+                    if part
+                )
+            )
+        blocked_signals = self._get_snapshot_blocked_signals(active_snapshot)
+        if blocked_signals:
+            lines.append("Blocked signals: " + " | ".join(blocked_signals[:4]))
+        main_text = self._get_snapshot_main_text(active_snapshot)
+        if main_text:
+            lines.append("Main text: " + main_text[:420])
+        blocks = self._get_snapshot_visible_text_blocks(active_snapshot)
+        if blocks:
+            lines.append("Visible text blocks:")
+            lines.extend(f"{index}. {text[:220]}" for index, text in enumerate(blocks[:max_blocks], 1))
+        return "\n".join(lines).strip()
+
+    def _stringify_llm_response(self, response: Any) -> str:
+        if response is None:
+            return ""
+        content = getattr(response, "content", None)
+        if content is not None:
+            if isinstance(content, str):
+                return content
+            try:
+                return json.dumps(content, ensure_ascii=False)
+            except TypeError:
+                return str(content)
+        if isinstance(response, str):
+            return response
+        try:
+            return json.dumps(response, ensure_ascii=False)
+        except TypeError:
+            return str(response)
+
+    async def _build_fallback_semantic_snapshot(self) -> Dict[str, Any]:
+        current_url = await self._get_current_url_value()
+        title = await self._get_title_value()
+        body_text = ""
+        visible_text_blocks: List[Dict[str, str]] = []
+        evaluate_result = await self._call_toolkit(
+            "evaluate_js",
+            r"""() => {
+                const bodyText = document.body && document.body.innerText ? document.body.innerText : '';
+                const blockCandidates = Array.from(document.querySelectorAll('main, article, section, [role="main"], [data-testid], p, h1, h2, h3, li'))
+                    .map((node) => {
+                        const text = (node.innerText || node.textContent || '').replace(/\s+/g, ' ').trim();
+                        if (!text) return null;
+                        const rect = node.getBoundingClientRect ? node.getBoundingClientRect() : { width: 0, height: 0 };
+                        return {
+                            text: text.slice(0, 240),
+                            tag: (node.tagName || '').toLowerCase(),
+                            role: node.getAttribute ? (node.getAttribute('role') || '') : '',
+                            width: Math.round(rect.width || 0),
+                            height: Math.round(rect.height || 0),
+                        };
+                    })
+                    .filter(Boolean)
+                    .slice(0, 12);
+                return {
+                    bodyText: bodyText.slice(0, 4000),
+                    visibleTextBlocks: blockCandidates,
+                };
+            }""",
+        )
+        if evaluate_result.success and isinstance(evaluate_result.data, dict):
+            body_text = str(evaluate_result.data.get("bodyText", "") or "").strip()
+            raw_blocks = evaluate_result.data.get("visibleTextBlocks", []) or []
+            if isinstance(raw_blocks, list):
+                for item in raw_blocks[:12]:
+                    if isinstance(item, dict):
+                        text = str(item.get("text", "") or "").strip()
+                        if text:
+                            visible_text_blocks.append(
+                                {
+                                    "text": text,
+                                    "tag": str(item.get("tag", "") or "").strip(),
+                                    "role": str(item.get("role", "") or "").strip(),
+                                }
+                            )
+        blocked_signals: List[str] = []
+        if self._looks_like_blocked_page(current_url, title):
+            blocked_signals.append(title or current_url)
+        combined_text = " ".join([title, body_text]).lower()
+        for token in ("unusual traffic", "robot check", "captcha", "异常流量", "人机身份验证", "验证码", "安全验证"):
+            if token in combined_text and token not in blocked_signals:
+                blocked_signals.append(token)
+        looks_like_serp = self._looks_like_search_results_url(current_url)
+        page_type = "blocked" if blocked_signals else ("serp" if looks_like_serp else "unknown")
+        page_stage = "blocked" if blocked_signals else ("selecting_source" if looks_like_serp else ("extracting" if body_text else "unknown"))
+        affordances = {
+            "has_results": looks_like_serp and (len(body_text) >= 240 or len(visible_text_blocks) >= 2),
+            "collection_item_count": 0,
+            "has_modal": False,
+            "has_pagination": False,
+            "has_load_more": False,
+        }
+        return {
+            "page_type": page_type,
+            "page_stage": page_stage,
+            "main_text": body_text,
+            "visible_text_blocks": visible_text_blocks,
+            "blocked_signals": blocked_signals,
+            "cards": [],
+            "collections": [],
+            "controls": [],
+            "elements": [],
+            "affordances": affordances,
+            "url": current_url,
+            "title": title,
+        }
+
     async def _get_semantic_snapshot(self) -> Dict[str, Any]:
-        snapshot_r = await self.toolkit.semantic_snapshot(max_elements=80, include_cards=True)
-        if snapshot_r.success and isinstance(snapshot_r.data, dict):
-            self._last_semantic_snapshot = snapshot_r.data
+        if hasattr(self.toolkit, "semantic_snapshot"):
+            snapshot_r = await self._call_toolkit("semantic_snapshot", max_elements=80, include_cards=True)
+            if snapshot_r.success and isinstance(snapshot_r.data, dict):
+                self._last_semantic_snapshot = snapshot_r.data
+                web_debug_recorder.write_json("browser_semantic_snapshot", self._last_semantic_snapshot)
+                return self._last_semantic_snapshot
+        fallback_snapshot = await self._build_fallback_semantic_snapshot()
+        self._last_semantic_snapshot = fallback_snapshot or {}
+        if self._last_semantic_snapshot:
             web_debug_recorder.write_json("browser_semantic_snapshot", self._last_semantic_snapshot)
-            return self._last_semantic_snapshot
-        return self._last_semantic_snapshot or {}
+        return self._last_semantic_snapshot
 
     def _elements_from_snapshot(self, snapshot: Dict[str, Any]) -> List[PageElement]:
         elements: List[PageElement] = []
@@ -457,6 +763,9 @@ class BrowserAgent:
                     title=str(item.get("title", "") or ""),
                     target_ref=str(item.get("target_ref", "") or ""),
                     target_selector=str(item.get("target_selector", "") or ""),
+                    link=str(item.get("link", "") or ""),
+                    raw_link=str(item.get("raw_link", "") or ""),
+                    target_url=str(item.get("target_url", "") or ""),
                     snippet=str(item.get("snippet", "") or ""),
                     source=str(item.get("source", "") or ""),
                     host=str(item.get("host", "") or ""),
@@ -570,6 +879,18 @@ class BrowserAgent:
             token for token in re.split(r"[^a-zA-Z0-9_\u4e00-\u9fff]+", self._normalize_text(task))
             if len(token) >= 2
         ]
+
+    def _normalize_auth_field_name(self, field_name: str) -> str:
+        normalized = self._normalize_text(field_name)
+        if not normalized:
+            return ""
+        if any(alias in normalized for alias in _AUTH_PASSWORD_ALIASES):
+            return "password"
+        if any(alias in normalized for alias in _AUTH_EMAIL_ALIASES):
+            return "email"
+        if any(alias in normalized for alias in _AUTH_USERNAME_ALIASES):
+            return "username"
+        return normalized
 
     def _extract_query_tokens(self, query: str) -> List[str]:
         tokens: List[str] = []
@@ -930,6 +1251,12 @@ class BrowserAgent:
         total_tokens: int,
     ) -> Tuple[Dict[str, str], Dict[str, Dict[str, Any]]]:
         data_text = self._format_data_for_llm(data, max_items=12)
+        snapshot_text = self._format_snapshot_text_for_llm(snapshot)
+        if snapshot_text:
+            if data_text and data_text != "(no visible data)":
+                data_text = f"{snapshot_text}\n{data_text}"
+            else:
+                data_text = snapshot_text
         cards_text = self._format_cards_for_llm(cards, max_items=14)
         collections_text = self._format_collections_for_llm(snapshot, max_items=6)
         controls_text = self._format_controls_for_llm(snapshot, max_items=6)
@@ -1111,6 +1438,8 @@ class BrowserAgent:
         if not self._should_assess_page_with_llm(task, current_url, intent, data, elements, last_action):
             return None
 
+        if not self._last_semantic_snapshot:
+            await self._get_semantic_snapshot()
         cache_key = self._page_assessment_cache_key(
             task,
             current_url,
@@ -1161,8 +1490,8 @@ class BrowserAgent:
                 elements=prompt_context.get("elements", "(no actionable elements)"),
             )
             if web_debug_recorder.is_enabled():
-                html_r = await self.toolkit.get_page_html()
-                web_debug_recorder.write_text("browser_page_html", html_r.data or "", suffix=".html")
+                page_html = await self._get_page_html_value()
+                web_debug_recorder.write_text("browser_page_html", page_html, suffix=".html")
             web_debug_recorder.write_json(
                 "browser_page_assessment_context",
                 {
@@ -1209,7 +1538,7 @@ class BrowserAgent:
                 temperature=0.1,
                 json_mode=True,
             )
-            web_debug_recorder.write_text("browser_page_assessment_response", response.content)
+            web_debug_recorder.write_text("browser_page_assessment_response", self._stringify_llm_response(response))
             payload = llm.parse_json_response(response)
             web_debug_recorder.write_json("browser_page_assessment_payload", payload)
             action = self._action_from_llm(payload, elements)
@@ -1275,7 +1604,8 @@ class BrowserAgent:
             self._element_cache = elements[:40]
             return self._element_cache
 
-        r = await self.toolkit.evaluate_js(
+        r = await self._call_toolkit(
+            "evaluate_js",
             r"""
             () => {
               // 🔥 扩展选择器：同时提取交互元素和内容元素
@@ -1433,8 +1763,38 @@ class BrowserAgent:
             }
             """
         )
-        raw = r.data if r.success else []
-        elements = [PageElement(**item) for item in (raw or [])]
+        raw = r.data if r.success and isinstance(r.data, list) else []
+        elements: List[PageElement] = []
+        for index, item in enumerate(raw or []):
+            if not isinstance(item, dict):
+                continue
+            selector = str(item.get("selector", "") or "").strip()
+            tag = str(item.get("tag", "") or "").strip()
+            element_type = str(item.get("element_type", item.get("type", item.get("role", ""))) or "").strip()
+            ref = str(item.get("ref", "") or "").strip()
+            if not any([selector, tag, element_type, ref]):
+                continue
+            try:
+                elements.append(PageElement(**item))
+            except TypeError:
+                elements.append(
+                    PageElement(
+                        index=int(item.get("index", index) or index),
+                        tag=tag,
+                        text=str(item.get("text", "") or ""),
+                        element_type=element_type,
+                        selector=selector,
+                        ref=ref,
+                        role=str(item.get("role", "") or ""),
+                        attributes=dict(item.get("attributes", {}) or {}),
+                        is_visible=bool(item.get("is_visible", item.get("visible", True))),
+                        is_clickable=bool(item.get("is_clickable", item.get("enabled", True))),
+                        context_before=str(item.get("context_before", "") or ""),
+                        context_after=str(item.get("context_after", "") or ""),
+                        parent_ref=str(item.get("parent_ref", "") or ""),
+                        region=str(item.get("region", "") or ""),
+                    )
+                )
         elements = self._filter_noise_elements(elements)
         self._element_cache = elements[:40]
         return self._element_cache
@@ -1513,6 +1873,23 @@ class BrowserAgent:
             confidence=0.9,
         )
 
+    def _element_action_haystack(self, element: PageElement) -> str:
+        attrs = element.attributes or {}
+        return self._normalize_text(
+            " ".join(
+                [
+                    element.text,
+                    attrs.get("labelText", ""),
+                    attrs.get("ariaLabel", ""),
+                    attrs.get("title", ""),
+                    attrs.get("name", ""),
+                    attrs.get("id", ""),
+                    attrs.get("value", ""),
+                    attrs.get("type", ""),
+                ]
+            )
+        )
+
     def _extract_click_target_text(self, task: str) -> str:
         for pattern in (
             r'"([^"\n]{2,64})"',
@@ -1539,6 +1916,34 @@ class BrowserAgent:
     def _extract_url_from_task(self, task: str) -> Optional[str]:
         return extract_first_url(task) or None
 
+    def _extract_auth_fields_from_free_text(self, task: str) -> Dict[str, str]:
+        text = self._strip_urls_from_text(task)
+        patterns = {
+            "username": [
+                r"(?:\u767b\u5f55\u8d26\u53f7|\u767b\u5f55\u540d|\u7528\u6237\u540d|\u8d26\u53f7|\u8d26\u6237|\u5e10\u53f7|username|user\s*name|login\s*name|login\s*account|account)\s*(?:is|=|:|\u662f|\u4e3a)\s*[\"'“”‘’]?([^\s,，。;；]+)",
+                r"(?:\u767b\u5f55\u8d26\u53f7|\u767b\u5f55\u540d|\u7528\u6237\u540d|\u8d26\u53f7|\u8d26\u6237|\u5e10\u53f7|username|user\s*name|login\s*name|login\s*account|account)\s*[\"'“”‘’]?([A-Za-z0-9_.@-]{2,})",
+            ],
+            "email": [
+                r"(?:email|e-mail|mail|\u90ae\u7bb1|\u7535\u5b50\u90ae\u7bb1)\s*(?:is|=|:|\u662f|\u4e3a)\s*[\"'“”‘’]?([^\s,，。;；]+)",
+                r"(?:email|e-mail|mail|\u90ae\u7bb1|\u7535\u5b50\u90ae\u7bb1)\s*[\"'“”‘’]?([A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,})",
+            ],
+            "password": [
+                r"(?:password|passcode|passwd|pwd|\u5bc6\u7801|\u767b\u5f55\u5bc6\u7801)\s*(?:is|=|:|\u662f|\u4e3a)\s*[\"'“”‘’]?([^\s,，。;；]+)",
+                r"(?:password|passcode|passwd|pwd|\u5bc6\u7801|\u767b\u5f55\u5bc6\u7801)\s*[\"'“”‘’]?([^\s,，。;；]{2,})",
+            ],
+        }
+        extracted: Dict[str, str] = {}
+        for field_name, regexes in patterns.items():
+            for pattern in regexes:
+                match = re.search(pattern, text, flags=re.IGNORECASE)
+                if not match:
+                    continue
+                value = re.sub(r"\s+", " ", str(match.group(1) or "")).strip(" \"'“”‘’")
+                if value:
+                    extracted[field_name] = value
+                    break
+        return extracted
+
     def _extract_structured_pairs(self, task: str) -> Dict[str, str]:
         pairs: Dict[str, str] = {}
         for key, value in re.findall(
@@ -1551,6 +1956,24 @@ class BrowserAgent:
                 pairs[normalized_key] = cleaned_value
         return pairs
 
+    def _extract_structured_pairs(self, task: str) -> Dict[str, str]:
+        pairs: Dict[str, str] = {}
+        for key, value in re.findall(
+            r"([A-Za-z0-9_\u4e00-\u9fff]{1,24})\s*[:：]\s*(.{1,160}?)(?=(?:\s+[A-Za-z0-9_\u4e00-\u9fff]{1,24}\s*[:：])|[\n,，;；]|$)",
+            task or "",
+        ):
+            normalized_key = self._normalize_auth_field_name(key)
+            cleaned_value = re.sub(r"\s+", " ", value).strip()
+            if normalized_key and cleaned_value:
+                pairs[normalized_key] = cleaned_value
+        auth_pairs = self._extract_auth_fields_from_free_text(task)
+        if auth_pairs:
+            for key in list(pairs.keys()):
+                if self._normalize_auth_field_name(key) in auth_pairs:
+                    pairs.pop(key, None)
+            pairs.update(auth_pairs)
+        return pairs
+
     async def _infer_task_intent(self, task: str) -> TaskIntent:
         cache_key = self._normalize_text(task)
         cached = self._intent_cache.get(cache_key)
@@ -1561,9 +1984,20 @@ class BrowserAgent:
         fields = self._extract_structured_pairs(task)
         target_text = self._extract_click_target_text(task)
         extracted_url = self._extract_url_from_task(task)
+        field_kinds = {self._normalize_auth_field_name(key) for key in fields}
+        auth_like = self._task_mentions_auth(task) or "password" in field_kinds
 
         if extracted_url:
-            if len(fields) >= 2:
+            if auth_like:
+                fallback = TaskIntent(
+                    intent_type="auth",
+                    query=query,
+                    confidence=0.65 if fields else 0.55,
+                    fields=fields,
+                    requires_interaction=True,
+                    target_text=target_text,
+                )
+            elif len(fields) >= 2:
                 fallback = TaskIntent(
                     intent_type="form",
                     query=query,
@@ -1582,6 +2016,15 @@ class BrowserAgent:
                 )
             else:
                 fallback = TaskIntent(intent_type="read", query=query, confidence=0.6, target_text=target_text)
+        elif auth_like:
+            fallback = TaskIntent(
+                intent_type="auth",
+                query=query,
+                confidence=0.65 if fields else 0.45,
+                fields=fields,
+                requires_interaction=True,
+                target_text=target_text,
+            )
         elif len(fields) >= 2:
             fallback = TaskIntent(
                 intent_type="form",
@@ -1626,16 +2069,18 @@ class BrowserAgent:
             normalized_fields: Dict[str, str] = {}
             if isinstance(llm_fields, dict):
                 for raw_key, raw_value in llm_fields.items():
-                    key = self._normalize_text(str(raw_key))
+                    key = self._normalize_auth_field_name(str(raw_key))
                     value = str(raw_value or "").strip()
                     if key and value:
                         normalized_fields[key] = value
+            merged_fields = dict(fields)
+            merged_fields.update(normalized_fields)
 
             llm_intent = TaskIntent(
                 intent_type=intent_type,
                 query=llm_query,
                 confidence=max(min(confidence, 1.0), 0.0),
-                fields=normalized_fields,
+                fields=merged_fields,
                 requires_interaction=bool(payload.get("requires_interaction", False)),
                 target_text=llm_target,
             )
@@ -1677,6 +2122,9 @@ class BrowserAgent:
 
     def _field_match_score(self, field_name: str, element: PageElement) -> float:
         attrs = element.attributes or {}
+        element_type = self._normalize_text(
+            attrs.get("type", "") or element.element_type or element.tag
+        )
         haystack = self._normalize_text(
             " ".join(
                 [
@@ -1692,6 +2140,7 @@ class BrowserAgent:
             )
         )
         score = 0.0
+        canonical_field = self._normalize_auth_field_name(field_name)
         for token in self._extract_task_tokens(field_name):
             if token and token in haystack:
                 score += 2.0
@@ -1699,7 +2148,46 @@ class BrowserAgent:
             score += 0.8
         if attrs.get("name"):
             score += 0.2
+        if canonical_field == "password":
+            if element_type == "password":
+                score += 6.0
+            else:
+                score -= 3.0
+            if any(alias in haystack for alias in _AUTH_PASSWORD_ALIASES):
+                score += 4.0
+        elif canonical_field in {"username", "email"}:
+            if element_type == "password":
+                score -= 5.0
+            if canonical_field == "email" and element_type == "email":
+                score += 4.0
+            elif element_type in {"text", "search", "email", "input", "textarea"}:
+                score += 2.5
+            alias_pool = _AUTH_EMAIL_ALIASES if canonical_field == "email" else _AUTH_USERNAME_ALIASES + _AUTH_EMAIL_ALIASES
+            if any(alias in haystack for alias in alias_pool):
+                score += 4.0
         return score
+
+    def _mapping_matches_current_elements(
+        self,
+        mapping: Dict[str, str],
+        elements: List[PageElement],
+    ) -> bool:
+        if not mapping:
+            return False
+        element_by_selector = {
+            element.selector: element
+            for element in elements
+            if element.selector
+        }
+        matched = 0
+        for selector, expected in mapping.items():
+            element = element_by_selector.get(selector)
+            if element is None:
+                continue
+            current_value = str((element.attributes or {}).get("value", "") or "")
+            if self._normalize_text(current_value) == self._normalize_text(str(expected)):
+                matched += 1
+        return matched >= max(1, len(mapping))
 
     def _build_form_mapping_from_pairs(
         self,
@@ -1754,23 +2242,58 @@ class BrowserAgent:
         ]
         return controls[0] if controls else None
 
+    def _find_auth_submit_control(
+        self,
+        task: str,
+        elements: List[PageElement],
+        intent: Optional[TaskIntent] = None,
+    ) -> Optional[PageElement]:
+        controls = [
+            item
+            for item in elements
+            if item.is_visible
+            and item.is_clickable
+            and (
+                item.element_type in {"button", "submit", "link"}
+                or item.tag in {"button", "a"}
+                or self._normalize_text((item.attributes or {}).get("type", "")) in {"submit", "button"}
+            )
+        ]
+        if not controls:
+            return None
+
+        target_hint = self._normalize_text((intent.target_text if intent else "") or "")
+        ranked: List[Tuple[float, PageElement]] = []
+        for control in controls:
+            score = 0.0
+            attrs = control.attributes or {}
+            haystack = self._element_action_haystack(control)
+            if self._normalize_text(attrs.get("type", "")) == "submit":
+                score += 2.5
+            if any(token in haystack for token in _AUTH_SUBMIT_POSITIVE_TOKENS):
+                score += 5.0
+            if any(token in haystack for token in _AUTH_SUBMIT_NEGATIVE_TOKENS):
+                score -= 6.0
+            if target_hint and target_hint in haystack:
+                score += 4.0
+            if self._task_mentions_auth(task) and any(token in haystack for token in ("login", "\u767b\u5f55", "\u767b\u5165")):
+                score += 2.0
+            if score > 0:
+                ranked.append((score, control))
+        ranked.sort(key=lambda item: item[0], reverse=True)
+        return ranked[0][1] if ranked else None
+
     async def _bootstrap_search_results(self, query: str) -> bool:
         if not query:
             return False
-        search_candidates = [
-            f"https://www.bing.com/search?q={quote_plus(query)}",
-            f"https://www.baidu.com/s?wd={quote_plus(query)}",
-            f"https://duckduckgo.com/?q={quote_plus(query)}",
-            f"https://www.google.com/search?q={quote_plus(query)}&hl=en",
-        ]
-        for search_url in search_candidates:
+        for profile, search_url in build_direct_search_urls(query):
             result = await self.toolkit.goto(search_url, timeout=30000)
             if not result.success:
                 continue
             await self._wait_for_page_ready()
             ready = await self._wait_for_search_results_ready(search_url)
             if ready:
-                log_agent_action(self.name, "bootstrap_search", query[:120])
+                log_agent_action(self.name, f"bootstrap_search:{profile.name}", query[:120])
                 return True
         return False
 
@@ -1906,11 +2429,12 @@ class BrowserAgent:
     ) -> PageState:
         active_intent = intent or TaskIntent(intent_type="read", query="", confidence=0.0)
         active_snapshot = snapshot or self._last_semantic_snapshot or {}
-        page_type = str(active_snapshot.get("page_type", "") or "")
+        page_type = str(active_snapshot.get("page_type", "") or "").strip()
         if not page_type:
-            page_type = "serp" if self._is_search_engine_url(current_url) else "unknown"
+            page_type = "serp" if self._looks_like_search_results_url(current_url) else "unknown"
 
         affordances = self._get_snapshot_affordances(active_snapshot)
+        blocked_signals = self._get_snapshot_blocked_signals(active_snapshot)
         target_count = self._extract_target_result_count(task)
         goal_satisfied = self._page_data_satisfies_goal(
             task,
@@ -1923,9 +2447,24 @@ class BrowserAgent:
         has_pagination = bool(affordances.get("has_pagination"))
         has_load_more = bool(affordances.get("has_load_more"))
         has_modal = self._snapshot_has_actionable_modal(active_snapshot, elements)
+        snapshot_stage = str(active_snapshot.get("page_stage", "") or "").strip()
+        if blocked_signals or self._looks_like_blocked_page(current_url):
+            page_type = "blocked"
 
         stage = "unknown"
-        if has_modal:
+        if page_type == "blocked":
+            stage = "blocked"
+        elif snapshot_stage in {
+            "searching",
+            "selecting_source",
+            "extracting",
+            "interacting",
+            "dismiss_modal",
+            "collecting_more",
+            "completing",
+        }:
+            stage = snapshot_stage
+        elif has_modal:
             stage = "dismiss_modal"
         elif page_type == "serp":
             stage = "completing" if goal_satisfied else "selecting_source"
@@ -1946,7 +2485,9 @@ class BrowserAgent:
             stage = "extracting"
 
         confidence = 0.45
-        if page_type in {"serp", "list", "detail", "form", "login", "modal"}:
+        if page_type == "blocked":
+            confidence = 0.92
+        elif page_type in {"serp", "list", "detail", "form", "login", "modal"}:
             confidence = 0.8
         elif item_count > 0:
             confidence = 0.65
@@ -2270,12 +2811,35 @@ class BrowserAgent:
         if active_intent.intent_type in {"form", "auth"}:
             mapping = self._build_form_mapping_from_pairs(active_intent.fields, elements)
             if mapping:
-                return self._build_form_fill_action(mapping)
-            submit_control = self._find_primary_submit_control(elements)
+                if self._mapping_matches_current_elements(mapping, elements):
+                    if active_intent.intent_type == "auth" or self._task_mentions_auth(task):
+                        submit_control = self._find_auth_submit_control(task, elements, active_intent)
+                    else:
+                        submit_control = self._find_primary_submit_control(elements)
+                    if submit_control:
+                        return BrowserAction(
+                            action_type=ActionType.CLICK,
+                            target_selector=submit_control.selector,
+                            target_ref=submit_control.ref,
+                            description="submit interactive form",
+                            confidence=0.78,
+                        )
+                else:
+                    return self._build_form_fill_action(mapping)
+            if active_intent.intent_type == "auth" and self._iter_input_candidates(elements):
+                submit_control = self._find_auth_submit_control(task, elements, active_intent)
+                if submit_control and not active_intent.fields:
+                    return None
+            submit_control = (
+                self._find_auth_submit_control(task, elements, active_intent)
+                if active_intent.intent_type == "auth" or self._task_mentions_auth(task)
+                else self._find_primary_submit_control(elements)
+            )
             if submit_control:
                 return BrowserAction(
                     action_type=ActionType.CLICK,
                     target_selector=submit_control.selector,
+                    target_ref=submit_control.ref,
                     description="submit interactive form",
                     confidence=0.62,
                 )
@@ -2448,7 +3012,7 @@ class BrowserAgent:
             web_debug_recorder.write_text("browser_action_decision_prompt", messages[1]["content"])
             llm = self._get_llm()
             response = await llm.achat(messages, temperature=0.1, json_mode=True)
-            web_debug_recorder.write_text("browser_action_decision_response", response.content)
+            web_debug_recorder.write_text("browser_action_decision_response", self._stringify_llm_response(response))
             action = self._action_from_llm(llm.parse_json_response(response), elements)
             web_debug_recorder.write_json("browser_action_decision_action", self._action_to_debug_payload(action))
             if (
@@ -2693,23 +3257,25 @@ class BrowserAgent:
     # ── verification (Agent-level, calls toolkit) ────────────
 
     async def _snapshot_page_state(self) -> Dict[str, Any]:
-        tk = self.toolkit
-        url_r = await tk.get_current_url()
-        title_r = await tk.get_title()
-        html_r = await tk.get_page_html()
-        html = str(html_r.data or "")
+        url = await self._get_current_url_value()
+        title = await self._get_title_value()
+        html = await self._get_page_html_value()
         semantic_snapshot = await self._get_semantic_snapshot()
         return {
-            "url": url_r.data or "",
-            "title": title_r.data or "",
+            "url": url,
+            "title": title,
             "content_len": len(html),
             "content_hash": hashlib.sha1(html[:12000].encode("utf-8", errors="ignore")).hexdigest() if html else "",
             "page_type": str(semantic_snapshot.get("page_type", "") or ""),
+            "page_stage": str(semantic_snapshot.get("page_stage", "") or ""),
             "card_count": len(semantic_snapshot.get("cards", []) or []),
             "item_count": self._get_snapshot_item_count(semantic_snapshot),
             "has_modal": self._snapshot_has_actionable_modal(semantic_snapshot),
             "has_pagination": bool(self._get_snapshot_affordances(semantic_snapshot).get("has_pagination")),
             "has_load_more": bool(self._get_snapshot_affordances(semantic_snapshot).get("has_load_more")),
+            "blocked_signals": self._get_snapshot_blocked_signals(semantic_snapshot),
+            "main_text_len": len(self._get_snapshot_main_text(semantic_snapshot)),
+            "visible_text_block_count": len(self._get_snapshot_visible_text_blocks(semantic_snapshot)),
         }
 
     def _action_must_change_state(self, action: BrowserAction) -> bool:
@@ -2789,9 +3355,32 @@ class BrowserAgent:
         if not self._is_search_engine_url(current_url):
             return []
 
+        snapshot = self._last_semantic_snapshot or await self._get_semantic_snapshot()
+        cards = self._cards_from_snapshot(snapshot)
+        if cards:
+            items: List[Dict[str, str]] = []
+            seen_links: set[str] = set()
+            for card in cards[:10]:
+                link = decode_search_redirect_url(card.target_url or card.link or card.raw_link)
+                if not link or self._is_search_engine_url(link) or link in seen_links:
+                    continue
+                seen_links.add(link)
+                items.append(
+                    {
+                        "title": card.title,
+                        "text": card.snippet,
+                        "link": link,
+                        "source": card.source,
+                        "date": card.date,
+                    }
+                )
+            if items:
+                return items
+
+        selectors = get_search_result_selectors(current_url)
         r = await self.toolkit.evaluate_js(
             r"""
-            () => {
+            (payload) => {
               const normalize = (value) => (value || '').replace(/\s+/g, ' ').trim();
               const isVisible = (element) => {
                 if (!element) return false;
@@ -2802,20 +3391,37 @@ class BrowserAgent:
               };
               const cleanHost = (value) => String(value || '').replace(/^www\./, '').toLowerCase();
               const currentHost = cleanHost(location.hostname || '');
-              const selectorMap = {
-                'bing.com': ['li.b_algo', '.b_news li', '.b_ans'],
-                'google.com': ['div.g', '.tF2Cxc', '[data-sokoban-container]'],
-                'baidu.com': ['.result', '.c-container', '.result-op'],
-                'duckduckgo.com': ['[data-testid="result"]', '.result'],
-                'sogou.com': ['.vrwrap', '.rb', '.results .fb']
-              };
-              let selectors = ['main a[href]', 'article a[href]'];
-              for (const [host, values] of Object.entries(selectorMap)) {
-                if (currentHost === host || currentHost.endsWith(`.${host}`)) {
-                  selectors = values;
-                  break;
+              const selectors = Array.isArray(payload?.selectors) && payload.selectors.length
+                ? payload.selectors
+                : ['main a[href]', 'article a[href]'];
+              const decodeParamValue = (value) => {
+                let text = normalize(value);
+                if (!text) return '';
+                for (let i = 0; i < 2; i += 1) {
+                  try {
+                    const decoded = decodeURIComponent(text);
+                    if (decoded === text) break;
+                    text = decoded;
+                  } catch (_error) {
+                    break;
+                  }
                 }
-              }
+                return /^https?:/i.test(text) ? text : '';
+              };
+              const decodeRedirectHref = (value) => {
+                const href = normalize(value);
+                if (!href) return '';
+                try {
+                  const parsed = new URL(href, location.href);
+                  const candidates = ['uddg', 'u', 'url', 'q', 'target', 'redirect', 'imgurl']
+                    .flatMap((key) => parsed.searchParams.getAll(key))
+                    .map((candidate) => decodeParamValue(candidate))
+                    .filter(Boolean);
+                  return candidates[0] || parsed.toString();
+                } catch (_error) {
+                  return '';
+                }
+              };
 
               const seen = new Set();
               const items = [];
@@ -2825,7 +3431,7 @@ class BrowserAgent:
                   ? container
                   : container.querySelector('h2 a, h3 a, a[href]');
                 if (!anchor || !isVisible(anchor)) continue;
-                const href = anchor.href || anchor.getAttribute('href') || '';
+                const href = decodeRedirectHref(anchor.href || anchor.getAttribute('href') || '');
                 if (!href || /^javascript:/i.test(href)) continue;
 
                 let linkHost = '';
@@ -2886,8 +3492,9 @@ class BrowserAgent:
               return items;
             }
             """,
+            {"selectors": selectors},
         )
-        return r.data or [] if r.success else []
+        return r.data if r.success and isinstance(r.data, list) else []
 
     # ── data extraction ────────────────────────────────────────
 
@@ -3174,7 +3781,111 @@ class BrowserAgent:
             await tk.wait_for_load("networkidle", timeout=3000)
         await tk.human_delay(40, 80)
 
+    async def _wait_for_search_results_ready_v2(self, search_url: str) -> bool:
+        selector = ", ".join(get_search_result_selectors(search_url))
+
+        last_probe: Dict[str, Any] = {}
+        last_snapshot: Dict[str, Any] = {}
+        for _ in range(4):
+            current_url = await self._get_current_url_value(search_url)
+            title = await self._get_title_value()
+            summary = await self._call_toolkit(
+                "evaluate_js",
+                r"""(sel) => {
+                    const nodes = Array.from(document.querySelectorAll(sel));
+                    const visible = nodes.filter((node) => {
+                        const style = window.getComputedStyle(node);
+                        return style && style.visibility !== 'hidden' && style.display !== 'none';
+                    });
+                    const blockCandidates = Array.from(document.querySelectorAll('main, article, section, [role="main"], [data-testid], p, h1, h2, h3, li'))
+                        .map((node) => {
+                            const text = (node.innerText || node.textContent || '').replace(/\s+/g, ' ').trim();
+                            return text ? text.slice(0, 220) : '';
+                        })
+                        .filter(Boolean)
+                        .slice(0, 10);
+                    return {
+                        matches: visible.length,
+                        textLength: document.body && document.body.innerText ? document.body.innerText.length : 0,
+                        bodyText: document.body && document.body.innerText ? document.body.innerText.slice(0, 4000) : '',
+                        visibleTextBlocks: blockCandidates,
+                    };
+                }""",
+                selector,
+            )
+            body_text = ""
+            text_length = 0
+            visible_text_blocks: List[str] = []
+            if summary.success and isinstance(summary.data, dict):
+                body_text = str(summary.data.get("bodyText", "") or "")
+                text_length = int(summary.data.get("textLength", 0) or 0)
+                raw_blocks = summary.data.get("visibleTextBlocks", []) or []
+                if isinstance(raw_blocks, list):
+                    visible_text_blocks = [str(item or "").strip() for item in raw_blocks if str(item or "").strip()]
+
+            snapshot = await self._get_semantic_snapshot()
+            affordances = self._get_snapshot_affordances(snapshot)
+            card_count = len(snapshot.get("cards", []) or [])
+            collection_item_count = int(affordances.get("collection_item_count", 0) or 0)
+            snapshot_main_text = self._get_snapshot_main_text(snapshot)
+            snapshot_blocks = self._get_snapshot_visible_text_blocks(snapshot)
+            blocked_signals = self._get_snapshot_blocked_signals(snapshot)
+            has_snapshot_results = bool(
+                card_count > 0
+                or collection_item_count >= 3
+                or affordances.get("has_results")
+                or (str(snapshot.get("page_type", "") or "") == "serp" and (snapshot_main_text or snapshot_blocks))
+            )
+            looks_like_results_url = self._looks_like_search_results_url(current_url)
+            matches = int(summary.data.get("matches", 0) or 0) if summary.success and isinstance(summary.data, dict) else 0
+            last_probe = {
+                "search_url": search_url,
+                "current_url": current_url,
+                "title": title,
+                "selector": selector,
+                "matches": matches,
+                "text_length": text_length,
+                "looks_like_results_url": looks_like_results_url,
+                "snapshot_page_type": str(snapshot.get("page_type", "") or ""),
+                "snapshot_page_stage": str(snapshot.get("page_stage", "") or ""),
+                "snapshot_card_count": card_count,
+                "snapshot_collection_item_count": collection_item_count,
+                "snapshot_has_results": has_snapshot_results,
+                "snapshot_main_text_len": len(snapshot_main_text),
+                "snapshot_visible_text_blocks": len(snapshot_blocks),
+                "snapshot_blocked_signals": blocked_signals,
+            }
+            web_debug_recorder.write_json("browser_search_ready_probe", last_probe)
+            if snapshot:
+                last_snapshot = snapshot
+            if blocked_signals or self._looks_like_blocked_page(current_url, title) or any(token in body_text.lower() for token in ("unusual traffic", "人机身份验证", "异常流量", "验证码", "安全验证")):
+                return False
+            if has_snapshot_results and (looks_like_results_url or text_length >= 300):
+                return True
+            if str(snapshot.get("page_type", "") or "") == "serp" and (len(snapshot_main_text) >= 180 or len(snapshot_blocks) >= 2):
+                return True
+
+            wait_result = await self._call_toolkit("wait_for_selector", selector, timeout=3000)
+            if wait_result.success and matches > 0:
+                return True
+            if matches >= 3:
+                return True
+            if text_length >= 300 and (looks_like_results_url or bool(visible_text_blocks)):
+                return True
+            await self._call_toolkit("human_delay", 300, 900)
+
+        if last_probe:
+            web_debug_recorder.record_event("browser_search_ready_failed", **last_probe)
+        if last_snapshot:
+            web_debug_recorder.write_json("browser_search_ready_last_snapshot", last_snapshot)
+        page_html = await self._get_page_html_value()
+        if page_html:
+            web_debug_recorder.write_text("browser_search_ready_page_html", page_html, suffix=".html")
+        return False
+
     async def _wait_for_search_results_ready(self, search_url: str) -> bool:
+        return await self._wait_for_search_results_ready_v2(search_url)
+
         selectors_by_host = {
             "bing.com": "li.b_algo, .b_ans, #b_results",
             "baidu.com": "#content_left .result, #content_left .c-container, #content_left",
@@ -3275,6 +3986,15 @@ class BrowserAgent:
                 return {
                     "success": False,
                     "message": f"navigation landed on blocked page: {page_title or current_url}",
+                    "url": current_url,
+                    "expected_url": expected_url,
+                    "title": page_title,
+                    "steps": steps,
+                }
+            if expected_url and current_url and not self._urls_look_related(expected_url, current_url) and (start_url or self._extract_url_from_task(task)):
+                return {
+                    "success": False,
+                    "message": f"navigation landed on unexpected page: expected {expected_url}, got {current_url}",
                     "url": current_url,
                     "expected_url": expected_url,
                     "title": page_title,

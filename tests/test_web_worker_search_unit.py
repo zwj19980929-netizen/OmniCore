@@ -12,9 +12,66 @@ def test_decode_bing_redirect_url_with_base64_payload():
     assert decoded == target
 
 
+def test_snapshot_cards_to_search_cards_prefers_target_url_for_intermediary_links():
+    worker = WebWorker()
+
+    cards = worker._snapshot_cards_to_search_cards(
+        {
+            "cards": [
+                {
+                    "title": "合肥天气",
+                    "link": "https://www.baidu.com/link?url=opaque-token",
+                    "target_url": "https://weather.example.com/hefei",
+                    "snippet": "今天晴，12℃",
+                    "target_ref": "el_1",
+                }
+            ]
+        }
+    )
+
+    assert cards == [
+        {
+            "title": "合肥天气",
+            "link": "https://weather.example.com/hefei",
+            "raw_link": "https://www.baidu.com/link?url=opaque-token",
+            "target_url": "https://weather.example.com/hefei",
+            "source": "",
+            "date": "",
+            "snippet": "今天晴，12℃",
+            "target_ref": "el_1",
+            "target_selector": "",
+        }
+    ]
+
+
 def test_search_engine_domain_filter():
     assert WebWorker._is_search_engine_domain("https://www.bing.com/search?q=test") is True
     assert WebWorker._is_search_engine_domain("https://www.reuters.com/world/") is False
+
+
+def test_format_semantic_snapshot_for_llm_includes_main_text_blocks_and_stage():
+    worker = WebWorker()
+
+    text = worker._format_semantic_snapshot_for_llm(
+        {
+            "page_type": "detail",
+            "page_stage": "extracting",
+            "url": "https://example.com/article",
+            "title": "Example Article",
+            "main_text": "This is the main article text.",
+            "visible_text_blocks": [
+                {"kind": "p", "text": "First paragraph", "selector": "article p:first-child"},
+                {"kind": "li", "text": "Key bullet", "selector": "article li"},
+            ],
+            "blocked_signals": ["body:captcha"],
+        }
+    )
+
+    assert "页面阶段: extracting" in text
+    assert "主体文本: This is the main article text." in text
+    assert "可见文本块:" in text
+    assert "First paragraph" in text
+    assert "阻塞信号: body:captcha" in text
 
 
 class _PlannerLLM:
@@ -118,6 +175,49 @@ def test_plan_search_queries_uses_llm_planned_short_queries():
     )
 
     assert queries == ["US Iran strikes Reuters", "site:bbc.com US Iran conflict"]
+
+
+def test_plan_search_queries_dedupes_near_duplicate_queries():
+    worker = WebWorker(
+        llm_client=_PlannerLLM(
+            {
+                "queries": [
+                    "合肥 今天 天气",
+                    "合肥 天气预报 今天",
+                    "合肥 今日 天气",
+                ]
+            }
+        )
+    )
+
+    queries = worker.plan_search_queries(
+        "帮我查一下合肥今天天气",
+        base_query="合肥 今天 天气",
+    )
+
+    assert queries == ["合肥 今天 天气"]
+
+
+def test_plan_search_queries_limits_detail_style_tasks_to_single_query():
+    worker = WebWorker(
+        llm_client=_PlannerLLM(
+            {
+                "queries": [
+                    "合肥 天气",
+                    "合肥 今天 天气 预报",
+                    "合肥 今日 天气",
+                ]
+            }
+        )
+    )
+
+    queries = worker.plan_search_queries(
+        "帮我查一下合肥今天天气详情",
+        base_query="合肥 今天 天气",
+        max_queries=4,
+    )
+
+    assert queries == ["合肥 天气"]
 
 
 def test_extract_table_links_fallback_filters_header_rows_for_vulnerability_lists():
@@ -287,11 +387,11 @@ def test_search_for_result_cards_falls_back_when_bing_is_blank(monkeypatch):
 
         async def evaluate_js(self, _script, arg=None):
             if isinstance(arg, str):
-                if "bing.com" in self.current_url:
+                if "google.com" in self.current_url:
                     return type("Result", (), {"success": True, "data": {"matches": 1, "textLength": 1200}})()
                 return type("Result", (), {"success": True, "data": {"matches": 0, "textLength": 30}})()
 
-            if "bing.com" in self.current_url:
+            if "google.com" in self.current_url:
                 return type(
                     "Result",
                     (),
@@ -397,10 +497,75 @@ def test_semantic_search_results_can_return_cards_when_snippets_are_sufficient()
     )
 
     assert result["handled"] is True
+    assert result["navigated"] is True
+    assert toolkit.clicked_ref == "el_2"
+
+
+def test_semantic_search_results_do_not_short_circuit_detail_tasks_even_when_serp_is_marked_sufficient():
+    worker = WebWorker(llm_client=_PlannerLLM({"selected_indexes": [1], "serp_sufficient": True}))
+    worker.validate_data_quality = lambda *_args, **_kwargs: {"valid": True}
+    toolkit = _SemanticSnapshotToolkit(
+        {
+            "page_type": "serp",
+            "cards": [
+                {
+                    "title": "合肥天气详情",
+                    "link": "https://weather.example.com/hefei",
+                    "source": "Example Weather",
+                    "snippet": "今天小雨，6~11°C，东北风3级。",
+                    "target_ref": "el_weather",
+                    "target_selector": "a.weather",
+                }
+            ],
+            "elements": [],
+        },
+        url="https://www.baidu.com/s?wd=%E5%90%88%E8%82%A5%E5%A4%A9%E6%B0%94",
+    )
+
+    result = asyncio.run(
+        worker._maybe_handle_semantic_search_results(
+            toolkit,
+            "帮我查一下合肥今天天气详情",
+            limit=1,
+        )
+    )
+
+    assert result["handled"] is True
+    assert result["navigated"] is True
+    assert toolkit.clicked_ref == "el_weather"
+
+
+def test_semantic_search_results_can_return_cards_for_list_tasks_when_snippets_are_sufficient():
+    worker = WebWorker(llm_client=_PlannerLLM({"selected_indexes": [1], "serp_sufficient": True}))
+    worker.validate_data_quality = lambda *_args, **_kwargs: {"valid": True}
+    toolkit = _SemanticSnapshotToolkit(
+        {
+            "page_type": "serp",
+            "cards": [
+                {
+                    "title": "Reuters: Public appearances indicate Khamenei is alive",
+                    "link": "https://www.reuters.com/world/middle-east/khamenei-update",
+                    "source": "Reuters",
+                    "snippet": "Recent public appearances indicate the reports are false.",
+                    "target_ref": "el_2",
+                    "target_selector": "a.result",
+                }
+            ],
+            "elements": [],
+        }
+    )
+
+    result = asyncio.run(
+        worker._maybe_handle_semantic_search_results(
+            toolkit,
+            "列出最近相关报道的标题和链接",
+            limit=1,
+        )
+    )
+
+    assert result["handled"] is True
     assert result["return_data"] is True
     assert result["data"][0]["link"] == "https://www.reuters.com/world/middle-east/khamenei-update"
-    assert result["data"][0]["url"] == "https://www.reuters.com/world/middle-east/khamenei-update"
-    assert result["data"][0]["summary"] == "Recent public appearances indicate the reports are false."
 
 
 def test_analyze_page_structure_includes_semantic_snapshot_context():
@@ -571,6 +736,188 @@ def test_search_for_result_cards_skips_engine_when_not_on_results_page():
     )
 
     assert cards == []
+
+
+def test_wait_for_search_results_ready_accepts_semantic_snapshot_results():
+    class _Toolkit:
+        async def wait_for_load(self, *_args, **_kwargs):
+            return type("Result", (), {"success": True})()
+
+        async def get_current_url(self):
+            return type("Result", (), {"success": True, "data": "https://www.baidu.com/s?wd=%E5%90%88%E8%82%A5%E5%A4%A9%E6%B0%94"})()
+
+        async def get_title(self):
+            return type("Result", (), {"success": True, "data": "合肥天气_百度搜索"})()
+
+        async def evaluate_js(self, _script, _arg=None):
+            return type(
+                "Result",
+                (),
+                {
+                    "success": True,
+                    "data": {
+                        "matches": 0,
+                        "textLength": 640,
+                        "bodyText": "合肥天气 今天晴 12℃ 北风 3级",
+                    },
+                },
+            )()
+
+        async def semantic_snapshot(self, *_args, **_kwargs):
+            return type(
+                "Result",
+                (),
+                {
+                    "success": True,
+                    "data": {
+                        "page_type": "serp",
+                        "cards": [
+                            {
+                                "title": "合肥天气",
+                                "link": "https://www.baidu.com/link?url=opaque-token",
+                                "target_url": "https://weather.example.com/hefei",
+                            }
+                        ],
+                        "affordances": {
+                            "has_results": True,
+                            "collection_item_count": 1,
+                        },
+                    },
+                },
+            )()
+
+        async def human_delay(self, *_args, **_kwargs):
+            return None
+
+        async def get_page_html(self):
+            return type("Result", (), {"success": True, "data": "<html></html>"})()
+
+    worker = WebWorker()
+
+    ready = asyncio.run(
+        worker._wait_for_search_results_ready(
+            _Toolkit(),
+            "https://www.baidu.com/s?wd=%E5%90%88%E8%82%A5%E5%A4%A9%E6%B0%94",
+        )
+    )
+
+    assert ready is True
+
+
+def test_search_for_result_cards_prefers_semantic_snapshot_for_baidu_results(monkeypatch):
+    class _SearchResponse:
+        def __init__(self, success=False, results=None, error=""):
+            self.success = success
+            self.results = results or []
+            self.error = error
+
+    class _FakeToolkit:
+        def __init__(self):
+            self.current_url = ""
+
+        async def create_page(self):
+            return None
+
+        async def goto(self, url):
+            self.current_url = url
+            return type("Result", (), {"success": True})()
+
+        async def human_delay(self, *_args, **_kwargs):
+            return None
+
+        async def wait_for_load(self, *_args, **_kwargs):
+            return type("Result", (), {"success": True})()
+
+        async def element_exists(self, *_args, **_kwargs):
+            return type("Result", (), {"success": True, "data": True})()
+
+        async def type_text(self, *_args, **_kwargs):
+            return type("Result", (), {"success": True})()
+
+        async def press_key(self, *_args, **_kwargs):
+            return type("Result", (), {"success": True})()
+
+        async def get_current_url(self):
+            return type("Result", (), {"success": True, "data": self.current_url})()
+
+        async def get_title(self):
+            title = "合肥天气_百度搜索" if "baidu.com" in self.current_url else "Search"
+            return type("Result", (), {"success": True, "data": title})()
+
+        async def evaluate_js(self, _script, arg=None):
+            if isinstance(arg, str):
+                if "baidu.com" in self.current_url:
+                    return type(
+                        "Result",
+                        (),
+                        {"success": True, "data": {"matches": 0, "textLength": 640, "bodyText": "合肥天气 今天晴 12℃"}},
+                    )()
+                return type(
+                    "Result",
+                    (),
+                    {"success": True, "data": {"matches": 0, "textLength": 24, "bodyText": "homepage"}},
+                )()
+            return type("Result", (), {"success": True, "data": []})()
+
+        async def semantic_snapshot(self, *_args, **_kwargs):
+            if "baidu.com" in self.current_url:
+                return type(
+                    "Result",
+                    (),
+                    {
+                        "success": True,
+                        "data": {
+                            "page_type": "serp",
+                            "cards": [
+                                {
+                                    "title": "合肥天气",
+                                    "link": "https://www.baidu.com/link?url=opaque-token",
+                                    "target_url": "https://weather.example.com/hefei",
+                                    "source": "天气网",
+                                    "snippet": "今天晴，12℃",
+                                    "target_ref": "el_weather",
+                                }
+                            ],
+                            "affordances": {"has_results": True, "collection_item_count": 1},
+                        },
+                    },
+                )()
+            return type(
+                "Result",
+                (),
+                {"success": True, "data": {"page_type": "unknown", "cards": [], "affordances": {}}},
+            )()
+
+        async def get_page_html(self):
+            return type("Result", (), {"success": True, "data": "<html></html>"})()
+
+        async def close(self):
+            return None
+
+    worker = WebWorker(llm_client=_PlannerLLM({"selected_indexes": [1], "serp_sufficient": False}))
+    worker._create_toolkit = lambda headless=True: _FakeToolkit()
+
+    async def _fake_search(*_args, **_kwargs):
+        return _SearchResponse(success=False, error="disabled")
+
+    worker.search_engine_manager.search = _fake_search
+
+    cards = asyncio.run(
+        worker.search_for_result_cards(
+            "合肥今天 天气",
+            task_description="帮我查一下合肥今天的天气",
+            max_results=1,
+            headless=False,
+        )
+    )
+
+    assert len(cards) == 1
+    assert cards[0]["title"] == "合肥天气"
+    assert cards[0]["url"] == "https://weather.example.com/hefei"
+    assert cards[0]["link"] == "https://weather.example.com/hefei"
+    assert cards[0]["summary"] == "今天晴，12℃"
+    assert cards[0]["source"] == "天气网"
+    assert cards[0]["target_ref"] == "el_weather"
 
 
 def test_direct_url_strategy_does_not_fake_google_success_for_unknown_queries():

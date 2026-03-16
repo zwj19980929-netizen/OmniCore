@@ -1216,11 +1216,36 @@ class BrowserToolkit:
                   const nodeToPayload = new Map(entries.map((entry) => [entry.node, entry.payload]));
                   const nodeToRef = new Map(entries.map((entry) => [entry.node, entry.payload.ref]));
 
+                  const looksLikeSearchResultsUrl = () => {
+                    const path = (location.pathname || '').toLowerCase();
+                    const params = new URLSearchParams(location.search || '');
+                    const hasAny = (...keys) => keys.some((key) => params.has(key));
+                    if (currentHost === 'bing.com' || currentHost.endsWith('.bing.com')) {
+                      return path.includes('/search') && hasAny('q');
+                    }
+                    if (currentHost === 'google.com' || currentHost.endsWith('.google.com')) {
+                      return path.includes('/search') && hasAny('q');
+                    }
+                    if (currentHost === 'baidu.com' || currentHost.endsWith('.baidu.com')) {
+                      return (path === '/s' || path.startsWith('/s')) && (
+                        hasAny('wd', 'word') ||
+                        !!document.querySelector('#content_left .result, #content_left .c-container, #content_left .result-op')
+                      );
+                    }
+                    if (currentHost === 'duckduckgo.com' || currentHost.endsWith('.duckduckgo.com')) {
+                      return (path === '/' || path.startsWith('/html') || path.startsWith('/lite')) && hasAny('q');
+                    }
+                    return (
+                      (path.includes('/search') && hasAny('q', 'query')) ||
+                      !!document.querySelector('#b_results .b_algo, #search .g, #content_left .result, .results .result')
+                    );
+                  };
+
                   const inferPageType = () => {
                     if (document.querySelector('dialog[open], [role="dialog"], [aria-modal="true"], .modal.show, .dialog')) {
                       return 'modal';
                     }
-                    if (isSearchHost) return 'serp';
+                    if (isSearchHost && looksLikeSearchResultsUrl()) return 'serp';
                     if (document.querySelector('input[type="password"]')) return 'login';
                     const forms = document.querySelectorAll('form');
                     if (forms.length && document.querySelectorAll('input, textarea, select').length >= 2) return 'form';
@@ -1234,11 +1259,11 @@ class BrowserToolkit:
                   const cards = [];
                   if (includeCards && isSearchHost) {
                     const selectorMap = {
-                      'bing.com': ['li.b_algo', '.b_news li', '.b_ans'],
-                      'google.com': ['div.g', '.tF2Cxc', '[data-sokoban-container]'],
-                      'baidu.com': ['.result', '.c-container', '.result-op'],
-                      'duckduckgo.com': ['[data-testid="result"]', '.result'],
-                      'sogou.com': ['.vrwrap', '.rb', '.results .fb'],
+                      'bing.com': ['#b_results li.b_algo', '#b_results li.b_ans', '#b_results .b_algo', '.b_algo'],
+                      'google.com': ['#search .tF2Cxc', '#search .g', '#search .MjjYud', '[data-sokoban-container]'],
+                      'baidu.com': ['#content_left .result', '#content_left .c-container', '#content_left .result-op', '#content_left .xpath-log'],
+                      'duckduckgo.com': ['.results .result', '.result', '.result__body', '[data-testid="result"]'],
+                      'sogou.com': ['.results .vrwrap', '.results .rb', '.results .fb', '.vrwrap', '.rb'],
                     };
                     let selectors = ['main a[href]'];
                     for (const [host, values] of Object.entries(selectorMap)) {
@@ -1250,18 +1275,121 @@ class BrowserToolkit:
 
                     const seen = new Set();
                     let rank = 0;
-                    const buildCard = (container, anchor) => {
-                      if (!container || !anchor || !isVisible(container) || !isVisible(anchor)) return false;
-                      const href = anchor.href || anchor.getAttribute('href') || '';
-                      if (!href || /^javascript:/i.test(href)) return false;
-
-                      let host = '';
+                    const toAbsoluteUrl = (value) => {
+                      const text = normalize(value);
+                      if (!text || /^javascript:/i.test(text)) return '';
                       try {
-                        host = cleanHost(new URL(href, location.href).hostname);
+                        return new URL(text, location.href).toString();
+                      } catch (_error) {
+                        return '';
+                      }
+                    };
+                    const hostOf = (value) => {
+                      try {
+                        return cleanHost(new URL(value, location.href).hostname);
+                      } catch (_error) {
+                        return '';
+                      }
+                    };
+                    const isSearchIntermediaryUrl = (value) => {
+                      const href = toAbsoluteUrl(value);
+                      if (!href) return false;
+                      try {
+                        const parsed = new URL(href, location.href);
+                        const host = cleanHost(parsed.hostname);
+                        if (!host || host !== currentHost) return false;
+                        const path = (parsed.pathname || '').toLowerCase();
+                        const params = new Set(Array.from(parsed.searchParams.keys()).map((key) => String(key || '').trim().toLowerCase()));
+                        if (path === '/s' && (params.has('wd') || params.has('word'))) return true;
+                        if (path.startsWith('/link') || path.startsWith('/url') || path.startsWith('/ck/a')) return true;
+                        return path.includes('/search') && (params.has('q') || params.has('query') || params.has('wd') || params.has('word'));
                       } catch (_error) {
                         return false;
                       }
-                      if (!host || host === currentHost) return false;
+                    };
+                    const parseDataLog = (value) => {
+                      const text = normalize(value);
+                      if (!text) return '';
+                      try {
+                        const parsed = JSON.parse(text);
+                        return normalize(
+                          parsed.mu ||
+                          parsed.url ||
+                          parsed.target ||
+                          parsed.lmu ||
+                          parsed.land_url ||
+                          (parsed.data && (parsed.data.mu || parsed.data.url || parsed.data.target)) ||
+                          ''
+                        );
+                      } catch (_error) {
+                        return '';
+                      }
+                    };
+                    const decodeParamValue = (value) => {
+                      let text = normalize(value);
+                      if (!text) return '';
+                      for (let i = 0; i < 2; i += 1) {
+                        try {
+                          const decoded = decodeURIComponent(text);
+                          if (decoded === text) break;
+                          text = decoded;
+                        } catch (_error) {
+                          break;
+                        }
+                      }
+                      return /^https?:/i.test(text) ? text : '';
+                    };
+                    const extractRedirectTarget = (value) => {
+                      const href = toAbsoluteUrl(value);
+                      if (!href) return '';
+                      try {
+                        const parsed = new URL(href, location.href);
+                        const candidates = ['uddg', 'u', 'url', 'q', 'target', 'redirect', 'imgurl']
+                          .flatMap((key) => parsed.searchParams.getAll(key))
+                          .map((candidate) => decodeParamValue(candidate))
+                          .filter(Boolean);
+                        return candidates[0] || '';
+                      } catch (_error) {
+                        return '';
+                      }
+                    };
+                    const resolveSearchResultUrl = (container, anchor) => {
+                      const rawHref = toAbsoluteUrl(anchor?.href || anchor?.getAttribute('href') || '');
+                      const candidates = [
+                        extractRedirectTarget(rawHref),
+                        anchor?.getAttribute('mu'),
+                        anchor?.getAttribute('data-landurl'),
+                        anchor?.getAttribute('data-url'),
+                        anchor?.getAttribute('data-target'),
+                        container?.getAttribute('mu'),
+                        container?.getAttribute('data-landurl'),
+                        container?.getAttribute('data-url'),
+                        container?.getAttribute('data-target'),
+                        parseDataLog(anchor?.getAttribute('data-log') || ''),
+                        parseDataLog(container?.getAttribute('data-log') || ''),
+                      ]
+                        .map((value) => toAbsoluteUrl(value))
+                        .filter(Boolean);
+                      const external = candidates.find((value) => {
+                        const candidateHost = hostOf(value);
+                        return candidateHost && candidateHost !== currentHost;
+                      }) || '';
+                      return {
+                        rawHref,
+                        targetUrl: external || candidates[0] || '',
+                        link: external || candidates[0] || rawHref,
+                      };
+                    };
+                    const buildCard = (container, anchor) => {
+                      if (!container || !anchor || !isVisible(container) || !isVisible(anchor)) return false;
+                      const resolvedLink = resolveSearchResultUrl(container, anchor);
+                      const href = resolvedLink.link;
+                      const rawHref = resolvedLink.rawHref || href;
+                      if (!href || /^javascript:/i.test(href)) return false;
+
+                      const host = hostOf(href);
+                      if (!host) return false;
+                      if (host === currentHost && !resolvedLink.targetUrl && !isSearchIntermediaryUrl(rawHref)) return false;
 
                       const titleNode = container.querySelector('h1, h2, h3') || anchor;
                       const title = normalize(
@@ -1286,7 +1414,7 @@ class BrowserToolkit:
                       }
                       const source = normalize(sourceNode?.innerText || sourceNode?.textContent || '');
                       const date = normalize(dateNode?.innerText || dateNode?.textContent || '');
-                      const key = `${title}|${href}`;
+                      const key = `${title}|${resolvedLink.targetUrl || href}`;
                       if (seen.has(key)) return false;
                       seen.add(key);
 
@@ -1310,6 +1438,8 @@ class BrowserToolkit:
                         date: date.slice(0, 80),
                         host,
                         link: href,
+                        raw_link: rawHref,
+                        target_url: resolvedLink.targetUrl,
                         rank,
                         target_ref: targetPayload ? targetPayload.ref : '',
                         target_selector: selectorOf(anchor),
@@ -1348,14 +1478,10 @@ class BrowserToolkit:
                             ''
                           );
                           if (candidateText.length < 3) return false;
-                          const href = candidate.href || candidate.getAttribute('href') || '';
-                          if (!href || /^javascript:/i.test(href)) return false;
-                          try {
-                            const host = cleanHost(new URL(href, location.href).hostname);
-                            return !!host && host !== currentHost;
-                          } catch (_error) {
-                            return false;
-                          }
+                          const resolvedLink = resolveSearchResultUrl(container, candidate);
+                          if (!resolvedLink.link) return false;
+                          const host = hostOf(resolvedLink.link);
+                          return !!host;
                         });
                         if (buildCard(container, anchor) && cards.length >= 10) break;
                       }
@@ -1625,10 +1751,83 @@ class BrowserToolkit:
                   registerControl('modal_secondary', modalSecondaryElement, 'dialog button');
                   registerControl('modal_close', modalCloseElement, 'dialog button');
 
+                  const pageType = inferPageType();
+                  const collectionItemCount = collections.reduce(
+                    (max, item) => Math.max(max, Number(item.item_count || 0)),
+                    cards.length
+                  );
+                  const hasResults = cards.length > 0 || collectionItemCount > 0;
+                  const contentRoot = document.querySelector('main, article, [role="main"]') || document.body;
+                  const mainText = normalize(
+                    contentRoot
+                      ? (
+                        contentRoot.innerText ||
+                        contentRoot.textContent ||
+                        document.body?.innerText ||
+                        document.body?.textContent ||
+                        ''
+                      )
+                      : (document.body?.innerText || document.body?.textContent || '')
+                  ).slice(0, 4000);
+
+                  const visibleTextBlocks = [];
+                  const seenBlockTexts = new Set();
+                  const blockNodes = Array.from(
+                    (contentRoot || document.body).querySelectorAll(
+                      'h1, h2, h3, p, li, article, section, table tbody tr, tbody tr, dd, dt, figcaption'
+                    )
+                  );
+                  for (const node of blockNodes) {
+                    if (!isVisible(node)) continue;
+                    const text = normalize(node.innerText || node.textContent || '');
+                    if (!text) continue;
+                    if (text.length < (isSearchHost ? 6 : 16)) continue;
+                    if (seenBlockTexts.has(text)) continue;
+                    seenBlockTexts.add(text);
+                    visibleTextBlocks.push({
+                      kind: node.tagName.toLowerCase(),
+                      text: text.slice(0, 240),
+                      selector: selectorOf(node),
+                      parent_ref: nodeToRef.get(node.closest('[data-testid], [id], article, section, main, li, tr')) || '',
+                    });
+                    if (visibleTextBlocks.length >= 12) break;
+                  }
+
+                  const blockedSignals = [];
+                  const urlText = `${location.pathname || ''} ${location.search || ''}`.toLowerCase();
+                  const titleText = normalize(document.title || '');
+                  const bodyText = normalize(document.body?.innerText || document.body?.textContent || '');
+                  const blockedChecks = [
+                    ['url', /\/(sorry|captcha|verify|challenge|blocked|forbidden)/i, urlText],
+                    ['title', /(unusual traffic|robot check|captcha|forbidden|access denied|blocked|人机身份验证|异常流量|验证码|安全验证|访问受限)/i, titleText],
+                    ['body', /(unusual traffic|robot check|captcha|forbidden|access denied|blocked|人机身份验证|异常流量|验证码|安全验证|访问受限)/i, bodyText],
+                  ];
+                  for (const [kind, pattern, source] of blockedChecks) {
+                    const match = String(source || '').match(pattern);
+                    if (match && match[0]) {
+                      blockedSignals.push(`${kind}:${String(match[0]).slice(0, 60)}`);
+                    }
+                  }
+
+                  const inferPageStage = () => {
+                    if (blockedSignals.length) return 'blocked';
+                    if (modalRoot) return 'dismiss_modal';
+                    if (pageType === 'serp') return hasResults ? 'selecting_source' : 'searching';
+                    if (pageType === 'list') return hasResults ? 'extracting' : 'loading';
+                    if (pageType === 'detail') return mainText.length >= 120 ? 'extracting' : 'loading';
+                    if (pageType === 'form' || pageType === 'login') return 'interacting';
+                    if (hasResults || mainText.length >= 120) return 'extracting';
+                    return 'unknown';
+                  };
+
                   return {
                     url: location.href,
                     title: document.title || '',
-                    page_type: inferPageType(),
+                    page_type: pageType,
+                    page_stage: inferPageStage(),
+                    main_text: mainText,
+                    visible_text_blocks: visibleTextBlocks,
+                    blocked_signals: blockedSignals,
                     regions,
                     elements: entries.map((entry) => entry.payload),
                     cards,
@@ -1652,8 +1851,8 @@ class BrowserToolkit:
                       modal_close_ref: modalCloseElement ? (nodeToRef.get(modalCloseElement) || 'ctl_modal_close') : '',
                       modal_close_selector: modalCloseElement ? (nodeToPayload.get(modalCloseElement)?.selector || selectorOf(modalCloseElement)) : '',
                       has_login_form: !!document.querySelector('input[type="password"]'),
-                      has_results: cards.length > 0,
-                      collection_item_count: collections.reduce((max, item) => Math.max(max, Number(item.item_count || 0)), cards.length),
+                      has_results: hasResults,
+                      collection_item_count: collectionItemCount,
                     },
                   };
                 }

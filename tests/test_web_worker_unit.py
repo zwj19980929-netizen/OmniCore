@@ -691,6 +691,7 @@ def test_fallback_search_queries_trust_explicit_base_query_for_weather_tasks():
 def test_smart_scrape_prefers_search_candidates_over_section_urls(monkeypatch):
     worker = WebWorker()
     attempted_urls = []
+    closed = {"value": False}
 
     async def _fake_determine_target_url(_task_description):
         return {
@@ -727,14 +728,268 @@ def test_smart_scrape_prefers_search_candidates_over_section_urls(monkeypatch):
             }
         return {"success": False, "error": "section page", "data": [], "url": url}
 
+    class _FakeToolkit:
+        page = None
+
+        async def create_page(self):
+            return None
+
+        async def close(self):
+            closed["value"] = True
+
     monkeypatch.setattr(worker, "determine_target_url", _fake_determine_target_url)
     monkeypatch.setattr(worker, "gather_search_candidates", _fake_gather_search_candidates)
     monkeypatch.setattr(worker, "_static_fetch", _fake_static_fetch)
+    monkeypatch.setattr(worker, "_create_toolkit", lambda **_kwargs: _FakeToolkit())
+    monkeypatch.setattr(worker, "validate_data_quality", lambda *_args, **_kwargs: {"valid": True})
 
     result = asyncio.run(worker.smart_scrape("", "核实近期美国与伊朗之间军事行动", limit=3))
 
     assert result["success"] is True
     assert attempted_urls[0] == "https://www.reuters.com/world/article-123"
+    assert closed["value"] is True
+
+
+def test_smart_scrape_reuses_search_page_and_opens_target_in_new_tab(monkeypatch):
+    worker = WebWorker()
+    opened_tabs = []
+    visited_urls = []
+    closed = {"value": False}
+
+    async def _fake_determine_target_url(_task_description):
+        return {
+            "url": "",
+            "backup_urls": [],
+            "need_search": True,
+            "search_query": "hefei weather today",
+        }
+
+    async def _fake_gather_search_candidates(*_args, **_kwargs):
+        return {
+            "queries": ["hefei weather today"],
+            "cards": [
+                {
+                    "title": "Hefei Weather",
+                    "link": "https://weather.example.com/hefei",
+                    "source": "Example Weather",
+                    "snippet": "Today cloudy",
+                }
+            ],
+            "urls": ["https://weather.example.com/hefei"],
+            "serp_sufficient": False,
+        }
+
+    class _FakeToolkit:
+        page = None
+
+        @staticmethod
+        def _result(success=True, data=None, error=""):
+            return type("Result", (), {"success": success, "data": data, "error": error})()
+
+        def __init__(self):
+            self.current_url = "https://www.baidu.com/s?wd=hefei+weather+today"
+
+        async def create_page(self):
+            return None
+
+        async def get_current_url(self):
+            return self._result(True, self.current_url)
+
+        async def new_tab(self, url=""):
+            opened_tabs.append(url)
+            self.current_url = url
+            return self._result(True, url)
+
+        async def wait_for_load(self, *_args, **_kwargs):
+            return self._result(True)
+
+        async def human_delay(self, *_args, **_kwargs):
+            return None
+
+        async def goto(self, url, **_kwargs):
+            visited_urls.append(url)
+            self.current_url = url
+            return self._result(True, url)
+
+        async def wait_for_selector(self, *_args, **_kwargs):
+            return self._result(True)
+
+        async def detect_captcha(self):
+            return self._result(True, {"has_captcha": False})
+
+        async def scroll_down(self, *_args, **_kwargs):
+            return self._result(True)
+
+        async def semantic_snapshot(self, *_args, **_kwargs):
+            return self._result(True, {"page_type": "detail", "cards": [], "collections": []})
+
+        async def close(self):
+            closed["value"] = True
+
+    async def _fake_analyze_page_structure(_tk, _task_description):
+        return {"item_selector": "li.weather", "fields": {"text": "text()"}}
+
+    async def _fake_extract_data(_tk, _config, _limit):
+        return [
+            {"text": "Today cloudy 18C"},
+            {"text": "Humidity 60%"},
+            {"text": "Wind 3 level"},
+        ]
+
+    monkeypatch.setattr(worker, "determine_target_url", _fake_determine_target_url)
+    monkeypatch.setattr(worker, "gather_search_candidates", _fake_gather_search_candidates)
+    monkeypatch.setattr(worker, "_can_use_static_fetch", lambda *_args, **_kwargs: False)
+    monkeypatch.setattr(worker, "_create_toolkit", lambda **_kwargs: _FakeToolkit())
+    monkeypatch.setattr(worker, "analyze_page_structure", _fake_analyze_page_structure)
+    monkeypatch.setattr(worker, "extract_data_with_selectors", _fake_extract_data)
+    monkeypatch.setattr(worker, "validate_data_quality", lambda *_args, **_kwargs: {"valid": True})
+
+    result = asyncio.run(worker.smart_scrape("", "帮我查一下合肥今天天气", limit=3))
+
+    assert result["success"] is True
+    assert opened_tabs == ["https://weather.example.com/hefei"]
+    assert visited_urls == []
+    assert closed["value"] is True
+
+
+def test_smart_scrape_retries_next_search_candidate_from_same_search_page(monkeypatch):
+    worker = WebWorker()
+    opened_tabs = []
+    closed_tabs = {"count": 0}
+    closed = {"value": False}
+    gather_calls = {"count": 0}
+
+    async def _fake_determine_target_url(_task_description):
+        return {
+            "url": "",
+            "backup_urls": [],
+            "need_search": True,
+            "search_query": "hefei weather today",
+        }
+
+    async def _fake_gather_search_candidates(*_args, **_kwargs):
+        gather_calls["count"] += 1
+        return {
+            "queries": ["hefei weather today"],
+            "cards": [
+                {
+                    "title": "Bad Weather Page",
+                    "link": "https://weather.example.com/bad",
+                    "source": "Example Weather",
+                    "snippet": "Incomplete page",
+                },
+                {
+                    "title": "Good Weather Page",
+                    "link": "https://weather.example.com/good",
+                    "source": "Example Weather",
+                    "snippet": "Today cloudy",
+                },
+            ],
+            "urls": [
+                "https://weather.example.com/bad",
+                "https://weather.example.com/good",
+            ],
+            "serp_sufficient": False,
+        }
+
+    class _FakeToolkit:
+        page = None
+
+        @staticmethod
+        def _result(success=True, data=None, error=""):
+            return type("Result", (), {"success": success, "data": data, "error": error})()
+
+        def __init__(self):
+            self.search_url = "https://www.baidu.com/s?wd=hefei+weather+today"
+            self.current_url = self.search_url
+
+        async def create_page(self):
+            return None
+
+        async def get_current_url(self):
+            return self._result(True, self.current_url)
+
+        async def new_tab(self, url=""):
+            opened_tabs.append(url)
+            self.current_url = url
+            return self._result(True, url)
+
+        async def close_tab(self):
+            closed_tabs["count"] += 1
+            self.current_url = self.search_url
+            return self._result(True)
+
+        async def wait_for_load(self, *_args, **_kwargs):
+            return self._result(True)
+
+        async def human_delay(self, *_args, **_kwargs):
+            return None
+
+        async def goto(self, url, **_kwargs):
+            self.current_url = url
+            return self._result(True, url)
+
+        async def wait_for_selector(self, *_args, **_kwargs):
+            return self._result(True)
+
+        async def detect_captcha(self):
+            return self._result(True, {"has_captcha": False})
+
+        async def scroll_down(self, *_args, **_kwargs):
+            return self._result(True)
+
+        async def semantic_snapshot(self, *_args, **_kwargs):
+            page_type = "serp" if "baidu.com/s?" in self.current_url else "detail"
+            return self._result(True, {"page_type": page_type, "cards": [], "collections": []})
+
+        async def query_all(self, *_args, **_kwargs):
+            return self._result(True, [])
+
+        async def close(self):
+            closed["value"] = True
+
+    async def _fake_analyze_page_structure(_tk, _task_description):
+        return {"item_selector": "li.weather", "fields": {"text": "text()"}}
+
+    async def _fake_extract_data(tk, _config, _limit):
+        if str(getattr(tk, "current_url", "")).endswith("/good"):
+            return [
+                {"text": "Today cloudy 18C"},
+                {"text": "Humidity 60%"},
+                {"text": "Wind 3 level"},
+            ]
+        return []
+
+    async def _empty_async(*_args, **_kwargs):
+        return []
+
+    async def _no_navigation(*_args, **_kwargs):
+        return None
+
+    monkeypatch.setattr(worker, "determine_target_url", _fake_determine_target_url)
+    monkeypatch.setattr(worker, "gather_search_candidates", _fake_gather_search_candidates)
+    monkeypatch.setattr(worker, "_can_use_static_fetch", lambda *_args, **_kwargs: False)
+    monkeypatch.setattr(worker, "_create_toolkit", lambda **_kwargs: _FakeToolkit())
+    monkeypatch.setattr(worker, "analyze_page_structure", _fake_analyze_page_structure)
+    monkeypatch.setattr(worker, "extract_data_with_selectors", _fake_extract_data)
+    monkeypatch.setattr(worker, "extract_detail_text_blocks", _empty_async)
+    monkeypatch.setattr(worker, "extract_weather_text_blocks", _empty_async)
+    monkeypatch.setattr(worker, "extract_news_links_fallback", _empty_async)
+    monkeypatch.setattr(worker, "extract_table_links_fallback", _empty_async)
+    monkeypatch.setattr(worker, "explore_for_data_page", _no_navigation)
+    monkeypatch.setattr(worker, "validate_data_quality", lambda data, *_args, **_kwargs: {"valid": bool(data)})
+
+    result = asyncio.run(worker.smart_scrape("", "帮我查一下合肥今天天气", limit=3))
+
+    assert result["success"] is True
+    assert result["source"] == "https://weather.example.com/good"
+    assert opened_tabs == [
+        "https://weather.example.com/bad",
+        "https://weather.example.com/good",
+    ]
+    assert closed_tabs["count"] == 1
+    assert gather_calls["count"] == 1
+    assert closed["value"] is True
 
 
 def test_smart_scrape_does_not_search_when_explicit_homepage_url_is_provided(monkeypatch):

@@ -218,9 +218,34 @@ class EnhancedWebWorker:
 
         lines = [
             f"页面类型: {self._normalize_text(snapshot.get('page_type', 'unknown')) or 'unknown'}",
+            f"页面阶段: {self._normalize_text(snapshot.get('page_stage', 'unknown')) or 'unknown'}",
             f"URL: {self._normalize_text(snapshot.get('url', ''))}",
             f"标题: {self._normalize_text(snapshot.get('title', ''))}",
         ]
+
+        blocked_signals = [
+            self._normalize_text(item)
+            for item in (snapshot.get("blocked_signals", []) or [])[:6]
+            if self._normalize_text(item)
+        ]
+        if blocked_signals:
+            lines.append("阻塞信号: " + " | ".join(blocked_signals))
+
+        main_text = self._normalize_text(snapshot.get("main_text", ""))
+        if main_text:
+            lines.append(f"主体文本: {main_text[:500]}")
+
+        visible_text_blocks = snapshot.get("visible_text_blocks", []) or []
+        if visible_text_blocks:
+            lines.append("可见文本块:")
+            for idx, block in enumerate(visible_text_blocks[:8], 1):
+                if not isinstance(block, dict):
+                    continue
+                lines.append(
+                    f"{idx}. kind={self._normalize_text(block.get('kind', ''))} "
+                    f"text={self._normalize_text(block.get('text', ''))[:140]} "
+                    f"selector={self._normalize_text(block.get('selector', ''))[:80]}"
+                )
 
         affordances = snapshot.get("affordances", {}) or {}
         if affordances:
@@ -330,9 +355,20 @@ class EnhancedWebWorker:
         try:
             understanding = self.llm.parse_json_response(response)
             understanding["success"] = True
+            understanding.setdefault(
+                "page_type",
+                self._normalize_text(semantic_snapshot.get("page_type", "")) or "unknown",
+            )
+            understanding.setdefault(
+                "page_stage",
+                self._normalize_text(semantic_snapshot.get("page_stage", "")) or "unknown",
+            )
             understanding["page_structure"] = page_structure
             understanding["semantic_snapshot"] = semantic_snapshot
             understanding["semantic_snapshot_text"] = semantic_snapshot_text
+            understanding["main_text"] = self._normalize_text(semantic_snapshot.get("main_text", ""))
+            understanding["visible_text_blocks"] = semantic_snapshot.get("visible_text_blocks", []) or []
+            understanding["blocked_signals"] = semantic_snapshot.get("blocked_signals", []) or []
             self._understanding_cache[cache_key] = understanding
             return understanding
         except Exception as exc:

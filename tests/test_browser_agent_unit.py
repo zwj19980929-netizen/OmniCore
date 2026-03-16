@@ -535,6 +535,115 @@ def test_infer_task_intent_fallback_uses_structured_pairs():
     assert "email" in intent.fields
 
 
+def test_infer_task_intent_recovers_auth_fields_from_free_text():
+    agent = BrowserAgent(llm_client=FailingIntentLLM(), headless=True)
+
+    intent = asyncio.run(
+        agent._infer_task_intent(
+            "http://localhost:8000/ui/user/login\u8fd9\u4e2a\u7ed9\u6211\u6d4b\u8bd5\u4e0b\u767b\u5f55\u529f\u80fd\uff0c"
+            "\u6d4b\u8bd5\u7528\u6237\u540d\u767b\u5f55\u3002\u767b\u5f55\u8d26\u53f7admin \u5bc6\u7801AiAgent#2025"
+        )
+    )
+
+    assert intent.intent_type == "auth"
+    assert intent.fields["username"] == "admin"
+    assert intent.fields["password"] == "AiAgent#2025"
+
+
+def test_build_form_mapping_prefers_password_input_for_password_field():
+    agent = BrowserAgent(headless=True)
+    elements = [
+        PageElement(
+            index=0,
+            tag="input",
+            text="",
+            element_type="text",
+            selector="#username",
+            attributes={"labelText": "Username", "name": "username", "type": "text"},
+            is_visible=True,
+            is_clickable=True,
+        ),
+        PageElement(
+            index=1,
+            tag="input",
+            text="",
+            element_type="password",
+            selector="#password",
+            attributes={"labelText": "Password", "name": "password", "type": "password"},
+            is_visible=True,
+            is_clickable=True,
+        ),
+    ]
+
+    mapping = agent._build_form_mapping_from_pairs(
+        {"username": "admin", "password": "AiAgent#2025"},
+        elements,
+    )
+
+    assert mapping == {"#username": "admin", "#password": "AiAgent#2025"}
+
+
+def test_local_decision_submits_login_after_fields_are_already_filled():
+    agent = BrowserAgent(headless=True)
+    elements = [
+        PageElement(
+            index=0,
+            tag="input",
+            text="",
+            element_type="text",
+            selector="#username",
+            attributes={"labelText": "Username", "name": "username", "type": "text", "value": "admin"},
+            is_visible=True,
+            is_clickable=True,
+        ),
+        PageElement(
+            index=1,
+            tag="input",
+            text="",
+            element_type="password",
+            selector="#password",
+            attributes={"labelText": "Password", "name": "password", "type": "password", "value": "AiAgent#2025"},
+            is_visible=True,
+            is_clickable=True,
+        ),
+        PageElement(
+            index=2,
+            tag="button",
+            text="Register",
+            element_type="button",
+            selector="#register",
+            attributes={"type": "button"},
+            is_visible=True,
+            is_clickable=True,
+        ),
+        PageElement(
+            index=3,
+            tag="button",
+            text="Login",
+            element_type="button",
+            selector="#login",
+            attributes={"type": "submit"},
+            is_visible=True,
+            is_clickable=True,
+        ),
+    ]
+
+    action = agent._decide_action_locally(
+        "Test the login flow with username admin and password AiAgent#2025",
+        elements,
+        TaskIntent(
+            intent_type="auth",
+            fields={"username": "admin", "password": "AiAgent#2025"},
+            requires_interaction=True,
+            confidence=0.9,
+        ),
+    )
+
+    assert action is not None
+    assert action.action_type == ActionType.CLICK
+    assert action.target_selector == "#login"
+
+
 def test_decide_action_locally_prefers_intent_driven_search_input():
     agent = BrowserAgent(headless=True)
     elements = [

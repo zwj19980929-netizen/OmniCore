@@ -199,6 +199,30 @@ class _SelectorWorker(EnhancedWebWorker):
         }
 
 
+def test_format_semantic_snapshot_for_llm_includes_main_text_blocks_and_stage():
+    worker = EnhancedWebWorker(llm_client=_DummyLLM())
+
+    text = worker._format_semantic_snapshot_for_llm(
+        {
+            "page_type": "detail",
+            "page_stage": "extracting",
+            "url": "https://example.com/article",
+            "title": "Example Article",
+            "main_text": "This is the main article text.",
+            "visible_text_blocks": [
+                {"kind": "p", "text": "First paragraph", "selector": "article p:first-child"},
+            ],
+            "blocked_signals": ["body:captcha"],
+        }
+    )
+
+    assert "页面阶段: extracting" in text
+    assert "主体文本: This is the main article text." in text
+    assert "可见文本块:" in text
+    assert "First paragraph" in text
+    assert "阻塞信号: body:captcha" in text
+
+
 def test_smart_extract_normalizes_attribute_style_fields():
     worker = _SelectorWorker(llm_client=_DummyLLM())
     result = asyncio.run(
