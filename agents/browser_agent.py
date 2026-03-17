@@ -241,6 +241,82 @@ _AUTH_SUBMIT_NEGATIVE_TOKENS = (
     "\u8fd4\u56de",
     "\u6e38\u5ba2",
 )
+_AUTH_SECONDARY_PROVIDER_TOKENS = (
+    "sso",
+    "oauth",
+    "openid",
+    "single sign-on",
+    "single sign on",
+    "continue with",
+    "use another",
+    "third-party",
+    "third party",
+    "unified",
+    "enterprise",
+    "google",
+    "github",
+    "microsoft",
+    "wechat",
+    "\u7b2c\u4e09\u65b9",
+    "\u7edf\u4e00\u8ba4\u8bc1",
+    "\u7edf\u4e00\u767b\u5f55",
+    "\u4f01\u4e1a\u767b\u5f55",
+)
+_AUTH_VALUE_NOISE_TOKENS = frozenset(
+    {
+        "login",
+        "log",
+        "sign",
+        "signin",
+        "sign in",
+        "username",
+        "user",
+        "password",
+        "passcode",
+        "passwd",
+        "account",
+        "email",
+        "mail",
+        "button",
+        "page",
+        "open",
+        "click",
+        "test",
+        "report",
+        "with",
+        "then",
+        "primary",
+        "\u767b\u5f55",
+        "\u767b\u5165",
+        "\u7528\u6237\u540d",
+        "\u8d26\u53f7",
+        "\u8d26\u6237",
+        "\u5bc6\u7801",
+        "\u6309\u94ae",
+        "\u9875\u9762",
+        "\u70b9\u51fb",
+        "\u6d4b\u8bd5",
+        "\u62a5\u544a",
+    }
+)
+_NON_TEXT_INPUT_TYPES = {
+    "button",
+    "checkbox",
+    "color",
+    "date",
+    "datetime-local",
+    "file",
+    "hidden",
+    "image",
+    "month",
+    "radio",
+    "range",
+    "reset",
+    "submit",
+    "time",
+    "week",
+}
+_STRUCTURED_PAIR_SKIP_KEYS = {"http", "https", "ftp", "www", "localhost"}
 
 
 class BrowserAgent:
@@ -329,11 +405,17 @@ class BrowserAgent:
         return re.sub(r"\s+", " ", (value or "").strip()).lower()
 
     def _strip_urls_from_text(self, text: str) -> str:
-        return re.sub(
-            r"https?://[A-Za-z0-9._~:/?#\[\]@!$&'()*+,;=%-]+",
-            " ",
-            text or "",
-        )
+        raw = str(text or "")
+        for match in re.finditer(r"https?://[^\s\u4e00-\u9fff]+", raw, flags=re.IGNORECASE):
+            candidate = str(match.group(0) or "")
+            if "???" in candidate:
+                candidate = candidate.split("???", 1)[0]
+            elif candidate.count("?") > 1 and "=" not in candidate and "&" not in candidate:
+                candidate = candidate.split("?", 1)[0]
+            candidate = candidate.rstrip(".,);]}>\"'锛屻€傦紒锛燂紱锛氥€侊級锛姐€戯綕銆夈€嬨€嶃€忊€濃€?")
+            if candidate:
+                raw = raw.replace(candidate, " ")
+        return raw
 
     def _task_mentions_interaction(self, task: str) -> bool:
         normalized = self._normalize_text(self._strip_urls_from_text(task))
@@ -496,6 +578,163 @@ class BrowserAgent:
         self._action_history.append(self._action_signature(action))
         self._action_history = self._action_history[-6:]
 
+    def _format_intent_fields_for_llm(self, fields: Optional[Dict[str, str]]) -> str:
+        if not fields:
+            return "(none)"
+        compact = {
+            str(key)[:48]: str(value)[:160]
+            for key, value in fields.items()
+            if key
+        }
+        return json.dumps(compact, ensure_ascii=False, sort_keys=True)
+
+    def _step_action_signature(self, step: Dict[str, Any]) -> str:
+        action_type_raw = str(step.get("action_type") or step.get("plan") or "failed").lower()
+        try:
+            action_type = ActionType(action_type_raw)
+        except ValueError:
+            action_type = ActionType.FAILED
+        return self._action_signature(
+            BrowserAction(
+                action_type=action_type,
+                target_selector=str(step.get("selector") or step.get("action") or ""),
+                target_ref=str(step.get("target_ref") or ""),
+                value=str(step.get("value") or ""),
+                description=str(step.get("description") or step.get("plan") or ""),
+            )
+        )
+
+    def _format_recent_steps_for_llm(self, steps: Optional[List[Dict[str, Any]]], max_items: int = 4) -> str:
+        if not steps:
+            return "(none)"
+        lines: List[str] = []
+        for step in steps[-max_items:]:
+            parts = [f"step={step.get('step', '?')}"]
+            action_type = str(step.get("action_type") or step.get("plan") or "unknown")
+            parts.append(f"action={action_type[:48]}")
+            description = str(step.get("description") or step.get("plan") or "")
+            if description and description != action_type:
+                parts.append(f"desc={description[:72]}")
+            selector = str(step.get("selector") or step.get("action") or "")
+            if selector:
+                parts.append(f"target={selector[:96]}")
+            value = str(step.get("value") or "")
+            if value:
+                parts.append(f"value={value[:64]}")
+            result = str(step.get("result") or step.get("observation") or "")
+            if result:
+                parts.append(f"result={result[:24]}")
+            url = str(step.get("url") or "")
+            if url:
+                parts.append(f"url={url[:120]}")
+            lines.append(" | ".join(parts))
+        return "\n".join(lines)
+
+    def _action_requires_direct_target(self, action: BrowserAction) -> bool:
+        return action.action_type in {
+            ActionType.CLICK,
+            ActionType.INPUT,
+            ActionType.SELECT,
+            ActionType.DOWNLOAD,
+            ActionType.UPLOAD_FILE,
+            ActionType.SWITCH_IFRAME,
+        }
+
+    def _recent_failed_action_matches(
+        self,
+        action: BrowserAction,
+        recent_steps: Optional[List[Dict[str, Any]]],
+        max_items: int = 2,
+    ) -> bool:
+        if not recent_steps:
+            return False
+        action_sig = self._action_signature(action)
+        for step in reversed(recent_steps[-max_items:]):
+            if str(step.get("result") or "") != "failed":
+                continue
+            if self._step_action_signature(step) == action_sig:
+                return True
+        return False
+
+    def _sanitize_planned_action(
+        self,
+        task: str,
+        current_url: str,
+        elements: List[PageElement],
+        intent: Optional[TaskIntent],
+        data: List[Dict[str, str]],
+        action: Optional[BrowserAction],
+        snapshot: Optional[Dict[str, Any]] = None,
+        recent_steps: Optional[List[Dict[str, Any]]] = None,
+    ) -> Optional[BrowserAction]:
+        if action is None:
+            return None
+        if action.action_type == ActionType.FAILED:
+            return None
+        if self._recent_failed_action_matches(action, recent_steps):
+            return None
+
+        active_intent = intent or TaskIntent(intent_type="read", query="", confidence=0.0)
+        active_snapshot = snapshot or self._last_semantic_snapshot or {}
+        current_elements = elements or []
+        current_data = data or []
+
+        if self._action_requires_direct_target(action) and not (action.target_selector or action.target_ref):
+            if action.use_keyboard_fallback and action.keyboard_key:
+                return BrowserAction(
+                    action_type=ActionType.PRESS_KEY,
+                    value=action.keyboard_key,
+                    description=action.description or "use keyboard fallback",
+                    confidence=action.confidence,
+                )
+            return None
+
+        if action.action_type == ActionType.WAIT:
+            if self._snapshot_is_transient_loading(active_snapshot) or (not current_elements and not current_data):
+                if not action.value:
+                    action = self._clone_action(action) or action
+                    action.value = "1"
+                return action
+            return None
+
+        if action.action_type == ActionType.DONE:
+            if self._task_looks_satisfied(
+                task,
+                current_url,
+                active_intent,
+                snapshot=active_snapshot,
+                elements=current_elements,
+                data=current_data,
+            ):
+                return action
+            return None
+
+        if action.action_type == ActionType.EXTRACT:
+            if active_intent.intent_type in {"form", "auth"} and self._interaction_requires_follow_up(
+                task,
+                active_intent,
+                current_elements,
+                snapshot=active_snapshot,
+            ):
+                return None
+            if current_data:
+                return action
+            if self._is_read_only_task(task, active_intent):
+                return action
+            if self._get_snapshot_main_text(active_snapshot) and not active_intent.requires_interaction:
+                return action
+            return None
+
+        if action.action_type == ActionType.INPUT and not action.value:
+            query = active_intent.query or self._derive_primary_query(task)
+            if query:
+                action = self._clone_action(action) or action
+                action.value = query
+                return action
+            return None
+
+        return action
+
     def _is_action_looping(self, action: BrowserAction, threshold: int = 3) -> bool:
         """
         检测动作是否陷入循环
@@ -511,6 +750,8 @@ class BrowserAgent:
 
         # 统计最近动作中的重复次数
         recent_count = recent_actions.count(action_sig)
+        if action.action_type == ActionType.WAIT:
+            return recent_count >= max(threshold + 2, 5)
 
         # 如果最近5个动作中重复3次以上，才判定为循环
         if recent_count >= threshold:
@@ -939,6 +1180,29 @@ class BrowserAgent:
         if any(alias in normalized for alias in _AUTH_USERNAME_ALIASES):
             return "username"
         return normalized
+
+    def _clean_auth_candidate_value(self, field_name: str, value: str) -> str:
+        cleaned = re.sub(r"\s+", " ", str(value or "")).strip(" \"'鈥溾€濃€樷€?")
+        cleaned = cleaned.strip(".,;:!?)]}>")
+        if not cleaned:
+            return ""
+
+        normalized = self._normalize_text(cleaned)
+        if not normalized:
+            return ""
+        if "://" in cleaned or cleaned.startswith("//"):
+            return ""
+        if normalized in _AUTH_VALUE_NOISE_TOKENS:
+            return ""
+        if normalized in {
+            *[self._normalize_text(item) for item in _AUTH_USERNAME_ALIASES],
+            *[self._normalize_text(item) for item in _AUTH_EMAIL_ALIASES],
+            *[self._normalize_text(item) for item in _AUTH_PASSWORD_ALIASES],
+        }:
+            return ""
+        if field_name == "email" and "@" not in cleaned:
+            return ""
+        return cleaned
 
     def _extract_query_tokens(self, query: str) -> List[str]:
         tokens: List[str] = []
@@ -1403,6 +1667,7 @@ class BrowserAgent:
         data: List[Dict[str, str]],
         elements: List[PageElement],
         last_action: Optional[BrowserAction] = None,
+        recent_steps: Optional[List[Dict[str, Any]]] = None,
     ) -> str:
         active_intent = intent or TaskIntent(intent_type="read", query="", confidence=0.0)
         cards = self._cards_from_snapshot(self._last_semantic_snapshot)
@@ -1414,7 +1679,18 @@ class BrowserAgent:
             "page_stage": self._infer_page_state(task, current_url, active_intent, data, self._last_semantic_snapshot).stage,
             "intent": active_intent.intent_type,
             "query": active_intent.query[:160],
+            "fields": self._format_intent_fields_for_llm(active_intent.fields),
             "last_action": self._action_signature(last_action) if last_action else "",
+            "recent_steps": [
+                {
+                    "step": step.get("step"),
+                    "action_type": step.get("action_type"),
+                    "selector": str(step.get("selector") or step.get("action") or "")[:80],
+                    "result": str(step.get("result") or "")[:16],
+                    "url": str(step.get("url") or "")[:120],
+                }
+                for step in (recent_steps or [])[-3:]
+            ],
             "data": [
                 {
                     "title": str(item.get("title", "") or "")[:80],
@@ -1462,6 +1738,8 @@ class BrowserAgent:
         if not data and not elements:
             return False
         active_intent = intent or TaskIntent(intent_type="read", query="", confidence=0.0)
+        if active_intent.intent_type in {"form", "auth"} and elements:
+            return True
         if data and self._is_read_only_task(task, active_intent):
             return True
         if self._is_search_engine_url(current_url):
@@ -1482,6 +1760,7 @@ class BrowserAgent:
         intent: Optional[TaskIntent],
         data: List[Dict[str, str]],
         last_action: Optional[BrowserAction] = None,
+        recent_steps: Optional[List[Dict[str, Any]]] = None,
     ) -> Optional[BrowserAction]:
         if not self._should_assess_page_with_llm(task, current_url, intent, data, elements, last_action):
             return None
@@ -1496,6 +1775,7 @@ class BrowserAgent:
             data,
             elements,
             last_action,
+            recent_steps,
         )
         if cache_key in self._page_assessment_cache:
             web_debug_recorder.record_event(
@@ -1525,11 +1805,13 @@ class BrowserAgent:
                 task=task or "",
                 intent=active_intent.intent_type,
                 query=active_intent.query or self._derive_primary_query(task),
+                fields=self._format_intent_fields_for_llm(active_intent.fields),
                 url=current_url or "",
                 title=title or "",
                 page_type=page_state.page_type,
                 page_stage=page_state.stage,
                 last_action=(last_action.description or last_action.action_type.value) if last_action else "none",
+                recent_steps=self._format_recent_steps_for_llm(recent_steps),
                 context_coverage=prompt_context.get("context_coverage", ""),
                 data=prompt_context.get("data", "(no visible data)"),
                 cards=prompt_context.get("cards", "(no cards)"),
@@ -1574,6 +1856,7 @@ class BrowserAgent:
                     "elements": self._elements_to_debug_payload(elements),
                     "snapshot": snapshot,
                     "last_action": self._action_to_debug_payload(last_action),
+                    "recent_steps": (recent_steps or [])[-4:],
                     "prompt_budget": prompt_budget,
                 },
             )
@@ -1962,6 +2245,22 @@ class BrowserAgent:
         )
 
     def _extract_click_target_text(self, task: str) -> str:
+        clean_patterns = (
+            r'"([^"\n]{2,64})"',
+            r"'([^'\n]{2,64})'",
+            r"“([^”\n]{2,64})”",
+            r"‘([^’\n]{2,64})’",
+            r"「([^」\n]{2,64})」",
+            r"『([^』\n]{2,64})』",
+            r"《([^》\n]{2,64})》",
+        )
+        for pattern in clean_patterns:
+            match = re.search(pattern, task or "")
+            if not match:
+                continue
+            value = self._normalize_text(match.group(1))
+            if len(value) >= 2:
+                return value
         for pattern in (
             r'"([^"\n]{2,64})"',
             r"'([^'\n]{2,64})'",
@@ -1989,6 +2288,30 @@ class BrowserAgent:
 
     def _extract_auth_fields_from_free_text(self, task: str) -> Dict[str, str]:
         text = self._strip_urls_from_text(task)
+        clean_patterns = {
+            "username": [
+                r"(?:\u767b\u5f55\u8d26\u53f7|\u767b\u5f55\u540d|\u7528\u6237\u540d|\u8d26\u53f7|\u8d26\u6237|\u5e10\u53f7|username|user\s*name|login\s*name|login\s*account|account)\s*(?:is|=|:|\u662f|\u4e3a)?\s*[\"'“”‘’]?([A-Za-z0-9_.@-]{2,})",
+            ],
+            "email": [
+                r"(?:email|e-mail|mail|\u90ae\u7bb1|\u7535\u5b50\u90ae\u7bb1)\s*(?:is|=|:|\u662f|\u4e3a)?\s*[\"'“”‘’]?([A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,})",
+            ],
+            "password": [
+                r"(?:password|passcode|passwd|pwd|\u5bc6\u7801|\u767b\u5f55\u5bc6\u7801)\s*(?:is|=|:|\u662f|\u4e3a)?\s*[\"'“”‘’]?([^\s,，。；;]+)",
+            ],
+        }
+        clean_extracted: Dict[str, str] = {}
+        for field_name, regexes in clean_patterns.items():
+            for pattern in regexes:
+                candidates: List[str] = []
+                for match in re.finditer(pattern, text, flags=re.IGNORECASE):
+                    value = self._clean_auth_candidate_value(field_name, str(match.group(1) or ""))
+                    if value:
+                        candidates.append(value)
+                if candidates:
+                    clean_extracted[field_name] = candidates[-1]
+                    break
+        if clean_extracted:
+            return clean_extracted
         patterns = {
             "username": [
                 r"(?:\u767b\u5f55\u8d26\u53f7|\u767b\u5f55\u540d|\u7528\u6237\u540d|\u8d26\u53f7|\u8d26\u6237|\u5e10\u53f7|username|user\s*name|login\s*name|login\s*account|account)\s*(?:is|=|:|\u662f|\u4e3a)\s*[\"'“”‘’]?([^\s,，。;；]+)",
@@ -2006,35 +2329,31 @@ class BrowserAgent:
         extracted: Dict[str, str] = {}
         for field_name, regexes in patterns.items():
             for pattern in regexes:
-                match = re.search(pattern, text, flags=re.IGNORECASE)
-                if not match:
-                    continue
-                value = re.sub(r"\s+", " ", str(match.group(1) or "")).strip(" \"'“”‘’")
-                if value:
-                    extracted[field_name] = value
+                candidates: List[str] = []
+                for match in re.finditer(pattern, text, flags=re.IGNORECASE):
+                    value = self._clean_auth_candidate_value(field_name, str(match.group(1) or ""))
+                    if value:
+                        candidates.append(value)
+                if candidates:
+                    extracted[field_name] = candidates[-1]
                     break
         return extracted
 
     def _extract_structured_pairs(self, task: str) -> Dict[str, str]:
         pairs: Dict[str, str] = {}
-        for key, value in re.findall(
-            r"([A-Za-z0-9_\u4e00-\u9fff]{1,24})\s*[:：=]\s*([^\n,，;；]{1,160})",
-            task or "",
-        ):
-            normalized_key = self._normalize_text(key)
-            cleaned_value = re.sub(r"\s+", " ", value).strip()
-            if normalized_key and cleaned_value:
-                pairs[normalized_key] = cleaned_value
-        return pairs
-
-    def _extract_structured_pairs(self, task: str) -> Dict[str, str]:
-        pairs: Dict[str, str] = {}
+        stripped_task = self._strip_urls_from_text(task)
         for key, value in re.findall(
             r"([A-Za-z0-9_\u4e00-\u9fff]{1,24})\s*[:：]\s*(.{1,160}?)(?=(?:\s+[A-Za-z0-9_\u4e00-\u9fff]{1,24}\s*[:：])|[\n,，;；]|$)",
-            task or "",
+            stripped_task,
         ):
             normalized_key = self._normalize_auth_field_name(key)
             cleaned_value = re.sub(r"\s+", " ", value).strip()
+            if not normalized_key or normalized_key in _STRUCTURED_PAIR_SKIP_KEYS:
+                continue
+            if normalized_key.isdigit():
+                continue
+            if not cleaned_value or "://" in cleaned_value or cleaned_value.startswith("//"):
+                continue
             if normalized_key and cleaned_value:
                 pairs[normalized_key] = cleaned_value
         auth_pairs = self._extract_auth_fields_from_free_text(task)
@@ -2204,10 +2523,17 @@ class BrowserAgent:
         for element in elements:
             if not element.is_visible or not element.is_clickable:
                 continue
-            if element.element_type in {"input", "text", "search", "email", "password", "textarea"}:
+            attrs = element.attributes or {}
+            normalized_type = self._normalize_text(
+                attrs.get("type", "") or element.element_type or element.tag
+            )
+            if element.tag == "textarea" or normalized_type == "textarea":
                 candidates.append(element)
                 continue
-            if element.tag in {"input", "textarea"}:
+            if element.tag == "input" and normalized_type not in _NON_TEXT_INPUT_TYPES:
+                candidates.append(element)
+                continue
+            if element.element_type in {"input", "text", "search", "email", "password"} and normalized_type not in _NON_TEXT_INPUT_TYPES:
                 candidates.append(element)
         return candidates
 
@@ -2331,7 +2657,32 @@ class BrowserAgent:
             for item in elements
             if item.is_visible and item.is_clickable and item.element_type in {"button", "submit", "link"}
         ]
-        return controls[0] if controls else None
+        if not controls:
+            return None
+
+        ranked: List[Tuple[float, PageElement]] = []
+        for control in controls:
+            attrs = control.attributes or {}
+            selector = str(control.selector or "")
+            haystack = self._element_action_haystack(control)
+            score = 0.0
+            if self._normalize_text(attrs.get("type", "")) == "submit":
+                score += 5.0
+            if control.tag == "button":
+                score += 1.2
+            if any(token in haystack for token in _AUTH_SUBMIT_POSITIVE_TOKENS):
+                score += 4.0
+            if any(token in haystack for token in _AUTH_SUBMIT_NEGATIVE_TOKENS):
+                score -= 6.0
+            if any(token in haystack for token in _AUTH_SECONDARY_PROVIDER_TOKENS):
+                score -= 4.0
+            if selector and "form > button" in selector:
+                score += 1.5
+            score += max(0.0, 1.0 - 0.1 * float(control.index))
+            ranked.append((score, control))
+
+        ranked.sort(key=lambda item: item[0], reverse=True)
+        return ranked[0][1] if ranked else controls[0]
 
     def _find_auth_submit_control(
         self,
@@ -2359,20 +2710,86 @@ class BrowserAgent:
             score = 0.0
             attrs = control.attributes or {}
             haystack = self._element_action_haystack(control)
+            selector = str(control.selector or "")
+            selector_depth = selector.count(">")
             if self._normalize_text(attrs.get("type", "")) == "submit":
                 score += 2.5
             if any(token in haystack for token in _AUTH_SUBMIT_POSITIVE_TOKENS):
                 score += 5.0
             if any(token in haystack for token in _AUTH_SUBMIT_NEGATIVE_TOKENS):
                 score -= 6.0
+            if any(token in haystack for token in _AUTH_SECONDARY_PROVIDER_TOKENS):
+                score -= 4.0
             if target_hint and target_hint in haystack:
                 score += 4.0
             if self._task_mentions_auth(task) and any(token in haystack for token in ("login", "\u767b\u5f55", "\u767b\u5165")):
                 score += 2.0
+            if selector:
+                if "form > button" in selector:
+                    score += 2.5
+                score += max(0.0, 1.2 - 0.15 * selector_depth)
+                score += max(0.0, 1.0 - 0.01 * len(selector))
+            score += max(0.0, 1.0 - 0.1 * float(control.index))
             if score > 0:
                 ranked.append((score, control))
         ranked.sort(key=lambda item: item[0], reverse=True)
         return ranked[0][1] if ranked else None
+
+    def _find_submit_control_for_intent(
+        self,
+        task: str,
+        elements: List[PageElement],
+        intent: Optional[TaskIntent] = None,
+    ) -> Optional[PageElement]:
+        active_intent = intent or TaskIntent(intent_type="form", query="", confidence=0.0)
+        primary_submit = self._find_primary_submit_control(elements)
+        if active_intent.intent_type != "auth" and not self._task_mentions_auth(task):
+            return primary_submit
+
+        auth_submit = self._find_auth_submit_control(task, elements, active_intent)
+        if primary_submit is None:
+            return auth_submit
+        if auth_submit is None:
+            return primary_submit
+
+        primary_haystack = self._element_action_haystack(primary_submit)
+        auth_haystack = self._element_action_haystack(auth_submit)
+        auth_is_secondary = any(token in auth_haystack for token in _AUTH_SECONDARY_PROVIDER_TOKENS)
+        primary_is_secondary = any(token in primary_haystack for token in _AUTH_SECONDARY_PROVIDER_TOKENS)
+        if auth_is_secondary and not primary_is_secondary:
+            return primary_submit
+        if primary_submit.tag == "button" and auth_submit.tag == "a":
+            return primary_submit
+        if primary_submit.index <= auth_submit.index:
+            return primary_submit
+        return auth_submit
+
+    def _interaction_requires_follow_up(
+        self,
+        task: str,
+        intent: Optional[TaskIntent],
+        elements: List[PageElement],
+        snapshot: Optional[Dict[str, Any]] = None,
+    ) -> bool:
+        active_intent = intent or TaskIntent(intent_type="form", query="", confidence=0.0)
+        if active_intent.intent_type not in {"form", "auth"}:
+            return False
+
+        active_snapshot = snapshot or {}
+        page_type = str(active_snapshot.get("page_type", "") or "")
+        page_stage = str(active_snapshot.get("page_stage", "") or "")
+        if page_type in {"form", "login"} or page_stage == "interacting":
+            return True
+
+        if not elements:
+            return False
+
+        mapping = self._build_form_mapping_from_pairs(active_intent.fields, elements)
+        if not mapping or not self._mapping_matches_current_elements(mapping, elements):
+            return False
+
+        submit_control = self._find_submit_control_for_intent(task, elements, active_intent)
+        return submit_control is not None
 
     async def _bootstrap_search_results(self, query: str) -> bool:
         if not query:
@@ -2934,7 +3351,9 @@ class BrowserAgent:
                 ]).lower()
                 target_lower = click_target.lower()
                 # Only return if the target text (or significant part of it) actually appears in the element
-                target_tokens = [t for t in target_lower.split() if len(t) >= 3]
+                target_tokens = self._extract_task_tokens(target_lower)
+                if not target_tokens and any("\u4e00" <= ch <= "\u9fff" for ch in target_lower):
+                    target_tokens = [target_lower]
                 matched_tokens = sum(1 for t in target_tokens if t in haystack)
                 if target_tokens and matched_tokens >= max(1, len(target_tokens) // 2):
                     return BrowserAction(
@@ -2948,10 +3367,7 @@ class BrowserAgent:
             mapping = self._build_form_mapping_from_pairs(active_intent.fields, elements)
             if mapping:
                 if self._mapping_matches_current_elements(mapping, elements):
-                    if active_intent.intent_type == "auth" or self._task_mentions_auth(task):
-                        submit_control = self._find_auth_submit_control(task, elements, active_intent)
-                    else:
-                        submit_control = self._find_primary_submit_control(elements)
+                    submit_control = self._find_submit_control_for_intent(task, elements, active_intent)
                     if submit_control:
                         return BrowserAction(
                             action_type=ActionType.CLICK,
@@ -2963,14 +3379,10 @@ class BrowserAgent:
                 else:
                     return self._build_form_fill_action(mapping)
             if active_intent.intent_type == "auth" and self._iter_input_candidates(elements):
-                submit_control = self._find_auth_submit_control(task, elements, active_intent)
+                submit_control = self._find_submit_control_for_intent(task, elements, active_intent)
                 if submit_control and not active_intent.fields:
                     return None
-            submit_control = (
-                self._find_auth_submit_control(task, elements, active_intent)
-                if active_intent.intent_type == "auth" or self._task_mentions_auth(task)
-                else self._find_primary_submit_control(elements)
-            )
+            submit_control = self._find_submit_control_for_intent(task, elements, active_intent)
             if submit_control:
                 return BrowserAction(
                     action_type=ActionType.CLICK,
@@ -3081,10 +3493,16 @@ class BrowserAgent:
                     target_ref = element.ref
                     break
 
+        raw_value = action_payload.get("value", flat_action_payload.get("value", ""))
+        if isinstance(raw_value, (dict, list)):
+            value = json.dumps(raw_value, ensure_ascii=False)
+        else:
+            value = str(raw_value or "")
+
         return BrowserAction(
             action_type=action_type, target_selector=selector,
             target_ref=target_ref,
-            value=str(action_payload.get("value") or flat_action_payload.get("value") or ""),
+            value=value,
             description=str(action_payload.get("description") or flat_action_payload.get("description") or ""),
             confidence=float(payload.get("confidence", action_payload.get("confidence", flat_action_payload.get("confidence", 0.0))) or 0.0),
             requires_confirmation=bool(
@@ -3118,35 +3536,57 @@ class BrowserAgent:
             ),
         )
 
-    async def _decide_action_with_llm(self, task: str, elements: List[PageElement]) -> BrowserAction:
+    async def _decide_action_with_llm(
+        self,
+        task: str,
+        elements: List[PageElement],
+        intent: Optional[TaskIntent] = None,
+        data: Optional[List[Dict[str, str]]] = None,
+        snapshot: Optional[Dict[str, Any]] = None,
+        current_url: str = "",
+        title: str = "",
+        last_action: Optional[BrowserAction] = None,
+        recent_steps: Optional[List[Dict[str, Any]]] = None,
+    ) -> BrowserAction:
         try:
             if not elements:
-                if self._is_read_only_task(task):
+                if self._is_read_only_task(task, intent):
                     return BrowserAction(action_type=ActionType.EXTRACT, description="extract visible data")
                 return BrowserAction(action_type=ActionType.WAIT, value="1", description="no actionable elements", confidence=0.05)
 
-            title_r = await self.toolkit.get_title()
-            page_title = title_r.data or ""
-            url_r = await self.toolkit.get_current_url()
+            page_title = title or ""
+            if not page_title:
+                title_r = await self.toolkit.get_title()
+                page_title = title_r.data or ""
+            resolved_url = current_url or ""
+            if not resolved_url:
+                url_r = await self.toolkit.get_current_url()
+                resolved_url = url_r.data or ""
 
-            surface = self.toolkit.active_surface
-            current_data = await self._maybe_extract_data()
+            active_intent = intent or TaskIntent(
+                intent_type="read",
+                query=self._derive_primary_query(task),
+                confidence=0.0,
+            )
+            current_data = list(data or [])
+            if not current_data:
+                current_data = await self._extract_data_for_intent(active_intent)
             data_collected = len(current_data) if current_data else 0
             target_match = re.search(r'(\d+)\s*(?:个|条|款|项|条数据|items?|results?)', task or "")
             data_target = int(target_match.group(1)) if target_match else 10
             data_progress = f"Data progress: collected {data_collected} / target {data_target}"
             if data_collected >= data_target:
                 data_progress += " (ENOUGH - consider using DONE)"
-            snapshot = await self._get_semantic_snapshot()
-            cards = self._cards_from_snapshot(snapshot)
-            page_state = self._infer_page_state(task, url_r.data or "", None, current_data or [], snapshot)
-            elements_text = self._format_elements_for_llm(task, elements, max_items=18)
+            active_snapshot = snapshot or await self._get_semantic_snapshot()
+            cards = self._cards_from_snapshot(active_snapshot)
+            page_state = self._infer_page_state(task, resolved_url, active_intent, current_data or [], active_snapshot)
+            elements_text = self._format_assessment_elements_for_llm(task, resolved_url, elements, max_items=18)
             prompt_context, prompt_budget = self._build_budgeted_browser_prompt_context(
                 task=task,
-                current_url=url_r.data or "",
+                current_url=resolved_url,
                 data=current_data or [],
                 cards=cards,
-                snapshot=snapshot,
+                snapshot=active_snapshot,
                 elements_text=elements_text,
                 total_tokens=_ACTION_DECISION_CONTEXT_TOKENS,
             )
@@ -3154,10 +3594,18 @@ class BrowserAgent:
             messages = [
                 {"role": "system", "content": "Return JSON only."},
                 {"role": "user", "content": ACTION_DECISION_PROMPT.format(
-                    task=task, url=url_r.data or "", title=page_title,
+                    task=task,
+                    intent=active_intent.intent_type,
+                    query=active_intent.query or self._derive_primary_query(task),
+                    fields=self._format_intent_fields_for_llm(active_intent.fields),
+                    requires_interaction=str(bool(active_intent.requires_interaction)).lower(),
+                    url=resolved_url,
+                    title=page_title,
                     data_progress=data_progress,
                     page_type=page_state.page_type,
                     page_stage=page_state.stage,
+                    last_action=(last_action.description or last_action.action_type.value) if last_action else "none",
+                    recent_steps=self._format_recent_steps_for_llm(recent_steps),
                     context_coverage=prompt_context.get("context_coverage", ""),
                     data=prompt_context.get("data", "(no visible data)"),
                     cards=prompt_context.get("cards", "(no cards)"),
@@ -3193,11 +3641,11 @@ class BrowserAgent:
             ):
                 state_action = self._choose_snapshot_navigation_action(
                     task,
-                    url_r.data or "",
+                    resolved_url,
                     elements,
-                    None,
+                    active_intent,
                     current_data or [],
-                    snapshot,
+                    active_snapshot,
                 )
                 if state_action is not None:
                     return state_action
@@ -3205,6 +3653,129 @@ class BrowserAgent:
         except Exception as exc:
             log_warning(f"LLM action fallback failed: {exc}")
             return BrowserAction(action_type=ActionType.WAIT, value="1", description="fallback wait", confidence=0.1)
+
+    async def _plan_next_action(
+        self,
+        task: str,
+        current_url: str,
+        title: str,
+        elements: List[PageElement],
+        intent: Optional[TaskIntent],
+        data: List[Dict[str, str]],
+        snapshot: Optional[Dict[str, Any]] = None,
+        last_action: Optional[BrowserAction] = None,
+        recent_steps: Optional[List[Dict[str, Any]]] = None,
+    ) -> Tuple[Optional[BrowserAction], str]:
+        active_snapshot = snapshot or self._last_semantic_snapshot or {}
+
+        assessed_action = await self._assess_page_with_llm(
+            task,
+            current_url,
+            title,
+            elements,
+            intent,
+            data,
+            last_action=last_action,
+            recent_steps=recent_steps,
+        )
+        active_snapshot = snapshot or self._last_semantic_snapshot or active_snapshot
+        assessed_action = self._sanitize_planned_action(
+            task,
+            current_url,
+            elements,
+            intent,
+            data,
+            assessed_action,
+            snapshot=active_snapshot,
+            recent_steps=recent_steps,
+        )
+        if assessed_action is not None and assessed_action.action_type not in {ActionType.WAIT, ActionType.FAILED}:
+            return assessed_action, "page_assessment_llm"
+
+        llm_action = await self._decide_action_with_llm(
+            task,
+            elements,
+            intent=intent,
+            data=data,
+            snapshot=active_snapshot,
+            current_url=current_url,
+            title=title,
+            last_action=last_action,
+            recent_steps=recent_steps,
+        )
+        llm_action = self._sanitize_planned_action(
+            task,
+            current_url,
+            elements,
+            intent,
+            data,
+            llm_action,
+            snapshot=active_snapshot,
+            recent_steps=recent_steps,
+        )
+        if llm_action is not None and llm_action.action_type not in {ActionType.WAIT, ActionType.FAILED}:
+            return llm_action, "action_llm"
+
+        observation_action = self._choose_observation_driven_action(
+            task,
+            current_url,
+            elements,
+            intent,
+            data,
+            snapshot=active_snapshot,
+        )
+        observation_action = self._sanitize_planned_action(
+            task,
+            current_url,
+            elements,
+            intent,
+            data,
+            observation_action,
+            snapshot=active_snapshot,
+            recent_steps=recent_steps,
+        )
+        if observation_action is not None and observation_action.action_type not in {ActionType.WAIT, ActionType.FAILED}:
+            return observation_action, "observation_fallback"
+
+        search_result_action = self._find_search_result_click_action(
+            task,
+            current_url,
+            elements,
+            intent,
+            snapshot=active_snapshot,
+        )
+        search_result_action = self._sanitize_planned_action(
+            task,
+            current_url,
+            elements,
+            intent,
+            data,
+            search_result_action,
+            snapshot=active_snapshot,
+            recent_steps=recent_steps,
+        )
+        if search_result_action is not None and search_result_action.action_type not in {ActionType.WAIT, ActionType.FAILED}:
+            return search_result_action, "search_result_fallback"
+
+        local_action = self._decide_action_locally(task, elements, intent)
+        local_action = self._sanitize_planned_action(
+            task,
+            current_url,
+            elements,
+            intent,
+            data,
+            local_action,
+            snapshot=active_snapshot,
+            recent_steps=recent_steps,
+        )
+        if local_action is not None and local_action.action_type not in {ActionType.WAIT, ActionType.FAILED}:
+            return local_action, "local_fallback"
+
+        if llm_action is not None:
+            return llm_action, "action_llm_wait"
+        if assessed_action is not None:
+            return assessed_action, "page_assessment_wait"
+        return None, "no_action"
 
     # ── recovery ─────────────────────────────────────────────
 
@@ -3915,6 +4486,9 @@ class BrowserAgent:
         current_url: str,
         intent: Optional[TaskIntent] = None,
         target_url: str = "",
+        snapshot: Optional[Dict[str, Any]] = None,
+        elements: Optional[List[PageElement]] = None,
+        data: Optional[List[Dict[str, str]]] = None,
     ) -> bool:
         active_intent = intent or TaskIntent(
             intent_type="search",
@@ -3936,6 +4510,30 @@ class BrowserAgent:
                 return bool(haystack)
             return any(token in haystack for token in tokens)
         if active_intent.intent_type in {"form", "auth"}:
+            active_snapshot = snapshot or self._last_semantic_snapshot or {}
+            current_elements = elements or []
+            current_data = data or []
+            if self._page_data_satisfies_goal(
+                task,
+                current_url,
+                active_intent,
+                current_data,
+                snapshot=active_snapshot,
+            ):
+                return True
+            if self._interaction_requires_follow_up(
+                task,
+                active_intent,
+                current_elements,
+                snapshot=active_snapshot,
+            ):
+                return False
+            if target_url and self._urls_look_related(target_url, current_url):
+                return True
+            page_type = str(active_snapshot.get("page_type", "") or "")
+            page_stage = str(active_snapshot.get("page_stage", "") or "")
+            if page_stage == "interacting" or page_type in {"form", "login", "modal"}:
+                return False
             return bool(current_url)
         if active_intent.intent_type == "navigate":
             if target_url:
@@ -3949,6 +4547,32 @@ class BrowserAgent:
         if not tk.fast_mode:
             await tk.wait_for_load("networkidle", timeout=3000)
         await tk.human_delay(40, 80)
+
+    def _snapshot_is_transient_loading(self, snapshot: Optional[Dict[str, Any]]) -> bool:
+        active_snapshot = snapshot or {}
+        page_type = str(active_snapshot.get("page_type", "") or "").strip().lower()
+        title = self._normalize_text(str(active_snapshot.get("title", "") or ""))
+        main_text = self._normalize_text(str(active_snapshot.get("main_text", "") or ""))
+        has_structured_content = any(
+            bool(active_snapshot.get(key))
+            for key in ("elements", "cards", "collections", "controls", "regions")
+        )
+        if has_structured_content:
+            return False
+        if page_type not in {"", "unknown"}:
+            return False
+        if title:
+            return False
+        return main_text.startswith("loading")
+
+    async def _wait_for_interactive_hydration(self, max_rounds: int = 6) -> Dict[str, Any]:
+        snapshot = self._last_semantic_snapshot or await self._get_semantic_snapshot()
+        for _ in range(max_rounds):
+            if not self._snapshot_is_transient_loading(snapshot):
+                return snapshot
+            await asyncio.sleep(1.0)
+            snapshot = await self._get_semantic_snapshot()
+        return snapshot
 
     async def _wait_for_search_results_ready_v2(self, search_url: str) -> bool:
         selector = ", ".join(get_search_result_selectors(search_url))
@@ -4144,6 +4768,7 @@ class BrowserAgent:
                 return {"success": False, "message": f"初始导航失败: {str(nav_err)[:200]}", "url": url, "steps": steps}
 
             await self._wait_for_page_ready()
+            await self._wait_for_interactive_hydration()
             current_url_r = await tk.get_current_url()
             current_url = current_url_r.data or ""
             title_r = await tk.get_title()
@@ -4283,36 +4908,17 @@ class BrowserAgent:
                     log_warning(f"[DEBUG] 已收集数据: {len(_accumulated_data)} 条")
                     log_warning(f"[DEBUG] ====================================")
 
-                action = await self._assess_page_with_llm(
+                action, action_source = await self._plan_next_action(
                     task,
                     current_url_r.data or "",
                     title_r.data or "",
                     elements,
                     task_intent,
                     _accumulated_data or observed_data,
+                    snapshot=snapshot,
                     last_action=last_action,
+                    recent_steps=steps,
                 )
-                if action is None:
-                    action = self._choose_observation_driven_action(
-                        task,
-                        current_url_r.data or "",
-                        elements,
-                        task_intent,
-                        _accumulated_data or observed_data,
-                        snapshot=snapshot,
-                    )
-                if action is None:
-                    action = self._find_search_result_click_action(
-                        task,
-                        current_url_r.data or "",
-                        elements,
-                        task_intent,
-                        snapshot=snapshot,
-                    )
-                if action is None:
-                    action = self._decide_action_locally(task, elements, task_intent)
-                if action is None:
-                    action = await self._decide_action_with_llm(task, elements)
                 if action is None or action.action_type == ActionType.WAIT:
                     visual_action = await self._decide_action_with_vision(
                         task,
@@ -4326,6 +4932,7 @@ class BrowserAgent:
                     )
                     if visual_action is not None:
                         action = visual_action
+                        action_source = "vision_fallback"
                 if action is None:
                     action = BrowserAction(
                         action_type=ActionType.WAIT,
@@ -4333,9 +4940,13 @@ class BrowserAgent:
                         description="no actionable elements",
                         confidence=0.05,
                     )
+                    action_source = "implicit_wait"
                 web_debug_recorder.write_json(
                     f"browser_step_{step_no}_action",
-                    self._action_to_debug_payload(action),
+                    {
+                        **self._action_to_debug_payload(action),
+                        "source": action_source,
+                    },
                 )
 
                 # 🔥 新增：输出决策的动作到控制台
@@ -4415,6 +5026,7 @@ class BrowserAgent:
                             action = recovery
                             self._record_action(action)
                             last_action = action
+                            action_source = "local_recovery"
                 if not success:
                     visual_recovery = await self._decide_action_with_vision(
                         task,
@@ -4436,12 +5048,14 @@ class BrowserAgent:
                             action = visual_recovery
                             self._record_action(action)
                             last_action = action
+                            action_source = "vision_recovery"
 
                 url_r = await tk.get_current_url()
                 steps.append({
                     "step": step_no,
                     "plan": action.description or action.action_type.value,
                     "action": action.target_selector or action.action_type.value,
+                    "source": action_source,
                     "observation": "success" if success else "failed",
                     "decision": "continue" if success else "retry_or_fail",
                     "action_type": action.action_type.value,
@@ -4485,6 +5099,13 @@ class BrowserAgent:
                                 "steps": steps, "data": _accumulated_data or await self._extract_data_for_intent(task_intent)}
 
                 if action.action_type in {ActionType.CLICK, ActionType.INPUT, ActionType.FILL_FORM, ActionType.PRESS_KEY}:
+                    post_snapshot = await self._get_semantic_snapshot()
+                    post_elements = self._filter_noise_elements(self._elements_from_snapshot(post_snapshot))
+                    if post_elements:
+                        self._element_cache = post_elements[:40]
+                    else:
+                        post_elements = await self._extract_interactive_elements()
+                        post_snapshot = self._last_semantic_snapshot or post_snapshot
                     step_data = await self._extract_data_for_intent(task_intent)
                     _merge_new_data(step_data)
                     candidate_data = _accumulated_data or step_data
@@ -4493,7 +5114,15 @@ class BrowserAgent:
                     if task_intent.intent_type == "search" and candidate_data:
                         has_sufficient_data = self._is_data_relevant(task_intent.query, candidate_data)
                     if (
-                        self._task_looks_satisfied(task, url_r.data or "", task_intent, target_url=expected_url)
+                        self._task_looks_satisfied(
+                            task,
+                            url_r.data or "",
+                            task_intent,
+                            target_url=expected_url,
+                            snapshot=post_snapshot,
+                            elements=post_elements,
+                            data=candidate_data,
+                        )
                         and (has_sufficient_data or not requires_data)
                     ):
                         title_r = await tk.get_title()

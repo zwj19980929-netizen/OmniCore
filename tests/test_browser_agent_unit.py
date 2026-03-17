@@ -37,6 +37,21 @@ class SemanticAssessmentLLM:
         return self.payload
 
 
+class CapturingActionLLM:
+    def __init__(self, payload):
+        self.payload = payload
+        self.calls = 0
+        self.last_messages = None
+
+    async def achat(self, messages, *_args, **_kwargs):
+        self.calls += 1
+        self.last_messages = messages
+        return {"ok": True}
+
+    def parse_json_response(self, _response):
+        return self.payload
+
+
 class VisionDecisionLLM:
     def __init__(self, payload):
         self.payload = payload
@@ -217,6 +232,240 @@ def test_local_decision_uses_intent_target_text():
     assert action.target_selector == "#login"
 
 
+def test_task_looks_satisfied_keeps_auth_flow_pending_on_interactive_form():
+    agent = BrowserAgent(headless=True)
+    intent = TaskIntent(
+        intent_type="auth",
+        query="user login",
+        confidence=0.9,
+        fields={"username": "admin", "password": "secret"},
+        requires_interaction=True,
+    )
+    elements = [
+        PageElement(
+            index=0,
+            tag="input",
+            text="",
+            element_type="text",
+            selector="#username",
+            attributes={"name": "username", "placeholder": "Username", "value": "admin"},
+            is_visible=True,
+            is_clickable=True,
+        ),
+        PageElement(
+            index=1,
+            tag="input",
+            text="",
+            element_type="password",
+            selector="#password",
+            attributes={"name": "password", "type": "password", "placeholder": "Password", "value": "secret"},
+            is_visible=True,
+            is_clickable=True,
+        ),
+        PageElement(
+            index=2,
+            tag="button",
+            text="Login",
+            element_type="button",
+            selector="#submit",
+            attributes={"type": "submit", "labelText": "Login"},
+            is_visible=True,
+            is_clickable=True,
+        ),
+    ]
+
+    satisfied = agent._task_looks_satisfied(
+        "log in with the provided account",
+        "http://localhost/login",
+        intent,
+        snapshot={"page_type": "login", "page_stage": "interacting"},
+        elements=elements,
+        data=[],
+    )
+
+    assert satisfied is False
+
+
+def test_task_looks_satisfied_keeps_auth_flow_pending_when_submit_still_available():
+    agent = BrowserAgent(headless=True)
+    intent = TaskIntent(
+        intent_type="auth",
+        query="user login",
+        confidence=0.9,
+        fields={"username": "admin", "password": "secret"},
+        requires_interaction=True,
+    )
+    elements = [
+        PageElement(
+            index=0,
+            tag="input",
+            text="",
+            element_type="text",
+            selector="#username",
+            attributes={"name": "username", "placeholder": "Username", "value": "admin"},
+            is_visible=True,
+            is_clickable=True,
+        ),
+        PageElement(
+            index=1,
+            tag="input",
+            text="",
+            element_type="password",
+            selector="#password",
+            attributes={"name": "password", "type": "password", "placeholder": "Password", "value": "secret"},
+            is_visible=True,
+            is_clickable=True,
+        ),
+        PageElement(
+            index=2,
+            tag="button",
+            text="Sign in",
+            element_type="button",
+            selector="#submit",
+            attributes={"type": "submit", "labelText": "Sign in"},
+            is_visible=True,
+            is_clickable=True,
+        ),
+    ]
+
+    satisfied = agent._task_looks_satisfied(
+        "test the sign in flow",
+        "http://localhost/login",
+        intent,
+        snapshot={},
+        elements=elements,
+        data=[],
+    )
+
+    assert satisfied is False
+
+
+def test_task_looks_satisfied_allows_auth_flow_after_leaving_form_state():
+    agent = BrowserAgent(headless=True)
+    intent = TaskIntent(
+        intent_type="auth",
+        query="user login",
+        confidence=0.9,
+        fields={"username": "admin", "password": "secret"},
+        requires_interaction=True,
+    )
+    elements = [
+        PageElement(
+            index=0,
+            tag="a",
+            text="Workspace",
+            element_type="link",
+            selector="a.workspace",
+            attributes={"href": "/workspace"},
+            is_visible=True,
+            is_clickable=True,
+        )
+    ]
+
+    satisfied = agent._task_looks_satisfied(
+        "log in with the provided account",
+        "http://localhost/workspace",
+        intent,
+        snapshot={"page_type": "detail", "page_stage": "completing"},
+        elements=elements,
+        data=[{"title": "Workspace", "link": "http://localhost/workspace"}],
+    )
+
+    assert satisfied is True
+
+
+def test_extract_structured_pairs_ignores_url_scheme_and_recovers_auth_fields():
+    agent = BrowserAgent(headless=True)
+    task = (
+        "Open http://localhost:8000/ui/user/login, "
+        "test username login with username admin and password AiAgent#2025."
+    )
+
+    pairs = agent._extract_structured_pairs(task)
+
+    assert "http" not in pairs
+    assert pairs["username"] == "admin"
+    assert pairs["password"] == "AiAgent#2025"
+
+
+def test_build_form_mapping_from_pairs_skips_checkbox_controls():
+    agent = BrowserAgent(headless=True)
+    fields = {"username": "admin", "password": "secret", "agree": "yes"}
+    elements = [
+        PageElement(
+            index=0,
+            tag="input",
+            text="",
+            element_type="text",
+            selector="#username",
+            attributes={"name": "username", "placeholder": "Username"},
+            is_visible=True,
+            is_clickable=True,
+        ),
+        PageElement(
+            index=1,
+            tag="input",
+            text="",
+            element_type="password",
+            selector="#password",
+            attributes={"name": "password", "type": "password", "placeholder": "Password"},
+            is_visible=True,
+            is_clickable=True,
+        ),
+        PageElement(
+            index=2,
+            tag="input",
+            text="on",
+            element_type="checkbox",
+            selector="#agree",
+            attributes={"name": "agree", "type": "checkbox"},
+            is_visible=True,
+            is_clickable=True,
+        ),
+    ]
+
+    mapping = agent._build_form_mapping_from_pairs(fields, elements)
+
+    assert mapping["#username"] == "admin"
+    assert mapping["#password"] == "secret"
+    assert "#agree" not in mapping
+
+
+def test_find_submit_control_for_intent_prefers_primary_button_over_sso_alternative():
+    agent = BrowserAgent(headless=True)
+    elements = [
+        PageElement(
+            index=2,
+            tag="button",
+            text="Sign in",
+            element_type="button",
+            selector="div > form > button",
+            attributes={"type": "button", "labelText": "Sign in"},
+            is_visible=True,
+            is_clickable=True,
+        ),
+        PageElement(
+            index=3,
+            tag="button",
+            text="Continue with SSO",
+            element_type="button",
+            selector="div > form > div:nth-of-type(6) > button",
+            attributes={"type": "button", "labelText": "Continue with SSO"},
+            is_visible=True,
+            is_clickable=True,
+        ),
+    ]
+
+    selected = agent._find_submit_control_for_intent(
+        "log in with the provided account",
+        elements,
+        TaskIntent(intent_type="auth", query="login", confidence=0.9, requires_interaction=True),
+    )
+
+    assert selected is not None
+    assert selected.selector == "div > form > button"
+
+
 def test_decide_action_with_llm_skips_llm_when_no_elements_for_extract_task():
     guard = LLMGuard()
     agent = BrowserAgent(llm_client=guard, headless=True)
@@ -225,6 +474,253 @@ def test_decide_action_with_llm_skips_llm_when_no_elements_for_extract_task():
 
     assert action.action_type == ActionType.EXTRACT
     assert guard.called is False
+
+
+def test_decide_action_with_llm_includes_intent_fields_and_recent_steps():
+    llm = CapturingActionLLM(
+        {
+            "confidence": 0.77,
+            "action": {
+                "type": "click",
+                "element_index": 0,
+                "description": "submit login form",
+            },
+        }
+    )
+    agent = BrowserAgent(llm_client=llm, headless=True)
+    elements = [
+        PageElement(
+            index=0,
+            tag="button",
+            text="Login",
+            element_type="button",
+            selector="#submit",
+            attributes={"type": "submit", "labelText": "Login"},
+            is_visible=True,
+            is_clickable=True,
+        )
+    ]
+    intent = TaskIntent(
+        intent_type="auth",
+        query="login",
+        confidence=0.9,
+        fields={"username": "admin", "password": "AiAgent#2025"},
+        requires_interaction=True,
+    )
+
+    action = asyncio.run(
+        agent._decide_action_with_llm(
+            "test the login flow",
+            elements,
+            intent=intent,
+            data=[{"text": "Login page"}],
+            snapshot={"page_type": "form", "page_stage": "interacting"},
+            current_url="http://localhost/login",
+            title="Login",
+            recent_steps=[
+                {
+                    "step": 1,
+                    "action_type": "click",
+                    "description": "open login form",
+                    "result": "failed",
+                    "url": "http://localhost/login",
+                }
+            ],
+        )
+    )
+
+    assert action.action_type == ActionType.CLICK
+    assert action.target_selector == "#submit"
+    assert llm.calls == 1
+    assert llm.last_messages is not None
+    prompt = llm.last_messages[1]["content"]
+    assert "Structured fields:" in prompt
+    assert '"username": "admin"' in prompt
+    assert "Recent execution history:" in prompt
+    assert "open login form" in prompt
+
+
+def test_plan_next_action_prefers_ai_planner_before_local_fallback():
+    agent = BrowserAgent(headless=True)
+    calls = []
+    elements = [
+        PageElement(
+            index=0,
+            tag="button",
+            text="Continue",
+            element_type="button",
+            selector="#continue",
+            is_visible=True,
+            is_clickable=True,
+        )
+    ]
+
+    async def fake_assess(*_args, **_kwargs):
+        calls.append("assess")
+        return None
+
+    async def fake_llm(*_args, **_kwargs):
+        calls.append("llm")
+        return BrowserAction(
+            action_type=ActionType.CLICK,
+            target_selector="#continue",
+            description="model-chosen action",
+            confidence=0.81,
+        )
+
+    def fake_observation(*_args, **_kwargs):
+        calls.append("observation")
+        return BrowserAction(action_type=ActionType.CLICK, target_selector="#observation")
+
+    def fake_search_result(*_args, **_kwargs):
+        calls.append("search_result")
+        return BrowserAction(action_type=ActionType.CLICK, target_selector="#search-result")
+
+    def fake_local(*_args, **_kwargs):
+        calls.append("local")
+        return BrowserAction(action_type=ActionType.CLICK, target_selector="#local")
+
+    agent._assess_page_with_llm = fake_assess
+    agent._decide_action_with_llm = fake_llm
+    agent._choose_observation_driven_action = fake_observation
+    agent._find_search_result_click_action = fake_search_result
+    agent._decide_action_locally = fake_local
+
+    action, source = asyncio.run(
+        agent._plan_next_action(
+            "continue the flow",
+            "https://example.com/start",
+            "Example",
+            elements,
+            TaskIntent(intent_type="navigate", query="continue", confidence=0.9, requires_interaction=True),
+            [],
+            snapshot={"page_type": "detail", "page_stage": "interacting"},
+        )
+    )
+
+    assert action is not None
+    assert action.target_selector == "#continue"
+    assert source == "action_llm"
+    assert calls == ["assess", "llm"]
+
+
+def test_plan_next_action_falls_back_to_local_when_ai_only_waits():
+    agent = BrowserAgent(headless=True)
+    calls = []
+    elements = [
+        PageElement(
+            index=0,
+            tag="button",
+            text="Continue",
+            element_type="button",
+            selector="#continue",
+            is_visible=True,
+            is_clickable=True,
+        )
+    ]
+
+    async def fake_assess(*_args, **_kwargs):
+        calls.append("assess")
+        return BrowserAction(action_type=ActionType.WAIT, value="1", description="still loading")
+
+    async def fake_llm(*_args, **_kwargs):
+        calls.append("llm")
+        return BrowserAction(action_type=ActionType.WAIT, value="1", description="wait")
+
+    def fake_observation(*_args, **_kwargs):
+        calls.append("observation")
+        return None
+
+    def fake_search_result(*_args, **_kwargs):
+        calls.append("search_result")
+        return None
+
+    def fake_local(*_args, **_kwargs):
+        calls.append("local")
+        return BrowserAction(
+            action_type=ActionType.CLICK,
+            target_selector="#continue",
+            description="local fallback",
+            confidence=0.5,
+        )
+
+    agent._assess_page_with_llm = fake_assess
+    agent._decide_action_with_llm = fake_llm
+    agent._choose_observation_driven_action = fake_observation
+    agent._find_search_result_click_action = fake_search_result
+    agent._decide_action_locally = fake_local
+
+    action, source = asyncio.run(
+        agent._plan_next_action(
+            "continue the flow",
+            "https://example.com/start",
+            "Example",
+            elements,
+            TaskIntent(intent_type="navigate", query="continue", confidence=0.9, requires_interaction=True),
+            [],
+            snapshot={"page_type": "detail", "page_stage": "complete"},
+        )
+    )
+
+    assert action is not None
+    assert action.target_selector == "#continue"
+    assert source == "local_fallback"
+    assert calls == ["assess", "llm", "observation", "search_result", "local"]
+
+
+def test_sanitize_planned_action_rejects_done_for_active_auth_form():
+    agent = BrowserAgent(headless=True)
+    intent = TaskIntent(
+        intent_type="auth",
+        query="login",
+        confidence=0.9,
+        fields={"username": "admin", "password": "secret"},
+        requires_interaction=True,
+    )
+    elements = [
+        PageElement(
+            index=0,
+            tag="input",
+            text="",
+            element_type="text",
+            selector="#username",
+            attributes={"name": "username", "value": "admin"},
+            is_visible=True,
+            is_clickable=True,
+        ),
+        PageElement(
+            index=1,
+            tag="input",
+            text="",
+            element_type="password",
+            selector="#password",
+            attributes={"name": "password", "type": "password", "value": "secret"},
+            is_visible=True,
+            is_clickable=True,
+        ),
+        PageElement(
+            index=2,
+            tag="button",
+            text="Login",
+            element_type="button",
+            selector="#submit",
+            attributes={"type": "submit"},
+            is_visible=True,
+            is_clickable=True,
+        ),
+    ]
+
+    sanitized = agent._sanitize_planned_action(
+        "test the login flow",
+        "http://localhost/login",
+        elements,
+        intent,
+        [],
+        BrowserAction(action_type=ActionType.DONE, description="already finished"),
+        snapshot={"page_type": "login", "page_stage": "interacting"},
+    )
+
+    assert sanitized is None
 
 
 def test_format_elements_for_llm_uses_compact_budget():
@@ -288,8 +784,8 @@ def test_action_loop_detection_counts_repeated_signatures():
     agent = BrowserAgent(headless=True)
     action = BrowserAction(action_type=ActionType.WAIT, value="1", description="wait")
 
-    agent._record_action(action)
-    agent._record_action(action)
+    for _ in range(5):
+        agent._record_action(action)
 
     assert agent._is_action_looping(action) is True
 
