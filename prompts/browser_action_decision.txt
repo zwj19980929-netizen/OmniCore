@@ -13,7 +13,7 @@ Recent execution history:
 {recent_steps}
 {data_progress}
 Context coverage: {context_coverage}
-Visible data:
+Visible data & page content:
 {data}
 Search result cards:
 {cards}
@@ -23,9 +23,16 @@ Controls:
 {controls}
 Elements:
 {elements}
+Headings:
+{headings}
+Page regions:
+{regions}
+Vision description:
+{vision_description}
 
 Important decision rules:
-- The context below is a prioritized, partial view of the page. Do not assume omitted content is absent.
+- The context above includes page regions, main text, and visible text blocks. Use these to understand the page layout and content before deciding the next action.
+- The context is a prioritized, partial view of the page. Do not assume omitted content is absent.
 - Base the next action on the current visible state and the recent execution history, not on generic assumptions about the website.
 - Prefer `target_ref` over `target_selector` whenever a relevant card or element ref is available.
 - Avoid repeating the same failed action unless the page clearly changed.
@@ -38,6 +45,8 @@ Important decision rules:
 - If data_collected < data_target and you see "加载更多"/"Load More"/"查看更多" buttons, CLICK them.
 - If data_collected >= data_target or no more data can be loaded, use DONE.
 - SCROLL value should be pixels to scroll down (e.g. "800" for one screen).
+- If vision_description is provided, cross-reference it with the element list to resolve ambiguity about page layout and interactive targets.
+- For forms with multiple fields, prefer `fill_form` with all field values in one action.
 
 Return keys: thinking, action, confidence, requires_human_confirm.
 The action object should contain:

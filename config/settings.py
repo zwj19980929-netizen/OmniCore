@@ -165,6 +165,11 @@ class Settings:
         os.getenv("WEB_PERCEPTION_DEBUG_DIR", DATA_DIR / "debug" / "web_perception")
     )
 
+    # === Vision Perception (浏览器视觉感知) ===
+    VISION_PERCEPTION_MODEL = os.getenv("VISION_PERCEPTION_MODEL", "gemini/gemini-2.0-flash")
+    VISION_PERCEPTION_ENABLED = os.getenv("VISION_PERCEPTION_ENABLED", "true").lower() == "true"
+    VISION_PERCEPTION_COMPLEXITY_THRESHOLD = float(os.getenv("VISION_PERCEPTION_COMPLEXITY_THRESHOLD", "0.4"))
+
     # === 浏览器执行配置 ===
     # 快速模式：减少随机延迟与不必要等待，优先吞吐
     BROWSER_FAST_MODE = os.getenv("BROWSER_FAST_MODE", "true").lower() == "true"

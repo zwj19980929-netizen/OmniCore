@@ -113,8 +113,10 @@ class AccessibilityTreeExtractor:
             snapshot = await page.accessibility.snapshot()
             if snapshot:
                 self._traverse_a11y_tree(snapshot)
-        except Exception as e:
-            # 降级到方法2
+                # Resolve selectors for a11y-sourced elements (they have empty tag/selector)
+                if self.elements:
+                    await self._resolve_a11y_selectors(page)
+        except Exception:
             pass
 
         # 方法2: 如果方法1失败，使用JavaScript提取
@@ -177,6 +179,69 @@ class AccessibilityTreeExtractor:
             # 非交互元素，继续遍历子节点（不改变parent_ref）
             for child in node.get('children', []):
                 self._traverse_a11y_tree(child, parent_ref, current_region, depth + 1)
+
+    async def _resolve_a11y_selectors(self, page):
+        """
+        For elements sourced from the a11y tree, resolve their tag and CSS selector
+        by matching role+name against DOM elements via JavaScript.
+        """
+        queries = [{"role": e.role, "name": e.name} for e in self.elements if not e.selector]
+        if not queries:
+            return
+        try:
+            results = await page.evaluate("""
+                (queries) => {
+                    const normalize = (v) => String(v || '').replace(/\\s+/g, ' ').trim();
+                    const selectorOf = (el) => {
+                        if (!el) return '';
+                        const stableAttrs = ['data-testid', 'data-id', 'data-cy', 'data-qa', 'data-test'];
+                        for (const attr of stableAttrs) { const v = el.getAttribute(attr); if (v) return `[${attr}="${CSS.escape(v)}"]`; }
+                        if (el.id) return `#${CSS.escape(el.id)}`;
+                        const name = el.getAttribute('name');
+                        if (name) return `${el.tagName.toLowerCase()}[name="${CSS.escape(name)}"]`;
+                        const ph = el.getAttribute('placeholder');
+                        if (ph) return `${el.tagName.toLowerCase()}[placeholder="${CSS.escape(ph)}"]`;
+                        const href = el.getAttribute('href');
+                        if (href && href.length <= 200) return `${el.tagName.toLowerCase()}[href="${CSS.escape(href)}"]`;
+                        return el.tagName.toLowerCase();
+                    };
+                    const roleToSelector = {
+                        'button': 'button, [role="button"], input[type="button"], input[type="submit"]',
+                        'link': 'a[href], [role="link"]',
+                        'textbox': 'input:not([type="hidden"]), textarea, [role="textbox"]',
+                        'searchbox': 'input[type="search"], [role="searchbox"]',
+                        'combobox': 'select, [role="combobox"]',
+                        'checkbox': 'input[type="checkbox"], [role="checkbox"]',
+                        'radio': 'input[type="radio"], [role="radio"]',
+                        'tab': '[role="tab"]',
+                        'menuitem': '[role="menuitem"]',
+                        'switch': '[role="switch"]',
+                        'slider': 'input[type="range"], [role="slider"]',
+                    };
+                    return queries.map(q => {
+                        const candidates = document.querySelectorAll(roleToSelector[q.role] || `[role="${q.role}"]`);
+                        for (const el of candidates) {
+                            const name = normalize(
+                                el.getAttribute('aria-label') || el.getAttribute('title') ||
+                                el.getAttribute('placeholder') || el.textContent || el.value || ''
+                            );
+                            if (name && name.includes(q.name.substring(0, 30))) {
+                                return { tag: el.tagName.toLowerCase(), selector: selectorOf(el) };
+                            }
+                        }
+                        return { tag: '', selector: '' };
+                    });
+                }
+            """, queries)
+            idx = 0
+            for elem in self.elements:
+                if not elem.selector:
+                    if idx < len(results):
+                        elem.tag = results[idx].get('tag', '')
+                        elem.selector = results[idx].get('selector', '')
+                    idx += 1
+        except Exception:
+            pass
 
     async def _extract_via_javascript(self, page):
         """

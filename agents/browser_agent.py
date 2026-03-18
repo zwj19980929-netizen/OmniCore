@@ -8,6 +8,7 @@ import json
 import os
 import random
 import re
+import time
 from urllib.parse import parse_qs, urlparse
 from dataclasses import dataclass, field
 from enum import Enum
@@ -15,7 +16,9 @@ from typing import Any, Dict, List, Optional, Tuple
 
 from config.settings import settings
 from core.llm import LLMClient
+from utils.accessibility_tree_extractor import AccessibilityTreeExtractor, AccessibleElement
 from utils.browser_toolkit import BrowserToolkit, ToolkitResult
+from utils.enhanced_page_perceiver import EnhancedPagePerceiver, PageContent
 from utils.logger import log_agent_action, log_error, log_success, log_warning
 from utils.retry import async_retry, is_retryable
 from utils.search_engine_profiles import (
@@ -124,6 +127,18 @@ class PageState:
     goal_satisfied: bool = False
 
 
+@dataclass
+class PageObservation:
+    """Unified page observation combining all perception sources."""
+    snapshot: Dict[str, Any] = field(default_factory=dict)
+    a11y_elements: List[Any] = field(default_factory=list)  # AccessibleElement list
+    page_content: Optional[Any] = None  # PageContent from perceiver
+    vision_description: str = ""
+    snapshot_version: int = 0
+    timestamp: float = 0.0
+    headings: List[Dict[str, str]] = field(default_factory=list)
+
+
 _QUERY_STOP_TOKENS = frozenset(
     {
         "the", "and", "for", "with", "from", "that", "this", "into", "about",
@@ -171,8 +186,9 @@ from utils.prompt_manager import get_prompt
 ACTION_DECISION_PROMPT = get_prompt("browser_action_decision")
 PAGE_ASSESSMENT_PROMPT = get_prompt("browser_page_assessment")
 VISION_ACTION_PROMPT = get_prompt("browser_vision_decision")
-_PAGE_ASSESSMENT_CONTEXT_TOKENS = 1600
-_ACTION_DECISION_CONTEXT_TOKENS = 1400
+UNIFIED_PLAN_PROMPT = get_prompt("browser_unified_plan")
+_PAGE_ASSESSMENT_CONTEXT_TOKENS = 2400
+_ACTION_DECISION_CONTEXT_TOKENS = 2200
 _AUTH_USERNAME_ALIASES = (
     "username",
     "user name",
@@ -337,6 +353,15 @@ class BrowserAgent:
         self._vision_llm: Optional[LLMClient] = None
         self._vision_llm_attempted = False
         self._vision_llm_unavailable_logged = False
+
+        # Perception subsystems
+        self.a11y_extractor = AccessibilityTreeExtractor()
+        self.page_perceiver = EnhancedPagePerceiver()
+
+        # Snapshot caching (Phase 3)
+        self._snapshot_version: int = 0
+        self._last_snapshot_hash: str = ""
+        self._last_observation: Optional[PageObservation] = None
 
         # 如果外部传入 toolkit 就用，否则自建
         if toolkit:
@@ -853,7 +878,7 @@ class BrowserAgent:
     def _get_snapshot_main_text(self, snapshot: Optional[Dict[str, Any]]) -> str:
         return str((snapshot or {}).get("main_text", "") or "").strip()
 
-    def _format_snapshot_text_for_llm(self, snapshot: Optional[Dict[str, Any]], max_blocks: int = 6) -> str:
+    def _format_snapshot_text_for_llm(self, snapshot: Optional[Dict[str, Any]], max_blocks: int = 8) -> str:
         active_snapshot = snapshot or {}
         lines: List[str] = []
         page_type = str(active_snapshot.get("page_type", "") or "").strip()
@@ -873,13 +898,58 @@ class BrowserAgent:
         blocked_signals = self._get_snapshot_blocked_signals(active_snapshot)
         if blocked_signals:
             lines.append("Blocked signals: " + " | ".join(blocked_signals[:4]))
+
+        # 页面区域结构（regions）—— 帮助 LLM 理解页面布局
+        regions = active_snapshot.get("regions") or []
+        if regions:
+            lines.append("Page regions:")
+            for region in regions[:6]:
+                kind = str(region.get("kind", "") or "")
+                heading = str(region.get("heading", "") or "").strip()
+                item_count = int(region.get("item_count", 0) or 0)
+                link_count = int(region.get("link_count", 0) or 0)
+                control_count = int(region.get("control_count", 0) or 0)
+                text_sample = str(region.get("text_sample", "") or "").strip()
+                sample_items = region.get("sample_items") or []
+
+                parts = [f"[{kind}]"]
+                if heading:
+                    parts.append(f'"{heading[:80]}"')
+                metrics = []
+                if item_count:
+                    metrics.append(f"{item_count} items")
+                if link_count:
+                    metrics.append(f"{link_count} links")
+                if control_count:
+                    metrics.append(f"{control_count} controls")
+                if metrics:
+                    parts.append(f"({', '.join(metrics)})")
+                if sample_items:
+                    parts.append("samples: " + " | ".join(s[:100] for s in sample_items[:3]))
+                elif text_sample:
+                    parts.append("text: " + text_sample[:160])
+                lines.append("- " + " ".join(parts))
+
+        # 页面标题结构（headings）
+        headings = active_snapshot.get("headings") or []
+        if headings:
+            lines.append("Headings:")
+            for h in headings[:8]:
+                level = str(h.get("level", "") or "")
+                text = str(h.get("text", "") or "").strip()
+                if text:
+                    lines.append(f"  [{level}] {text[:120]}")
+
+        # 主要文本 —— detail 页面给更多内容
         main_text = self._get_snapshot_main_text(active_snapshot)
         if main_text:
-            lines.append("Main text: " + main_text[:420])
+            main_text_limit = 800 if page_type == "detail" else 520
+            lines.append("Main text: " + main_text[:main_text_limit])
+
         blocks = self._get_snapshot_visible_text_blocks(active_snapshot)
         if blocks:
             lines.append("Visible text blocks:")
-            lines.extend(f"{index}. {text[:220]}" for index, text in enumerate(blocks[:max_blocks], 1))
+            lines.extend(f"{index}. {text[:240]}" for index, text in enumerate(blocks[:max_blocks], 1))
         return "\n".join(lines).strip()
 
     def _stringify_llm_response(self, response: Any) -> str:
@@ -905,17 +975,23 @@ class BrowserAgent:
         title = await self._get_title_value()
         body_text = ""
         visible_text_blocks: List[Dict[str, str]] = []
+        fallback_elements: List[Dict[str, Any]] = []
+        fallback_controls: List[Dict[str, Any]] = []
+        has_modal = False
+        has_search_box = False
+        search_input_selector = ""
         evaluate_result = await self._call_toolkit(
             "evaluate_js",
             r"""() => {
+                const normalize = (v) => String(v || '').replace(/\s+/g, ' ').trim();
                 const bodyText = document.body && document.body.innerText ? document.body.innerText : '';
                 const blockCandidates = Array.from(document.querySelectorAll('main, article, section, [role="main"], [data-testid], p, h1, h2, h3, li'))
                     .map((node) => {
-                        const text = (node.innerText || node.textContent || '').replace(/\s+/g, ' ').trim();
+                        const text = normalize(node.innerText || node.textContent || '');
                         if (!text) return null;
                         const rect = node.getBoundingClientRect ? node.getBoundingClientRect() : { width: 0, height: 0 };
                         return {
-                            text: text.slice(0, 240),
+                            text: text.slice(0, 320),
                             tag: (node.tagName || '').toLowerCase(),
                             role: node.getAttribute ? (node.getAttribute('role') || '') : '',
                             width: Math.round(rect.width || 0),
@@ -923,10 +999,88 @@ class BrowserAgent:
                         };
                     })
                     .filter(Boolean)
-                    .slice(0, 12);
+                    .slice(0, 16);
+
+                // 提取交互元素（简化版）
+                const isVisible = (el) => {
+                    if (!el) return false;
+                    const rect = el.getBoundingClientRect();
+                    return rect.width > 0 && rect.height > 0;
+                };
+                const selectorOf = (el) => {
+                    if (!el) return '';
+                    if (el.id) return '#' + el.id;
+                    const name = el.getAttribute('name');
+                    if (name) return el.tagName.toLowerCase() + '[name="' + name + '"]';
+                    const ph = el.getAttribute('placeholder');
+                    if (ph) return el.tagName.toLowerCase() + '[placeholder="' + ph + '"]';
+                    const href = el.getAttribute('href');
+                    if (href && href.length <= 120) return el.tagName.toLowerCase() + '[href="' + href + '"]';
+                    return el.tagName.toLowerCase();
+                };
+
+                const interactiveNodes = Array.from(document.querySelectorAll(
+                    'a[href], button, input:not([type="hidden"]), textarea, select, [role="button"], [role="link"], [contenteditable="true"]'
+                )).filter(isVisible).slice(0, 60);
+
+                const elements = interactiveNodes.map((el, idx) => {
+                    const tag = el.tagName.toLowerCase();
+                    const inputType = normalize(el.getAttribute('type') || '').toLowerCase();
+                    let role = normalize(el.getAttribute('role') || '').toLowerCase();
+                    if (!role) {
+                        if (tag === 'a') role = 'link';
+                        else if (tag === 'button') role = 'button';
+                        else if (tag === 'input') role = (inputType === 'search') ? 'searchbox' : 'textbox';
+                        else if (tag === 'textarea') role = 'textbox';
+                        else if (tag === 'select') role = 'combobox';
+                        else role = tag;
+                    }
+                    return {
+                        ref: 'el_' + (idx + 1),
+                        role: role,
+                        tag: tag,
+                        type: inputType || tag,
+                        text: normalize(el.innerText || el.textContent || el.value || el.getAttribute('aria-label') || el.getAttribute('placeholder') || '').slice(0, 160),
+                        href: el.href || el.getAttribute('href') || '',
+                        value: typeof el.value === 'string' ? String(el.value || '').slice(0, 160) : '',
+                        label: '',
+                        placeholder: normalize(el.getAttribute('placeholder') || '').slice(0, 120),
+                        selector: selectorOf(el),
+                        visible: true,
+                        enabled: !el.disabled,
+                        region: 'body',
+                    };
+                });
+
+                // 检测 modal
+                const hasModal = !!document.querySelector('dialog[open], [role="dialog"], [aria-modal="true"], .modal.show');
+
+                // 检测搜索框
+                const searchInput = document.querySelector('input[type="search"], input[name*="search"], input[placeholder*="search" i], input[placeholder*="搜索"]');
+                const hasSearchBox = !!searchInput;
+                const searchSelector = searchInput ? selectorOf(searchInput) : '';
+
+                // 检测当前焦点元素（对于刚打开的 modal 很重要）
+                const focused = document.activeElement;
+                let focusedInfo = null;
+                if (focused && focused !== document.body && isVisible(focused)) {
+                    focusedInfo = {
+                        tag: focused.tagName.toLowerCase(),
+                        type: normalize(focused.getAttribute('type') || '').toLowerCase(),
+                        selector: selectorOf(focused),
+                        placeholder: normalize(focused.getAttribute('placeholder') || ''),
+                        role: normalize(focused.getAttribute('role') || ''),
+                    };
+                }
+
                 return {
-                    bodyText: bodyText.slice(0, 4000),
+                    bodyText: bodyText.slice(0, 6000),
                     visibleTextBlocks: blockCandidates,
+                    elements: elements,
+                    hasModal: hasModal,
+                    hasSearchBox: hasSearchBox,
+                    searchSelector: searchSelector,
+                    focusedElement: focusedInfo,
                 };
             }""",
         )
@@ -934,7 +1088,7 @@ class BrowserAgent:
             body_text = str(evaluate_result.data.get("bodyText", "") or "").strip()
             raw_blocks = evaluate_result.data.get("visibleTextBlocks", []) or []
             if isinstance(raw_blocks, list):
-                for item in raw_blocks[:12]:
+                for item in raw_blocks[:16]:
                     if isinstance(item, dict):
                         text = str(item.get("text", "") or "").strip()
                         if text:
@@ -945,6 +1099,33 @@ class BrowserAgent:
                                     "role": str(item.get("role", "") or "").strip(),
                                 }
                             )
+            raw_elements = evaluate_result.data.get("elements", []) or []
+            if isinstance(raw_elements, list):
+                fallback_elements = [e for e in raw_elements if isinstance(e, dict)]
+
+            has_modal = bool(evaluate_result.data.get("hasModal", False))
+            has_search_box = bool(evaluate_result.data.get("hasSearchBox", False))
+            search_input_selector = str(evaluate_result.data.get("searchSelector", "") or "")
+
+            # 如果有焦点元素（如刚打开的搜索弹窗），加入 controls
+            focused = evaluate_result.data.get("focusedElement")
+            if focused and isinstance(focused, dict):
+                focused_tag = str(focused.get("tag", "") or "")
+                if focused_tag in ("input", "textarea"):
+                    fallback_controls.append({
+                        "ref": "ctl_focused_input",
+                        "kind": "focused_input",
+                        "text": str(focused.get("placeholder", "") or "") or "focused input",
+                        "selector": str(focused.get("selector", "") or ""),
+                    })
+                    # 如果焦点在搜索类输入框上，也标记为 search_input
+                    focused_type = str(focused.get("type", "") or "")
+                    focused_role = str(focused.get("role", "") or "")
+                    if focused_type == "search" or focused_role == "searchbox" or "search" in str(focused.get("placeholder", "") or "").lower():
+                        has_search_box = True
+                        if not search_input_selector:
+                            search_input_selector = str(focused.get("selector", "") or "")
+
         blocked_signals: List[str] = []
         if self._looks_like_blocked_page(current_url, title):
             blocked_signals.append(title or current_url)
@@ -955,12 +1136,16 @@ class BrowserAgent:
         looks_like_serp = self._looks_like_search_results_url(current_url)
         page_type = "blocked" if blocked_signals else ("serp" if looks_like_serp else "unknown")
         page_stage = "blocked" if blocked_signals else ("selecting_source" if looks_like_serp else ("extracting" if body_text else "unknown"))
+        if has_modal:
+            page_stage = "dismiss_modal"
         affordances = {
             "has_results": looks_like_serp and (len(body_text) >= 240 or len(visible_text_blocks) >= 2),
             "collection_item_count": 0,
-            "has_modal": False,
+            "has_modal": has_modal,
             "has_pagination": False,
             "has_load_more": False,
+            "has_search_box": has_search_box,
+            "search_input_selector": search_input_selector,
         }
         return {
             "page_type": page_type,
@@ -970,8 +1155,8 @@ class BrowserAgent:
             "blocked_signals": blocked_signals,
             "cards": [],
             "collections": [],
-            "controls": [],
-            "elements": [],
+            "controls": fallback_controls,
+            "elements": fallback_elements,
             "affordances": affordances,
             "url": current_url,
             "title": title,
@@ -984,7 +1169,6 @@ class BrowserAgent:
                 self._last_semantic_snapshot = snapshot_r.data
                 web_debug_recorder.write_json("browser_semantic_snapshot", self._last_semantic_snapshot)
 
-                # 🔥 新增：输出语义快照摘要到控制台
                 if web_debug_recorder.is_enabled():
                     log_warning(f"[DEBUG] ========== 语义快照 ==========")
                     log_warning(f"[DEBUG] 页面类型: {self._last_semantic_snapshot.get('page_type', 'unknown')}")
@@ -998,12 +1182,14 @@ class BrowserAgent:
                     log_warning(f"[DEBUG] ====================================")
 
                 return self._last_semantic_snapshot
+            else:
+                log_warning(f"semantic_snapshot 主路径失败: {snapshot_r.error or 'unknown error'}")
+
         fallback_snapshot = await self._build_fallback_semantic_snapshot()
         self._last_semantic_snapshot = fallback_snapshot or {}
         if self._last_semantic_snapshot:
             web_debug_recorder.write_json("browser_semantic_snapshot", self._last_semantic_snapshot)
 
-            # 🔥 新增：fallback快照也输出到控制台
             if web_debug_recorder.is_enabled():
                 log_warning(f"[DEBUG] ========== 语义快照 (fallback) ==========")
                 log_warning(f"[DEBUG] 页面类型: {self._last_semantic_snapshot.get('page_type', 'unknown')}")
@@ -1011,6 +1197,311 @@ class BrowserAgent:
                 log_warning(f"[DEBUG] ====================================")
 
         return self._last_semantic_snapshot
+
+    # ── Unified observe pipeline ────────────────────────────────
+
+    async def _observe_page(self) -> PageObservation:
+        """
+        Unified page observation: JS snapshot + a11y tree + perceiver + vision.
+        Replaces scattered snapshot/elements passing with single PageObservation.
+        """
+        # 1. Get JS semantic snapshot
+        snapshot = await self._get_semantic_snapshot()
+
+        # 2. Snapshot caching: check if page changed
+        snap_hash = self._compute_snapshot_hash(snapshot)
+        if snap_hash == self._last_snapshot_hash and self._last_observation is not None:
+            # Reuse cached observation
+            self._snapshot_version += 1
+            self._last_observation.snapshot_version = self._snapshot_version
+            log_agent_action(self.name, "observe", "cache_hit")
+            return self._last_observation
+
+        self._last_snapshot_hash = snap_hash
+        self._snapshot_version += 1
+
+        # 3. A11y tree extraction
+        a11y_elements: List[AccessibleElement] = []
+        page = getattr(self.toolkit, '_page', None)
+        if page:
+            try:
+                a11y_elements = await self.a11y_extractor.extract_tree(page)
+                if a11y_elements:
+                    self._merge_a11y_into_snapshot(snapshot, a11y_elements)
+                    log_agent_action(self.name, "observe", f"a11y_elements={len(a11y_elements)}")
+            except Exception as exc:
+                log_warning(f"a11y extraction failed: {exc}")
+
+        # 4. Perceiver content (headings, text blocks, summary)
+        page_content: Optional[PageContent] = None
+        headings: List[Dict[str, str]] = []
+        if page:
+            try:
+                page_content = await self.page_perceiver.perceive_page(page)
+                if page_content:
+                    self._merge_perceiver_content(snapshot, page_content)
+                    headings = [{"level": h, "text": t} for h, t in
+                                zip(["h1", "h2", "h3"] * 10, page_content.main_headings)]
+                    # Fix: use actual heading data from snapshot
+                    headings = snapshot.get("headings") or []
+            except Exception as exc:
+                log_warning(f"perceiver extraction failed: {exc}")
+
+        # 5. Vision perception (conditional)
+        vision_description = ""
+        if settings.VISION_PERCEPTION_ENABLED and page:
+            complexity = self._compute_complexity_score(snapshot, a11y_elements)
+            page_type = str(snapshot.get("page_type", "") or "")
+            if complexity > settings.VISION_PERCEPTION_COMPLEXITY_THRESHOLD or page_type == "unknown":
+                try:
+                    vision_description = await self._get_vision_description(page)
+                    if vision_description:
+                        log_agent_action(self.name, "observe", f"vision_len={len(vision_description)}")
+                except Exception as exc:
+                    log_warning(f"vision perception failed: {exc}")
+
+        # 6. Apply versioned refs: prefix element refs with version number
+        version = self._snapshot_version
+        for elem in snapshot.get("elements") or []:
+            if isinstance(elem, dict) and elem.get("ref"):
+                elem["ref"] = f"{version}:{elem['ref']}"
+        for card in snapshot.get("cards") or []:
+            if isinstance(card, dict):
+                if card.get("ref"):
+                    card["ref"] = f"{version}:{card['ref']}"
+                if card.get("target_ref"):
+                    card["target_ref"] = f"{version}:{card['target_ref']}"
+        for ctrl in snapshot.get("controls") or []:
+            if isinstance(ctrl, dict) and ctrl.get("ref"):
+                ctrl["ref"] = f"{version}:{ctrl['ref']}"
+        # Also update toolkit ref_map with versioned keys
+        if hasattr(self.toolkit, '_semantic_ref_map'):
+            old_map = dict(self.toolkit._semantic_ref_map)
+            new_map = {}
+            for k, v in old_map.items():
+                new_map[f"{version}:{k}"] = v
+                new_map[k] = v  # keep unversioned for backward compat
+            self.toolkit._semantic_ref_map = new_map
+
+        observation = PageObservation(
+            snapshot=snapshot,
+            a11y_elements=a11y_elements,
+            page_content=page_content,
+            vision_description=vision_description,
+            snapshot_version=self._snapshot_version,
+            timestamp=time.time(),
+            headings=headings,
+        )
+        self._last_observation = observation
+        return observation
+
+    def _compute_snapshot_hash(self, snapshot: Dict[str, Any]) -> str:
+        """Hash of url + element count + first 5 element names for cache invalidation."""
+        url = str(snapshot.get("url", "") or "")
+        elements = snapshot.get("elements") or []
+        elem_count = len(elements)
+        first_names = "|".join(
+            str(e.get("text", "") or "")[:30]
+            for e in elements[:5]
+            if isinstance(e, dict)
+        )
+        raw = f"{url}|{elem_count}|{first_names}"
+        return hashlib.md5(raw.encode("utf-8", errors="ignore")).hexdigest()
+
+    def _merge_a11y_into_snapshot(
+        self, snapshot: Dict[str, Any], a11y_elements: List[AccessibleElement]
+    ) -> None:
+        """
+        Enrich snapshot with a11y elements. If a11y extraction found elements,
+        use them as primary (they have better roles/names), keeping JS selectors.
+        """
+        if not a11y_elements:
+            return
+
+        # Build mapping from JS elements for selector fallback
+        js_elements = snapshot.get("elements") or []
+        js_by_selector: Dict[str, Dict] = {}
+        for el in js_elements:
+            sel = str(el.get("selector", "") or "")
+            if sel:
+                js_by_selector[sel] = el
+
+        # Convert a11y elements to snapshot element format
+        merged_elements: List[Dict[str, Any]] = []
+        for idx, ae in enumerate(a11y_elements[:80]):
+            # Try to find matching JS element by selector for bbox/href
+            js_match = js_by_selector.get(ae.selector, {})
+            merged_elements.append({
+                "ref": ae.ref,
+                "role": ae.role,
+                "tag": ae.tag or js_match.get("tag", ""),
+                "type": ae.role,
+                "text": ae.name,
+                "href": ae.attributes.get("href", "") or js_match.get("href", ""),
+                "value": ae.attributes.get("value", "") or js_match.get("value", ""),
+                "label": ae.name,
+                "placeholder": ae.attributes.get("placeholder", "") or js_match.get("placeholder", ""),
+                "selector": ae.selector or js_match.get("selector", ""),
+                "visible": ae.is_visible,
+                "enabled": True,
+                "region": ae.region or js_match.get("region", "body"),
+                "parent_ref": ae.parent_ref,
+                "bbox": ae.bbox or js_match.get("bbox", {}),
+            })
+
+        # Only replace if we got a reasonable count
+        if len(merged_elements) >= max(len(js_elements) // 3, 3):
+            snapshot["elements"] = merged_elements
+        snapshot["a11y_element_count"] = len(a11y_elements)
+
+    def _merge_perceiver_content(
+        self, snapshot: Dict[str, Any], page_content: PageContent
+    ) -> None:
+        """Enrich snapshot with perceiver's headings, text blocks, and summary."""
+        if page_content.main_headings:
+            snapshot["headings"] = [
+                {"level": f"h{min(i, 3)}", "text": h}
+                for i, h in enumerate(page_content.main_headings, 1)
+            ]
+
+        # Enrich visible_text_blocks
+        existing_blocks = snapshot.get("visible_text_blocks") or []
+        existing_texts = {str(b.get("text", "") or "")[:60] for b in existing_blocks if isinstance(b, dict)}
+        for block in page_content.text_blocks:
+            if block[:60] not in existing_texts:
+                existing_blocks.append({"kind": "p", "text": block[:320], "selector": "", "parent_ref": ""})
+                existing_texts.add(block[:60])
+        snapshot["visible_text_blocks"] = existing_blocks[:20]
+
+        if page_content.page_summary:
+            snapshot["page_summary"] = page_content.page_summary
+
+    def _compute_complexity_score(
+        self, snapshot: Dict[str, Any], a11y_elements: List[AccessibleElement]
+    ) -> float:
+        """Ratio of unnamed/ambiguous elements — high score means poor perception."""
+        elements = a11y_elements or []
+        if not elements:
+            elements_data = snapshot.get("elements") or []
+            if not elements_data:
+                return 1.0
+            unnamed = sum(1 for e in elements_data if not str(e.get("text", "") or "").strip())
+            return unnamed / max(len(elements_data), 1)
+        unnamed = sum(1 for e in elements if not e.name.strip())
+        return unnamed / max(len(elements), 1)
+
+    async def _get_vision_description(self, page) -> str:
+        """Take screenshot and describe via vision model."""
+        if not self._vision_llm and not self._vision_llm_attempted:
+            self._vision_llm_attempted = True
+            try:
+                self._vision_llm = LLMClient.for_vision()
+            except Exception:
+                if not self._vision_llm_unavailable_logged:
+                    log_warning("vision LLM unavailable for perception")
+                    self._vision_llm_unavailable_logged = True
+                return ""
+
+        if not self._vision_llm:
+            return ""
+
+        try:
+            screenshot_bytes = await page.screenshot(type="jpeg", quality=50, full_page=False)
+            response = self._vision_llm.chat_with_image(
+                text="Describe this webpage briefly: layout, main content area, key interactive elements, any modals/overlays. Be concise (2-3 sentences).",
+                image=screenshot_bytes,
+                temperature=0.2,
+                max_tokens=300,
+            )
+            content = getattr(response, "content", None)
+            if isinstance(content, str):
+                return content.strip()[:500]
+            return str(content or "").strip()[:500]
+        except Exception as exc:
+            log_warning(f"vision description failed: {exc}")
+            return ""
+
+    def _validate_action(
+        self, action: Optional[BrowserAction], observation: PageObservation
+    ) -> Optional[BrowserAction]:
+        """Lightweight validation: does target_ref exist? Is selector valid? Auto-fix stale versioned refs."""
+        if action is None:
+            return None
+        if action.action_type in {ActionType.DONE, ActionType.FAILED, ActionType.WAIT, ActionType.SCROLL,
+                                   ActionType.PRESS_KEY, ActionType.NAVIGATE, ActionType.EXTRACT}:
+            return action
+
+        snapshot = observation.snapshot
+        elements = snapshot.get("elements") or []
+        ref_set = {str(e.get("ref", "") or "") for e in elements if isinstance(e, dict)}
+        for card in snapshot.get("cards") or []:
+            ref_set.add(str(card.get("ref", "") or ""))
+            ref_set.add(str(card.get("target_ref", "") or ""))
+        for ctrl in snapshot.get("controls") or []:
+            ref_set.add(str(ctrl.get("ref", "") or ""))
+        ref_set.discard("")
+
+        if action.target_ref and action.target_ref not in ref_set:
+            # Stale versioned ref? Try stripping version prefix and re-matching
+            ref = action.target_ref
+            bare_ref = ref.split(":", 1)[1] if ":" in ref else ref
+            current_version = observation.snapshot_version
+
+            # Try current version prefix
+            versioned = f"{current_version}:{bare_ref}"
+            if versioned in ref_set:
+                log_warning(f"resolved stale ref '{ref}' → '{versioned}'")
+                action.target_ref = versioned
+            else:
+                # Try name-based matching as last resort
+                log_warning(f"action target_ref '{ref}' not in snapshot, attempting name match")
+                desc_lower = (action.description or "").lower()
+                for elem in elements:
+                    if isinstance(elem, dict):
+                        text = str(elem.get("text", "") or "").lower()
+                        if text and desc_lower and text[:20] in desc_lower:
+                            action.target_ref = str(elem.get("ref", "") or "")
+                            action.target_selector = str(elem.get("selector", "") or "")
+                            break
+
+        return action
+
+    def _format_headings_for_llm(self, snapshot: Dict[str, Any]) -> str:
+        """Format headings from snapshot for LLM prompt."""
+        headings = snapshot.get("headings") or []
+        if not headings:
+            return "(no headings)"
+        lines = []
+        for h in headings[:8]:
+            level = str(h.get("level", "") or "")
+            text = str(h.get("text", "") or "").strip()
+            if text:
+                lines.append(f"[{level}] {text[:120]}")
+        return "\n".join(lines) if lines else "(no headings)"
+
+    def _format_regions_for_llm(self, snapshot: Dict[str, Any]) -> str:
+        """Format regions from snapshot for LLM prompt."""
+        regions = snapshot.get("regions") or []
+        if not regions:
+            return "(no regions)"
+        lines = []
+        for r in regions[:6]:
+            kind = str(r.get("kind", "") or "")
+            heading = str(r.get("heading", "") or "").strip()
+            items = int(r.get("item_count", 0) or 0)
+            links = int(r.get("link_count", 0) or 0)
+            parts = [f"[{kind}]"]
+            if heading:
+                parts.append(f'"{heading[:80]}"')
+            metrics = []
+            if items:
+                metrics.append(f"{items} items")
+            if links:
+                metrics.append(f"{links} links")
+            if metrics:
+                parts.append(f"({', '.join(metrics)})")
+            lines.append(" ".join(parts))
+        return "\n".join(lines) if lines else "(no regions)"
 
     def _elements_from_snapshot(self, snapshot: Dict[str, Any]) -> List[PageElement]:
         elements: List[PageElement] = []
@@ -1577,9 +2068,9 @@ class BrowserAgent:
                 BudgetSection(
                     name="data",
                     text=data_text,
-                    min_chars=240,
-                    max_chars=1100,
-                    weight=0.8,
+                    min_chars=360,
+                    max_chars=1800,
+                    weight=1.0,
                     mode="lines",
                     omission_label="data lines",
                 ),
@@ -1587,7 +2078,7 @@ class BrowserAgent:
                     name="cards",
                     text=cards_text,
                     min_chars=480,
-                    max_chars=1700,
+                    max_chars=2200,
                     weight=1.4,
                     mode="lines",
                     omission_label="card lines",
@@ -1596,7 +2087,7 @@ class BrowserAgent:
                     name="collections",
                     text=collections_text,
                     min_chars=260,
-                    max_chars=900,
+                    max_chars=1200,
                     weight=0.9,
                     mode="lines",
                     omission_label="collection lines",
@@ -1605,7 +2096,7 @@ class BrowserAgent:
                     name="controls",
                     text=controls_text,
                     min_chars=180,
-                    max_chars=700,
+                    max_chars=800,
                     weight=0.8,
                     mode="lines",
                     omission_label="control lines",
@@ -1614,7 +2105,7 @@ class BrowserAgent:
                     name="elements",
                     text=elements_text,
                     min_chars=520,
-                    max_chars=1900,
+                    max_chars=2400,
                     weight=1.5,
                     mode="lines",
                     omission_label="element lines",
@@ -1945,7 +2436,8 @@ class BrowserAgent:
     # ── element extraction (Agent's "eyes", uses toolkit.evaluate_js) ──
 
     async def _extract_interactive_elements(self) -> List[PageElement]:
-        snapshot = await self._get_semantic_snapshot()
+        observation = await self._observe_page()
+        snapshot = observation.snapshot
         snapshot_elements = self._elements_from_snapshot(snapshot)
         if snapshot_elements:
             elements = self._filter_noise_elements(snapshot_elements)
@@ -3612,6 +4104,9 @@ class BrowserAgent:
                     collections=prompt_context.get("collections", "(no collections)"),
                     controls=prompt_context.get("controls", "(no controls)"),
                     elements=prompt_context.get("elements", "(no actionable elements)"),
+                    headings=self._format_headings_for_llm(active_snapshot),
+                    regions=self._format_regions_for_llm(active_snapshot),
+                    vision_description=getattr(self._last_observation, 'vision_description', '') if self._last_observation else '',
                 )},
             ]
             web_debug_recorder.write_json("browser_action_decision_budget", prompt_budget)
@@ -3654,6 +4149,102 @@ class BrowserAgent:
             log_warning(f"LLM action fallback failed: {exc}")
             return BrowserAction(action_type=ActionType.WAIT, value="1", description="fallback wait", confidence=0.1)
 
+    async def _unified_plan_action(
+        self,
+        task: str,
+        current_url: str,
+        title: str,
+        elements: List[PageElement],
+        intent: Optional[TaskIntent],
+        data: List[Dict[str, str]],
+        observation: Optional[PageObservation] = None,
+        last_action: Optional[BrowserAction] = None,
+        recent_steps: Optional[List[Dict[str, Any]]] = None,
+    ) -> Optional[BrowserAction]:
+        """
+        Single observe-plan LLM call using unified prompt with all observation data.
+        Returns None if the unified call fails (caller falls back to legacy pipeline).
+        """
+        obs = observation or self._last_observation
+        if obs is None:
+            return None
+
+        active_snapshot = obs.snapshot or {}
+        active_intent = intent or TaskIntent(intent_type="read", query=self._derive_primary_query(task), confidence=0.0)
+        current_data = list(data or [])
+        data_collected = len(current_data)
+        target_match = re.search(r'(\d+)\s*(?:个|条|款|项|条数据|items?|results?)', task or "")
+        data_target = int(target_match.group(1)) if target_match else 10
+        data_progress = f"Data progress: collected {data_collected} / target {data_target}"
+        if data_collected >= data_target:
+            data_progress += " (ENOUGH - consider using DONE)"
+
+        cards = self._cards_from_snapshot(active_snapshot)
+        elements_text = self._format_assessment_elements_for_llm(task, current_url, elements, max_items=18)
+        prompt_context, prompt_budget = self._build_budgeted_browser_prompt_context(
+            task=task, current_url=current_url, data=current_data,
+            cards=cards, snapshot=active_snapshot, elements_text=elements_text,
+            total_tokens=_ACTION_DECISION_CONTEXT_TOKENS,
+        )
+
+        # Format text blocks for prompt
+        text_blocks = self._get_snapshot_visible_text_blocks(active_snapshot)
+        text_blocks_str = "\n".join(f"{i}. {t[:240]}" for i, t in enumerate(text_blocks[:8], 1)) if text_blocks else "(none)"
+
+        main_text = self._get_snapshot_main_text(active_snapshot)
+
+        try:
+            prompt = UNIFIED_PLAN_PROMPT.format(
+                task=task,
+                intent=active_intent.intent_type,
+                query=active_intent.query or self._derive_primary_query(task),
+                fields=self._format_intent_fields_for_llm(active_intent.fields),
+                requires_interaction=str(bool(active_intent.requires_interaction)).lower(),
+                url=current_url or "",
+                title=title or "",
+                page_type=active_snapshot.get("page_type", "unknown"),
+                page_stage=active_snapshot.get("page_stage", "unknown"),
+                snapshot_version=obs.snapshot_version,
+                headings=self._format_headings_for_llm(active_snapshot),
+                regions=self._format_regions_for_llm(active_snapshot),
+                main_text=main_text[:600] if main_text else "(none)",
+                visible_text_blocks=text_blocks_str,
+                vision_description=obs.vision_description or "(not available)",
+                cards=prompt_context.get("cards", "(no cards)"),
+                collections=prompt_context.get("collections", "(no collections)"),
+                controls=prompt_context.get("controls", "(no controls)"),
+                elements=prompt_context.get("elements", "(no actionable elements)"),
+                last_action=(last_action.description or last_action.action_type.value) if last_action else "none",
+                recent_steps=self._format_recent_steps_for_llm(recent_steps),
+                data_progress=data_progress,
+            )
+
+            web_debug_recorder.write_text("browser_unified_plan_prompt", prompt)
+
+            llm = self._get_llm()
+            response = await llm.achat(
+                messages=[
+                    {"role": "system", "content": "Return JSON only."},
+                    {"role": "user", "content": prompt},
+                ],
+                temperature=0.1,
+                json_mode=True,
+            )
+            web_debug_recorder.write_text("browser_unified_plan_response", self._stringify_llm_response(response))
+
+            payload = llm.parse_json_response(response)
+            action = self._action_from_llm(payload, elements)
+            action = self._validate_action(action, obs)
+
+            web_debug_recorder.write_json("browser_unified_plan_action", self._action_to_debug_payload(action))
+
+            if action and action.action_type != ActionType.FAILED:
+                return action
+            return None
+        except Exception as exc:
+            log_warning(f"unified plan call failed: {exc}")
+            return None
+
     async def _plan_next_action(
         self,
         task: str,
@@ -3668,6 +4259,24 @@ class BrowserAgent:
     ) -> Tuple[Optional[BrowserAction], str]:
         active_snapshot = snapshot or self._last_semantic_snapshot or {}
 
+        # Try unified single-call plan first (fewer LLM calls)
+        observation = self._last_observation
+        if observation is not None:
+            unified_action = await self._unified_plan_action(
+                task, current_url, title, elements, intent, data,
+                observation=observation,
+                last_action=last_action,
+                recent_steps=recent_steps,
+            )
+            if unified_action is not None:
+                unified_action = self._sanitize_planned_action(
+                    task, current_url, elements, intent, data,
+                    unified_action, snapshot=active_snapshot, recent_steps=recent_steps,
+                )
+                if unified_action is not None and unified_action.action_type not in {ActionType.WAIT, ActionType.FAILED}:
+                    return unified_action, "unified_plan"
+
+        # Fallback to legacy multi-call pipeline
         assessed_action = await self._assess_page_with_llm(
             task,
             current_url,
@@ -3883,10 +4492,58 @@ class BrowserAgent:
         if selector:
             strategies.append(("direct_type", lambda: tk.type_text(selector, value, delay=20)))
 
+        # 焦点元素策略：如果前面都失败了，尝试直接往当前焦点元素输入
+        # 对于刚用快捷键打开的搜索弹窗等场景非常有效
+        async def _try_focused_input():
+            focused_r = await tk.evaluate_js(
+                r"""() => {
+                    const el = document.activeElement;
+                    if (!el || el === document.body) return null;
+                    const tag = el.tagName.toLowerCase();
+                    if (!['input', 'textarea'].includes(tag) && el.contentEditable !== 'true') return null;
+                    if (el.id) return '#' + el.id;
+                    const name = el.getAttribute('name');
+                    if (name) return tag + '[name="' + name + '"]';
+                    const ph = el.getAttribute('placeholder');
+                    if (ph) return tag + '[placeholder="' + ph + '"]';
+                    return ':focus';
+                }"""
+            )
+            if focused_r.success and focused_r.data:
+                focused_selector = str(focused_r.data)
+                fill_r = await tk.input_text(focused_selector, value)
+                if isinstance(fill_r, ToolkitResult) and fill_r.success:
+                    return fill_r
+                type_r = await tk.type_text(focused_selector, value, delay=20)
+                return type_r
+            return ToolkitResult(success=False, error="no focused input")
+        strategies.append(("focused_input", _try_focused_input))
+
+        # 最终策略：直接用 keyboard.type 输入（不指定目标元素）
+        async def _try_keyboard_type():
+            return await tk.evaluate_js(
+                r"""(text) => {
+                    const el = document.activeElement;
+                    if (el && el !== document.body && (el.tagName === 'INPUT' || el.tagName === 'TEXTAREA' || el.contentEditable === 'true')) {
+                        // 使用 InputEvent 模拟输入
+                        el.value = text;
+                        el.dispatchEvent(new Event('input', { bubbles: true }));
+                        el.dispatchEvent(new Event('change', { bubbles: true }));
+                        return true;
+                    }
+                    return false;
+                }""",
+                value,
+            )
+        strategies.append(("keyboard_type_js", _try_keyboard_type))
+
         for name, handler in strategies:
             try:
                 r = await handler()
                 if isinstance(r, ToolkitResult) and r.success:
+                    # 对 keyboard_type_js，还需检查返回值
+                    if name == "keyboard_type_js" and r.data is False:
+                        continue
                     log_agent_action(self.name, "input", name)
                     return True
             except Exception:
@@ -3904,7 +4561,17 @@ class BrowserAgent:
 
         tk = self.toolkit
         success_count = 0
-        for selector, value in form_data.items():
+        for field_key, value in form_data.items():
+            # Support ref-based keys: if key looks like a ref (e.g. "el_3", "1:el_3"),
+            # resolve to selector first
+            selector = field_key
+            if field_key.startswith("el_") or field_key.startswith("ctl_") or ":" in field_key:
+                # Try to resolve ref to selector via toolkit
+                bare_ref = field_key.split(":", 1)[-1] if ":" in field_key else field_key
+                ref_info = tk.resolve_ref(field_key) or tk.resolve_ref(bare_ref)
+                if ref_info and ref_info.get("selector"):
+                    selector = ref_info["selector"]
+
             try:
                 exists = await tk.element_exists(selector)
                 if exists.data:
@@ -3939,6 +4606,12 @@ class BrowserAgent:
     # ── thin _execute_action mapping ───────────────────────────
 
     async def _execute_action(self, action: BrowserAction) -> bool:
+        # Invalidate snapshot cache on state-changing actions
+        if action.action_type in {ActionType.CLICK, ActionType.INPUT, ActionType.NAVIGATE,
+                                   ActionType.PRESS_KEY, ActionType.FILL_FORM, ActionType.SELECT}:
+            self._last_snapshot_hash = ""
+            self._last_observation = None
+
         tk = self.toolkit
         if action.action_type == ActionType.CLICK:
             return await self._try_click_with_fallbacks(action.target_selector, action)

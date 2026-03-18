@@ -1036,6 +1036,142 @@ class BrowserToolkit:
         max_elements: int = 80,
         include_cards: bool = True,
     ) -> ToolkitResult:
+        """Decomposed semantic snapshot: runs 5+ sub-scripts with per-script isolation."""
+        from utils.perception_scripts import (
+            SCRIPT_PAGE_META,
+            SCRIPT_REGIONS,
+            SCRIPT_INTERACTIVE_ELEMENTS,
+            SCRIPT_CONTENT_CARDS,
+            SCRIPT_TEXT_CONTENT,
+            SCRIPT_CONTROLS,
+            assemble_semantic_snapshot,
+        )
+
+        try:
+            surface = self.active_surface
+
+            # Run sub-scripts with per-script try/catch
+            page_meta = {}
+            try:
+                page_meta = await surface.evaluate(SCRIPT_PAGE_META) or {}
+            except Exception as exc:
+                log_warning(f"perception sub-script PAGE_META failed: {exc}")
+
+            regions_data = {}
+            try:
+                regions_data = await surface.evaluate(SCRIPT_REGIONS) or {}
+            except Exception as exc:
+                log_warning(f"perception sub-script REGIONS failed: {exc}")
+
+            elements_data = {}
+            try:
+                elements_data = await surface.evaluate(
+                    SCRIPT_INTERACTIVE_ELEMENTS,
+                    {"max_elements": max_elements},
+                ) or {}
+            except Exception as exc:
+                log_warning(f"perception sub-script INTERACTIVE_ELEMENTS failed: {exc}")
+
+            cards_data = {}
+            if include_cards:
+                try:
+                    cards_data = await surface.evaluate(
+                        SCRIPT_CONTENT_CARDS,
+                        {"elementRefs": {}},
+                    ) or {}
+                except Exception as exc:
+                    log_warning(f"perception sub-script CONTENT_CARDS failed: {exc}")
+
+            text_data = {}
+            try:
+                text_data = await surface.evaluate(SCRIPT_TEXT_CONTENT) or {}
+            except Exception as exc:
+                log_warning(f"perception sub-script TEXT_CONTENT failed: {exc}")
+
+            controls_data = {}
+            try:
+                controls_data = await surface.evaluate(SCRIPT_CONTROLS) or {}
+            except Exception as exc:
+                log_warning(f"perception sub-script CONTROLS failed: {exc}")
+
+            # Assemble into unified snapshot
+            snapshot = assemble_semantic_snapshot(
+                page_meta=page_meta,
+                regions=regions_data,
+                elements=elements_data,
+                cards_and_collections=cards_data,
+                text_content=text_data,
+                controls=controls_data,
+            )
+
+            # Build ref map (same logic as before)
+            ref_map: Dict[str, Dict[str, Any]] = {}
+            for item in snapshot.get("elements", []) or []:
+                ref = str(item.get("ref", "") or "").strip()
+                if ref:
+                    ref_map[ref] = {
+                        "selector": str(item.get("selector", "") or ""),
+                        "role": str(item.get("role", "") or ""),
+                        "text": str(item.get("text", "") or ""),
+                        "label": str(item.get("label", "") or ""),
+                        "placeholder": str(item.get("placeholder", "") or ""),
+                        "value": str(item.get("value", "") or ""),
+                        "href": str(item.get("href", "") or ""),
+                        "type": str(item.get("type", "") or ""),
+                    }
+            for card in snapshot.get("cards", []) or []:
+                ref = str(card.get("ref", "") or "").strip()
+                if ref:
+                    ref_map[ref] = {
+                        "selector": str(card.get("target_selector", "") or ""),
+                        "role": "link",
+                        "text": str(card.get("title", "") or ""),
+                        "label": str(card.get("title", "") or ""),
+                        "placeholder": "",
+                        "value": "",
+                        "href": str(card.get("link", "") or ""),
+                        "type": "card",
+                        "target_ref": str(card.get("target_ref", "") or ""),
+                    }
+            for control in snapshot.get("controls", []) or []:
+                ref = str(control.get("ref", "") or "").strip()
+                if not ref:
+                    continue
+                ref_map[ref] = {
+                    "selector": str(control.get("selector", "") or ""),
+                    "role": "textbox" if str(control.get("kind", "") or "") == "search_input" else "button",
+                    "text": str(control.get("text", "") or ""),
+                    "label": str(control.get("text", "") or ""),
+                    "placeholder": str(control.get("text", "") or ""),
+                    "value": "",
+                    "href": "",
+                    "type": str(control.get("kind", "") or "control"),
+                }
+            for region in snapshot.get("regions", []) or []:
+                ref = str(region.get("ref", "") or "").strip()
+                if not ref:
+                    continue
+                ref_map[ref] = {
+                    "selector": str(region.get("selector", "") or ""),
+                    "role": "region",
+                    "text": str(region.get("heading", "") or region.get("text_sample", "") or ""),
+                    "label": str(region.get("heading", "") or ""),
+                    "placeholder": "",
+                    "value": "",
+                    "href": "",
+                    "type": str(region.get("kind", "") or "region"),
+                }
+            self._semantic_ref_map = ref_map
+            return ToolkitResult(success=True, data=snapshot)
+        except Exception as e:
+            return ToolkitResult(success=False, error=str(e))
+
+    async def _legacy_semantic_snapshot(
+        self,
+        max_elements: int = 80,
+        include_cards: bool = True,
+    ) -> ToolkitResult:
+        """Legacy monolithic semantic snapshot (kept as fallback)."""
         try:
             surface = self.active_surface
             payload = await surface.evaluate(
@@ -1247,10 +1383,20 @@ class BrowserToolkit:
                     }
                     if (isSearchHost && looksLikeSearchResultsUrl()) return 'serp';
                     if (document.querySelector('input[type="password"]')) return 'login';
+                    // form 判断：要求 form 内有 2+ text-like 输入框，避免仅有搜索框的页面被误判
                     const forms = document.querySelectorAll('form');
-                    if (forms.length && document.querySelectorAll('input, textarea, select').length >= 2) return 'form';
+                    if (forms.length) {
+                      const textInputCount = document.querySelectorAll(
+                        'form input[type="text"], form input[type="email"], form input[type="tel"], form input[type="number"], form input:not([type]), form textarea, form select'
+                      ).length;
+                      if (textInputCount >= 2) return 'form';
+                    }
                     if (document.querySelector('article h1, main h1, article time, article [datetime]')) return 'detail';
-                    const listCandidates = document.querySelectorAll('main li, main article, [role="main"] li, [role="main"] article, table tbody tr');
+                    // 扩展 list 检测：包括现代 SPA 常用的卡片式列表
+                    const listCandidates = document.querySelectorAll(
+                      'main li, main article, [role="main"] li, [role="main"] article, table tbody tr, ' +
+                      '[role="listitem"], [class*="card"]:not(nav *), [class*="result"]:not(nav *), [class*="item"]:not(nav *):not(li)'
+                    );
                     if (listCandidates.length >= 4) return 'list';
                     if (document.querySelector('article, main, [role="main"]')) return 'detail';
                     return 'unknown';
@@ -1643,6 +1789,33 @@ class BrowserToolkit:
                     if (listCollection) collections.push(listCollection);
                   }
 
+                  // 现代 SPA 卡片容器识别：div.card / div.item / [role="listitem"] 等
+                  if (collections.length < 3) {
+                    const cardRoot = document.querySelector('main, article, [role="main"]') || document.body;
+                    const cardSelectors = [
+                      '[role="listitem"]',
+                      '[class*="card"]:not(nav [class*="card"])',
+                      '[class*="item"]:not(nav [class*="item"]):not(li)',
+                      '[class*="result"]:not(nav [class*="result"])',
+                      '[class*="post"]:not(nav [class*="post"])',
+                      '[class*="entry"]:not(nav [class*="entry"])',
+                    ];
+                    for (const cardSel of cardSelectors) {
+                      if (collections.length >= 3) break;
+                      const cardNodes = Array.from(
+                        cardRoot.querySelectorAll(cardSel)
+                      ).filter((node) => {
+                        if (!isVisible(node)) return false;
+                        const text = normalize(node.innerText || node.textContent || '');
+                        return text.length >= 20 && text.length < 2000;
+                      });
+                      if (cardNodes.length >= 3) {
+                        const cardCollection = buildCollection('cards', cardNodes, `collection_${collections.length + 1}`);
+                        if (cardCollection) collections.push(cardCollection);
+                      }
+                    }
+                  }
+
                   const nextPageElement = findVisibleAction(
                     [
                       'a[rel="next"]',
@@ -1768,13 +1941,13 @@ class BrowserToolkit:
                         ''
                       )
                       : (document.body?.innerText || document.body?.textContent || '')
-                  ).slice(0, 4000);
+                  ).slice(0, 6000);
 
                   const visibleTextBlocks = [];
                   const seenBlockTexts = new Set();
                   const blockNodes = Array.from(
                     (contentRoot || document.body).querySelectorAll(
-                      'h1, h2, h3, p, li, article, section, table tbody tr, tbody tr, dd, dt, figcaption'
+                      'h1, h2, h3, h4, p, li, article, section, table tbody tr, tbody tr, dd, dt, figcaption, blockquote, [class*="content"], [class*="summary"], [class*="desc"]'
                     )
                   );
                   for (const node of blockNodes) {
@@ -1786,11 +1959,11 @@ class BrowserToolkit:
                     seenBlockTexts.add(text);
                     visibleTextBlocks.push({
                       kind: node.tagName.toLowerCase(),
-                      text: text.slice(0, 240),
+                      text: text.slice(0, 320),
                       selector: selectorOf(node),
                       parent_ref: nodeToRef.get(node.closest('[data-testid], [id], article, section, main, li, tr')) || '',
                     });
-                    if (visibleTextBlocks.length >= 12) break;
+                    if (visibleTextBlocks.length >= 16) break;
                   }
 
                   const blockedSignals = [];
