@@ -187,8 +187,7 @@ ACTION_DECISION_PROMPT = get_prompt("browser_action_decision")
 PAGE_ASSESSMENT_PROMPT = get_prompt("browser_page_assessment")
 VISION_ACTION_PROMPT = get_prompt("browser_vision_decision")
 UNIFIED_PLAN_PROMPT = get_prompt("browser_unified_plan")
-_PAGE_ASSESSMENT_CONTEXT_TOKENS = 2400
-_ACTION_DECISION_CONTEXT_TOKENS = 2200
+_PAGE_ASSESSMENT_CONTEXT_TOKENS = None  # use settings.PAGE_ASSESSMENT_CONTEXT_TOKENS
 _AUTH_USERNAME_ALIASES = (
     "username",
     "user name",
@@ -878,7 +877,9 @@ class BrowserAgent:
     def _get_snapshot_main_text(self, snapshot: Optional[Dict[str, Any]]) -> str:
         return str((snapshot or {}).get("main_text", "") or "").strip()
 
-    def _format_snapshot_text_for_llm(self, snapshot: Optional[Dict[str, Any]], max_blocks: int = 8) -> str:
+    def _format_snapshot_text_for_llm(self, snapshot: Optional[Dict[str, Any]], max_blocks: int = 0) -> str:
+        if max_blocks <= 0:
+            max_blocks = settings.TEXT_BLOCKS_DISPLAY_LIMIT
         active_snapshot = snapshot or {}
         lines: List[str] = []
         page_type = str(active_snapshot.get("page_type", "") or "").strip()
@@ -940,16 +941,17 @@ class BrowserAgent:
                 if text:
                     lines.append(f"  [{level}] {text[:120]}")
 
-        # 主要文本 —— detail 页面给更多内容
+        # 主要文本 —— detail/list 页面给更多内容
         main_text = self._get_snapshot_main_text(active_snapshot)
         if main_text:
-            main_text_limit = 800 if page_type == "detail" else 520
+            main_text_limit = settings.MAIN_TEXT_LIMIT_DETAIL if page_type in ("detail", "list", "serp") else settings.MAIN_TEXT_LIMIT_DEFAULT
             lines.append("Main text: " + main_text[:main_text_limit])
 
         blocks = self._get_snapshot_visible_text_blocks(active_snapshot)
         if blocks:
             lines.append("Visible text blocks:")
-            lines.extend(f"{index}. {text[:240]}" for index, text in enumerate(blocks[:max_blocks], 1))
+            tb_chars = settings.TEXT_BLOCK_DISPLAY_CHARS
+            lines.extend(f"{index}. {text[:tb_chars]}" for index, text in enumerate(blocks[:max_blocks], 1))
         return "\n".join(lines).strip()
 
     def _stringify_llm_response(self, response: Any) -> str:
@@ -1178,7 +1180,7 @@ class BrowserAgent:
                     log_warning(f"[DEBUG] 集合数量: {len(self._last_semantic_snapshot.get('collections', []))}")
                     main_text = self._last_semantic_snapshot.get('main_text', '')
                     if main_text:
-                        log_warning(f"[DEBUG] 主要文本 (前200字符): {main_text[:200]}...")
+                        log_warning(f"[DEBUG] 主要文本 (前500字符): {main_text[:500]}...")
                     log_warning(f"[DEBUG] ====================================")
 
                 return self._last_semantic_snapshot
@@ -1237,7 +1239,7 @@ class BrowserAgent:
         headings: List[Dict[str, str]] = []
         if page:
             try:
-                page_content = await self.page_perceiver.perceive_page(page)
+                page_content = await self.page_perceiver.perceive_page(page, snapshot=snapshot)
                 if page_content:
                     self._merge_perceiver_content(snapshot, page_content)
                     headings = [{"level": h, "text": t} for h, t in
@@ -1927,15 +1929,15 @@ class BrowserAgent:
                 lines.append(f"[{index}] " + " | ".join(parts))
         return "\n".join(lines) or "(no visible data)"
 
-    def _format_cards_for_llm(self, cards: List[SearchResultCard], max_items: int = 8) -> str:
+    def _format_cards_for_llm(self, cards: List[SearchResultCard], max_items: int = 10) -> str:
         lines: List[str] = []
         for card in cards[:max_items]:
             parts = [
-                card.title[:100],
-                card.source[:48],
+                card.title[:settings.CARD_TITLE_DISPLAY_CHARS],
+                card.source[:settings.CARD_SOURCE_DISPLAY_CHARS],
                 card.host[:48],
                 card.date[:40],
-                card.snippet[:160],
+                card.snippet[:settings.CARD_SNIPPET_DISPLAY_CHARS],
             ]
             payload = " | ".join(part for part in parts if part)
             if payload:
@@ -1987,8 +1989,10 @@ class BrowserAgent:
         task: str,
         current_url: str,
         elements: List[PageElement],
-        max_items: int = 10,
+        max_items: int = 0,
     ) -> str:
+        if max_items <= 0:
+            max_items = settings.ELEMENT_DISPLAY_LIMIT
         prioritized = self._prioritize_elements(task, elements, limit=max_items * 2)
         ranked: List[Tuple[float, PageElement]] = []
         for element in prioritized:
@@ -2010,13 +2014,16 @@ class BrowserAgent:
                 continue
             seen_selectors.add(element.selector)
             attrs = element.attributes or {}
+            el_text_limit = settings.ELEMENT_TEXT_DISPLAY_CHARS
+            el_attr_limit = settings.ELEMENT_ATTR_DISPLAY_CHARS
+            el_href_limit = settings.ELEMENT_HREF_DISPLAY_CHARS
             details = " | ".join(
                 part for part in [
-                    element.text[:60],
-                    attrs.get("labelText", "")[:48],
-                    attrs.get("placeholder", "")[:48],
-                    attrs.get("value", "")[:48],
-                    attrs.get("href", "")[:100],
+                    element.text[:el_text_limit],
+                    attrs.get("labelText", "")[:el_attr_limit],
+                    attrs.get("placeholder", "")[:el_attr_limit],
+                    attrs.get("value", "")[:el_attr_limit],
+                    attrs.get("href", "")[:el_href_limit],
                 ] if part
             )
 
@@ -2068,8 +2075,8 @@ class BrowserAgent:
                 BudgetSection(
                     name="data",
                     text=data_text,
-                    min_chars=360,
-                    max_chars=1800,
+                    min_chars=settings.DATA_BUDGET_MIN_CHARS,
+                    max_chars=settings.DATA_BUDGET_MAX_CHARS,
                     weight=1.0,
                     mode="lines",
                     omission_label="data lines",
@@ -2077,8 +2084,8 @@ class BrowserAgent:
                 BudgetSection(
                     name="cards",
                     text=cards_text,
-                    min_chars=480,
-                    max_chars=2200,
+                    min_chars=settings.CARDS_BUDGET_MIN_CHARS,
+                    max_chars=settings.CARDS_BUDGET_MAX_CHARS,
                     weight=1.4,
                     mode="lines",
                     omission_label="card lines",
@@ -2104,8 +2111,8 @@ class BrowserAgent:
                 BudgetSection(
                     name="elements",
                     text=elements_text,
-                    min_chars=520,
-                    max_chars=2400,
+                    min_chars=settings.ELEMENTS_BUDGET_MIN_CHARS,
+                    max_chars=settings.ELEMENTS_BUDGET_MAX_CHARS,
                     weight=1.5,
                     mode="lines",
                     omission_label="element lines",
@@ -2281,7 +2288,7 @@ class BrowserAgent:
             snapshot = self._last_semantic_snapshot or await self._get_semantic_snapshot()
             cards = self._cards_from_snapshot(snapshot)
             page_state = self._infer_page_state(task, current_url, active_intent, data, snapshot)
-            elements_text = self._format_assessment_elements_for_llm(task, current_url, elements, max_items=18)
+            elements_text = self._format_assessment_elements_for_llm(task, current_url, elements)
             prompt_context, prompt_budget = self._build_budgeted_browser_prompt_context(
                 task=task,
                 current_url=current_url,
@@ -2289,7 +2296,7 @@ class BrowserAgent:
                 cards=cards,
                 snapshot=snapshot,
                 elements_text=elements_text,
-                total_tokens=_PAGE_ASSESSMENT_CONTEXT_TOKENS,
+                total_tokens=settings.PAGE_ASSESSMENT_CONTEXT_TOKENS,
             )
             llm = self._get_llm()
             prompt = PAGE_ASSESSMENT_PROMPT.format(
@@ -3639,7 +3646,7 @@ class BrowserAgent:
             data=self._format_data_for_llm(data),
             cards=self._format_cards_for_llm(self._cards_from_snapshot(active_snapshot)),
             collections=self._format_collections_for_llm(active_snapshot),
-            elements=self._format_assessment_elements_for_llm(task, current_url, elements, max_items=14),
+            elements=self._format_assessment_elements_for_llm(task, current_url, elements),
         )
 
         try:
@@ -4065,14 +4072,19 @@ class BrowserAgent:
                 current_data = await self._extract_data_for_intent(active_intent)
             data_collected = len(current_data) if current_data else 0
             target_match = re.search(r'(\d+)\s*(?:个|条|款|项|条数据|items?|results?)', task or "")
-            data_target = int(target_match.group(1)) if target_match else 10
-            data_progress = f"Data progress: collected {data_collected} / target {data_target}"
-            if data_collected >= data_target:
-                data_progress += " (ENOUGH - consider using DONE)"
+            if target_match:
+                data_target = int(target_match.group(1))
+                data_progress = f"Data progress: collected {data_collected} / target {data_target}"
+                if data_collected >= data_target:
+                    data_progress += " (ENOUGH - consider using DONE)"
+            else:
+                data_progress = f"Data collected: {data_collected} items"
+                if data_collected > 0:
+                    data_progress += " — judge whether the task goal is already satisfied based on the task description and current page content, not an arbitrary count."
             active_snapshot = snapshot or await self._get_semantic_snapshot()
             cards = self._cards_from_snapshot(active_snapshot)
             page_state = self._infer_page_state(task, resolved_url, active_intent, current_data or [], active_snapshot)
-            elements_text = self._format_assessment_elements_for_llm(task, resolved_url, elements, max_items=18)
+            elements_text = self._format_assessment_elements_for_llm(task, resolved_url, elements)
             prompt_context, prompt_budget = self._build_budgeted_browser_prompt_context(
                 task=task,
                 current_url=resolved_url,
@@ -4080,7 +4092,7 @@ class BrowserAgent:
                 cards=cards,
                 snapshot=active_snapshot,
                 elements_text=elements_text,
-                total_tokens=_ACTION_DECISION_CONTEXT_TOKENS,
+                total_tokens=settings.ACTION_DECISION_CONTEXT_TOKENS,
             )
 
             messages = [
@@ -4174,22 +4186,29 @@ class BrowserAgent:
         current_data = list(data or [])
         data_collected = len(current_data)
         target_match = re.search(r'(\d+)\s*(?:个|条|款|项|条数据|items?|results?)', task or "")
-        data_target = int(target_match.group(1)) if target_match else 10
-        data_progress = f"Data progress: collected {data_collected} / target {data_target}"
-        if data_collected >= data_target:
-            data_progress += " (ENOUGH - consider using DONE)"
+        if target_match:
+            data_target = int(target_match.group(1))
+            data_progress = f"Data progress: collected {data_collected} / target {data_target}"
+            if data_collected >= data_target:
+                data_progress += " (ENOUGH - consider using DONE)"
+        else:
+            data_progress = f"Data collected: {data_collected} items"
+            if data_collected > 0:
+                data_progress += " — judge whether the task goal is already satisfied based on the task description and current page content, not an arbitrary count."
 
         cards = self._cards_from_snapshot(active_snapshot)
-        elements_text = self._format_assessment_elements_for_llm(task, current_url, elements, max_items=18)
+        elements_text = self._format_assessment_elements_for_llm(task, current_url, elements)
         prompt_context, prompt_budget = self._build_budgeted_browser_prompt_context(
             task=task, current_url=current_url, data=current_data,
             cards=cards, snapshot=active_snapshot, elements_text=elements_text,
-            total_tokens=_ACTION_DECISION_CONTEXT_TOKENS,
+            total_tokens=settings.ACTION_DECISION_CONTEXT_TOKENS,
         )
 
         # Format text blocks for prompt
         text_blocks = self._get_snapshot_visible_text_blocks(active_snapshot)
-        text_blocks_str = "\n".join(f"{i}. {t[:240]}" for i, t in enumerate(text_blocks[:8], 1)) if text_blocks else "(none)"
+        tb_limit = settings.TEXT_BLOCKS_DISPLAY_LIMIT
+        tb_chars = settings.TEXT_BLOCK_DISPLAY_CHARS
+        text_blocks_str = "\n".join(f"{i}. {t[:tb_chars]}" for i, t in enumerate(text_blocks[:tb_limit], 1)) if text_blocks else "(none)"
 
         main_text = self._get_snapshot_main_text(active_snapshot)
 
@@ -4207,7 +4226,7 @@ class BrowserAgent:
                 snapshot_version=obs.snapshot_version,
                 headings=self._format_headings_for_llm(active_snapshot),
                 regions=self._format_regions_for_llm(active_snapshot),
-                main_text=main_text[:600] if main_text else "(none)",
+                main_text=main_text[:settings.MAIN_TEXT_LIMIT_DETAIL] if main_text else "(none)",
                 visible_text_blocks=text_blocks_str,
                 vision_description=obs.vision_description or "(not available)",
                 cards=prompt_context.get("cards", "(no cards)"),
@@ -4490,7 +4509,10 @@ class BrowserAgent:
                 if label and label.strip():
                     strategies.append((f"label:{label[:30]}", lambda l=label.strip()[:60]: tk.fill_by_label(l, value)))
         if selector:
-            strategies.append(("direct_type", lambda: tk.type_text(selector, value, delay=20)))
+            async def _clear_then_type(s=selector):
+                await tk.clear_input(s)
+                return await tk.type_text(s, value, delay=20)
+            strategies.append(("direct_type", _clear_then_type))
 
         # 焦点元素策略：如果前面都失败了，尝试直接往当前焦点元素输入
         # 对于刚用快捷键打开的搜索弹窗等场景非常有效
@@ -4514,6 +4536,8 @@ class BrowserAgent:
                 fill_r = await tk.input_text(focused_selector, value)
                 if isinstance(fill_r, ToolkitResult) and fill_r.success:
                     return fill_r
+                # fill 失败时用 type，但先清空避免追加
+                await tk.clear_input(focused_selector)
                 type_r = await tk.type_text(focused_selector, value, delay=20)
                 return type_r
             return ToolkitResult(success=False, error="no focused input")
@@ -4701,42 +4725,54 @@ class BrowserAgent:
     async def _verify_action_effect(self, before: Dict[str, Any], action: BrowserAction) -> bool:
         if not self._action_must_change_state(action):
             return True
+        # 对可能触发导航的操作（如按 Enter），先等待导航完成
+        if action.action_type == ActionType.PRESS_KEY and action.keyboard_key in ("Enter", "Return"):
+            try:
+                await asyncio.sleep(1.5)
+                await self._wait_for_page_ready()
+            except Exception:
+                pass
         after = await self._snapshot_page_state()
         result = False
+        # 1) 优先检查：期望的页面类型或文本匹配
         if action.expected_page_type and after.get("page_type") == action.expected_page_type:
             result = True
         elif action.expected_text:
-            text_wait = await self.toolkit.wait_for_text_appear(action.expected_text, timeout=2500)
+            text_wait = await self.toolkit.wait_for_text_appear(action.expected_text, timeout=3000)
             if text_wait.success:
                 result = True
-        elif after["url"] != before["url"]:
-            result = True
-        elif after["title"] != before["title"]:
-            result = True
-        elif before.get("page_type") and after.get("page_type") and before.get("page_type") != after.get("page_type"):
-            result = True
-        elif int(after.get("card_count", 0) or 0) > int(before.get("card_count", 0) or 0):
-            result = True
-        elif int(after.get("item_count", 0) or 0) > int(before.get("item_count", 0) or 0):
-            result = True
-        elif bool(before.get("has_modal")) and not bool(after.get("has_modal")):
-            result = True
-        elif abs(after["content_len"] - before["content_len"]) > 80:
-            result = True
-        elif after.get("content_hash") and after.get("content_hash") != before.get("content_hash"):
-            result = True
-        elif action.action_type == ActionType.INPUT:
-            if action.target_ref:
-                ref_info = self.toolkit.resolve_ref(action.target_ref)
-                selector = str(ref_info.get("selector", "") or "")
-            else:
-                selector = action.target_selector
-            if selector:
-                r = await self.toolkit.get_input_value(selector)
-                if r.success:
-                    result = self._normalize_text(r.data) == self._normalize_text(action.value)
-        elif action.action_type == ActionType.FILL_FORM:
-            result = await self._verify_form_values(action.value)
+        # 2) 回退：即使期望指标未匹配，也检测通用页面变化
+        if not result:
+            if after["url"] != before["url"]:
+                result = True
+            elif after["title"] != before["title"]:
+                result = True
+            elif before.get("page_type") and after.get("page_type") and before.get("page_type") != after.get("page_type"):
+                result = True
+            elif int(after.get("card_count", 0) or 0) > int(before.get("card_count", 0) or 0):
+                result = True
+            elif int(after.get("item_count", 0) or 0) > int(before.get("item_count", 0) or 0):
+                result = True
+            elif bool(before.get("has_modal")) and not bool(after.get("has_modal")):
+                result = True
+            elif abs(after["content_len"] - before["content_len"]) > 80:
+                result = True
+            elif after.get("content_hash") and after.get("content_hash") != before.get("content_hash"):
+                result = True
+        # 3) 特定动作类型验证
+        if not result:
+            if action.action_type == ActionType.INPUT:
+                if action.target_ref:
+                    ref_info = self.toolkit.resolve_ref(action.target_ref)
+                    selector = str(ref_info.get("selector", "") or "")
+                else:
+                    selector = action.target_selector
+                if selector:
+                    r = await self.toolkit.get_input_value(selector)
+                    if r.success:
+                        result = self._normalize_text(r.data) == self._normalize_text(action.value)
+            elif action.action_type == ActionType.FILL_FORM:
+                result = await self._verify_form_values(action.value)
         web_debug_recorder.write_json(
             "browser_action_verification",
             {
@@ -5170,6 +5206,14 @@ class BrowserAgent:
         )
         if active_intent.intent_type == "search":
             if self._is_search_engine_url(current_url):
+                # On a SERP, the task can still be satisfied if the search
+                # results already contain the answer (e.g. knowledge panels,
+                # featured snippets).
+                current_data = data or []
+                if current_data:
+                    query = active_intent.query or self._derive_primary_query(task)
+                    if self._search_results_have_answer_evidence(query, current_data):
+                        return True
                 return False
             parsed = urlparse(current_url or "")
             query_string = " ".join(
@@ -5212,6 +5256,33 @@ class BrowserAgent:
             if target_url:
                 return self._urls_look_related(target_url, current_url)
             return bool(current_url) and not active_intent.target_text
+
+        # read intent: check if collected data or page content answers the task
+        if active_intent.intent_type == "read":
+            active_snapshot = snapshot or self._last_semantic_snapshot or {}
+            current_data = data or []
+            if self._page_data_satisfies_goal(
+                task,
+                current_url,
+                active_intent,
+                current_data,
+                snapshot=active_snapshot,
+            ):
+                return True
+            # Even without structured data, if main_text has substantial
+            # task-relevant content the goal may already be met.
+            main_text = self._get_snapshot_main_text(active_snapshot)
+            if main_text and len(main_text) >= 120:
+                query = active_intent.query or self._derive_primary_query(task)
+                if query:
+                    relevance = self._score_text_relevance(query, main_text[:3000])
+                    if relevance >= 4.0:
+                        return True
+                else:
+                    # No specific query but page has substantial content
+                    return True
+            return False
+
         return False
 
     async def _wait_for_page_ready(self) -> None:
@@ -5743,16 +5814,32 @@ class BrowserAgent:
                     steps[-1],
                 )
 
+                # 每步执行后保存截图供调试
+                if web_debug_recorder.is_enabled():
+                    try:
+                        _sc = await self.toolkit.screenshot(full_page=False)
+                        if _sc.success and _sc.data:
+                            web_debug_recorder.write_binary(
+                                f"browser_step_{step_no}_screenshot", _sc.data, ".png"
+                            )
+                    except Exception:
+                        pass
+
                 if not success:
                     if action.action_type == ActionType.WAIT:
                         continue
-                    _consecutive_fails = sum(1 for s in reversed(steps) if s.get("result") == "failed")
+                    _consecutive_fails = 0
+                    for _s in reversed(steps):
+                        if _s.get("result") == "failed":
+                            _consecutive_fails += 1
+                        else:
+                            break
 
                     # 改进：不要立即跳过，先尝试恢复
+                    _max_fails = settings.BROWSER_MAX_CONSECUTIVE_FAILS
                     if _consecutive_fails == 1:
                         # 第一次失败：记录警告，但继续尝试（可能是临时问题）
                         log_warning(f"step {step_no} 失败，将在下一步重新评估页面状态")
-                        # 等待一下，让页面稳定
                         await asyncio.sleep(1)
                         continue
                     elif _consecutive_fails == 2:
@@ -5760,16 +5847,19 @@ class BrowserAgent:
                         log_warning(f"连续2步失败，尝试刷新页面恢复")
                         await tk.refresh()
                         await self._wait_for_page_ready()
-                        # 重新获取页面状态，让LLM重新决策
                         continue
-                    else:
-                        # 连续3次失败：放弃
+                    elif _consecutive_fails >= _max_fails:
+                        # 达到容忍上限：放弃
                         title_r = await tk.get_title()
                         return {"success": False,
                                 "message": f"连续 {_consecutive_fails} 步失败，已尝试恢复但仍失败 (最后在 step {step_no})",
                                 "url": url_r.data or "", "title": title_r.data or "",
                                 "expected_url": expected_url,
                                 "steps": steps, "data": _accumulated_data or await self._extract_data_for_intent(task_intent)}
+                    else:
+                        # 中间失败：继续尝试，LLM可能换策略
+                        log_warning(f"连续{_consecutive_fails}步失败 (容忍上限{_max_fails})，继续尝试")
+                        continue
 
                 if action.action_type in {ActionType.CLICK, ActionType.INPUT, ActionType.FILL_FORM, ActionType.PRESS_KEY}:
                     post_snapshot = await self._get_semantic_snapshot()

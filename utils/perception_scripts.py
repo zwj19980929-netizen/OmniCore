@@ -146,7 +146,11 @@ SCRIPT_PAGE_META = r"""
       return (path.includes('/search') && hasAny('q','query')) || !!document.querySelector('#b_results .b_algo, #search .g, #content_left .result, .results .result');
     };
 
-    const hasModal = !!document.querySelector('dialog[open], [role="dialog"], [aria-modal="true"], .modal.show, .dialog');
+    const modalSelectors = ['dialog[open]', '[role="dialog"]', '[aria-modal="true"]', '.modal.show'];
+    const hasModal = modalSelectors.some(sel => {
+      const el = document.querySelector(sel);
+      return el && isVisible(el);
+    });
     const hasPassword = !!document.querySelector('input[type="password"]');
     const forms = document.querySelectorAll('form');
     let textInputCount = 0;
@@ -154,15 +158,28 @@ SCRIPT_PAGE_META = r"""
       textInputCount = document.querySelectorAll('form input[type="text"], form input[type="email"], form input[type="tel"], form input[type="number"], form input:not([type]), form textarea, form select').length;
     }
 
+    // Detect list-like content on page (used by multiple checks below)
+    const mainContent = document.querySelector('main, article, [role="main"]');
+    const mainContentLen = mainContent ? normalize(mainContent.innerText || mainContent.textContent || '').length : 0;
+    const listCandidates = document.querySelectorAll('main li, main article, [role="main"] li, [role="main"] article, table tbody tr, [role="listitem"], [class*="card"]:not(nav *), [class*="result"]:not(nav *), [class*="item"]:not(nav *):not(li)');
+    const hasListContent = listCandidates.length >= 4;
+
     const inferPageType = () => {
-      if (hasModal) return 'modal';
-      if (isSearchHost && looksLikeSearchResultsUrl()) return 'serp';
+      // Search results: search engine host OR any site with search URL pattern + list content
+      const urlLooksLikeSearch = looksLikeSearchResultsUrl();
+      if (isSearchHost && urlLooksLikeSearch) return 'serp';
+      if (!isSearchHost && urlLooksLikeSearch && hasListContent) return 'serp';
       if (hasPassword) return 'login';
+      // Modal: only if no substantial content behind it
+      if (hasModal && mainContentLen < __MODAL_THRESHOLD__) return 'modal';
+      // Detail page: has article heading or datetime
+      if (mainContent && document.querySelector('article h1, main h1, article time, article [datetime]')) return 'detail';
+      // List page: has 4+ list-like items (check BEFORE form, since search results pages have filter forms)
+      if (hasListContent) return 'list';
+      // Form: only if no list content (a page with forms + list items is a filtered list, not a form)
       if (forms.length && textInputCount >= 2) return 'form';
-      if (document.querySelector('article h1, main h1, article time, article [datetime]')) return 'detail';
-      const listCandidates = document.querySelectorAll('main li, main article, [role="main"] li, [role="main"] article, table tbody tr, [role="listitem"], [class*="card"]:not(nav *), [class*="result"]:not(nav *), [class*="item"]:not(nav *):not(li)');
-      if (listCandidates.length >= 4) return 'list';
-      if (document.querySelector('article, main, [role="main"]')) return 'detail';
+      if (mainContent) return 'detail';
+      if (hasModal) return 'modal';
       return 'unknown';
     };
 
@@ -183,16 +200,17 @@ SCRIPT_PAGE_META = r"""
     const pageType = inferPageType();
     const contentRoot = document.querySelector('main, article, [role="main"]') || document.body;
     const mainTextLen = normalize(contentRoot?.innerText || contentRoot?.textContent || '').length;
-    const hasResults = !!document.querySelector('#b_results .b_algo, #search .g, #content_left .result, .results .result') || mainTextLen >= 120;
+    const hasResults = hasListContent || !!document.querySelector('#b_results .b_algo, #search .g, #content_left .result, .results .result') || mainTextLen >= 120;
 
     const inferPageStage = () => {
       if (blockedSignals.length) return 'blocked';
-      if (hasModal) return 'dismiss_modal';
+      if (pageType === 'modal') return 'dismiss_modal';
       if (pageType === 'serp') return hasResults ? 'selecting_source' : 'searching';
       if (pageType === 'list') return hasResults ? 'extracting' : 'loading';
       if (pageType === 'detail') return mainTextLen >= 120 ? 'extracting' : 'loading';
       if (pageType === 'form' || pageType === 'login') return 'interacting';
       if (hasResults || mainTextLen >= 120) return 'extracting';
+      if (hasModal) return 'dismiss_modal';
       return 'unknown';
     };
 
@@ -390,6 +408,41 @@ SCRIPT_INTERACTIVE_ELEMENTS = r"""
         el.getAttribute('aria-label') || el.getAttribute('title') ||
         el.getAttribute('placeholder') || ''
       ).slice(0, 220);
+
+      // ARIA dynamic state signals
+      const ariaState = {};
+      const expanded = el.getAttribute('aria-expanded');
+      if (expanded !== null) ariaState.expanded = expanded === 'true';
+      const selected = el.getAttribute('aria-selected');
+      if (selected !== null) ariaState.selected = selected === 'true';
+      const checked = el.getAttribute('aria-checked');
+      if (checked !== null) ariaState.checked = checked === 'true';
+      const pressed = el.getAttribute('aria-pressed');
+      if (pressed !== null) ariaState.pressed = pressed === 'true';
+      const current = el.getAttribute('aria-current');
+      if (current && current !== 'false') ariaState.current = current;
+      const busy = el.getAttribute('aria-busy');
+      if (busy === 'true') ariaState.busy = true;
+      const live = el.getAttribute('aria-live');
+      if (live && live !== 'off') ariaState.live = live;
+
+      // Form state signals
+      const formState = {};
+      if (el.required || el.getAttribute('aria-required') === 'true') formState.required = true;
+      if (el.validity && !el.validity.valid) formState.invalid = true;
+      const errMsg = el.getAttribute('aria-errormessage') || el.getAttribute('aria-describedby');
+      if (errMsg && formState.invalid) {
+        const errEl = document.getElementById(errMsg);
+        if (errEl) formState.error = normalize(errEl.textContent || '').slice(0, 100);
+      }
+      if (el.readOnly) formState.readOnly = true;
+      // Fieldset/legend grouping
+      const fieldset = el.closest('fieldset');
+      if (fieldset) {
+        const legend = fieldset.querySelector('legend');
+        if (legend) formState.group = normalize(legend.textContent || '').slice(0, 80);
+      }
+
       return {
         ref: `el_${idx + 1}`,
         role: roleOf(el),
@@ -406,6 +459,8 @@ SCRIPT_INTERACTIVE_ELEMENTS = r"""
         region: regionOf(el),
         parent_ref: '',
         bbox: { x: Math.round(rect.x), y: Math.round(rect.y), width: Math.round(rect.width), height: Math.round(rect.height) },
+        aria_state: Object.keys(ariaState).length ? ariaState : undefined,
+        form_state: Object.keys(formState).length ? formState : undefined,
       };
     });
 
@@ -469,60 +524,129 @@ SCRIPT_CONTENT_CARDS = r"""
     };
 
     const cards = [];
+    const seen = new Set();
+    let rank = 0;
+
+    // Detect if current page looks like a search results page (any site)
+    const urlPath = (location.pathname || '').toLowerCase();
+    const urlParams = new URLSearchParams(location.search || '');
+    const looksLikeSearchPage = isSearchHost ||
+      (urlPath.includes('/search') && (urlParams.has('q') || urlParams.has('query')));
+
+    const buildCard = (container, anchor, allowSameHost) => {
+      if (!container || !anchor || !isVisible(container) || !isVisible(anchor)) return false;
+      const resolved = resolveSearchResultUrl(container, anchor);
+      const href = resolved.link; const rawHref = resolved.rawHref || href;
+      if (!href || /^javascript:/i.test(href)) return false;
+      const host = hostOf(href); if (!host) return false;
+      // For search engines, skip same-host links (results should point externally)
+      // For other sites (e.g. GitHub search), same-host results are normal
+      if (!allowSameHost && host === currentHost && !resolved.targetUrl && !isSearchIntermediaryUrl(rawHref)) return false;
+      const titleNode = container.querySelector('h1, h2, h3, h4') || anchor;
+      const title = normalize(titleNode?.innerText || titleNode?.textContent || anchor.getAttribute('aria-label') || anchor.getAttribute('title') || '');
+      if (title.length < 3) return false;
+      const snippetNode = container.querySelector('.b_caption p, .snippet, .st, .c-abstract, .compText, p, [data-testid="result-snippet"]');
+      const sourceNode = container.querySelector('cite, .cite, .b_attribution, .source, .news-source, [data-testid="result-source"]');
+      const dateNode = container.querySelector('time, .news-date, .timestamp, .date, [datetime]');
+      let snippet = normalize(snippetNode?.innerText || snippetNode?.textContent || '');
+      if (!snippet) snippet = normalize((container.innerText || container.textContent || '').replace(title, ''));
+      const source = normalize(sourceNode?.innerText || sourceNode?.textContent || '');
+      const date = normalize(dateNode?.innerText || dateNode?.textContent || '');
+      const key = `${title}|${resolved.targetUrl || href}`;
+      if (seen.has(key)) return false; seen.add(key);
+      rank++;
+      cards.push({ ref: `card_${rank}`, card_type: 'search_result', title: title.slice(0, __CARD_TITLE_CHARS__), source: source.slice(0, __CARD_SOURCE_CHARS__), snippet: snippet.slice(0, __CARD_SNIPPET_CHARS__), date: date.slice(0, 80), host, link: href, raw_link: rawHref, target_url: resolved.targetUrl, rank, target_ref: '', target_selector: selectorOf(anchor) });
+      return true;
+    };
+
+    // Phase 0: Inline answer boxes (weather, knowledge panels, calculators, etc.)
+    // Generic heuristic: find top-level result blocks whose links are mostly
+    // same-host (= not organic results pointing to external sites). These are
+    // typically the search engine's own answer widgets.
+    if (isSearchHost) {
+      const resultsRoot = document.querySelector('main, [role="main"], #b_results, #search, #content_left, .results') || document.body;
+      // Grab direct children or shallow containers that look like result items
+      const candidates = Array.from(resultsRoot.querySelectorAll(':scope > *, :scope > * > *'));
+      for (const box of candidates) {
+        if (!isVisible(box)) continue;
+        // Skip tiny or navigation elements
+        const rect = box.getBoundingClientRect();
+        if (rect.height < 40 || rect.width < 200) continue;
+        if (box.closest('nav, header, footer, aside')) continue;
+
+        const text = normalize(box.innerText || box.textContent || '');
+        if (text.length < 30 || text.length > 4000) continue;
+
+        // Heuristic: count links — answer boxes have few/no external links
+        const anchors = Array.from(box.querySelectorAll('a[href]'));
+        const externalCount = anchors.filter(a => {
+          try { return cleanHost(new URL(a.href, location.href).hostname) !== currentHost; } catch (_) { return false; }
+        }).length;
+        // If most links are external, this is a normal result cluster, skip
+        if (externalCount > 2) continue;
+        // Must have meaningful content density (not just a row of links)
+        const linkTextLen = anchors.reduce((s, a) => s + (a.innerText || '').trim().length, 0);
+        if (linkTextLen > 0 && text.length / linkTextLen < 1.5) continue;
+
+        // Deduplicate
+        const key = `answer_box|${text.slice(0, 80)}`;
+        if (seen.has(key)) continue;
+        seen.add(key);
+        rank++;
+        cards.push({
+          ref: `card_${rank}`, card_type: 'answer_box',
+          title: text.slice(0, __CARD_TITLE_CHARS__),
+          source: currentHost, snippet: text.slice(0, __CARD_SNIPPET_CHARS__),
+          date: '', host: currentHost, link: location.href,
+          raw_link: location.href, target_url: '', rank,
+          target_ref: '', target_selector: selectorOf(box),
+        });
+        if (cards.length >= 3) break;  // answer boxes are few, cap to avoid noise
+      }
+    }
+
+    // Phase 1: Search-engine-specific selectors
     if (isSearchHost) {
       const selectorMap = {
-        'bing.com': ['#b_results li.b_algo', '#b_results li.b_ans', '#b_results .b_algo', '.b_algo'],
+        'bing.com': ['#b_results li.b_algo', '#b_results .b_algo', '.b_algo'],
         'google.com': ['#search .tF2Cxc', '#search .g', '#search .MjjYud', '[data-sokoban-container]'],
-        'baidu.com': ['#content_left .result', '#content_left .c-container', '#content_left .result-op', '#content_left .xpath-log'],
+        'baidu.com': ['#content_left .result', '#content_left .c-container', '#content_left .xpath-log'],
         'duckduckgo.com': ['.results .result', '.result', '.result__body', '[data-testid="result"]'],
         'sogou.com': ['.results .vrwrap', '.results .rb', '.results .fb', '.vrwrap', '.rb'],
       };
-      let selectors = ['main a[href]'];
+      let selectors = [];
       for (const [host, vals] of Object.entries(selectorMap)) {
         if (currentHost === host || currentHost.endsWith('.'+host)) { selectors = vals; break; }
       }
-
-      const seen = new Set();
-      let rank = 0;
-      const buildCard = (container, anchor) => {
-        if (!container || !anchor || !isVisible(container) || !isVisible(anchor)) return false;
-        const resolved = resolveSearchResultUrl(container, anchor);
-        const href = resolved.link; const rawHref = resolved.rawHref || href;
-        if (!href || /^javascript:/i.test(href)) return false;
-        const host = hostOf(href); if (!host) return false;
-        if (host === currentHost && !resolved.targetUrl && !isSearchIntermediaryUrl(rawHref)) return false;
-        const titleNode = container.querySelector('h1, h2, h3') || anchor;
-        const title = normalize(titleNode?.innerText || titleNode?.textContent || anchor.getAttribute('aria-label') || anchor.getAttribute('title') || '');
-        if (title.length < 3) return false;
-        const snippetNode = container.querySelector('.b_caption p, .snippet, .st, .c-abstract, .compText, p, [data-testid="result-snippet"]');
-        const sourceNode = container.querySelector('cite, .cite, .b_attribution, .source, .news-source, [data-testid="result-source"]');
-        const dateNode = container.querySelector('time, .news-date, .timestamp, .date');
-        let snippet = normalize(snippetNode?.innerText || snippetNode?.textContent || '');
-        if (!snippet) snippet = normalize((container.innerText || container.textContent || '').replace(title, ''));
-        const source = normalize(sourceNode?.innerText || sourceNode?.textContent || '');
-        const date = normalize(dateNode?.innerText || dateNode?.textContent || '');
-        const key = `${title}|${resolved.targetUrl || href}`;
-        if (seen.has(key)) return false; seen.add(key);
-        rank++;
-        cards.push({ ref: `card_${rank}`, card_type: 'search_result', title: title.slice(0, 240), source: source.slice(0, 120), snippet: snippet.slice(0, 400), date: date.slice(0, 80), host, link: href, raw_link: rawHref, target_url: resolved.targetUrl, rank, target_ref: '', target_selector: selectorOf(anchor) });
-        return true;
-      };
-
-      const containers = Array.from(document.querySelectorAll(selectors.join(', ')));
-      for (const c of containers) {
-        if (!isVisible(c)) continue;
-        const anchor = c.matches('a[href]') ? c : c.querySelector('h2 a, h3 a, a[href]');
-        if (buildCard(c, anchor) && cards.length >= 10) break;
-      }
-
-      if (!cards.length) {
-        const fallback = Array.from(document.querySelectorAll('main li, main article, main section, main div, [role="main"] li, [role="main"] article, [role="main"] section, [role="main"] div'));
-        for (const c of fallback) {
-          if (!isVisible(c) || c.closest('nav, header, footer, aside, form, dialog, [role="dialog"], [aria-modal="true"]')) continue;
-          if (normalize(c.innerText || c.textContent || '').length < 12) continue;
-          const anchor = Array.from(c.querySelectorAll('a[href]')).find(a => { if (!isVisible(a)) return false; const t = normalize(a.innerText || a.textContent || a.getAttribute('aria-label') || a.getAttribute('title') || ''); if (t.length < 3) return false; const r = resolveSearchResultUrl(c, a); return !!r.link && !!hostOf(r.link); });
-          if (buildCard(c, anchor) && cards.length >= 10) break;
+      if (selectors.length) {
+        const containers = Array.from(document.querySelectorAll(selectors.join(', ')));
+        for (const c of containers) {
+          if (!isVisible(c)) continue;
+          const anchor = c.matches('a[href]') ? c : c.querySelector('h2 a, h3 a, a[href]');
+          if (buildCard(c, anchor, false) && cards.length >= __MAX_CARDS__) break;
         }
+      }
+    }
+
+    // Phase 2: Generic fallback — for any search-like page (including non-search-engine sites)
+    if (!cards.length && looksLikeSearchPage) {
+      const contentRoot = document.querySelector('main, [role="main"]') || document.body;
+      // Try list items, articles, sections, and divs with links inside the content area
+      const fallbackSels = 'li, article, section, [role="listitem"], [class*="result"], [class*="item"]:not(li), [class*="card"], [class*="repo"], [class*="entry"]';
+      const fallback = Array.from(contentRoot.querySelectorAll(fallbackSels));
+      for (const c of fallback) {
+        if (!isVisible(c)) continue;
+        // Skip navigation, sidebar, filters, footer, modal elements
+        if (c.closest('nav, header, footer, aside, dialog, [role="dialog"], [aria-modal="true"]')) continue;
+        const text = normalize(c.innerText || c.textContent || '');
+        if (text.length < 12 || text.length > 3000) continue;
+        // Find a meaningful anchor within the container
+        const anchor = Array.from(c.querySelectorAll('a[href]')).find(a => {
+          if (!isVisible(a)) return false;
+          const t = normalize(a.innerText || a.textContent || a.getAttribute('aria-label') || a.getAttribute('title') || '');
+          return t.length >= 3 && !/^(sign|log|next|prev|more|load)/i.test(t);
+        });
+        if (buildCard(c, anchor, true) && cards.length >= __MAX_CARDS__) break;
       }
     }
 
@@ -564,19 +688,50 @@ SCRIPT_TEXT_CONTENT = r"""
   try {
     """ + SCRIPT_COMMON_UTILS + r"""
 
-    const contentRoot = document.querySelector('main, article, [role="main"]') || document.body;
+    // Find the best content root: prefer a specific content area over the broad <main> that may include sidebars
+    const findContentRoot = () => {
+      // On search engine pages, use the broad main/body to capture ALL content
+      // (weather widgets, answer boxes, knowledge panels, AND organic results).
+      // Narrowing to a specific article/result would lose inline answer cards.
+      if (isSearchHost) {
+        return document.querySelector('#b_results, #search, #content_left, .results, main, [role="main"]') || document.body;
+      }
+      // Try specific content area selectors first (more targeted than <main>)
+      const specific = document.querySelector(
+        '[role="main"] > [class*="content"], main > [class*="content"], ' +
+        '[role="main"] > [class*="result"], main > [class*="result"], ' +
+        '[data-testid*="result"], [data-testid*="content"], ' +
+        'article, [role="article"]'
+      );
+      if (specific && isVisible(specific)) {
+        const text = normalize(specific.innerText || specific.textContent || '');
+        if (text.length >= 100) return specific;
+      }
+      return document.querySelector('main, [role="main"]') || document.body;
+    };
+    const contentRoot = findContentRoot();
     const mainText = normalize(
       contentRoot ? (contentRoot.innerText || contentRoot.textContent || document.body?.innerText || document.body?.textContent || '')
                   : (document.body?.innerText || document.body?.textContent || '')
-    ).slice(0, 6000);
+    ).slice(0, 10000);
 
-    // Headings
+    // Headings with hierarchy (depth tracking)
     const headings = [];
-    document.querySelectorAll('h1, h2, h3').forEach(h => {
+    const depthStack = [];  // track nesting: [{level, index}]
+    document.querySelectorAll('h1, h2, h3, h4').forEach(h => {
       const text = (h.textContent || '').trim();
-      if (text && text.length < 200) {
-        headings.push({ level: h.tagName.toLowerCase(), text });
+      if (!text || text.length >= 200) return;
+      const level = h.tagName.toLowerCase();
+      const levelNum = parseInt(level.charAt(1), 10);
+      // Pop stack until we find a parent with a smaller heading level
+      while (depthStack.length > 0 && depthStack[depthStack.length - 1].levelNum >= levelNum) {
+        depthStack.pop();
       }
+      const depth = depthStack.length;
+      const parentIdx = depthStack.length > 0 ? depthStack[depthStack.length - 1].index : -1;
+      const idx = headings.length;
+      headings.push({ level, text, depth, parent_index: parentIdx });
+      depthStack.push({ levelNum, index: idx });
     });
 
     // Visible text blocks
@@ -597,7 +752,7 @@ SCRIPT_TEXT_CONTENT = r"""
         selector: selectorOf(node),
         parent_ref: '',
       });
-      if (visibleTextBlocks.length >= 16) break;
+      if (visibleTextBlocks.length >= 24) break;
     }
 
     return { main_text: mainText, visible_text_blocks: visibleTextBlocks, headings: headings.slice(0, 10) };
@@ -624,7 +779,7 @@ SCRIPT_CONTROLS = r"""
       (el) => /(load more|show more|view more|more results|加载更多|查看更多|更多|展开更多)/i.test(normalize(el.innerText || el.textContent || el.getAttribute('aria-label') || ''))
     );
     const searchInputEl = findVisibleAction(['input[type="search"]', 'input[name*="search" i]', 'input[placeholder*="search" i]', 'input[placeholder*="搜索"]']);
-    const modalRoot = findVisibleAction(['dialog[open]', '[role="dialog"]', '[aria-modal="true"]', '.modal.show', '.dialog', '[class*="modal"]', '[class*="dialog"]']);
+    const modalRoot = findVisibleAction(['dialog[open]', '[role="dialog"]', '[aria-modal="true"]', '.modal.show']);
 
     const findModalAction = (patterns) => {
       if (!modalRoot) return null;
@@ -744,3 +899,23 @@ def assemble_semantic_snapshot(
         "_element_count_before_filter": elems.get("total_before_filter", 0),
         "_element_count_after_filter": elems.get("total_after_filter", 0),
     }
+
+
+def build_page_meta_script(modal_content_threshold: int = 200) -> str:
+    """Return SCRIPT_PAGE_META with configurable modal content threshold injected."""
+    return SCRIPT_PAGE_META.replace("__MODAL_THRESHOLD__", str(int(modal_content_threshold)))
+
+
+def build_content_cards_script(
+    max_cards: int = 12,
+    card_title_chars: int = 240,
+    card_source_chars: int = 120,
+    card_snippet_chars: int = 400,
+) -> str:
+    """Return SCRIPT_CONTENT_CARDS with configurable extraction limits injected."""
+    script = SCRIPT_CONTENT_CARDS
+    script = script.replace("__MAX_CARDS__", str(int(max_cards)))
+    script = script.replace("__CARD_TITLE_CHARS__", str(int(card_title_chars)))
+    script = script.replace("__CARD_SOURCE_CHARS__", str(int(card_source_chars)))
+    script = script.replace("__CARD_SNIPPET_CHARS__", str(int(card_snippet_chars)))
+    return script

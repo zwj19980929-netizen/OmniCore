@@ -33,17 +33,17 @@ Vision description:
 Important decision rules:
 - The context above includes page regions, main text, and visible text blocks. Use these to understand the page layout and content before deciding the next action.
 - The context is a prioritized, partial view of the page. Do not assume omitted content is absent.
+- CRITICAL: After each action, re-read the task and ask yourself "does the current page already contain the answer to the task?" If YES, use DONE immediately. Do not continue navigating or collecting data unnecessarily. The current URL, page title, and visible text may already be the answer.
 - Base the next action on the current visible state and the recent execution history, not on generic assumptions about the website.
 - Prefer `target_ref` over `target_selector` whenever a relevant card or element ref is available.
 - Avoid repeating the same failed action unless the page clearly changed.
 - If the page type is `serp` and a search result card clearly looks like the best source, CLICK that card's `target_ref`.
-- If data_collected < data_target and you see pagination controls (下一页/Next/page numbers/arrows), CLICK the next page button.
-- If data_collected < data_target and no pagination is visible, use SCROLL (value="800") to trigger lazy loading, then EXTRACT.
+- If the task specifies a numeric target and you haven't reached it, and you see pagination controls, CLICK the next page button.
+- If the task specifies a numeric target and you haven't reached it, and no pagination is visible, use SCROLL (value="800") to trigger lazy loading, then EXTRACT.
 - If the task intent is `form` or `auth`, use `Structured fields` plus the visible elements to decide whether to fill inputs, submit the form, or wait for a state change.
 - Do not return `done` or `extract` for an active `form` or `auth` page that still shows editable inputs or a plausible submit action.
 - Choose `wait` only for clear loading or hydration states, or when there is no justified actionable target.
-- If data_collected < data_target and you see "加载更多"/"Load More"/"查看更多" buttons, CLICK them.
-- If data_collected >= data_target or no more data can be loaded, use DONE.
+- If the task goal is satisfied by the current page content (URL, title, visible text, or collected data), use DONE.
 - SCROLL value should be pixels to scroll down (e.g. "800" for one screen).
 - If vision_description is provided, cross-reference it with the element list to resolve ambiguity about page layout and interactive targets.
 - For forms with multiple fields, prefer `fill_form` with all field values in one action.

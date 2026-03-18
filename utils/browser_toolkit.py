@@ -389,6 +389,7 @@ class BrowserToolkit:
     async def goto(self, url: str, wait_until: str = "domcontentloaded", timeout: int = None) -> ToolkitResult:
         try:
             timeout_ms = timeout if timeout is not None else settings.BROWSER_NAVIGATION_TIMEOUT
+            self._semantic_ref_map.clear()  # 导航会切换页面，旧 ref 失效
             await self._page.goto(url, wait_until=wait_until, timeout=self._timeout(timeout_ms))
             return ToolkitResult(success=True, data=self._page.url)
         except Exception as e:
@@ -396,6 +397,7 @@ class BrowserToolkit:
 
     async def go_back(self) -> ToolkitResult:
         try:
+            self._semantic_ref_map.clear()
             await self._page.go_back(timeout=self._timeout(settings.BROWSER_NAVIGATION_TIMEOUT))
             return ToolkitResult(success=True)
         except Exception as e:
@@ -403,6 +405,7 @@ class BrowserToolkit:
 
     async def go_forward(self) -> ToolkitResult:
         try:
+            self._semantic_ref_map.clear()
             await self._page.go_forward(timeout=self._timeout(settings.BROWSER_NAVIGATION_TIMEOUT))
             return ToolkitResult(success=True)
         except Exception as e:
@@ -1031,6 +1034,23 @@ class BrowserToolkit:
 
     # ── semantic snapshot / ref actions ─────────────────────
 
+    async def _trigger_lazy_content(self) -> None:
+        """Quick scroll nudge to trigger IntersectionObserver / lazy-loaded content."""
+        try:
+            surface = self.active_surface
+            # Scroll down ~1 viewport then back, giving lazy loaders time to fire
+            await surface.evaluate("""
+                () => {
+                    const vh = window.innerHeight || 768;
+                    window.scrollBy(0, vh);
+                }
+            """)
+            await asyncio.sleep(0.3)
+            await surface.evaluate("window.scrollTo(0, 0)")
+            await asyncio.sleep(0.15)
+        except Exception:
+            pass  # Non-critical — best effort
+
     async def semantic_snapshot(
         self,
         max_elements: int = 80,
@@ -1038,22 +1058,27 @@ class BrowserToolkit:
     ) -> ToolkitResult:
         """Decomposed semantic snapshot: runs 5+ sub-scripts with per-script isolation."""
         from utils.perception_scripts import (
-            SCRIPT_PAGE_META,
             SCRIPT_REGIONS,
             SCRIPT_INTERACTIVE_ELEMENTS,
-            SCRIPT_CONTENT_CARDS,
             SCRIPT_TEXT_CONTENT,
             SCRIPT_CONTROLS,
             assemble_semantic_snapshot,
+            build_page_meta_script,
+            build_content_cards_script,
         )
+        from config.settings import settings
 
         try:
             surface = self.active_surface
 
+            # Trigger lazy-loaded content before snapshot
+            await self._trigger_lazy_content()
+
             # Run sub-scripts with per-script try/catch
             page_meta = {}
             try:
-                page_meta = await surface.evaluate(SCRIPT_PAGE_META) or {}
+                page_meta_script = build_page_meta_script(settings.MODAL_CONTENT_THRESHOLD)
+                page_meta = await surface.evaluate(page_meta_script) or {}
             except Exception as exc:
                 log_warning(f"perception sub-script PAGE_META failed: {exc}")
 
@@ -1075,8 +1100,14 @@ class BrowserToolkit:
             cards_data = {}
             if include_cards:
                 try:
+                    cards_script = build_content_cards_script(
+                        max_cards=settings.MAX_EXTRACT_CARDS,
+                        card_title_chars=settings.CARD_TITLE_DISPLAY_CHARS,
+                        card_source_chars=settings.CARD_SOURCE_DISPLAY_CHARS,
+                        card_snippet_chars=settings.CARD_SNIPPET_DISPLAY_CHARS,
+                    )
                     cards_data = await surface.evaluate(
-                        SCRIPT_CONTENT_CARDS,
+                        cards_script,
                         {"elementRefs": {}},
                     ) or {}
                 except Exception as exc:
@@ -1093,6 +1124,45 @@ class BrowserToolkit:
                 controls_data = await surface.evaluate(SCRIPT_CONTROLS) or {}
             except Exception as exc:
                 log_warning(f"perception sub-script CONTROLS failed: {exc}")
+
+            # Collect text/elements from same-origin iframes
+            iframe_texts = []
+            iframe_elements = []
+            try:
+                page_obj = self._page
+                if page_obj:
+                    for frame in page_obj.frames:
+                        if frame == page_obj.main_frame:
+                            continue
+                        # Only process same-origin frames (cross-origin will throw)
+                        try:
+                            frame_url = frame.url or ""
+                            if not frame_url or frame_url.startswith("about:") or frame_url.startswith("javascript:"):
+                                continue
+                            frame_text = await frame.evaluate(SCRIPT_TEXT_CONTENT) or {}
+                            ft = (frame_text.get("main_text") or "").strip()
+                            if ft and len(ft) > 30:
+                                iframe_texts.append(ft[:3000])
+                            frame_elems = await frame.evaluate(
+                                SCRIPT_INTERACTIVE_ELEMENTS,
+                                {"max_elements": 20},
+                            ) or {}
+                            for el in (frame_elems.get("elements") or []):
+                                el["ref"] = f"iframe_{el.get('ref', '')}"
+                                el["region"] = "iframe"
+                                iframe_elements.append(el)
+                        except Exception:
+                            continue  # cross-origin or detached frame
+            except Exception:
+                pass
+
+            # Merge iframe content into main results
+            if iframe_texts:
+                existing_main = text_data.get("main_text") or ""
+                text_data["main_text"] = existing_main + "\n[iframe content]\n" + "\n".join(iframe_texts)
+            if iframe_elements:
+                existing_elems = elements_data.get("elements") or []
+                elements_data["elements"] = existing_elems + iframe_elements
 
             # Assemble into unified snapshot
             snapshot = assemble_semantic_snapshot(
@@ -2158,11 +2228,8 @@ class BrowserToolkit:
             if by_label.success:
                 return by_label
 
-        if selector:
-            typed = await self.type_text(selector, value, timeout=timeout)
-            if typed.success:
-                return typed
-
+        # 注意：不在这里做 type_text 回退，避免和调用方的 direct_type 策略重复
+        # type_text 是追加模式，重复调用会导致文字翻倍（如 "openclawopenclaw"）
         return ToolkitResult(success=False, error=f"failed to input ref: {ref}")
 
     async def select_ref(self, ref: str, value: str, timeout: int = None) -> ToolkitResult:

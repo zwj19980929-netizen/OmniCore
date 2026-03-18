@@ -170,7 +170,45 @@ class Settings:
     VISION_PERCEPTION_ENABLED = os.getenv("VISION_PERCEPTION_ENABLED", "true").lower() == "true"
     VISION_PERCEPTION_COMPLEXITY_THRESHOLD = float(os.getenv("VISION_PERCEPTION_COMPLEXITY_THRESHOLD", "0.4"))
 
+    # === 页面感知配置 ===
+    # 传给 LLM 的主文本字符上限（detail/list/serp 页面）
+    MAIN_TEXT_LIMIT_DETAIL = _env_int("MAIN_TEXT_LIMIT_DETAIL", 4000)
+    # 传给 LLM 的主文本字符上限（其他页面）
+    MAIN_TEXT_LIMIT_DEFAULT = _env_int("MAIN_TEXT_LIMIT_DEFAULT", 2400)
+    # Modal 判定：主内容区低于此字符数时，才将页面类型标记为 modal
+    MODAL_CONTENT_THRESHOLD = _env_int("MODAL_CONTENT_THRESHOLD", 200)
+
+    # === LLM 上下文预算 ===
+    # 动作决策总 token 预算（所有区块共享）
+    ACTION_DECISION_CONTEXT_TOKENS = _env_int("ACTION_DECISION_CONTEXT_TOKENS", 6000)
+    # 页面评估总 token 预算
+    PAGE_ASSESSMENT_CONTEXT_TOKENS = _env_int("PAGE_ASSESSMENT_CONTEXT_TOKENS", 2400)
+    # 各区块预算：(min_chars, max_chars, weight)
+    DATA_BUDGET_MIN_CHARS = _env_int("DATA_BUDGET_MIN_CHARS", 800)
+    DATA_BUDGET_MAX_CHARS = _env_int("DATA_BUDGET_MAX_CHARS", 4000)
+    CARDS_BUDGET_MIN_CHARS = _env_int("CARDS_BUDGET_MIN_CHARS", 600)
+    CARDS_BUDGET_MAX_CHARS = _env_int("CARDS_BUDGET_MAX_CHARS", 3200)
+    ELEMENTS_BUDGET_MIN_CHARS = _env_int("ELEMENTS_BUDGET_MIN_CHARS", 600)
+    ELEMENTS_BUDGET_MAX_CHARS = _env_int("ELEMENTS_BUDGET_MAX_CHARS", 3600)
+
+    # === 感知展示限制（传给 LLM 的格式化截断） ===
+    # 卡片提取与展示
+    MAX_EXTRACT_CARDS = _env_int("MAX_EXTRACT_CARDS", 14)
+    CARD_TITLE_DISPLAY_CHARS = _env_int("CARD_TITLE_DISPLAY_CHARS", 160)
+    CARD_SOURCE_DISPLAY_CHARS = _env_int("CARD_SOURCE_DISPLAY_CHARS", 60)
+    CARD_SNIPPET_DISPLAY_CHARS = _env_int("CARD_SNIPPET_DISPLAY_CHARS", 500)
+    # 元素展示
+    ELEMENT_TEXT_DISPLAY_CHARS = _env_int("ELEMENT_TEXT_DISPLAY_CHARS", 120)
+    ELEMENT_ATTR_DISPLAY_CHARS = _env_int("ELEMENT_ATTR_DISPLAY_CHARS", 80)
+    ELEMENT_HREF_DISPLAY_CHARS = _env_int("ELEMENT_HREF_DISPLAY_CHARS", 160)
+    ELEMENT_DISPLAY_LIMIT = _env_int("ELEMENT_DISPLAY_LIMIT", 30)
+    # 文本块展示
+    TEXT_BLOCKS_DISPLAY_LIMIT = _env_int("TEXT_BLOCKS_DISPLAY_LIMIT", 18)
+    TEXT_BLOCK_DISPLAY_CHARS = _env_int("TEXT_BLOCK_DISPLAY_CHARS", 400)
+
     # === 浏览器执行配置 ===
+    # 连续失败容忍次数：连续多少次操作失败后放弃任务
+    BROWSER_MAX_CONSECUTIVE_FAILS = _env_int("BROWSER_MAX_CONSECUTIVE_FAILS", 4)
     # 快速模式：减少随机延迟与不必要等待，优先吞吐
     BROWSER_FAST_MODE = os.getenv("BROWSER_FAST_MODE", "true").lower() == "true"
     # 阻断重资源：图片/字体/媒体，减少页面负载
