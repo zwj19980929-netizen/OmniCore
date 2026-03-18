@@ -12,7 +12,7 @@
 - 步骤编号：第 {step_no} 步
 - 执行的动作：{action}
 - 期望结果：{expected}
-- 实际结果：{actual}
+- 实际结果：{actual}」
 - 错误信息：{error}
 
 ## 历史表现
