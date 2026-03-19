@@ -16,6 +16,14 @@ if TYPE_CHECKING:
 _SCOPE_KEYS = ("session_id", "goal_id", "project_id", "todo_id")
 
 
+def _safe_json_dumps(obj: Any) -> str:
+    """安全序列化为 JSON 字符串，不可序列化的对象降级为 str()。"""
+    try:
+        return json.dumps(obj, ensure_ascii=False, default=str)
+    except Exception:
+        return "[]"
+
+
 def build_memory_scope(
     *,
     session_id: str = "",
@@ -204,7 +212,7 @@ class MemoryManager:
                     "intent": sanitize_text(intent or ""),
                     "tool_sequence": tool_sequence,
                     "visited_urls": visited_urls,
-                    "artifact_refs": artifact_refs[:5],
+                    "artifact_refs": _safe_json_dumps(artifact_refs[:5]),
                 },
                 fingerprint=hashlib.sha1(
                     json.dumps(fingerprint_payload, ensure_ascii=False, sort_keys=True).encode("utf-8")

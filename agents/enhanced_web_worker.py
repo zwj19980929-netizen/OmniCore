@@ -13,6 +13,8 @@ from core.llm import LLMClient
 from utils.browser_toolkit import BrowserToolkit
 from utils.page_perceiver import get_page_understanding
 from utils.logger import log_agent_action, log_success, log_warning, log_error
+from utils.text_relevance import extract_relevant_text_safe_async
+from config.settings import settings
 from utils.web_result_normalizer import normalize_search_cards, normalize_web_results
 
 
@@ -212,7 +214,7 @@ class EnhancedWebWorker:
         except Exception:
             return str(payload)
 
-    def _format_semantic_snapshot_for_llm(self, snapshot: Dict[str, Any]) -> str:
+    async def _format_semantic_snapshot_for_llm(self, snapshot: Dict[str, Any], query: str = "") -> str:
         if not isinstance(snapshot, dict) or not snapshot:
             return "(无语义快照)"
 
@@ -233,7 +235,12 @@ class EnhancedWebWorker:
 
         main_text = self._normalize_text(snapshot.get("main_text", ""))
         if main_text:
-            lines.append(f"主体文本: {main_text[:500]}")
+            page_type = str(snapshot.get("page_type", "") or "")
+            text_limit = settings.MAIN_TEXT_LIMIT_DETAIL if page_type in ("detail", "list", "serp") else settings.MAIN_TEXT_LIMIT_DEFAULT
+            relevant_text = await extract_relevant_text_safe_async(
+                main_text, query, fallback_limit=text_limit, max_chars=text_limit,
+            )
+            lines.append(f"主体文本: {relevant_text}")
 
         visible_text_blocks = snapshot.get("visible_text_blocks", []) or []
         if visible_text_blocks:
@@ -335,7 +342,7 @@ class EnhancedWebWorker:
             snapshot_r = await toolkit.semantic_snapshot(max_elements=80, include_cards=True)
             if snapshot_r.success and isinstance(snapshot_r.data, dict):
                 semantic_snapshot = snapshot_r.data
-                semantic_snapshot_text = self._format_semantic_snapshot_for_llm(semantic_snapshot)
+                semantic_snapshot_text = await self._format_semantic_snapshot_for_llm(semantic_snapshot, query=task_description)
         except Exception as exc:
             log_warning(f"获取语义快照失败: {exc}")
 

@@ -126,6 +126,22 @@ class Settings:
     DEEPSEEK_API_KEY = os.getenv("DEEPSEEK_API_KEY", "")
     KIMI_API_KEY = os.getenv("KIMI_API_KEY", "")
     MINIMAX_API_KEY = os.getenv("MINIMAX_API_KEY", "")
+    ZHIPU_API_KEY = os.getenv("ZHIPU_API_KEY", "")
+
+    # === Embedding 语义匹配配置 ===
+    ZHIPU_EMBEDDING_MODEL = os.getenv("ZHIPU_EMBEDDING_MODEL", "embedding-3")
+    # 语义匹配：文本分块大小（字符数）
+    RELEVANCE_CHUNK_SIZE = max(_env_int("RELEVANCE_CHUNK_SIZE", 256), 64)
+    # 语义匹配：块之间的重叠字符数（必须小于 chunk_size）
+    RELEVANCE_CHUNK_OVERLAP = min(
+        _env_int("RELEVANCE_CHUNK_OVERLAP", 64),
+        max(_env_int("RELEVANCE_CHUNK_SIZE", 256), 64) - 1,
+    )
+    # 语义匹配：返回的 top-k 最相关块数量
+    RELEVANCE_TOP_K = _env_int("RELEVANCE_TOP_K", 8)
+    # 语义匹配：文本总长度低于此值时跳过匹配直接返回全文
+    RELEVANCE_MIN_TEXT_LENGTH = _env_int("RELEVANCE_MIN_TEXT_LENGTH", 1500)
+
     ALLOW_SYSTEM_PROXY = os.getenv("ALLOW_SYSTEM_PROXY", "false").lower() == "true"
     OMNICORE_HTTP_PROXY = os.getenv("OMNICORE_HTTP_PROXY", "").strip()
     OMNICORE_HTTPS_PROXY = os.getenv("OMNICORE_HTTPS_PROXY", "").strip()

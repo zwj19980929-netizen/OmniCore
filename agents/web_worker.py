@@ -42,6 +42,7 @@ from utils.web_result_normalizer import (
     score_detail_like_url,
 )
 import utils.web_debug_recorder as web_debug_recorder
+from utils.text_relevance import extract_relevant_text_safe_async
 from config.settings import settings
 from config.domain_keywords import SEARCH_STOPWORDS_SET
 
@@ -429,7 +430,7 @@ class WebWorker:
         )
         return cards
 
-    def _format_semantic_snapshot_for_llm(self, snapshot: Dict[str, Any]) -> str:
+    async def _format_semantic_snapshot_for_llm(self, snapshot: Dict[str, Any], query: str = "") -> str:
         if not isinstance(snapshot, dict) or not snapshot:
             return "(无语义快照)"
 
@@ -448,7 +449,12 @@ class WebWorker:
             lines.append("阻塞信号: " + " | ".join(blocked_signals))
         main_text = str(snapshot.get("main_text", "") or "").strip()
         if main_text:
-            lines.append(f"主体文本: {main_text[:500]}")
+            page_type = str(snapshot.get("page_type", "") or "")
+            text_limit = settings.MAIN_TEXT_LIMIT_DETAIL if page_type in ("detail", "list", "serp") else settings.MAIN_TEXT_LIMIT_DEFAULT
+            relevant_text = await extract_relevant_text_safe_async(
+                main_text, query, fallback_limit=text_limit, max_chars=text_limit,
+            )
+            lines.append(f"主体文本: {relevant_text}")
         visible_text_blocks = snapshot.get("visible_text_blocks", []) or []
         if visible_text_blocks:
             lines.append("可见文本块:")
@@ -1406,7 +1412,7 @@ class WebWorker:
             snapshot_r = await tk.semantic_snapshot(max_elements=80, include_cards=True)
             if snapshot_r.success and isinstance(snapshot_r.data, dict):
                 semantic_snapshot = snapshot_r.data
-                semantic_snapshot_text = self._format_semantic_snapshot_for_llm(semantic_snapshot)
+                semantic_snapshot_text = await self._format_semantic_snapshot_for_llm(semantic_snapshot, query=task_description)
                 web_debug_recorder.write_json("semantic_snapshot", semantic_snapshot)
                 web_debug_recorder.write_text("semantic_snapshot_llm", semantic_snapshot_text)
                 log_agent_action(
@@ -1909,7 +1915,7 @@ class WebWorker:
         normalized_title = str(title or "").lower()
         normalized_body = str(body_text or "").lower()
         url_tokens = ("/sorry", "/captcha", "/verify", "/challenge", "/blocked")
-        text_tokens = ("unusual traffic", "robot check", "captcha", "异常流量", "人机身份验证", "验证码", "安全验证")
+        text_tokens = ("unusual traffic", "robot check", "captcha", "异常流量", "人机身份验证", "验证码", "安全验证", "请解决以下难题")
         return any(token in normalized_url for token in url_tokens) or any(
             token in normalized_title or token in normalized_body for token in text_tokens
         )
@@ -1987,6 +1993,11 @@ class WebWorker:
                 if snapshot:
                     last_snapshot = snapshot
                 if self._looks_like_search_blocked_page(current_url, title, body_text):
+                    # 尝试绕过反机器人验证
+                    bypass_r = await tk.bypass_robot_challenge(max_retries=2)
+                    if bypass_r.success:
+                        log_agent_action(self.name, "反机器人验证绕过成功，继续等待搜索结果")
+                        continue  # 重新检测页面状态
                     return False
                 matches = int(summary.data.get("matches", 0) or 0)
                 if has_snapshot_results and (
@@ -2297,9 +2308,40 @@ class WebWorker:
         target_ref = str(candidate.get("target_ref", "") or "").strip()
         target_url = str(candidate.get("link", "") or candidate.get("url", "") or "").strip()
         if prefer_click and target_ref and hasattr(tk, "click_ref"):
+            # 记录点击前的标签页数量，用于检测 target="_blank" 打开的新标签
+            tabs_before = len(tk.context.pages) if tk.context else 0
+
             click_r = await tk.click_ref(target_ref)
             if click_r.success:
                 await tk.human_delay(180, 600)
+
+                # 检查是否因 target="_blank" 打开了新标签页
+                tabs_after = len(tk.context.pages) if tk.context else 0
+                if tabs_after > tabs_before:
+                    # 链接打开了新标签页，切换到最新的标签
+                    await tk.switch_tab(-1)
+                    await tk.wait_for_load("domcontentloaded", timeout=10000)
+                    if not self.fast_mode:
+                        await tk.wait_for_load("networkidle", timeout=5000)
+                    current_after = ""
+                    try:
+                        current_after_r = await tk.get_current_url()
+                        if current_after_r.success:
+                            current_after = str(current_after_r.data or "").strip()
+                    except Exception:
+                        pass
+                    web_debug_recorder.record_event(
+                        "search_target_opened_via_click_ref_new_tab",
+                        search_url=current_url,
+                        target_ref=target_ref,
+                        target_url=current_after or target_url,
+                    )
+                    return {
+                        "opened": True,
+                        "method": "new_tab",  # 标记为 new_tab，以便返回时用 close_tab
+                        "target_url": current_after or target_url,
+                    }
+
                 await tk.wait_for_load("domcontentloaded", timeout=10000)
                 if hasattr(tk, "wait_for_page_type_change"):
                     await tk.wait_for_page_type_change("serp", timeout=4000)
@@ -2391,21 +2433,59 @@ class WebWorker:
                     )
                     return True
 
-        if hasattr(tk, "close_tab"):
-            close_r = await tk.close_tab()
-            if close_r.success:
+        # 关闭所有非搜索引擎的多余标签页，只保留搜索引擎标签
+        if hasattr(tk, "close_tab") and tk.context:
+            # 找到搜索引擎标签的索引
+            search_tab_idx = None
+            pages = [p for p in tk.context.pages if not p.is_closed()]
+            for idx, page in enumerate(pages):
                 try:
-                    current_url_r = await tk.get_current_url()
-                    current_url = str(current_url_r.data or "").strip() if current_url_r.success else ""
+                    page_url = page.url or ""
+                    if self._is_search_engine_domain(page_url):
+                        search_tab_idx = idx
+                        break
                 except Exception:
-                    current_url = ""
-                if self._is_search_engine_domain(current_url):
-                    web_debug_recorder.record_event(
-                        "search_results_tab_restored",
-                        method="close_tab",
-                        current_url=current_url,
-                    )
-                    return True
+                    continue
+
+            if search_tab_idx is not None:
+                # 关闭所有搜索引擎标签之后的标签（它们是目标页的重复标签）
+                pages = [p for p in tk.context.pages if not p.is_closed()]
+                for idx in range(len(pages) - 1, search_tab_idx, -1):
+                    try:
+                        await pages[idx].close()
+                    except Exception:
+                        pass
+                # 切换回搜索引擎标签
+                switch_r = await tk.switch_tab(search_tab_idx)
+                if switch_r.success:
+                    try:
+                        current_url_r = await tk.get_current_url()
+                        current_url = str(current_url_r.data or "").strip() if current_url_r.success else ""
+                    except Exception:
+                        current_url = ""
+                    if self._is_search_engine_domain(current_url):
+                        web_debug_recorder.record_event(
+                            "search_results_tab_restored",
+                            method="close_extra_tabs",
+                            current_url=current_url,
+                        )
+                        return True
+            else:
+                # 没找到搜索引擎标签，尝试关闭当前标签回退
+                close_r = await tk.close_tab()
+                if close_r.success:
+                    try:
+                        current_url_r = await tk.get_current_url()
+                        current_url = str(current_url_r.data or "").strip() if current_url_r.success else ""
+                    except Exception:
+                        current_url = ""
+                    if self._is_search_engine_domain(current_url):
+                        web_debug_recorder.record_event(
+                            "search_results_tab_restored",
+                            method="close_tab",
+                            current_url=current_url,
+                        )
+                        return True
 
         if hasattr(tk, "switch_tab"):
             switch_r = await tk.switch_tab(0)
@@ -3488,15 +3568,24 @@ class WebWorker:
                             timeout=4000 if self.fast_mode else 10000,
                         )
 
-                        captcha_r = await tk.detect_captcha()
-                        if captcha_r.success and captcha_r.data and captcha_r.data.get("has_captcha"):
-                            solve_r = await tk.solve_captcha(max_retries=5)
-                            if not solve_r.success:
-                                log_warning(f"搜索候选重试验证码处理失败: {next_url[:80]}")
-                                continue
-                            await tk.human_delay(250, 3000)
-                            await tk.wait_for_load("domcontentloaded", timeout=10000)
-                            await tk.wait_for_load("networkidle", timeout=10000)
+                        # 优先使用 anti-robot bypass 处理各类验证挑战
+                        robot_r = await tk.detect_robot_challenge()
+                        if robot_r.success and robot_r.data and robot_r.data.get("has_challenge"):
+                            bypass_r = await tk.bypass_robot_challenge(max_retries=3)
+                            if bypass_r.success:
+                                await tk.human_delay(250, 3000)
+                                await tk.wait_for_load("domcontentloaded", timeout=10000)
+                            else:
+                                # 回退到传统验证码处理
+                                captcha_r = await tk.detect_captcha()
+                                if captcha_r.success and captcha_r.data and captcha_r.data.get("has_captcha"):
+                                    solve_r = await tk.solve_captcha(max_retries=5)
+                                    if not solve_r.success:
+                                        log_warning(f"搜索候选重试验证处理失败: {next_url[:80]}")
+                                        continue
+                                    await tk.human_delay(250, 3000)
+                                    await tk.wait_for_load("domcontentloaded", timeout=10000)
+                                    await tk.wait_for_load("networkidle", timeout=10000)
 
                         for _ in range(random.randint(1, 2) if self.fast_mode else random.randint(2, 3)):
                             await tk.scroll_down(random.randint(200, 500))
@@ -3652,7 +3741,27 @@ class WebWorker:
                     timeout=4000 if self.fast_mode else 10000,
                 )
 
-                # Step 2.5: 检测并处理验证码
+                # Step 2.5: 检测并处理反机器人验证 + 传统验证码
+                robot_r = await tk.detect_robot_challenge()
+                web_debug_recorder.write_json(
+                    "anti_robot_detection",
+                    {
+                        "success": robot_r.success,
+                        "data": robot_r.data,
+                        "error": getattr(robot_r, "error", ""),
+                    },
+                )
+                if robot_r.success and robot_r.data and robot_r.data.get("has_challenge"):
+                    log_agent_action(self.name, f"检测到反机器人挑战: {robot_r.data.get('challenge_type')}")
+                    bypass_r = await tk.bypass_robot_challenge(max_retries=3)
+                    web_debug_recorder.write_json(
+                        "anti_robot_bypass",
+                        {
+                            "success": bypass_r.success,
+                            "error": getattr(bypass_r, "error", ""),
+                        },
+                    )
+
                 captcha_r = await tk.detect_captcha()
                 web_debug_recorder.write_json(
                     "captcha_detection",
@@ -3663,7 +3772,7 @@ class WebWorker:
                     },
                 )
                 if captcha_r.success and captcha_r.data and captcha_r.data.get("has_captcha"):
-                    log_agent_action(self.name, "检测到验证码，尝试自动处理")
+                    log_agent_action(self.name, "检测到传统验证码，尝试自动处理")
                     solve_r = await tk.solve_captcha(max_retries=5)
                     web_debug_recorder.write_json(
                         "captcha_solution",

@@ -179,6 +179,10 @@ SCRIPT_PAGE_META = r"""
       // Form: only if no list content (a page with forms + list items is a filtered list, not a form)
       if (forms.length && textInputCount >= 2) return 'form';
       if (mainContent) return 'detail';
+      // Fallback: pages without semantic elements (main/article/[role=main]) but with
+      // substantial body text should be treated as detail pages, not unknown.
+      const bodyLen = normalize(document.body?.innerText || document.body?.textContent || '').length;
+      if (bodyLen >= 200) return 'detail';
       if (hasModal) return 'modal';
       return 'unknown';
     };
@@ -189,8 +193,8 @@ SCRIPT_PAGE_META = r"""
     const bodyText = normalize(document.body?.innerText || document.body?.textContent || '').slice(0, 2000);
     const blockedChecks = [
       ['url', /\/(sorry|captcha|verify|challenge|blocked|forbidden)/i, urlText],
-      ['title', /(unusual traffic|robot check|captcha|forbidden|access denied|blocked|人机身份验证|异常流量|验证码|安全验证|访问受限)/i, titleText],
-      ['body', /(unusual traffic|robot check|captcha|forbidden|access denied|blocked|人机身份验证|异常流量|验证码|安全验证|访问受限)/i, bodyText],
+      ['title', /(unusual traffic|robot check|captcha|forbidden|access denied|blocked|人机身份验证|异常流量|验证码|安全验证|访问受限|请解决以下难题)/i, titleText],
+      ['body', /(unusual traffic|robot check|captcha|forbidden|access denied|blocked|人机身份验证|异常流量|验证码|安全验证|访问受限|请解决以下难题)/i, bodyText],
     ];
     for (const [kind, pattern, source] of blockedChecks) {
       const match = String(source || '').match(pattern);
@@ -295,15 +299,15 @@ SCRIPT_REGIONS = r"""
     };
 
     const rawRegions = Array.from(document.querySelectorAll('main, [role="main"], article, section, form, table, ul, ol, nav, aside, dialog[open], [role="dialog"], [aria-modal="true"]'))
-      .filter(el => {
-        if (!isVisible(el)) return false;
+      .reduce((acc, el) => {
+        if (!isVisible(el)) return acc;
         const m = regionMetrics(el);
-        if (!m.text_sample && m.control_count === 0 && m.link_count === 0) return false;
-        if (m.kind === 'navigation' && m.link_count < 3) return false;
-        if (m.kind === 'section' && m.text_length < 80 && m.item_count < 2) return false;
-        return true;
-      })
-      .map(el => regionMetrics(el))
+        if (!m.text_sample && m.control_count === 0 && m.link_count === 0) return acc;
+        if (m.kind === 'navigation' && m.link_count < 3) return acc;
+        if (m.kind === 'section' && m.text_length < 80 && m.item_count < 2) return acc;
+        acc.push(m);
+        return acc;
+      }, [])
       .sort((a, b) => b.score - a.score);
 
     const regions = [];

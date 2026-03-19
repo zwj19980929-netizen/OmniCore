@@ -65,6 +65,7 @@ class BrowserToolkit:
         )
         self.user_data_dir = user_data_dir
         self._captcha_solver = None  # lazy
+        self._anti_robot = None  # lazy
         self._semantic_ref_map: Dict[str, Dict[str, Any]] = {}
 
     # ── context manager support ──────────────────────────────
@@ -188,7 +189,7 @@ class BrowserToolkit:
 
             self._page = await self._context.new_page()
 
-            # 注入反检测脚本（合并两处最优）
+            # 注入反检测脚本（合并两处最优 + 增强反机器人检测）
             await self._page.add_init_script("""
                 (() => {
                     const overrideGetter = (obj, key, value) => {
@@ -200,8 +201,35 @@ class BrowserToolkit:
                         } catch (e) {}
                     };
 
+                    // ── 核心: 隐藏自动化痕迹 ──
                     overrideGetter(navigator, 'webdriver', undefined);
-                    overrideGetter(navigator, 'plugins', [1, 2, 3, 4, 5]);
+
+                    // 删除 Playwright/Puppeteer 注入的全局变量
+                    delete window.__playwright;
+                    delete window.__pw_manual;
+                    delete window.__PW_inspect;
+                    delete window.cdc_adoQpoasnfa76pfcZLmcfl_Array;
+                    delete window.cdc_adoQpoasnfa76pfcZLmcfl_Promise;
+                    delete window.cdc_adoQpoasnfa76pfcZLmcfl_Symbol;
+
+                    // 构造逼真的 PluginArray
+                    const makePlugin = (name, filename, desc) => {
+                        const p = { name, filename, description: desc, length: 1 };
+                        p[0] = { type: 'application/pdf', suffixes: 'pdf', description: '' };
+                        return p;
+                    };
+                    const fakePlugins = [
+                        makePlugin('PDF Viewer', 'internal-pdf-viewer', 'Portable Document Format'),
+                        makePlugin('Chrome PDF Viewer', 'internal-pdf-viewer', ''),
+                        makePlugin('Chromium PDF Viewer', 'internal-pdf-viewer', ''),
+                        makePlugin('Microsoft Edge PDF Viewer', 'internal-pdf-viewer', ''),
+                        makePlugin('WebKit built-in PDF', 'internal-pdf-viewer', ''),
+                    ];
+                    fakePlugins.item = (i) => fakePlugins[i] || null;
+                    fakePlugins.namedItem = (name) => fakePlugins.find(p => p.name === name) || null;
+                    fakePlugins.refresh = () => {};
+                    overrideGetter(navigator, 'plugins', fakePlugins);
+
                     overrideGetter(navigator, 'languages', ['zh-CN', 'zh', 'en']);
                     overrideGetter(navigator, 'platform', 'Win32');
                     overrideGetter(navigator, 'vendor', 'Google Inc.');
@@ -296,6 +324,63 @@ class BrowserToolkit:
                             if (parameter === 37446) return 'Intel Iris OpenGL Engine';
                             return originalGetParameter2.call(this, parameter);
                         };
+                    }
+
+                    // ── 增强: 防止 toString 检测 ──
+                    // 部分检测器会检查原生函数的 toString 是否被篡改
+                    const nativeToString = Function.prototype.toString;
+                    const spoofedFns = new Set();
+                    const originalCall = Function.prototype.toString.call.bind(nativeToString);
+                    Function.prototype.toString = function() {
+                        if (spoofedFns.has(this)) {
+                            return 'function ' + (this.name || '') + '() { [native code] }';
+                        }
+                        return originalCall(this);
+                    };
+                    spoofedFns.add(Function.prototype.toString);
+
+                    // ── 增强: 防 iframe contentWindow 检测 ──
+                    // 一些检测器通过创建 iframe 检测 navigator.webdriver
+                    const origCreate = document.createElement.bind(document);
+                    document.createElement = function(tagName, options) {
+                        const el = origCreate(tagName, options);
+                        if (tagName.toLowerCase() === 'iframe') {
+                            const origAppend = el.__proto__.appendChild || Node.prototype.appendChild;
+                            // 在 iframe 加载后也注入反检测
+                            el.addEventListener('load', () => {
+                                try {
+                                    if (el.contentWindow && el.contentWindow.navigator) {
+                                        Object.defineProperty(el.contentWindow.navigator, 'webdriver', {
+                                            get: () => undefined, configurable: true,
+                                        });
+                                    }
+                                } catch (e) {} // 跨域 iframe 会抛错，忽略
+                            });
+                        }
+                        return el;
+                    };
+                    spoofedFns.add(document.createElement);
+
+                    // ── 增强: Connection API ──
+                    if (navigator.connection) {
+                        overrideGetter(navigator.connection, 'rtt', 50);
+                        overrideGetter(navigator.connection, 'downlink', 10);
+                        overrideGetter(navigator.connection, 'effectiveType', '4g');
+                        overrideGetter(navigator.connection, 'saveData', false);
+                    }
+
+                    // ── 增强: Battery API 不暴露 ──
+                    // 真实浏览器中 getBattery 返回 Promise
+                    if (navigator.getBattery) {
+                        navigator.getBattery = () => Promise.resolve({
+                            charging: true,
+                            chargingTime: 0,
+                            dischargingTime: Infinity,
+                            level: 1.0,
+                            addEventListener: () => {},
+                            removeEventListener: () => {},
+                        });
+                        spoofedFns.add(navigator.getBattery);
                     }
                 })();
             """)
@@ -975,6 +1060,40 @@ class BrowserToolkit:
         try:
             solved = await self.captcha_solver.solve(max_retries=max_retries)
             return ToolkitResult(success=solved)
+        except Exception as e:
+            return ToolkitResult(success=False, error=str(e))
+
+    # ── anti-robot facade ────────────────────────────────────
+
+    @property
+    def anti_robot(self):
+        """懒加载 AntiRobotBypass"""
+        if self._anti_robot is None:
+            from utils.anti_robot_bypass import AntiRobotBypass
+            self._anti_robot = AntiRobotBypass(toolkit=self)
+        return self._anti_robot
+
+    async def detect_robot_challenge(self) -> ToolkitResult:
+        """检测当前页面是否有反机器人验证挑战"""
+        try:
+            detection = await self.anti_robot.detect_challenge()
+            return ToolkitResult(
+                success=True,
+                data={
+                    "has_challenge": detection.challenge_type.value != "none",
+                    "challenge_type": detection.challenge_type.value,
+                    "confidence": detection.confidence,
+                    "detail": detection.detail,
+                },
+            )
+        except Exception as e:
+            return ToolkitResult(success=False, error=str(e))
+
+    async def bypass_robot_challenge(self, max_retries: int = 3) -> ToolkitResult:
+        """检测并绕过反机器人验证挑战"""
+        try:
+            bypassed = await self.anti_robot.detect_and_bypass(max_retries=max_retries)
+            return ToolkitResult(success=bypassed)
         except Exception as e:
             return ToolkitResult(success=False, error=str(e))
 

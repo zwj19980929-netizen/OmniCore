@@ -31,6 +31,7 @@ from utils.search_engine_profiles import (
 from utils.url_utils import extract_first_url
 from utils.web_prompt_budget import BudgetSection, render_budgeted_sections
 import utils.web_debug_recorder as web_debug_recorder
+from utils.text_relevance import extract_relevant_text_safe_async
 
 
 class ActionType(Enum):
@@ -879,7 +880,7 @@ class BrowserAgent:
     def _get_snapshot_main_text(self, snapshot: Optional[Dict[str, Any]]) -> str:
         return str((snapshot or {}).get("main_text", "") or "").strip()
 
-    def _format_snapshot_text_for_llm(self, snapshot: Optional[Dict[str, Any]], max_blocks: int = 0) -> str:
+    async def _format_snapshot_text_for_llm(self, snapshot: Optional[Dict[str, Any]], max_blocks: int = 0, query: str = "") -> str:
         if max_blocks <= 0:
             max_blocks = settings.TEXT_BLOCKS_DISPLAY_LIMIT
         active_snapshot = snapshot or {}
@@ -943,11 +944,14 @@ class BrowserAgent:
                 if text:
                     lines.append(f"  [{level}] {text[:120]}")
 
-        # 主要文本 —— detail/list 页面给更多内容
+        # 主要文本 —— 语义匹配提取最相关部分
         main_text = self._get_snapshot_main_text(active_snapshot)
         if main_text:
             main_text_limit = settings.MAIN_TEXT_LIMIT_DETAIL if page_type in ("detail", "list", "serp") else settings.MAIN_TEXT_LIMIT_DEFAULT
-            lines.append("Main text: " + main_text[:main_text_limit])
+            relevant_text = await extract_relevant_text_safe_async(
+                main_text, query, fallback_limit=main_text_limit, max_chars=main_text_limit,
+            )
+            lines.append("Main text: " + relevant_text)
 
         blocks = self._get_snapshot_visible_text_blocks(active_snapshot)
         if blocks:
@@ -1134,7 +1138,7 @@ class BrowserAgent:
         if self._looks_like_blocked_page(current_url, title):
             blocked_signals.append(title or current_url)
         combined_text = " ".join([title, body_text]).lower()
-        for token in ("unusual traffic", "robot check", "captcha", "异常流量", "人机身份验证", "验证码", "安全验证"):
+        for token in ("unusual traffic", "robot check", "captcha", "异常流量", "人机身份验证", "验证码", "安全验证", "请解决以下难题"):
             if token in combined_text and token not in blocked_signals:
                 blocked_signals.append(token)
         looks_like_serp = self._looks_like_search_results_url(current_url)
@@ -2051,7 +2055,7 @@ class BrowserAgent:
             lines.append(f"... {len(ranked) - total_candidates} more candidate elements omitted")
         return "\n".join(lines) or "(no actionable elements)"
 
-    def _build_budgeted_browser_prompt_context(
+    async def _build_budgeted_browser_prompt_context(
         self,
         *,
         task: str,
@@ -2063,7 +2067,7 @@ class BrowserAgent:
         total_tokens: int,
     ) -> Tuple[Dict[str, str], Dict[str, Dict[str, Any]]]:
         data_text = self._format_data_for_llm(data, max_items=12)
-        snapshot_text = self._format_snapshot_text_for_llm(snapshot)
+        snapshot_text = await self._format_snapshot_text_for_llm(snapshot, query=task)
         if snapshot_text:
             if data_text and data_text != "(no visible data)":
                 data_text = f"{snapshot_text}\n{data_text}"
@@ -2291,7 +2295,7 @@ class BrowserAgent:
             cards = self._cards_from_snapshot(snapshot)
             page_state = self._infer_page_state(task, current_url, active_intent, data, snapshot)
             elements_text = self._format_assessment_elements_for_llm(task, current_url, elements)
-            prompt_context, prompt_budget = self._build_budgeted_browser_prompt_context(
+            prompt_context, prompt_budget = await self._build_budgeted_browser_prompt_context(
                 task=task,
                 current_url=current_url,
                 data=data,
@@ -3524,12 +3528,22 @@ class BrowserAgent:
     ) -> Optional[BrowserAction]:
         active_snapshot = snapshot or self._last_semantic_snapshot or {}
         page_state = self._infer_page_state(task, current_url, intent, data, active_snapshot, elements=elements)
-        if page_state.goal_satisfied and data:
-            return BrowserAction(
-                action_type=ActionType.EXTRACT,
-                description="extract current structured content",
-                confidence=0.84,
-            )
+        if page_state.goal_satisfied:
+            if data:
+                return BrowserAction(
+                    action_type=ActionType.EXTRACT,
+                    description="extract current structured content",
+                    confidence=0.84,
+                )
+            # goal_satisfied 但 data 为空 — 说明 main_text 已包含目标信息，
+            # 用 snapshot main_text 构建数据后触发 EXTRACT
+            main_text = self._get_snapshot_main_text(active_snapshot)
+            if main_text and len(main_text) >= 80:
+                return BrowserAction(
+                    action_type=ActionType.EXTRACT,
+                    description="extract from page main text",
+                    confidence=0.80,
+                )
 
         if page_state.has_modal:
             modal_action = self._choose_modal_action(task, elements, active_snapshot)
@@ -3694,7 +3708,25 @@ class BrowserAgent:
         if not self._is_search_engine_url(current_url):
             if page_type == "list" and target_count and len(data or []) < target_count:
                 return False
-            return bool(data)
+            if data:
+                return True
+            # 如果 data 为空，但 snapshot main_text 已经包含任务所需信息，
+            # 也视为目标满足（常见于天气、单页信息提取等场景）
+            main_text = self._get_snapshot_main_text(active_snapshot)
+            if main_text and len(main_text) >= 100:
+                task_lower = task.lower()
+                # 天气类: main_text 包含温度信号
+                weather_tokens = ("天气", "weather", "温度", "temperature", "forecast", "预报", "气温")
+                if any(t in task_lower for t in weather_tokens):
+                    if re.search(r'\d+\s*[°℃]', main_text):
+                        return True
+                # 通用: 任务关键词在 main_text 中出现
+                task_tokens = [t for t in re.findall(r'[\u4e00-\u9fff]+|[a-zA-Z]{3,}', task_lower) if len(t) >= 2]
+                if task_tokens:
+                    hits = sum(1 for t in task_tokens if t in main_text.lower())
+                    if hits >= max(1, len(task_tokens) // 2):
+                        return True
+            return False
         return self._search_results_have_answer_evidence(query, data)
 
     def _choose_observation_driven_action(
@@ -4087,7 +4119,7 @@ class BrowserAgent:
             cards = self._cards_from_snapshot(active_snapshot)
             page_state = self._infer_page_state(task, resolved_url, active_intent, current_data or [], active_snapshot)
             elements_text = self._format_assessment_elements_for_llm(task, resolved_url, elements)
-            prompt_context, prompt_budget = self._build_budgeted_browser_prompt_context(
+            prompt_context, prompt_budget = await self._build_budgeted_browser_prompt_context(
                 task=task,
                 current_url=resolved_url,
                 data=current_data or [],
@@ -4200,7 +4232,7 @@ class BrowserAgent:
 
         cards = self._cards_from_snapshot(active_snapshot)
         elements_text = self._format_assessment_elements_for_llm(task, current_url, elements)
-        prompt_context, prompt_budget = self._build_budgeted_browser_prompt_context(
+        prompt_context, prompt_budget = await self._build_budgeted_browser_prompt_context(
             task=task, current_url=current_url, data=current_data,
             cards=cards, snapshot=active_snapshot, elements_text=elements_text,
             total_tokens=settings.ACTION_DECISION_CONTEXT_TOKENS,
@@ -4992,7 +5024,11 @@ class BrowserAgent:
                 '#7d li', '#15d li', '.forecast li', '.weather li',
                 'main p', 'article p', '[role="main"] p', 'section p',
                 'main h1', 'article h1', 'main h2', 'article h2',
-                'main h3', 'article h3', 'tr'
+                'main h3', 'article h3', 'tr',
+                'main div', 'article div', '[role="main"] div', 'section div',
+                '.today div', '.forecast div', '.weather div',
+                '[class*="weather"] div', '[class*="temp"] div',
+                '[class*="detail"] div', '[class*="info"] div',
               ].join(', ');
 
               const denseContent = dedupe(
@@ -5535,14 +5571,24 @@ class BrowserAgent:
                 log_warning(f"[DEBUG] ====================================")
 
             if self._looks_like_blocked_page(current_url, page_title):
-                return {
-                    "success": False,
-                    "message": f"navigation landed on blocked page: {page_title or current_url}",
-                    "url": current_url,
-                    "expected_url": expected_url,
-                    "title": page_title,
-                    "steps": steps,
-                }
+                # 尝试绕过反机器人验证
+                bypass_r = await tk.bypass_robot_challenge(max_retries=3)
+                if not bypass_r.success:
+                    return {
+                        "success": False,
+                        "message": f"navigation landed on blocked page: {page_title or current_url}",
+                        "url": current_url,
+                        "expected_url": expected_url,
+                        "title": page_title,
+                        "steps": steps,
+                    }
+                # 绕过成功，刷新页面信息
+                url_r = await tk.get_current_url()
+                current_url = (url_r.data or current_url) if url_r.success else current_url
+                title_r = await tk.get_title()
+                page_title = (title_r.data or "") if title_r.success else page_title
+                log_agent_action(self.name, "反机器人验证绕过成功", current_url[:80])
+
             if expected_url and current_url and not self._urls_look_related(expected_url, current_url) and (start_url or self._extract_url_from_task(task)):
                 return {
                     "success": False,
@@ -5610,15 +5656,18 @@ class BrowserAgent:
                 current_url_r = await tk.get_current_url()
                 title_r = await tk.get_title()
                 if self._looks_like_blocked_page(current_url_r.data or "", title_r.data or ""):
-                    return {
-                        "success": False,
-                        "message": f"browser landed on blocked page during execution: {title_r.data or current_url_r.data or ''}",
-                        "url": current_url_r.data or "",
-                        "title": title_r.data or "",
-                        "expected_url": expected_url,
-                        "steps": steps,
-                        "data": _accumulated_data,
-                    }
+                    bypass_r = await tk.bypass_robot_challenge(max_retries=3)
+                    if not bypass_r.success:
+                        return {
+                            "success": False,
+                            "message": f"browser landed on blocked page during execution: {title_r.data or current_url_r.data or ''}",
+                            "url": current_url_r.data or "",
+                            "title": title_r.data or "",
+                            "expected_url": expected_url,
+                            "steps": steps,
+                            "data": _accumulated_data,
+                        }
+                    log_agent_action(self.name, "执行中反机器人验证绕过成功")
                 elements = await self._extract_interactive_elements()
                 snapshot = self._last_semantic_snapshot or await self._get_semantic_snapshot()
                 observed_data = await self._extract_data_for_intent(task_intent)
@@ -5716,6 +5765,13 @@ class BrowserAgent:
                 if action.action_type == ActionType.EXTRACT:
                     data = await self._extract_data_for_intent(task_intent)
                     _merge_new_data(data)
+                    # 如果结构化提取为空，尝试从 snapshot main_text 构建数据
+                    if not _accumulated_data and not data:
+                        snapshot = self._last_semantic_snapshot or {}
+                        main_text = self._get_snapshot_main_text(snapshot)
+                        if main_text and len(main_text) >= 50:
+                            data = [{"text": main_text, "source": "page_main_text"}]
+                            _merge_new_data(data)
                     url_r = await tk.get_current_url()
                     title_r = await tk.get_title()
                     return {"success": True, "message": "data extracted",
@@ -5741,9 +5797,12 @@ class BrowserAgent:
                     url_r = await tk.get_current_url()
                     title_r = await tk.get_title()
                     if self._looks_like_blocked_page(url_r.data or "", title_r.data or ""):
-                        return {"success": False, "message": f"browser stuck on blocked page: {title_r.data or url_r.data or ''}",
-                                "url": url_r.data or "", "title": title_r.data or "",
-                                "expected_url": expected_url, "steps": steps, "data": _accumulated_data}
+                        bypass_r = await tk.bypass_robot_challenge(max_retries=2)
+                        if not bypass_r.success:
+                            return {"success": False, "message": f"browser stuck on blocked page: {title_r.data or url_r.data or ''}",
+                                    "url": url_r.data or "", "title": title_r.data or "",
+                                    "expected_url": expected_url, "steps": steps, "data": _accumulated_data}
+                        log_agent_action(self.name, "循环检测中反机器人验证绕过成功")
                     if self._is_read_only_task(task, task_intent):
                         _merge_new_data(await self._extract_data_for_intent(task_intent))
                         return {"success": True, "message": "repeated action avoided; extracted current page",
