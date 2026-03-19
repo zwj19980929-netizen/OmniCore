@@ -436,7 +436,9 @@ class BrowserAgent:
                 candidate = candidate.split("???", 1)[0]
             elif candidate.count("?") > 1 and "=" not in candidate and "&" not in candidate:
                 candidate = candidate.split("?", 1)[0]
-            candidate = candidate.rstrip(".,);]}>\"'锛屻€傦紒锛燂紱锛氥€侊級锛姐€戯綕銆夈€嬨€嶃€忊€濃€?")
+            candidate = candidate.rstrip(
+                ".,);]}>\"'?!:" + "\uFF0C\u3002\uFF01\uFF1F\uFF1B\uFF1A\u3001\uFF09\u300B\u300D\u300F"
+            )
             if candidate:
                 raw = raw.replace(candidate, " ")
         return raw
@@ -1675,7 +1677,7 @@ class BrowserAgent:
         return normalized
 
     def _clean_auth_candidate_value(self, field_name: str, value: str) -> str:
-        cleaned = re.sub(r"\s+", " ", str(value or "")).strip(" \"'鈥溾€濃€樷€?")
+        cleaned = re.sub(r"\s+", " ", str(value or "")).strip(" \"'" + "\u201C\u201D\u2018\u2019")
         cleaned = cleaned.strip(".,;:!?)]}>")
         if not cleaned:
             return ""

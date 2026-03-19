@@ -23,17 +23,20 @@ from core.statuses import (
 )
 from core.state import create_initial_state
 from core.graph import get_graph
+from memory.manager import MemoryManager, build_memory_scope
 from utils.logger import console, log_agent_action, log_debug_metrics, log_error, log_warning
 from utils.text import sanitize_text, sanitize_value
 
 if TYPE_CHECKING:
-    from memory.chroma_store import ChromaMemory
+    from memory.scoped_chroma_store import ChromaMemory
 
 
 _queue_worker_lock = threading.Lock()
 _queue_worker_thread: Optional[threading.Thread] = None
 _queue_worker_process: Optional[subprocess.Popen] = None
 _queue_worker_stop = threading.Event()
+_runtime_memory_instance: Optional["ChromaMemory"] = None
+_runtime_memory_init_failed = False
 
 
 def _build_special_result(
@@ -81,6 +84,29 @@ def _collect_runtime_metrics() -> Dict[str, Any]:
         log_debug_metrics("runtime.browser_pool", metrics["browser_pool"])
 
     return metrics
+
+
+def _resolve_runtime_memory(
+    memory: Optional["ChromaMemory"] = None,
+) -> Optional["ChromaMemory"]:
+    global _runtime_memory_instance, _runtime_memory_init_failed
+
+    if memory is not None:
+        return memory
+    if _runtime_memory_instance is not None:
+        return _runtime_memory_instance
+    if _runtime_memory_init_failed:
+        return None
+
+    try:
+        from memory.scoped_chroma_store import ChromaMemory
+
+        _runtime_memory_instance = ChromaMemory()
+        return _runtime_memory_instance
+    except Exception as e:
+        _runtime_memory_init_failed = True
+        log_warning(f"Memory initialization skipped: {e}")
+        return None
 
 
 def _is_pid_running(pid: int) -> bool:
@@ -263,6 +289,7 @@ def _load_work_runtime_context(
         "work_context": {},
         "resource_memory": [],
         "successful_paths": [],
+        "failure_patterns": [],
     }
 
     try:
@@ -279,6 +306,14 @@ def _load_work_runtime_context(
         )
         context["successful_paths"] = sanitize_value(
             work_store.suggest_success_paths(
+                query=user_input,
+                session_id=session_id,
+                goal_id=scope["goal_id"],
+                limit=3,
+            )
+        )
+        context["failure_patterns"] = sanitize_value(
+            work_store.suggest_failure_avoidance(
                 query=user_input,
                 session_id=session_id,
                 goal_id=scope["goal_id"],
@@ -490,6 +525,12 @@ def _finalize_runtime_result(result: Dict[str, Any], user_input: str) -> Dict[st
     goal_id = sanitize_text(job_record.get("goal_id") or "")
     project_id = sanitize_text(job_record.get("project_id") or "")
     todo_id = sanitize_text(job_record.get("todo_id") or "")
+    memory_scope = build_memory_scope(
+        session_id=session_id,
+        goal_id=goal_id,
+        project_id=project_id,
+        todo_id=todo_id,
+    )
 
     lifecycle_status = sanitize_text(finalized.get("status") or "")
     if lifecycle_status not in WAITING_JOB_STATUSES:
@@ -529,6 +570,36 @@ def _finalize_runtime_result(result: Dict[str, Any], user_input: str) -> Dict[st
                 project_id=project_id,
                 todo_id=todo_id,
                 summary=sanitize_text(finalized.get("output") or finalized.get("error") or ""),
+                task_details=tasks,
+                visited_urls=[
+                    sanitize_text(
+                        (
+                            (task.get("result") or {}).get("url")
+                            if isinstance(task.get("result"), dict)
+                            else ""
+                        )
+                        or (
+                            (task.get("result") or {}).get("current_url")
+                            if isinstance(task.get("result"), dict)
+                            else ""
+                        )
+                        or (
+                            (task.get("params") or {}).get("url")
+                            if isinstance(task.get("params"), dict)
+                            else ""
+                        )
+                        or (
+                            (task.get("params") or {}).get("start_url")
+                            if isinstance(task.get("params"), dict)
+                            else ""
+                        )
+                        or ""
+                    )
+                    for task in tasks
+                    if isinstance(task, dict)
+                ],
+                artifact_refs=sanitize_value(finalized.get("artifacts") or []),
+                failure_reason=sanitize_text(finalized.get("error") or ""),
             )
             if goal_id or project_id or todo_id:
                 work_store.record_job_link(
@@ -541,6 +612,26 @@ def _finalize_runtime_result(result: Dict[str, Any], user_input: str) -> Dict[st
         except Exception as e:
             finalized["work_context_store_error"] = sanitize_text(str(e))
             log_warning(f"Work context persistence failed: {e}")
+
+        try:
+            memory_store = _resolve_runtime_memory()
+            memory_manager = MemoryManager(memory_store)
+            finalized["memory_persistence"] = sanitize_value(
+                memory_manager.persist_job_outcome(
+                    user_input=user_input,
+                    success=bool(finalized.get("success", False)),
+                    final_output=sanitize_text(finalized.get("output") or ""),
+                    final_error=sanitize_text(finalized.get("error") or ""),
+                    intent=sanitize_text(finalized.get("intent") or ""),
+                    scope=memory_scope,
+                    tasks=tasks,
+                    artifacts=sanitize_value(finalized.get("artifacts") or []),
+                    is_special_command=bool(finalized.get("is_special_command", False)),
+                )
+            )
+        except Exception as e:
+            finalized["memory_store_error"] = sanitize_text(str(e))
+            log_warning(f"Memory persistence failed: {e}")
 
     _create_job_notification(finalized)
 
@@ -611,6 +702,44 @@ def _handle_special_command(
         )
 
     return None
+
+
+def _handle_scoped_memory_command(
+    user_input: str,
+    memory: Optional["ChromaMemory"] = None,
+    *,
+    scope: Optional[Dict[str, Any]] = None,
+) -> Optional[Dict[str, Any]]:
+    command = (user_input or "").strip().lower()
+    if command not in {"memory stats", "clear memory"}:
+        return None
+
+    if not memory:
+        return _build_special_result(
+            success=False,
+            error="Memory system is not available",
+            status="error",
+        )
+
+    if command == "memory stats":
+        scoped_stats = memory.get_stats(scope=scope)
+        total_stats = memory.get_stats()
+        return _build_special_result(
+            success=True,
+            output=f"Scoped memory stats: {scoped_stats}; total memory stats: {total_stats}",
+        )
+
+    cleared = memory.clear_scope(scope)
+    if cleared > 0:
+        return _build_special_result(
+            success=True,
+            output=f"Cleared {cleared} scoped memories",
+        )
+    return _build_special_result(
+        success=False,
+        error="No scoped memories matched the current session",
+        status="error",
+    )
 
 
 def submit_task(
@@ -750,12 +879,21 @@ def update_user_preferences(
 ) -> Dict[str, Any]:
     from utils.runtime_state_store import get_runtime_state_store
 
-    return sanitize_value(
+    updated = sanitize_value(
         get_runtime_state_store().update_preferences(
             preferences=sanitize_value(preferences or {}),
             session_id=sanitize_text(session_id or "") or None,
         )
     )
+    try:
+        memory_store = _resolve_runtime_memory()
+        MemoryManager(memory_store).persist_preferences(
+            updated,
+            session_id=sanitize_text(session_id or ""),
+        )
+    except Exception as e:
+        log_warning(f"Preference memory persistence failed: {e}")
+    return updated
 
 
 def get_notification_feed(
@@ -1564,6 +1702,14 @@ def _execute_submitted_job(
         job_id=runtime_job_id,
         user_input=clean_user_input,
     )
+    memory = _resolve_runtime_memory(memory)
+    memory_scope = build_memory_scope(
+        session_id=runtime_session_id,
+        goal_id=str((work_runtime_context.get("scope") or {}).get("goal_id", "") or ""),
+        project_id=str((work_runtime_context.get("scope") or {}).get("project_id", "") or ""),
+        todo_id=str((work_runtime_context.get("scope") or {}).get("todo_id", "") or ""),
+    )
+    memory_manager = MemoryManager(memory)
     try:
         from utils.runtime_state_store import get_runtime_state_store
 
@@ -1577,7 +1723,11 @@ def _execute_submitted_job(
     except Exception as e:
         log_warning(f"Runtime state start_job failed: {e}")
 
-    special = None if initial_state_override else _handle_special_command(clean_user_input, memory)
+    special = None if initial_state_override else _handle_scoped_memory_command(
+        clean_user_input,
+        memory,
+        scope=memory_scope,
+    )
     if special is not None:
         special["session_id"] = runtime_session_id
         special["job_id"] = runtime_job_id
@@ -1595,7 +1745,9 @@ def _execute_submitted_job(
         initial_state["shared_memory"]["work_context"] = work_runtime_context.get("work_context", {})
         initial_state["shared_memory"]["resource_memory"] = work_runtime_context.get("resource_memory", [])
         initial_state["shared_memory"]["successful_paths"] = work_runtime_context.get("successful_paths", [])
+        initial_state["shared_memory"]["failure_patterns"] = work_runtime_context.get("failure_patterns", [])
         initial_state["shared_memory"]["work_scope"] = work_runtime_context.get("scope", {})
+        initial_state["shared_memory"]["memory_scope"] = memory_scope
         if clean_history:
             initial_state["shared_memory"]["conversation_history"] = clean_history
     else:
@@ -1613,7 +1765,9 @@ def _execute_submitted_job(
         initial_state["shared_memory"]["work_context"] = work_runtime_context.get("work_context", {})
         initial_state["shared_memory"]["resource_memory"] = work_runtime_context.get("resource_memory", [])
         initial_state["shared_memory"]["successful_paths"] = work_runtime_context.get("successful_paths", [])
+        initial_state["shared_memory"]["failure_patterns"] = work_runtime_context.get("failure_patterns", [])
         initial_state["shared_memory"]["work_scope"] = work_runtime_context.get("scope", {})
+        initial_state["shared_memory"]["memory_scope"] = memory_scope
 
         try:
             from utils.runtime_state_store import get_runtime_state_store
@@ -1630,7 +1784,11 @@ def _execute_submitted_job(
 
         if memory:
             try:
-                related_memories = memory.search_memory(clean_user_input, n_results=3)
+                related_memories = memory_manager.search_related_history(
+                    clean_user_input,
+                    scope=memory_scope,
+                    n_results=3,
+                )
                 if related_memories:
                     related_memories = sanitize_value(related_memories)
                     log_agent_action("Memory", "Found related memories", f"{len(related_memories)} item(s)")
@@ -1657,11 +1815,17 @@ def _execute_submitted_job(
     initial_state["shared_memory"]["work_context"] = work_runtime_context.get("work_context", {})
     initial_state["shared_memory"]["resource_memory"] = work_runtime_context.get("resource_memory", [])
     initial_state["shared_memory"]["successful_paths"] = work_runtime_context.get("successful_paths", [])
+    initial_state["shared_memory"]["failure_patterns"] = work_runtime_context.get("failure_patterns", [])
     initial_state["shared_memory"]["work_scope"] = work_runtime_context.get("scope", {})
+    initial_state["shared_memory"]["memory_scope"] = memory_scope
 
     if memory and initial_state_override:
         try:
-            related_memories = memory.search_memory(clean_user_input, n_results=3)
+            related_memories = memory_manager.search_related_history(
+                clean_user_input,
+                scope=memory_scope,
+                n_results=3,
+            )
             if related_memories:
                 initial_state["shared_memory"]["related_history"] = sanitize_value(related_memories)
         except Exception as e:
@@ -1736,21 +1900,6 @@ def _execute_submitted_job(
             "runtime_metrics": _collect_runtime_metrics(),
         }, clean_user_input)
 
-    if memory and final_state.get("execution_status") == "completed":
-        output = sanitize_text(final_state.get("final_output") or "")
-        has_completed_tasks = any(
-            task["status"] == "completed" for task in final_state.get("task_queue", [])
-        )
-        if output and has_completed_tasks and "empty content" not in output and "analysis failed" not in output:
-            try:
-                memory.save_task_result(
-                    task_description=clean_user_input,
-                    result=output,
-                    success=True,
-                )
-            except Exception as e:
-                log_warning(f"Failed to save task result to memory: {e}")
-
     final_output = sanitize_text(final_state.get("final_output") or "")
     final_error = sanitize_text(final_state.get("error_trace") or "")
     final_tasks = sanitize_value(final_state.get("task_queue", []))
@@ -1797,6 +1946,7 @@ def run_task(
         log_warning("Detected unsafe input characters and sanitized them automatically.")
 
     log_agent_action("OmniCore", "Receive task", clean_user_input[:50])
+    memory = _resolve_runtime_memory(memory)
 
     submission = submit_task(
         clean_user_input,
@@ -1820,6 +1970,7 @@ def run_next_queued_task(
     conversation_history: Optional[List[Dict[str, Any]]] = None,
 ) -> Optional[Dict[str, Any]]:
     """Claim and execute the next queued job, if any."""
+    memory = _resolve_runtime_memory(memory)
     _release_due_schedules()
     _release_directory_watch_events()
     try:

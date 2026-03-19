@@ -15,7 +15,7 @@ from core.runtime import (
     start_background_worker,
     stop_background_worker,
 )
-from memory.chroma_store import ChromaMemory
+from memory.scoped_chroma_store import ChromaMemory
 from utils.cli_result_view import build_cli_result_view
 from utils.logger import console, log_error
 from utils.enhanced_input import EnhancedInput

@@ -28,9 +28,50 @@ def _short(value: Any, limit: int = 500) -> str:
 def _tokenize(text: str) -> set[str]:
     raw = str(text or "").lower()
     normalized = []
+    cjk_runs: List[str] = []
+    current_cjk: List[str] = []
     for ch in raw:
+        if "\u4e00" <= ch <= "\u9fff":
+            current_cjk.append(ch)
+            normalized.append(" ")
+            continue
+        if current_cjk:
+            cjk_runs.append("".join(current_cjk))
+            current_cjk = []
         normalized.append(ch if ch.isalnum() else " ")
-    return {item for item in "".join(normalized).split() if len(item) >= 3}
+    if current_cjk:
+        cjk_runs.append("".join(current_cjk))
+
+    tokens = {item for item in "".join(normalized).split() if len(item) >= 2}
+    for run in cjk_runs:
+        if len(run) == 1:
+            tokens.add(run)
+            continue
+        max_n = min(3, len(run))
+        for n in range(2, max_n + 1):
+            for index in range(len(run) - n + 1):
+                tokens.add(run[index : index + n])
+    return tokens
+
+
+def _recency_score(timestamp: str) -> float:
+    try:
+        delta = datetime.now() - datetime.fromisoformat(str(timestamp))
+    except (TypeError, ValueError):
+        return 0.0
+    days = max(delta.total_seconds() / 86400.0, 0.0)
+    return max(0.0, 1.0 - min(days / 30.0, 1.0))
+
+
+def _token_overlap_score(query_tokens: set[str], candidate_tokens: set[str]) -> float:
+    if not query_tokens:
+        return 0.0
+    overlap = len(query_tokens & candidate_tokens)
+    if overlap <= 0:
+        return 0.0
+    recall = overlap / max(len(query_tokens), 1)
+    precision = overlap / max(len(candidate_tokens), 1)
+    return (recall * 0.75) + (precision * 0.25)
 
 
 class WorkContextStore:
@@ -295,6 +336,10 @@ class WorkContextStore:
         project_id: str = "",
         todo_id: str = "",
         summary: str = "",
+        task_details: Optional[List[Dict[str, Any]]] = None,
+        visited_urls: Optional[List[str]] = None,
+        artifact_refs: Optional[List[Dict[str, Any]]] = None,
+        failure_reason: str = "",
     ) -> Dict[str, Any]:
         record = {
             "experience_id": _new_id("xp"),
@@ -309,14 +354,80 @@ class WorkContextStore:
             "tool_sequence": [_short(item, 120) for item in (tool_sequence or []) if str(item).strip()],
             "success": bool(success),
             "summary": _short(summary, 300),
+            "failure_reason": _short(failure_reason, 300),
+            "visited_urls": [
+                _short(item, 240)
+                for item in (visited_urls or [])
+                if str(item).strip()
+            ][:10],
+            "artifact_refs": [
+                {
+                    "artifact_type": _short((item or {}).get("artifact_type", ""), 60),
+                    "name": _short((item or {}).get("name", ""), 180),
+                    "path": _short((item or {}).get("path", ""), 300),
+                }
+                for item in (artifact_refs or [])
+                if isinstance(item, dict)
+            ][:8],
+            "task_details": [
+                {
+                    "tool_name": _short((item or {}).get("tool_name", ""), 120),
+                    "task_type": _short((item or {}).get("task_type", ""), 120),
+                    "status": _short((item or {}).get("status", ""), 40),
+                    "description": _short((item or {}).get("description", ""), 240),
+                }
+                for item in (task_details or [])
+                if isinstance(item, dict)
+            ][:12],
         }
         with self._lock:
             records = self._read_jsonl_locked(self.experiences_path)
             records.append(record)
-            if len(records) > 500:
-                records = records[-500:]
+            if len(records) > 1000:
+                records = records[-1000:]
             self._write_jsonl_locked(self.experiences_path, records)
         return dict(record)
+
+    def _score_experience(
+        self,
+        item: Dict[str, Any],
+        *,
+        query_tokens: set[str],
+        session_id: str = "",
+        goal_id: str = "",
+    ) -> float:
+        text = " ".join(
+            [
+                str(item.get("user_input", "") or ""),
+                str(item.get("intent", "") or ""),
+                " ".join(item.get("tool_sequence", []) or []),
+                str(item.get("summary", "") or ""),
+                str(item.get("failure_reason", "") or ""),
+                " ".join(item.get("visited_urls", []) or []),
+                " ".join(
+                    str(detail.get("description", "") or "")
+                    for detail in (item.get("task_details", []) or [])
+                    if isinstance(detail, dict)
+                ),
+            ]
+        )
+        candidate_tokens = _tokenize(text)
+        lexical = _token_overlap_score(query_tokens, candidate_tokens)
+        if lexical <= 0 and query_tokens:
+            return 0.0
+
+        scope_boost = 0.0
+        if session_id and str(item.get("session_id", "")) == str(session_id):
+            scope_boost += 1.0
+        elif str(item.get("session_id", "")) == "":
+            scope_boost += 0.2
+
+        if goal_id and str(item.get("goal_id", "")) == str(goal_id):
+            scope_boost += 0.6
+        elif goal_id and str(item.get("goal_id", "")) not in {"", str(goal_id)}:
+            return 0.0
+
+        return (lexical * 10.0) + scope_boost + _recency_score(str(item.get("created_at", "") or ""))
 
     def suggest_success_paths(
         self,
@@ -334,24 +445,57 @@ class WorkContextStore:
         for item in records:
             if not bool(item.get("success", False)):
                 continue
-            if session_id and str(item.get("session_id", "")) not in {"", str(session_id)}:
-                continue
-            if goal_id and str(item.get("goal_id", "")) not in {"", str(goal_id)}:
-                continue
-            text = " ".join([
-                str(item.get("user_input", "") or ""),
-                str(item.get("intent", "") or ""),
-                " ".join(item.get("tool_sequence", []) or []),
-                str(item.get("summary", "") or ""),
-            ])
-            tokens = _tokenize(text)
-            score = len(query_tokens & tokens)
-            if score <= 0 and query_tokens:
+            score = self._score_experience(
+                item,
+                query_tokens=query_tokens,
+                session_id=session_id,
+                goal_id=goal_id,
+            )
+            if score <= 0:
                 continue
             scored.append((score, item))
 
         scored.sort(key=lambda pair: (pair[0], pair[1].get("created_at", "")), reverse=True)
-        return [dict(item) for _, item in scored[:max(limit, 1)]]
+        suggestions: List[Dict[str, Any]] = []
+        for score, item in scored[: max(limit, 1)]:
+            candidate = dict(item)
+            candidate["match_score"] = round(score, 3)
+            suggestions.append(candidate)
+        return suggestions
+
+    def suggest_failure_avoidance(
+        self,
+        *,
+        query: str,
+        session_id: str = "",
+        goal_id: str = "",
+        limit: int = 3,
+    ) -> List[Dict[str, Any]]:
+        with self._lock:
+            records = self._read_jsonl_locked(self.experiences_path)
+
+        query_tokens = _tokenize(query)
+        scored = []
+        for item in records:
+            if bool(item.get("success", False)):
+                continue
+            score = self._score_experience(
+                item,
+                query_tokens=query_tokens,
+                session_id=session_id,
+                goal_id=goal_id,
+            )
+            if score <= 0:
+                continue
+            scored.append((score, item))
+
+        scored.sort(key=lambda pair: (pair[0], pair[1].get("created_at", "")), reverse=True)
+        suggestions: List[Dict[str, Any]] = []
+        for score, item in scored[: max(limit, 1)]:
+            candidate = dict(item)
+            candidate["match_score"] = round(score, 3)
+            suggestions.append(candidate)
+        return suggestions
 
 
 _work_context_store: Optional[WorkContextStore] = None

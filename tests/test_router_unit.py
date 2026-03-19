@@ -281,7 +281,7 @@ def test_router_uses_current_location_context_in_deterministic_weather_route():
     router.route(state)
 
     assert state["current_intent"] == "weather_query"
-    assert len(state["task_queue"]) == 2
+    assert len(state["task_queue"]) == 1
     assert "Shanghai, China" in state["task_queue"][0]["description"]
     assert state["task_queue"][0]["tool_name"] == "web.fetch_and_extract"
 
@@ -469,6 +469,26 @@ def test_router_includes_work_context_and_success_patterns():
     assert "Reusable resource memory" in fake_llm.last_user_message
     assert "last_week.md" in fake_llm.last_user_message
     assert "Successful execution patterns" in fake_llm.last_user_message
+
+
+def test_router_includes_failure_avoidance_hints():
+    fake_llm = _FakeLLM()
+    router = RouterAgent(llm_client=fake_llm)
+
+    router.analyze_intent(
+        "try the weekly update again",
+        failure_patterns=[
+            {
+                "tool_sequence": ["browser.interact", "file.read_write"],
+                "failure_reason": "The site redirected to an ad page.",
+                "visited_urls": ["https://example.com/start", "https://example.com/ad"],
+            }
+        ],
+    )
+
+    assert "Failure patterns to avoid" in fake_llm.last_user_message
+    assert "browser.interact -> file.read_write" in fake_llm.last_user_message
+    assert "redirected to an ad page" in fake_llm.last_user_message
 
 
 def test_router_system_prompt_uses_dynamic_tool_catalog(monkeypatch):

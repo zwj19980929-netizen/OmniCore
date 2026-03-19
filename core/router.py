@@ -1073,6 +1073,7 @@ class RouterAgent:
         work_context: dict = None,
         resource_memory: list = None,
         successful_paths: list = None,
+        failure_patterns: list = None,
     ) -> Dict[str, Any]:
         """
         分析用户意图并拆解任务
@@ -1119,7 +1120,18 @@ class RouterAgent:
             for memory in related_history[:3]:
                 content = str(memory.get("content", "")).replace("\n", " ").strip()
                 if content:
-                    memory_lines.append(f"- {content[:220]}")
+                    metadata = memory.get("metadata", {}) if isinstance(memory.get("metadata"), dict) else {}
+                    labels = []
+                    memory_type = str(metadata.get("type", "") or "").strip()
+                    if memory_type:
+                        labels.append(memory_type)
+                    if "success" in metadata:
+                        labels.append("success" if bool(metadata.get("success")) else "failure")
+                    scope_match = str(memory.get("scope_match", "") or "").strip()
+                    if scope_match:
+                        labels.append(scope_match)
+                    prefix = f"[{', '.join(labels)}] " if labels else ""
+                    memory_lines.append(f"- {prefix}{content[:220]}")
             if memory_lines:
                 user_message += "## 相关历史记忆（可用于复用上下文或直接回答追问）：\n"
                 user_message += "\n".join(memory_lines)
@@ -1279,6 +1291,35 @@ class RouterAgent:
                 user_message += "\n".join(pattern_lines)
                 user_message += "\n\n---\n"
 
+        if failure_patterns:
+            failure_lines = []
+            for item in failure_patterns[:3]:
+                if not isinstance(item, dict):
+                    continue
+                tools = [
+                    str(tool).strip()
+                    for tool in item.get("tool_sequence", []) or []
+                    if str(tool).strip()
+                ]
+                reason = str(item.get("failure_reason", "") or item.get("summary", "") or "").strip()
+                visited_urls = [
+                    str(url).strip()
+                    for url in item.get("visited_urls", []) or []
+                    if str(url).strip()
+                ]
+                line = "- Avoid repeating"
+                if tools:
+                    line += f": {' -> '.join(tools[:6])}"
+                if reason:
+                    line += f" | reason: {reason[:140]}"
+                if visited_urls:
+                    line += f" | urls: {', '.join(visited_urls[:3])}"
+                failure_lines.append(line)
+            if failure_lines:
+                user_message += "## Failure patterns to avoid (do not repeat these paths blindly):\n"
+                user_message += "\n".join(failure_lines)
+                user_message += "\n\n---\n"
+
         deterministic_hints = self._build_deterministic_tool_hints(
             user_input,
             session_artifacts,
@@ -1353,6 +1394,7 @@ class RouterAgent:
         work_context = state.get("shared_memory", {}).get("work_context")
         resource_memory = state.get("shared_memory", {}).get("resource_memory")
         successful_paths = state.get("shared_memory", {}).get("successful_paths")
+        failure_patterns = state.get("shared_memory", {}).get("failure_patterns")
         analysis = self.analyze_intent(
             user_input,
             conversation_history,
@@ -1364,6 +1406,7 @@ class RouterAgent:
             work_context,
             resource_memory,
             successful_paths,
+            failure_patterns,
         )
 
         # 构建任务队列

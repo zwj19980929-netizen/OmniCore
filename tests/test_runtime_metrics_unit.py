@@ -271,6 +271,9 @@ class FakeWorkContextStore:
     def suggest_success_paths(self, **kwargs):
         return []
 
+    def suggest_failure_avoidance(self, **kwargs):
+        return []
+
     def record_experience(self, **kwargs):
         self.experiences.append(kwargs)
         return {"experience_id": "xp_1"}

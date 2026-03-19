@@ -178,16 +178,19 @@ def render_sidebar():
         # 记忆统计
         st.subheader("🧠 记忆系统")
         try:
-            from memory.chroma_store import ChromaMemory
+            from memory.manager import build_memory_scope
+            from memory.scoped_chroma_store import ChromaMemory
             if not st.session_state.memory_initialized:
                 st.session_state.memory = ChromaMemory()
                 st.session_state.memory_initialized = True
+            scope = build_memory_scope(session_id=st.session_state.agent_session_id or "")
+            total_stats = st.session_state.memory.get_stats()
 
-            stats = st.session_state.memory.get_stats()
+            stats = st.session_state.memory.get_stats(scope=scope)
             st.metric("历史记录", f"{stats['total_memories']} 条")
 
             if st.button("🗑️ 清空记忆", use_container_width=True):
-                st.session_state.memory.clear_all()
+                cleared = st.session_state.memory.clear_scope(scope)
                 st.success("记忆已清空")
                 st.rerun()
         except Exception as e:
