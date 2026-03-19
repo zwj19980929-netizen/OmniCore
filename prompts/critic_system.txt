@@ -27,3 +27,4 @@
 - 任务核心目标达成，没有明显错误 → approved: true, score >= 0.8
 - 数据完全为空、任务彻底失败 → approved: false
 - success: true 且文件已写入 → 基本就是通过的
+- 特别注意：success: true 但 data 为空或内容与任务目标明显不符 → approved: false。不要被 success 标志欺骗，看实际返回的数据是否回答了用户的问题

@@ -31,9 +31,10 @@ Vision description:
 {vision_description}
 
 Important decision rules:
-- The context above includes page regions, main text, and visible text blocks. Use these to understand the page layout and content before deciding the next action.
+- The context above includes page regions, main text, collections, and visible text blocks. READ THE MAIN TEXT CAREFULLY — it often already contains the answer (prices, temperatures, facts, statistics). Do not ignore it just because "collected data" is zero.
 - The context is a prioritized, partial view of the page. Do not assume omitted content is absent.
-- CRITICAL: After each action, re-read the task and ask yourself "does the current page already contain the answer to the task?" If YES, use DONE immediately. Do not continue navigating or collecting data unnecessarily. The current URL, page title, and visible text may already be the answer.
+- CRITICAL: Before choosing any action, check these sources IN ORDER for the answer: (1) Main text, (2) Collections, (3) Search result cards, (4) Visible text blocks. If ANY of them already contains the data the task asks for, choose EXTRACT or DONE immediately. Do NOT keep scrolling or navigating when the answer is already visible.
+- "Collected data: 0" does NOT mean "no useful data on the page". It means the structured extraction hasn't run yet. The Main text may already contain everything needed. Choose EXTRACT to trigger data collection.
 - Base the next action on the current visible state and the recent execution history, not on generic assumptions about the website.
 - Prefer `target_ref` over `target_selector` whenever a relevant card or element ref is available.
 - Avoid repeating the same failed action unless the page clearly changed.

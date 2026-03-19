@@ -121,12 +121,15 @@ def evaluate_task_policy(task: Dict[str, Any]) -> PolicyDecision:
         )
 
     if task_type == str(TaskType.BROWSER_AGENT) or tool_name == "browser.interact":
-        browser_task = " ".join(
-            item for item in (
-                str(params.get("task", "") or ""),
-                description,
-            ) if item
-        ).lower()
+        # 只检查纯文本描述，排除 URL（URL 中的 "buy"/"book" 等不代表用户意图）
+        import re as _re
+        task_text = str(params.get("task", "") or "")
+        desc_text = description
+        # 去掉 URL 避免误匹配（如 /shop/buy-iphone 中的 buy）
+        _url_re = _re.compile(r'https?://\S+', _re.IGNORECASE)
+        task_text_clean = _url_re.sub("", task_text).lower()
+        desc_text_clean = _url_re.sub("", desc_text).lower()
+        browser_task = f"{task_text_clean} {desc_text_clean}"
         if any(token in browser_task for token in _BROWSER_CONFIRM_TOKENS):
             risk_level = "high" if any(
                 token in browser_task for token in _BROWSER_HIGH_RISK_TOKENS

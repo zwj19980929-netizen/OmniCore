@@ -47,7 +47,8 @@ Recent execution history:
 
 Decision rules:
 - Base decisions on the current visible state and recent history, not assumptions.
-- CRITICAL: After each action, re-read the task and ask yourself "does the current page already contain the answer to the task?" If YES, use DONE immediately. Do not continue navigating or collecting data unnecessarily. The current URL, page title, and visible text may already be the answer.
+- CRITICAL: Before choosing any action, check these sources IN ORDER for the answer: (1) Main text, (2) Collections, (3) Search result cards, (4) Visible text blocks. If ANY of them already contains the data the task asks for (prices, temperatures, facts, etc.), choose EXTRACT or DONE immediately. Do NOT keep scrolling or navigating when the answer is already visible.
+- "Collected data: 0" does NOT mean "no useful data on the page". It means structured extraction hasn't run yet. The Main text may already contain everything needed.
 - Prefer `target_ref` over `target_selector` when available.
 - Avoid repeating the same failed action unless the page clearly changed.
 - If page_type is `serp` and a card clearly matches, CLICK the card's `target_ref`.

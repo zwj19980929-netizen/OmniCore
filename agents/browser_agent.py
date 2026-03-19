@@ -950,6 +950,7 @@ class BrowserAgent:
             main_text_limit = settings.MAIN_TEXT_LIMIT_DETAIL if page_type in ("detail", "list", "serp") else settings.MAIN_TEXT_LIMIT_DEFAULT
             relevant_text = await extract_relevant_text_safe_async(
                 main_text, query, fallback_limit=main_text_limit, max_chars=main_text_limit,
+                page_type=page_type,
             )
             lines.append("Main text: " + relevant_text)
 
@@ -3710,22 +3711,15 @@ class BrowserAgent:
                 return False
             if data:
                 return True
-            # 如果 data 为空，但 snapshot main_text 已经包含任务所需信息，
-            # 也视为目标满足（常见于天气、单页信息提取等场景）
+            # 如果 data 为空，但 main_text 与任务语义相关度足够高，
+            # 也视为目标满足。相关度分数由 text_relevance 模块在
+            # 格式化 prompt 时已经计算并缓存，这里直接读取，零额外开销。
             main_text = self._get_snapshot_main_text(active_snapshot)
             if main_text and len(main_text) >= 100:
-                task_lower = task.lower()
-                # 天气类: main_text 包含温度信号
-                weather_tokens = ("天气", "weather", "温度", "temperature", "forecast", "预报", "气温")
-                if any(t in task_lower for t in weather_tokens):
-                    if re.search(r'\d+\s*[°℃]', main_text):
-                        return True
-                # 通用: 任务关键词在 main_text 中出现
-                task_tokens = [t for t in re.findall(r'[\u4e00-\u9fff]+|[a-zA-Z]{3,}', task_lower) if len(t) >= 2]
-                if task_tokens:
-                    hits = sum(1 for t in task_tokens if t in main_text.lower())
-                    if hits >= max(1, len(task_tokens) // 2):
-                        return True
+                from utils.text_relevance import get_relevance_score
+                score = get_relevance_score(main_text)
+                if score is not None and score >= 0.45:
+                    return True
             return False
         return self._search_results_have_answer_evidence(query, data)
 

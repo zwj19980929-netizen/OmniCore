@@ -36,7 +36,8 @@ Candidate elements:
 
 Rules:
 - The context below is a prioritized, partial view of the page. Do not assume omitted content is absent.
-- Use only the visible data, search result cards, and candidate elements provided above.
+- Use only the visible data, search result cards, and candidate elements provided above. READ THE VISIBLE DATA SECTION CAREFULLY — it includes Main text which often already contains the answer (prices, statistics, facts).
+- If the visible data already contains the information the task asks for, set goal_satisfied=true and choose action.type="extract". Do not require structured "collected data" to confirm — the Main text IS data.
 - Base the judgment on the current page state plus the recent execution history.
 - Use controls when pagination, load-more, or search-box actions are clearly relevant.
 - Prefer `target_ref` over `target_selector` whenever a relevant ref is available.

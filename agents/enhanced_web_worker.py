@@ -239,6 +239,7 @@ class EnhancedWebWorker:
             text_limit = settings.MAIN_TEXT_LIMIT_DETAIL if page_type in ("detail", "list", "serp") else settings.MAIN_TEXT_LIMIT_DEFAULT
             relevant_text = await extract_relevant_text_safe_async(
                 main_text, query, fallback_limit=text_limit, max_chars=text_limit,
+                page_type=page_type,
             )
             lines.append(f"主体文本: {relevant_text}")
 
