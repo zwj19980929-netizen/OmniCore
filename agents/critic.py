@@ -215,11 +215,74 @@ class CriticAgent:
 
         return None
 
+    def _vision_verify_result(
+        self,
+        task_description: str,
+        task_result: Any,
+        page_screenshot: bytes,
+    ) -> Optional[Dict[str, Any]]:
+        """
+        视觉验证：当 LLM 审查给低分时，用截图让视觉模型复核。
+        如果截图显示任务实际已完成，则覆盖评分。
+        """
+        try:
+            vision_llm = LLMClient.for_vision()
+        except Exception:
+            return None
+
+        # 构建简洁的结果摘要（避免把大量数据塞进 prompt）
+        result_summary = {}
+        if isinstance(task_result, dict):
+            result_summary = {
+                "success": task_result.get("success"),
+                "message": str(task_result.get("message", ""))[:200],
+                "url": str(task_result.get("url", ""))[:200],
+                "title": str(task_result.get("title", ""))[:200],
+                "data_count": len(task_result.get("data") or []),
+            }
+
+        prompt = (
+            f"You are verifying whether a browser automation task was completed successfully.\n\n"
+            f"Task: {task_description}\n\n"
+            f"System report: {result_summary}\n\n"
+            f"The system thinks this task may have FAILED. Look at the final page screenshot above.\n"
+            f"Does the page visually contain the information the task was trying to extract or achieve?\n\n"
+            f"Return JSON:\n"
+            f'{{"task_completed": true/false, "confidence": 0.0-1.0, '
+            f'"extracted_answer": "brief summary of what the page actually shows relevant to the task"}}'
+        )
+
+        try:
+            response = vision_llm.chat_with_image(prompt, page_screenshot, 0.2, 800)
+            parsed = vision_llm.parse_json_response(response)
+            completed = bool(parsed.get("task_completed", False))
+            confidence = float(parsed.get("confidence", 0.0))
+            answer = str(parsed.get("extracted_answer", ""))
+
+            if completed and confidence >= 0.6:
+                log_agent_action(
+                    self.name,
+                    f"视觉复核通过: {answer[:80]}",
+                    f"confidence={confidence:.2f}",
+                )
+                return {
+                    "approved": True,
+                    "score": min(0.85, confidence),
+                    "issues": [],
+                    "suggestions": [],
+                    "summary": f"视觉复核通过: {answer[:120]}",
+                }
+            return None
+        except Exception as exc:
+            logger.warning(f"Critic vision verify failed: {exc}")
+            return None
+
     def review_task_result(
         self,
         task_description: str,
         task_result: Any,
         expected_format: Optional[str] = None,
+        page_screenshot: Optional[bytes] = None,
     ) -> Dict[str, Any]:
         """
         审查单个任务的执行结果
@@ -228,6 +291,7 @@ class CriticAgent:
             task_description: 任务描述
             task_result: 任务执行结果
             expected_format: 期望的输出格式
+            page_screenshot: 最终页面截图（可选），用于视觉复核
 
         Returns:
             审查结果字典
@@ -270,6 +334,21 @@ class CriticAgent:
                 f"审查完成: {'通过' if result.get('approved') else '未通过'}",
                 f"评分: {result.get('score', 0):.2f}"
             )
+
+            # Layer 3: 视觉复核 — 当 LLM 审查给低分且有截图时，用视觉模型复核
+            if (
+                result.get("score", 0) < 0.5
+                and page_screenshot
+                and isinstance(task_result, dict)
+                and task_result.get("success")
+            ):
+                log_agent_action(self.name, "LLM 审查低分，启动视觉复核")
+                vision_override = self._vision_verify_result(
+                    task_description, task_result, page_screenshot,
+                )
+                if vision_override is not None:
+                    return vision_override
+
             return result
         except Exception as e:
             logger.error(f"Critic 解析失败: {e}")
@@ -386,9 +465,14 @@ class CriticAgent:
 
             completed_count += 1
             if task["result"]:
+                # 提取截图供视觉复核，之后清理避免大数据留在 state 中
+                _screenshot = None
+                if isinstance(task["result"], dict):
+                    _screenshot = task["result"].pop("_page_screenshot", None)
                 review_result = self.review_task_result(
                     task_description=task["description"],
                     task_result=task["result"],
+                    page_screenshot=_screenshot,
                 )
                 task["critic_review"] = review_result
                 task["critic_approved"] = bool(review_result.get("approved"))

@@ -187,6 +187,12 @@ class ModelRegistry:
             all_models.update(self.get_models(p))
         return all_models
 
+    # 能力 → settings 中用户可配置的环境变量字段名
+    _CAPABILITY_ENV_OVERRIDE = {
+        ModelCapability.VISION: "VISION_MODEL",
+        ModelCapability.TEXT_CHAT: "DEFAULT_MODEL",
+    }
+
     def get_model_for_capability(
         self,
         capability: ModelCapability,
@@ -199,6 +205,14 @@ class ModelRegistry:
         Returns:
             模型全名 "provider/model_id" 或 None
         """
+        # 优先使用用户通过环境变量显式指定的模型
+        env_field = self._CAPABILITY_ENV_OVERRIDE.get(capability)
+        if env_field and not provider:
+            user_model = getattr(settings, env_field, None)
+            if user_model and os.getenv(env_field):
+                logger.info(f"能力 {capability.value} → 使用用户配置 {env_field}={user_model}")
+                return user_model
+
         target = provider or self.active_provider
         cost_pref = prefer_cost or self.cost_preference
 

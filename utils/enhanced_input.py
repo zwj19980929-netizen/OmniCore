@@ -7,6 +7,12 @@ import sys
 from typing import List, Optional, Callable
 
 
+def _is_libedit(readline_module) -> bool:
+    """检测 readline 后端是否为 macOS libedit（而非 GNU readline）"""
+    doc = getattr(readline_module, "__doc__", "") or ""
+    return "libedit" in doc
+
+
 class EnhancedInput:
     """增强的命令行输入"""
 
@@ -33,13 +39,11 @@ class EnhancedInput:
             # 设置历史记录最大条数
             readline.set_history_length(1000)
 
-            # 启用 Tab 补全
-            readline.parse_and_bind("tab: complete")
-
-            # macOS 特殊处理
-            if sys.platform == "darwin":
-                # macOS 使用 libedit，需要不同的绑定
+            # 根据实际后端选择正确的绑定语法
+            if _is_libedit(readline):
                 readline.parse_and_bind("bind ^I rl_complete")
+            else:
+                readline.parse_and_bind("tab: complete")
 
             # 设置补全函数
             readline.set_completer(self._completer)
@@ -63,11 +67,7 @@ class EnhancedInput:
 
     def input(self, prompt: str = "> ") -> str:
         """增强的输入函数"""
-        try:
-            return input(prompt).strip()
-        except EOFError:
-            # Ctrl+D
-            raise KeyboardInterrupt("EOF")
+        return input(prompt).strip()
 
     def save_history(self):
         """保存历史记录"""

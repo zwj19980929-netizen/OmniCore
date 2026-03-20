@@ -67,7 +67,9 @@ def interactive_mode():
 
     while True:
         try:
-            user_input = enhanced_input.input("\n🎯 OmniCore > ")
+            # prompt 不使用 emoji，避免 readline/libedit 光标错位
+            console.print()
+            user_input = enhanced_input.input("OmniCore > ")
 
             if user_input.lower() in ["quit", "exit", "q"]:
                 console.print("\n[yellow]再见！👋[/yellow]")
@@ -122,13 +124,8 @@ def interactive_mode():
                 border_style=view["border_style"],
             ))
 
-        except KeyboardInterrupt:
-            # Ctrl+C 优雅退出
-            console.print("\n[yellow]再见！👋[/yellow]")
-            break
-        except EOFError:
-            # Ctrl+D 优雅退出
-            console.print("\n[yellow]再见！👋[/yellow]")
+        except (KeyboardInterrupt, EOFError):
+            console.print("\n[yellow]再见！[/yellow]")
             break
         except Exception as e:
             error_detail = traceback.format_exc()

@@ -1430,6 +1430,112 @@ class BrowserAgent:
             log_warning(f"vision description failed: {exc}")
             return ""
 
+    async def _extract_data_with_vision(
+        self,
+        task: str,
+        task_intent: TaskIntent,
+        snapshot: Optional[Dict[str, Any]] = None,
+    ) -> List[Dict[str, str]]:
+        """截图 → 视觉模型 → 按任务目标提取结构化数据（DOM 提取失败时的回退）"""
+        vision_llm = self._get_vision_llm()
+        if vision_llm is None:
+            return []
+
+        screenshot_r = await self.toolkit.screenshot(full_page=False)
+        if not screenshot_r.success or not screenshot_r.data:
+            return []
+
+        query = task_intent.query or self._derive_primary_query(task)
+        fields = ", ".join(f"{k}: {v}" for k, v in task_intent.fields.items()) if task_intent.fields else "auto-detect"
+        page_type = str((snapshot or {}).get("page_type", "unknown"))
+
+        prompt_template = get_prompt("browser_vision_data_extraction", "")
+        if prompt_template:
+            prompt = prompt_template.format(task=task, query=query, fields=fields, page_type=page_type)
+        else:
+            prompt = (
+                f"Extract data from this webpage screenshot.\n"
+                f"Task: {task}\nQuery: {query}\nFields: {fields}\n"
+                f"Return JSON: {{\"found\": true/false, \"items\": [{{...}}]}}"
+            )
+
+        try:
+            response = await asyncio.to_thread(
+                vision_llm.chat_with_image, prompt, screenshot_r.data, 0.2, 2000,
+            )
+            web_debug_recorder.write_text("vision_data_extraction_prompt", prompt)
+            web_debug_recorder.write_text("vision_data_extraction_response", response.content)
+
+            parsed = vision_llm.parse_json_response(response)
+            if not parsed.get("found"):
+                return []
+            items = parsed.get("items") or parsed.get("data") or []
+            if isinstance(items, dict):
+                items = [items]
+            if not isinstance(items, list):
+                return []
+            # 确保每个 item 的值都是字符串
+            result = []
+            for item in items:
+                if isinstance(item, dict):
+                    result.append({str(k): str(v) for k, v in item.items()})
+            log_agent_action(self.name, f"视觉提取成功: {len(result)} 条数据")
+            return result
+        except Exception as exc:
+            log_warning(f"vision data extraction failed: {exc}")
+            return []
+
+    async def _vision_check_page_relevance(
+        self,
+        task: str,
+        query: str,
+        snapshot: Optional[Dict[str, Any]] = None,
+    ) -> Tuple[bool, str]:
+        """截图 → 视觉模型 → 判断当前页面是否包含任务所需信息"""
+        vision_llm = self._get_vision_llm()
+        if vision_llm is None:
+            return (False, "")
+
+        screenshot_r = await self.toolkit.screenshot(full_page=False)
+        if not screenshot_r.success or not screenshot_r.data:
+            return (False, "")
+
+        prompt_template = get_prompt("browser_vision_relevance_check", "")
+        if prompt_template:
+            prompt = prompt_template.format(task=task, query=query or task)
+        else:
+            prompt = (
+                f"Does this webpage contain information relevant to: '{query or task}'?\n"
+                f"Return JSON: {{\"relevant\": true/false, \"confidence\": 0.0-1.0, \"summary\": \"...\"}}"
+            )
+
+        try:
+            response = await asyncio.to_thread(
+                vision_llm.chat_with_image, prompt, screenshot_r.data, 0.2, 500,
+            )
+            web_debug_recorder.write_text("vision_relevance_prompt", prompt)
+            web_debug_recorder.write_text("vision_relevance_response", response.content)
+
+            parsed = vision_llm.parse_json_response(response)
+            relevant = bool(parsed.get("relevant", False))
+            confidence = float(parsed.get("confidence", 0.0))
+            summary = str(parsed.get("summary", ""))
+            if relevant and confidence >= 0.5:
+                log_agent_action(self.name, f"视觉判定页面相关: {summary[:80]}")
+                return (True, summary)
+            return (False, summary)
+        except Exception as exc:
+            log_warning(f"vision relevance check failed: {exc}")
+            return (False, "")
+
+    async def _capture_final_screenshot(self) -> Optional[bytes]:
+        """捕获最终页面截图，供 Critic 视觉验证使用"""
+        try:
+            sc = await self.toolkit.screenshot(full_page=False)
+            return sc.data if sc.success else None
+        except Exception:
+            return None
+
     def _validate_action(
         self, action: Optional[BrowserAction], observation: PageObservation
     ) -> Optional[BrowserAction]:
@@ -5626,9 +5732,11 @@ class BrowserAgent:
                     # 只有在数据足够多（至少3条）且确实满足目标时才提前返回
                     title_r = await tk.get_title()
                     url_r = await tk.get_current_url()
+                    _final_screenshot = await self._capture_final_screenshot()
                     return {"success": True, "message": "read-only task satisfied from initial page",
                             "url": url_r.data or "", "title": title_r.data or "",
-                            "expected_url": expected_url, "steps": steps, "data": initial_data}
+                            "expected_url": expected_url, "steps": steps, "data": initial_data,
+                            "_page_screenshot": _final_screenshot}
                 else:
                     # 数据不够或不满足，继续执行步骤
                     log_warning(f"初始数据不足（{len(initial_data)} 条），继续执行步骤")
@@ -5697,17 +5805,38 @@ class BrowserAgent:
                     log_warning(f"[DEBUG] 已收集数据: {len(_accumulated_data)} 条")
                     log_warning(f"[DEBUG] ====================================")
 
-                action, action_source = await self._plan_next_action(
-                    task,
-                    current_url_r.data or "",
-                    title_r.data or "",
-                    elements,
-                    task_intent,
-                    _accumulated_data or observed_data,
-                    snapshot=snapshot,
-                    last_action=last_action,
-                    recent_steps=steps,
-                )
+                # Layer 2: 视觉内容验证 — 当 DOM 没提取到数据且页面类型不明时，
+                # 用截图判断页面是否包含目标信息，如果是则直接走提取而非盲目导航
+                action = None
+                action_source = ""
+                if (
+                    not observed_data
+                    and not _accumulated_data
+                    and str((snapshot or {}).get("page_type", "")).strip() in {"", "unknown"}
+                ):
+                    relevant, vision_summary = await self._vision_check_page_relevance(
+                        task, task_intent.query or self._derive_primary_query(task), snapshot,
+                    )
+                    if relevant:
+                        action = BrowserAction(
+                            action_type=ActionType.EXTRACT,
+                            description=f"vision detected relevant content: {vision_summary[:100]}",
+                            confidence=0.7,
+                        )
+                        action_source = "vision_relevance"
+
+                if action is None:
+                    action, action_source = await self._plan_next_action(
+                        task,
+                        current_url_r.data or "",
+                        title_r.data or "",
+                        elements,
+                        task_intent,
+                        _accumulated_data or observed_data,
+                        snapshot=snapshot,
+                        last_action=last_action,
+                        recent_steps=steps,
+                    )
                 if action is None or action.action_type == ActionType.WAIT:
                     visual_action = await self._decide_action_with_vision(
                         task,
@@ -5749,28 +5878,49 @@ class BrowserAgent:
                 if action.action_type == ActionType.DONE:
                     data = await self._extract_data_for_intent(task_intent)
                     _merge_new_data(data)
-                    log_success("browser task completed")
-                    url_r = await tk.get_current_url()
-                    title_r = await tk.get_title()
-                    return {"success": True, "message": "task completed",
-                            "url": url_r.data or "", "title": title_r.data or "",
-                            "expected_url": expected_url, "steps": steps, "data": _accumulated_data or data}
-
-                if action.action_type == ActionType.EXTRACT:
-                    data = await self._extract_data_for_intent(task_intent)
-                    _merge_new_data(data)
-                    # 如果结构化提取为空，尝试从 snapshot main_text 构建数据
+                    # 回退1: main_text
                     if not _accumulated_data and not data:
                         snapshot = self._last_semantic_snapshot or {}
                         main_text = self._get_snapshot_main_text(snapshot)
                         if main_text and len(main_text) >= 50:
                             data = [{"text": main_text, "source": "page_main_text"}]
                             _merge_new_data(data)
+                    # 回退2: 视觉提取
+                    if not _accumulated_data:
+                        vision_data = await self._extract_data_with_vision(task, task_intent, snapshot)
+                        if vision_data:
+                            _merge_new_data(vision_data)
+                    log_success("browser task completed")
                     url_r = await tk.get_current_url()
                     title_r = await tk.get_title()
+                    _final_screenshot = await self._capture_final_screenshot()
+                    return {"success": True, "message": "task completed",
+                            "url": url_r.data or "", "title": title_r.data or "",
+                            "expected_url": expected_url, "steps": steps, "data": _accumulated_data or data,
+                            "_page_screenshot": _final_screenshot}
+
+                if action.action_type == ActionType.EXTRACT:
+                    data = await self._extract_data_for_intent(task_intent)
+                    _merge_new_data(data)
+                    # 回退1: main_text
+                    if not _accumulated_data and not data:
+                        snapshot = self._last_semantic_snapshot or {}
+                        main_text = self._get_snapshot_main_text(snapshot)
+                        if main_text and len(main_text) >= 50:
+                            data = [{"text": main_text, "source": "page_main_text"}]
+                            _merge_new_data(data)
+                    # 回退2: 视觉提取
+                    if not _accumulated_data:
+                        vision_data = await self._extract_data_with_vision(task, task_intent, snapshot)
+                        if vision_data:
+                            _merge_new_data(vision_data)
+                    url_r = await tk.get_current_url()
+                    title_r = await tk.get_title()
+                    _final_screenshot = await self._capture_final_screenshot()
                     return {"success": True, "message": "data extracted",
                             "url": url_r.data or "", "title": title_r.data or "",
-                            "expected_url": expected_url, "steps": steps, "data": _accumulated_data or data}
+                            "expected_url": expected_url, "steps": steps, "data": _accumulated_data or data,
+                            "_page_screenshot": _final_screenshot}
 
                 if action.requires_confirmation and settings.REQUIRE_HUMAN_CONFIRM:
                     # 🔥 修复：不要直接退出，而是询问用户
@@ -5799,9 +5949,11 @@ class BrowserAgent:
                         log_agent_action(self.name, "循环检测中反机器人验证绕过成功")
                     if self._is_read_only_task(task, task_intent):
                         _merge_new_data(await self._extract_data_for_intent(task_intent))
+                        _final_screenshot = await self._capture_final_screenshot()
                         return {"success": True, "message": "repeated action avoided; extracted current page",
                                 "url": url_r.data or "", "title": title_r.data or "",
-                                "expected_url": expected_url, "steps": steps, "data": _accumulated_data}
+                                "expected_url": expected_url, "steps": steps, "data": _accumulated_data,
+                                "_page_screenshot": _final_screenshot}
                     return {"success": False, "message": f"repeated action loop detected at step {step_no}",
                             "url": url_r.data or "", "title": title_r.data or "",
                             "expected_url": expected_url, "steps": steps, "data": _accumulated_data}
@@ -5944,10 +6096,12 @@ class BrowserAgent:
                         and (has_sufficient_data or not requires_data)
                     ):
                         title_r = await tk.get_title()
+                        _final_screenshot = await self._capture_final_screenshot()
                         return {"success": True, "message": "task reached target page",
                                 "url": url_r.data or "", "title": title_r.data or "",
                                 "expected_url": expected_url,
-                                "steps": steps, "data": candidate_data or await self._extract_data_for_intent(task_intent)}
+                                "steps": steps, "data": candidate_data or await self._extract_data_for_intent(task_intent),
+                                "_page_screenshot": _final_screenshot}
 
                 if action.action_type == ActionType.SCROLL:
                     step_data = await self._extract_data_for_intent(task_intent)
@@ -5955,14 +6109,27 @@ class BrowserAgent:
 
             # max steps reached
             _merge_new_data(await self._extract_data_for_intent(task_intent))
+            # 回退1: main_text
+            if not _accumulated_data:
+                snapshot = self._last_semantic_snapshot or {}
+                main_text = self._get_snapshot_main_text(snapshot)
+                if main_text and len(main_text) >= 50:
+                    _merge_new_data([{"text": main_text, "source": "page_main_text"}])
+            # 回退2: 视觉提取
+            if not _accumulated_data:
+                vision_data = await self._extract_data_with_vision(task, task_intent, self._last_semantic_snapshot)
+                if vision_data:
+                    _merge_new_data(vision_data)
             url_r = await tk.get_current_url()
             title_r = await tk.get_title()
+            _final_screenshot = await self._capture_final_screenshot()
             return {
                 "success": len(_accumulated_data) > 0,
                 "message": "max steps reached" + (f", but collected {len(_accumulated_data)} items" if _accumulated_data else ""),
                 "url": url_r.data or "", "title": title_r.data or "",
                 "expected_url": expected_url,
                 "steps": steps, "data": _accumulated_data,
+                "_page_screenshot": _final_screenshot,
             }
         except Exception as exc:
             log_error(f"browser task failed: {exc}")
