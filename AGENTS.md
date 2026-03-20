@@ -24,5 +24,23 @@ Recent history uses short imperative subjects, often with `feat:` or `fix:` pref
 ## Security & Configuration Tips
 Start from `.env.example`; never commit `.env`, API keys, or generated `data/` contents. If a change alters model routing, browser automation, or approval behavior, document the new environment variables or operational risks in `README.md` or `docs/`.
 
-## Active Architecture Upgrade (2026-03-19)
-A 7-direction architecture upgrade is in progress. Infrastructure for all 7 directions has been built; **runtime integration is pending for 5 of them**. Before starting any new work, read `docs/2026-03-19-架构升级集成计划.md` for the full plan, file index, and execution order. Key new modules: `core/stage_registry.py`, `core/agent_registry.py`, `core/message_bus.py`, `core/persistence_coordinator.py`, `utils/structured_logger.py`, `agents/browser_perception.py`, `agents/browser_decision.py`, `agents/browser_execution.py`, `config/agents.yaml`.
+## Architecture (7-Direction Upgrade — Completed 2026-03-20)
+All 7 directions of the architecture upgrade are now integrated into the runtime. See `docs/2026-03-19-架构升级集成计划.md` for the original plan and file index.
+
+| Direction | Status | Key Integration Points |
+|-----------|--------|----------------------|
+| 1. Composable Graph | ✅ Done | `after_validator` and other edge functions consult `StageRegistry.build_execution_plan()` to respect `skip_condition` |
+| 2. Agent Registry | ✅ Done | Router prompt auto-injects agent descriptions from `config/agents.yaml` via `{{AGENT_CAPABILITIES}}`; `WorkerPool` uses factory pattern backed by registry |
+| 3. Browser 3-Layer Split | ✅ Done | `agents/browser_perception.py`, `browser_decision.py`, `browser_execution.py` |
+| 4. Message Bus | ✅ Done | 6 key `shared_memory` keys dual-written to `MessageBus`; reads prefer bus with shared_memory fallback |
+| 5. Persistence Coordinator | ✅ Done | `_finalize_runtime_result()` calls `PersistenceCoordinator.complete_job()` for unified 3-store write |
+| 6. Structured Logging | ✅ Done | All 7 stage nodes, LLM calls, browser actions, and job lifecycle emit JSONL to `data/logs/omnicore.log` |
+| 7. Adaptive Routing | ✅ Done | `_after_parallel_executor_adaptive` in `core/graph.py` |
+
+**Key conventions introduced by the upgrade:**
+- **Dual-write pattern**: new code writes to both `MessageBus` and `shared_memory`; reads go bus-first. Do not remove `shared_memory` writes until all consumers are migrated.
+- **`config/agents.yaml`**: add new agent types here instead of modifying code. The router prompt and `WorkerPool` pick them up automatically.
+- **`@register_stage` decorator**: all graph nodes use this; stage metadata drives `build_execution_plan()`.
+- **JSONL structured logs**: use `get_structured_logger()` + `LogContext` for any new instrumentation. Logs rotate daily in `data/logs/`.
+
+**Known test state**: 304 passed, 24 failed (pre-existing failures in `test_web_worker_unit.py` and `test_web_worker_perception.py`, unrelated to the upgrade).
