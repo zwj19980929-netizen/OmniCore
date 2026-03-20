@@ -23,3 +23,6 @@ Recent history uses short imperative subjects, often with `feat:` or `fix:` pref
 
 ## Security & Configuration Tips
 Start from `.env.example`; never commit `.env`, API keys, or generated `data/` contents. If a change alters model routing, browser automation, or approval behavior, document the new environment variables or operational risks in `README.md` or `docs/`.
+
+## Active Architecture Upgrade (2026-03-19)
+A 7-direction architecture upgrade is in progress. Infrastructure for all 7 directions has been built; **runtime integration is pending for 5 of them**. Before starting any new work, read `docs/2026-03-19-架构升级集成计划.md` for the full plan, file index, and execution order. Key new modules: `core/stage_registry.py`, `core/agent_registry.py`, `core/message_bus.py`, `core/persistence_coordinator.py`, `utils/structured_logger.py`, `agents/browser_perception.py`, `agents/browser_decision.py`, `agents/browser_execution.py`, `config/agents.yaml`.

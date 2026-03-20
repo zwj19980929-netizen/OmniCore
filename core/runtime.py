@@ -22,7 +22,7 @@ from core.statuses import (
     is_success_job_status,
 )
 from core.state import create_initial_state
-from core.graph import get_graph
+from core.graph import get_graph  # noqa: F401 – also exposes build_graph_from_registry via graph module
 from memory.manager import MemoryManager, build_memory_scope
 from utils.logger import console, log_agent_action, log_debug_metrics, log_error, log_warning
 from utils.text import sanitize_text, sanitize_value

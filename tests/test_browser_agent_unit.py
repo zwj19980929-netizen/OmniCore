@@ -1198,6 +1198,12 @@ class _ReadOnlyToolkit:
     async def get_current_url(self):
         return ToolkitResult(success=True, data=self._current_url)
 
+    async def bypass_robot_challenge(self, *_args, **_kwargs):
+        return ToolkitResult(success=False, error="not implemented in test stub")
+
+    async def screenshot(self, *_args, **_kwargs):
+        return ToolkitResult(success=False, data=None)
+
 
 class _SearchResultsToolkit:
     fast_mode = False

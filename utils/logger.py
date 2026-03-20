@@ -92,3 +92,26 @@ def log_debug_metrics(scope: str, metrics: dict):
         return
     parts = [f"{key}={metrics[key]}" for key in sorted(metrics)]
     console.print(f"[dim][debug] {scope}: {', '.join(parts)}[/dim]", highlight=False)
+
+
+# ---------------------------------------------------------------------------
+# Structured logger integration
+# ---------------------------------------------------------------------------
+from utils.structured_logger import StructuredLogger, LogContext, get_structured_logger  # noqa: E402
+
+# Initialize the singleton so the JSONL handler is ready
+_structured_logger = StructuredLogger()
+
+__all__ = [
+    "logger",
+    "console",
+    "setup_logger",
+    "log_agent_action",
+    "log_task_status",
+    "log_success",
+    "log_error",
+    "log_warning",
+    "log_debug_metrics",
+    "get_structured_logger",
+    "LogContext",
+]

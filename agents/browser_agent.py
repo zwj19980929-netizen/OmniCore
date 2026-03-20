@@ -363,7 +363,7 @@ class BrowserAgent:
         self._last_snapshot_hash: str = ""
         self._last_observation: Optional[PageObservation] = None
 
-        # 如果外部传入 toolkit 就用，否则自建
+        # Build or accept toolkit
         if toolkit:
             self.toolkit = toolkit
         else:
@@ -374,11 +374,65 @@ class BrowserAgent:
                 block_heavy_resources=settings.BLOCK_HEAVY_RESOURCES,
                 user_data_dir=user_data_dir,
             )
-        self._owns_toolkit = toolkit is None  # 自建的才负责关闭
+        self._owns_toolkit = toolkit is None
+
+        # ── Three-layer architecture ─────────────────────────
+        # Layer 1: Perception - transforms raw browser state into structured observations
+        from agents.browser_perception import BrowserPerceptionLayer
+        self.perception = BrowserPerceptionLayer(
+            toolkit=self.toolkit,
+            llm_client_getter=self._get_llm,
+            a11y_extractor=self.a11y_extractor,
+            page_perceiver=self.page_perceiver,
+            agent_name=self.name,
+        )
+
+        # Layer 2: Decision - decides next action (as pure as possible, no side effects)
+        from agents.browser_decision import BrowserDecisionLayer
+        self.decision = BrowserDecisionLayer(
+            llm_client_getter=self._get_llm,
+            agent_name=self.name,
+        )
+
+        # Layer 3: Execution - executes browser actions via toolkit (pure side effects)
+        from agents.browser_execution import BrowserExecutionLayer
+        self.execution = BrowserExecutionLayer(
+            toolkit=self.toolkit,
+            agent_name=self.name,
+        )
 
     async def close(self) -> None:
         if self._owns_toolkit:
             await self.toolkit.close()
+
+    # ── Layer sync helpers ───────────────────────────────────
+    # Keep the orchestrator's state in sync with the layer objects.
+    # The layers own the canonical state; these properties bridge
+    # the legacy code that still reads from self._ attributes.
+
+    def _sync_perception_state(self) -> None:
+        """Push perception layer state back into orchestrator attributes."""
+        self._last_semantic_snapshot = self.perception.last_semantic_snapshot
+        self._last_observation = self.perception.last_observation
+        self._snapshot_version = self.perception.snapshot_version
+        self._vision_llm = self.perception._vision_llm
+        self._vision_llm_attempted = self.perception._vision_llm_attempted
+
+    def _sync_decision_state(self) -> None:
+        """Push decision layer state back into orchestrator attributes."""
+        self._action_history = self.decision._action_history
+        self._page_assessment_cache = self.decision._page_assessment_cache
+
+    def _sync_state_to_layers(self) -> None:
+        """Push orchestrator state into the layer objects."""
+        self.perception._last_semantic_snapshot = self._last_semantic_snapshot
+        self.perception._last_observation = self._last_observation
+        self.perception._snapshot_version = self._snapshot_version
+        self.perception._vision_llm = self._vision_llm
+        self.perception._vision_llm_attempted = self._vision_llm_attempted
+        self.decision._action_history = self._action_history
+        self.decision._page_assessment_cache = self._page_assessment_cache
+        self.execution.element_cache = self._element_cache
 
     def _get_llm(self) -> LLMClient:
         if self.llm is None:
@@ -593,17 +647,12 @@ class BrowserAgent:
         return True
 
     def _action_signature(self, action: BrowserAction) -> str:
-        return "|".join([
-            action.action_type.value,
-            action.target_ref[:80],
-            action.target_selector[:80],
-            self._normalize_text(action.value)[:80],
-            self._normalize_text(action.description)[:80],
-        ])
+        return self.decision._action_signature(action)
 
     def _record_action(self, action: BrowserAction) -> None:
-        self._action_history.append(self._action_signature(action))
-        self._action_history = self._action_history[-6:]
+        self._sync_state_to_layers()
+        self.decision.record_action(action)
+        self._sync_decision_state()
 
     def _format_intent_fields_for_llm(self, fields: Optional[Dict[str, str]]) -> str:
         if not fields:
@@ -763,35 +812,9 @@ class BrowserAgent:
         return action
 
     def _is_action_looping(self, action: BrowserAction, threshold: int = 3) -> bool:
-        """
-        检测动作是否陷入循环
-
-        改进：
-        1. 提高阈值从2到3（允许重试一次）
-        2. 检查最近的动作序列，而不是整个历史
-        3. 只有连续重复才算循环
-        """
-        # 检查最近5个动作中的重复
-        recent_actions = self._action_history[-5:] if len(self._action_history) >= 5 else self._action_history
-        action_sig = self._action_signature(action)
-
-        # 统计最近动作中的重复次数
-        recent_count = recent_actions.count(action_sig)
-        if action.action_type == ActionType.WAIT:
-            return recent_count >= max(threshold + 2, 5)
-
-        # 如果最近5个动作中重复3次以上，才判定为循环
-        if recent_count >= threshold:
-            return True
-
-        # 检查是否连续重复（更严格的循环检测）
-        if len(self._action_history) >= 2:
-            last_two = self._action_history[-2:]
-            if all(sig == action_sig for sig in last_two):
-                # 连续3次相同动作才是真正的循环
-                return True
-
-        return False
+        """Detect if action is stuck in a loop. Delegates to the decision layer."""
+        self._sync_state_to_layers()
+        return self.decision.is_action_looping(action, threshold)
 
     def _is_noise_element(self, element: PageElement) -> bool:
         attrs = element.attributes or {}
@@ -820,65 +843,28 @@ class BrowserAgent:
         return ToolkitResult(success=True, data=result)
 
     async def _get_current_url_value(self, fallback: str = "") -> str:
-        result = await self._call_toolkit("get_current_url")
-        if result.success and result.data is not None:
-            value = str(result.data or "").strip()
-            if value:
-                return value
-        for attr_name in ("current_url", "_current_url", "_url"):
-            value = str(getattr(self.toolkit, attr_name, "") or "").strip()
-            if value:
-                return value
-        return str(fallback or "")
+        """Get current URL. Delegates to perception layer (Layer 1)."""
+        return await self.perception.get_current_url(fallback)
 
     async def _get_title_value(self, fallback: str = "") -> str:
-        result = await self._call_toolkit("get_title")
-        if result.success and result.data is not None:
-            value = str(result.data or "").strip()
-            if value:
-                return value
-        for attr_name in ("title", "_title"):
-            value = str(getattr(self.toolkit, attr_name, "") or "").strip()
-            if value:
-                return value
-        return str(fallback or "")
+        """Get page title. Delegates to perception layer (Layer 1)."""
+        return await self.perception.get_title(fallback)
 
     async def _get_page_html_value(self) -> str:
-        result = await self._call_toolkit("get_page_html")
-        if result.success and result.data is not None:
-            return str(result.data or "")
-        for attr_name in ("html", "_html"):
-            value = getattr(self.toolkit, attr_name, None)
-            if value:
-                return str(value)
-        return ""
+        """Get page HTML. Delegates to perception layer (Layer 1)."""
+        return await self.perception.get_page_html()
 
     def _get_snapshot_blocked_signals(self, snapshot: Optional[Dict[str, Any]]) -> List[str]:
-        signals: List[str] = []
-        for item in (snapshot or {}).get("blocked_signals", []) or []:
-            text = ""
-            if isinstance(item, dict):
-                text = str(item.get("text", "") or item.get("signal", "") or "").strip()
-            else:
-                text = str(item or "").strip()
-            if text and text not in signals:
-                signals.append(text)
-        return signals
+        """Get blocked signals from snapshot. Delegates to perception layer."""
+        return self.perception.get_snapshot_blocked_signals(snapshot)
 
     def _get_snapshot_visible_text_blocks(self, snapshot: Optional[Dict[str, Any]]) -> List[str]:
-        blocks: List[str] = []
-        for item in (snapshot or {}).get("visible_text_blocks", []) or []:
-            text = ""
-            if isinstance(item, dict):
-                text = str(item.get("text", "") or "").strip()
-            else:
-                text = str(item or "").strip()
-            if text:
-                blocks.append(text)
-        return blocks
+        """Get visible text blocks. Delegates to perception layer."""
+        return self.perception.get_snapshot_visible_text_blocks(snapshot)
 
     def _get_snapshot_main_text(self, snapshot: Optional[Dict[str, Any]]) -> str:
-        return str((snapshot or {}).get("main_text", "") or "").strip()
+        """Get main text. Delegates to perception layer."""
+        return self.perception.get_snapshot_main_text(snapshot)
 
     async def _format_snapshot_text_for_llm(self, snapshot: Optional[Dict[str, Any]], max_blocks: int = 0, query: str = "") -> str:
         if max_blocks <= 0:
@@ -1212,223 +1198,41 @@ class BrowserAgent:
     async def _observe_page(self) -> PageObservation:
         """
         Unified page observation: JS snapshot + a11y tree + perceiver + vision.
-        Replaces scattered snapshot/elements passing with single PageObservation.
+        Delegates to the perception layer (Layer 1).
         """
-        # 1. Get JS semantic snapshot
-        snapshot = await self._get_semantic_snapshot()
-
-        # 2. Snapshot caching: check if page changed
-        snap_hash = self._compute_snapshot_hash(snapshot)
-        if snap_hash == self._last_snapshot_hash and self._last_observation is not None:
-            # Reuse cached observation
-            self._snapshot_version += 1
-            self._last_observation.snapshot_version = self._snapshot_version
-            log_agent_action(self.name, "observe", "cache_hit")
-            return self._last_observation
-
-        self._last_snapshot_hash = snap_hash
-        self._snapshot_version += 1
-
-        # 3. A11y tree extraction
-        a11y_elements: List[AccessibleElement] = []
-        page = getattr(self.toolkit, '_page', None)
-        if page:
-            try:
-                a11y_elements = await self.a11y_extractor.extract_tree(page)
-                if a11y_elements:
-                    self._merge_a11y_into_snapshot(snapshot, a11y_elements)
-                    log_agent_action(self.name, "observe", f"a11y_elements={len(a11y_elements)}")
-            except Exception as exc:
-                log_warning(f"a11y extraction failed: {exc}")
-
-        # 4. Perceiver content (headings, text blocks, summary)
-        page_content: Optional[PageContent] = None
-        headings: List[Dict[str, str]] = []
-        if page:
-            try:
-                page_content = await self.page_perceiver.perceive_page(page, snapshot=snapshot)
-                if page_content:
-                    self._merge_perceiver_content(snapshot, page_content)
-                    headings = [{"level": h, "text": t} for h, t in
-                                zip(["h1", "h2", "h3"] * 10, page_content.main_headings)]
-                    # Fix: use actual heading data from snapshot
-                    headings = snapshot.get("headings") or []
-            except Exception as exc:
-                log_warning(f"perceiver extraction failed: {exc}")
-
-        # 5. Vision perception (conditional)
-        vision_description = ""
-        if settings.VISION_PERCEPTION_ENABLED and page:
-            complexity = self._compute_complexity_score(snapshot, a11y_elements)
-            page_type = str(snapshot.get("page_type", "") or "")
-            if complexity > settings.VISION_PERCEPTION_COMPLEXITY_THRESHOLD or page_type == "unknown":
-                try:
-                    vision_description = await self._get_vision_description(page)
-                    if vision_description:
-                        log_agent_action(self.name, "observe", f"vision_len={len(vision_description)}")
-                except Exception as exc:
-                    log_warning(f"vision perception failed: {exc}")
-
-        # 6. Apply versioned refs: prefix element refs with version number
-        version = self._snapshot_version
-        for elem in snapshot.get("elements") or []:
-            if isinstance(elem, dict) and elem.get("ref"):
-                elem["ref"] = f"{version}:{elem['ref']}"
-        for card in snapshot.get("cards") or []:
-            if isinstance(card, dict):
-                if card.get("ref"):
-                    card["ref"] = f"{version}:{card['ref']}"
-                if card.get("target_ref"):
-                    card["target_ref"] = f"{version}:{card['target_ref']}"
-        for ctrl in snapshot.get("controls") or []:
-            if isinstance(ctrl, dict) and ctrl.get("ref"):
-                ctrl["ref"] = f"{version}:{ctrl['ref']}"
-        # Also update toolkit ref_map with versioned keys
-        if hasattr(self.toolkit, '_semantic_ref_map'):
-            old_map = dict(self.toolkit._semantic_ref_map)
-            new_map = {}
-            for k, v in old_map.items():
-                new_map[f"{version}:{k}"] = v
-                new_map[k] = v  # keep unversioned for backward compat
-            self.toolkit._semantic_ref_map = new_map
-
-        observation = PageObservation(
-            snapshot=snapshot,
-            a11y_elements=a11y_elements,
-            page_content=page_content,
-            vision_description=vision_description,
-            snapshot_version=self._snapshot_version,
-            timestamp=time.time(),
-            headings=headings,
-        )
-        self._last_observation = observation
+        self._sync_state_to_layers()
+        observation = await self.perception.observe(self._get_semantic_snapshot)
+        self._sync_perception_state()
         return observation
 
     def _compute_snapshot_hash(self, snapshot: Dict[str, Any]) -> str:
-        """Hash of url + element count + first 5 element names for cache invalidation."""
-        url = str(snapshot.get("url", "") or "")
-        elements = snapshot.get("elements") or []
-        elem_count = len(elements)
-        first_names = "|".join(
-            str(e.get("text", "") or "")[:30]
-            for e in elements[:5]
-            if isinstance(e, dict)
-        )
-        raw = f"{url}|{elem_count}|{first_names}"
-        return hashlib.md5(raw.encode("utf-8", errors="ignore")).hexdigest()
+        """Delegates to perception layer."""
+        return self.perception.compute_snapshot_hash(snapshot)
 
     def _merge_a11y_into_snapshot(
         self, snapshot: Dict[str, Any], a11y_elements: List[AccessibleElement]
     ) -> None:
-        """
-        Enrich snapshot with a11y elements. If a11y extraction found elements,
-        use them as primary (they have better roles/names), keeping JS selectors.
-        """
-        if not a11y_elements:
-            return
-
-        # Build mapping from JS elements for selector fallback
-        js_elements = snapshot.get("elements") or []
-        js_by_selector: Dict[str, Dict] = {}
-        for el in js_elements:
-            sel = str(el.get("selector", "") or "")
-            if sel:
-                js_by_selector[sel] = el
-
-        # Convert a11y elements to snapshot element format
-        merged_elements: List[Dict[str, Any]] = []
-        for idx, ae in enumerate(a11y_elements[:80]):
-            # Try to find matching JS element by selector for bbox/href
-            js_match = js_by_selector.get(ae.selector, {})
-            merged_elements.append({
-                "ref": ae.ref,
-                "role": ae.role,
-                "tag": ae.tag or js_match.get("tag", ""),
-                "type": ae.role,
-                "text": ae.name,
-                "href": ae.attributes.get("href", "") or js_match.get("href", ""),
-                "value": ae.attributes.get("value", "") or js_match.get("value", ""),
-                "label": ae.name,
-                "placeholder": ae.attributes.get("placeholder", "") or js_match.get("placeholder", ""),
-                "selector": ae.selector or js_match.get("selector", ""),
-                "visible": ae.is_visible,
-                "enabled": True,
-                "region": ae.region or js_match.get("region", "body"),
-                "parent_ref": ae.parent_ref,
-                "bbox": ae.bbox or js_match.get("bbox", {}),
-            })
-
-        # Only replace if we got a reasonable count
-        if len(merged_elements) >= max(len(js_elements) // 3, 3):
-            snapshot["elements"] = merged_elements
-        snapshot["a11y_element_count"] = len(a11y_elements)
+        """Delegates to perception layer."""
+        self.perception.merge_a11y_into_snapshot(snapshot, a11y_elements)
 
     def _merge_perceiver_content(
         self, snapshot: Dict[str, Any], page_content: PageContent
     ) -> None:
-        """Enrich snapshot with perceiver's headings, text blocks, and summary."""
-        if page_content.main_headings:
-            snapshot["headings"] = [
-                {"level": f"h{min(i, 3)}", "text": h}
-                for i, h in enumerate(page_content.main_headings, 1)
-            ]
-
-        # Enrich visible_text_blocks
-        existing_blocks = snapshot.get("visible_text_blocks") or []
-        existing_texts = {str(b.get("text", "") or "")[:60] for b in existing_blocks if isinstance(b, dict)}
-        for block in page_content.text_blocks:
-            if block[:60] not in existing_texts:
-                existing_blocks.append({"kind": "p", "text": block[:320], "selector": "", "parent_ref": ""})
-                existing_texts.add(block[:60])
-        snapshot["visible_text_blocks"] = existing_blocks[:20]
-
-        if page_content.page_summary:
-            snapshot["page_summary"] = page_content.page_summary
+        """Delegates to perception layer."""
+        self.perception.merge_perceiver_content(snapshot, page_content)
 
     def _compute_complexity_score(
         self, snapshot: Dict[str, Any], a11y_elements: List[AccessibleElement]
     ) -> float:
-        """Ratio of unnamed/ambiguous elements — high score means poor perception."""
-        elements = a11y_elements or []
-        if not elements:
-            elements_data = snapshot.get("elements") or []
-            if not elements_data:
-                return 1.0
-            unnamed = sum(1 for e in elements_data if not str(e.get("text", "") or "").strip())
-            return unnamed / max(len(elements_data), 1)
-        unnamed = sum(1 for e in elements if not e.name.strip())
-        return unnamed / max(len(elements), 1)
+        """Delegates to perception layer."""
+        return self.perception.compute_complexity_score(snapshot, a11y_elements)
 
     async def _get_vision_description(self, page) -> str:
-        """Take screenshot and describe via vision model."""
-        if not self._vision_llm and not self._vision_llm_attempted:
-            self._vision_llm_attempted = True
-            try:
-                self._vision_llm = LLMClient.for_vision()
-            except Exception:
-                if not self._vision_llm_unavailable_logged:
-                    log_warning("vision LLM unavailable for perception")
-                    self._vision_llm_unavailable_logged = True
-                return ""
-
-        if not self._vision_llm:
-            return ""
-
-        try:
-            screenshot_bytes = await page.screenshot(type="jpeg", quality=50, full_page=False)
-            response = self._vision_llm.chat_with_image(
-                text="Describe this webpage briefly: layout, main content area, key interactive elements, any modals/overlays. Be concise (2-3 sentences).",
-                image=screenshot_bytes,
-                temperature=0.2,
-                max_tokens=300,
-            )
-            content = getattr(response, "content", None)
-            if isinstance(content, str):
-                return content.strip()[:500]
-            return str(content or "").strip()[:500]
-        except Exception as exc:
-            log_warning(f"vision description failed: {exc}")
-            return ""
+        """Delegates to perception layer."""
+        self._sync_state_to_layers()
+        result = await self.perception.get_vision_description(page)
+        self._sync_perception_state()
+        return result
 
     async def _extract_data_with_vision(
         self,
@@ -1436,54 +1240,14 @@ class BrowserAgent:
         task_intent: TaskIntent,
         snapshot: Optional[Dict[str, Any]] = None,
     ) -> List[Dict[str, str]]:
-        """截图 → 视觉模型 → 按任务目标提取结构化数据（DOM 提取失败时的回退）"""
-        vision_llm = self._get_vision_llm()
-        if vision_llm is None:
-            return []
-
-        screenshot_r = await self.toolkit.screenshot(full_page=False)
-        if not screenshot_r.success or not screenshot_r.data:
-            return []
-
-        query = task_intent.query or self._derive_primary_query(task)
-        fields = ", ".join(f"{k}: {v}" for k, v in task_intent.fields.items()) if task_intent.fields else "auto-detect"
-        page_type = str((snapshot or {}).get("page_type", "unknown"))
-
-        prompt_template = get_prompt("browser_vision_data_extraction", "")
-        if prompt_template:
-            prompt = prompt_template.format(task=task, query=query, fields=fields, page_type=page_type)
-        else:
-            prompt = (
-                f"Extract data from this webpage screenshot.\n"
-                f"Task: {task}\nQuery: {query}\nFields: {fields}\n"
-                f"Return JSON: {{\"found\": true/false, \"items\": [{{...}}]}}"
-            )
-
-        try:
-            response = await asyncio.to_thread(
-                vision_llm.chat_with_image, prompt, screenshot_r.data, 0.2, 2000,
-            )
-            web_debug_recorder.write_text("vision_data_extraction_prompt", prompt)
-            web_debug_recorder.write_text("vision_data_extraction_response", response.content)
-
-            parsed = vision_llm.parse_json_response(response)
-            if not parsed.get("found"):
-                return []
-            items = parsed.get("items") or parsed.get("data") or []
-            if isinstance(items, dict):
-                items = [items]
-            if not isinstance(items, list):
-                return []
-            # 确保每个 item 的值都是字符串
-            result = []
-            for item in items:
-                if isinstance(item, dict):
-                    result.append({str(k): str(v) for k, v in item.items()})
-            log_agent_action(self.name, f"视觉提取成功: {len(result)} 条数据")
-            return result
-        except Exception as exc:
-            log_warning(f"vision data extraction failed: {exc}")
-            return []
+        """Screenshot -> vision model -> extract structured data. Delegates to perception layer."""
+        self._sync_state_to_layers()
+        result = await self.perception.extract_data_with_vision(
+            task, task_intent, snapshot,
+            derive_primary_query_fn=self._derive_primary_query,
+        )
+        self._sync_perception_state()
+        return result
 
     async def _vision_check_page_relevance(
         self,
@@ -1491,95 +1255,21 @@ class BrowserAgent:
         query: str,
         snapshot: Optional[Dict[str, Any]] = None,
     ) -> Tuple[bool, str]:
-        """截图 → 视觉模型 → 判断当前页面是否包含任务所需信息"""
-        vision_llm = self._get_vision_llm()
-        if vision_llm is None:
-            return (False, "")
-
-        screenshot_r = await self.toolkit.screenshot(full_page=False)
-        if not screenshot_r.success or not screenshot_r.data:
-            return (False, "")
-
-        prompt_template = get_prompt("browser_vision_relevance_check", "")
-        if prompt_template:
-            prompt = prompt_template.format(task=task, query=query or task)
-        else:
-            prompt = (
-                f"Does this webpage contain information relevant to: '{query or task}'?\n"
-                f"Return JSON: {{\"relevant\": true/false, \"confidence\": 0.0-1.0, \"summary\": \"...\"}}"
-            )
-
-        try:
-            response = await asyncio.to_thread(
-                vision_llm.chat_with_image, prompt, screenshot_r.data, 0.2, 500,
-            )
-            web_debug_recorder.write_text("vision_relevance_prompt", prompt)
-            web_debug_recorder.write_text("vision_relevance_response", response.content)
-
-            parsed = vision_llm.parse_json_response(response)
-            relevant = bool(parsed.get("relevant", False))
-            confidence = float(parsed.get("confidence", 0.0))
-            summary = str(parsed.get("summary", ""))
-            if relevant and confidence >= 0.5:
-                log_agent_action(self.name, f"视觉判定页面相关: {summary[:80]}")
-                return (True, summary)
-            return (False, summary)
-        except Exception as exc:
-            log_warning(f"vision relevance check failed: {exc}")
-            return (False, "")
+        """Screenshot -> vision model -> check page relevance. Delegates to perception layer."""
+        self._sync_state_to_layers()
+        result = await self.perception.check_relevance(task, query, snapshot)
+        self._sync_perception_state()
+        return result
 
     async def _capture_final_screenshot(self) -> Optional[bytes]:
-        """捕获最终页面截图，供 Critic 视觉验证使用"""
-        try:
-            sc = await self.toolkit.screenshot(full_page=False)
-            return sc.data if sc.success else None
-        except Exception:
-            return None
+        """Capture final page screenshot. Delegates to perception layer."""
+        return await self.perception.capture_screenshot()
 
     def _validate_action(
         self, action: Optional[BrowserAction], observation: PageObservation
     ) -> Optional[BrowserAction]:
-        """Lightweight validation: does target_ref exist? Is selector valid? Auto-fix stale versioned refs."""
-        if action is None:
-            return None
-        if action.action_type in {ActionType.DONE, ActionType.FAILED, ActionType.WAIT, ActionType.SCROLL,
-                                   ActionType.PRESS_KEY, ActionType.NAVIGATE, ActionType.EXTRACT}:
-            return action
-
-        snapshot = observation.snapshot
-        elements = snapshot.get("elements") or []
-        ref_set = {str(e.get("ref", "") or "") for e in elements if isinstance(e, dict)}
-        for card in snapshot.get("cards") or []:
-            ref_set.add(str(card.get("ref", "") or ""))
-            ref_set.add(str(card.get("target_ref", "") or ""))
-        for ctrl in snapshot.get("controls") or []:
-            ref_set.add(str(ctrl.get("ref", "") or ""))
-        ref_set.discard("")
-
-        if action.target_ref and action.target_ref not in ref_set:
-            # Stale versioned ref? Try stripping version prefix and re-matching
-            ref = action.target_ref
-            bare_ref = ref.split(":", 1)[1] if ":" in ref else ref
-            current_version = observation.snapshot_version
-
-            # Try current version prefix
-            versioned = f"{current_version}:{bare_ref}"
-            if versioned in ref_set:
-                log_warning(f"resolved stale ref '{ref}' → '{versioned}'")
-                action.target_ref = versioned
-            else:
-                # Try name-based matching as last resort
-                log_warning(f"action target_ref '{ref}' not in snapshot, attempting name match")
-                desc_lower = (action.description or "").lower()
-                for elem in elements:
-                    if isinstance(elem, dict):
-                        text = str(elem.get("text", "") or "").lower()
-                        if text and desc_lower and text[:20] in desc_lower:
-                            action.target_ref = str(elem.get("ref", "") or "")
-                            action.target_selector = str(elem.get("selector", "") or "")
-                            break
-
-        return action
+        """Lightweight validation. Delegates to the decision layer (Layer 2)."""
+        return self.decision.validate_action(action, observation)
 
     def _format_headings_for_llm(self, snapshot: Dict[str, Any]) -> str:
         """Format headings from snapshot for LLM prompt."""
@@ -1619,79 +1309,20 @@ class BrowserAgent:
         return "\n".join(lines) if lines else "(no regions)"
 
     def _elements_from_snapshot(self, snapshot: Dict[str, Any]) -> List[PageElement]:
-        elements: List[PageElement] = []
-        for index, item in enumerate((snapshot.get("elements", []) or [])[:60]):
-            if not isinstance(item, dict):
-                continue
-            elements.append(
-                PageElement(
-                    index=int(item.get("index", index)),
-                    tag=str(item.get("tag", "") or ""),
-                    text=str(item.get("text", "") or ""),
-                    element_type=str(item.get("type", item.get("role", "")) or ""),
-                    selector=str(item.get("selector", "") or ""),
-                    ref=str(item.get("ref", "") or ""),
-                    role=str(item.get("role", "") or ""),
-                    attributes={
-                        "href": str(item.get("href", "") or ""),
-                        "value": str(item.get("value", "") or ""),
-                        "placeholder": str(item.get("placeholder", "") or ""),
-                        "labelText": str(item.get("label", "") or ""),
-                        "ariaLabel": str(item.get("label", "") or ""),
-                    },
-                    is_visible=bool(item.get("visible", True)),
-                    is_clickable=bool(item.get("enabled", True)),
-                    parent_ref=str(item.get("parent_ref", "") or ""),
-                    region=str(item.get("region", "") or ""),
-                )
-            )
-        return elements
+        """Convert snapshot to PageElement list. Delegates to perception layer."""
+        return self.perception.elements_from_snapshot(snapshot)
 
     def _cards_from_snapshot(self, snapshot: Optional[Dict[str, Any]]) -> List[SearchResultCard]:
-        cards: List[SearchResultCard] = []
-        for item in (snapshot or {}).get("cards", []) or []:
-            if not isinstance(item, dict):
-                continue
-            cards.append(
-                SearchResultCard(
-                    ref=str(item.get("ref", "") or ""),
-                    title=str(item.get("title", "") or ""),
-                    target_ref=str(item.get("target_ref", "") or ""),
-                    target_selector=str(item.get("target_selector", "") or ""),
-                    link=str(item.get("link", "") or ""),
-                    raw_link=str(item.get("raw_link", "") or ""),
-                    target_url=str(item.get("target_url", "") or ""),
-                    snippet=str(item.get("snippet", "") or ""),
-                    source=str(item.get("source", "") or ""),
-                    host=str(item.get("host", "") or ""),
-                    date=str(item.get("date", "") or ""),
-                    rank=int(item.get("rank", 0) or 0),
-                )
-            )
-        return cards
+        """Convert snapshot to SearchResultCard list. Delegates to perception layer."""
+        return self.perception.cards_from_snapshot(snapshot)
 
     def _collections_from_snapshot(self, snapshot: Optional[Dict[str, Any]]) -> List[Dict[str, Any]]:
-        collections: List[Dict[str, Any]] = []
-        for item in (snapshot or {}).get("collections", []) or []:
-            if not isinstance(item, dict):
-                continue
-            collections.append(
-                {
-                    "ref": str(item.get("ref", "") or ""),
-                    "kind": str(item.get("kind", "") or ""),
-                    "item_count": int(item.get("item_count", 0) or 0),
-                    "sample_items": [
-                        str(sample or "")
-                        for sample in (item.get("sample_items", []) or [])[:5]
-                        if str(sample or "").strip()
-                    ],
-                }
-            )
-        return collections
+        """Convert snapshot to collections list. Delegates to perception layer."""
+        return self.perception.collections_from_snapshot(snapshot)
 
     def _get_snapshot_affordances(self, snapshot: Optional[Dict[str, Any]]) -> Dict[str, Any]:
-        affordances = (snapshot or {}).get("affordances", {}) or {}
-        return affordances if isinstance(affordances, dict) else {}
+        """Get snapshot affordances. Delegates to perception layer."""
+        return self.perception.get_snapshot_affordances(snapshot)
 
     def _extract_target_result_count(self, task: str) -> int:
         match = re.search(
@@ -3404,18 +3035,10 @@ class BrowserAgent:
         return submit_control is not None
 
     async def _bootstrap_search_results(self, query: str) -> bool:
-        if not query:
-            return False
-        for profile, search_url in build_direct_search_urls(query):
-            result = await self.toolkit.goto(search_url, timeout=30000)
-            if not result.success:
-                continue
-            await self._wait_for_page_ready()
-            ready = await self._wait_for_search_results_ready(search_url)
-            if ready:
-                log_agent_action(self.name, f"bootstrap_search:{profile.name}", query[:120])
-                return True
-        return False
+        """Bootstrap search results. Delegates to execution layer (Layer 3)."""
+        return await self.execution.bootstrap_search_results(
+            query, wait_ready_fn=self._wait_for_search_results_ready
+        )
 
     def _search_input_matches_query(self, elements: List[PageElement], query: str) -> bool:
         if not query:
@@ -3724,19 +3347,11 @@ class BrowserAgent:
         return None
 
     def _get_vision_llm(self) -> Optional[LLMClient]:
-        if self._vision_llm is not None:
-            return self._vision_llm
-        if self._vision_llm_attempted:
-            return None
-        self._vision_llm_attempted = True
-        try:
-            self._vision_llm = LLMClient.for_vision()
-            return self._vision_llm
-        except Exception as exc:
-            if not self._vision_llm_unavailable_logged:
-                log_warning(f"vision llm unavailable: {exc}")
-                self._vision_llm_unavailable_logged = True
-            return None
+        """Get vision LLM. Delegates to perception layer (Layer 1)."""
+        self._sync_state_to_layers()
+        result = self.perception.get_vision_llm()
+        self._sync_perception_state()
+        return result
 
     async def _decide_action_with_vision(
         self,
@@ -4575,49 +4190,9 @@ class BrowserAgent:
     # ── click/input fallback strategies (Agent-level, calls toolkit) ──
 
     async def _try_click_with_fallbacks(self, selector: str, action: Optional[BrowserAction] = None) -> bool:
-        tk = self.toolkit
-        strategies: List[Tuple[str, Any]] = []
-        if action and action.target_ref:
-            strategies.append((f"ref:{action.target_ref}", lambda r=action.target_ref: tk.click_ref(r)))
-        if selector:
-            strategies.append(("direct_click", lambda: tk.click(selector)))
-        # semantic strategies from cache
-        element = self._get_cached_element_by_ref(action.target_ref) if action and action.target_ref else None
-        if element is None:
-            element = self._get_cached_element_by_selector(selector)
-        if element:
-            attrs = element.attributes or {}
-            labels = [element.text, attrs.get("labelText", ""), attrs.get("ariaLabel", ""), attrs.get("title", "")]
-            labels = [l.strip()[:60] for l in labels if l and l.strip()]
-            labels = list(dict.fromkeys(labels))
-            role = "link" if element.element_type == "link" else "button"
-            for label in labels:
-                strategies.append((f"role:{role}:{label}", lambda r=role, l=label: tk.click_by_role(r, l)))
-            for label in [attrs.get("labelText", ""), attrs.get("ariaLabel", "")]:
-                if label and label.strip():
-                    strategies.append((f"label:{label[:30]}", lambda l=label.strip()[:60]: tk.click_by_label(l)))
-        if selector:
-            strategies.append(("locator_click", lambda: tk.locator_click(selector)))
-        if action and action.fallback_selector:
-            fb = action.fallback_selector
-            strategies.append((f"fallback:{fb}", lambda s=fb: tk.click(s)))
-        if selector:
-            strategies.append(("force_click", lambda: tk.force_click(selector)))
-        if action and action.use_keyboard_fallback and action.keyboard_key:
-            strategies.append((f"keyboard:{action.keyboard_key}", lambda k=action.keyboard_key: tk.press_key(k)))
-
-        for name, handler in strategies:
-            try:
-                r = await handler()
-                if isinstance(r, ToolkitResult) and r.success:
-                    log_agent_action(self.name, "click", name)
-                    return True
-                elif not isinstance(r, ToolkitResult):
-                    log_agent_action(self.name, "click", name)
-                    return True
-            except Exception:
-                continue
-        return False
+        """Click with fallback strategies. Delegates to execution layer (Layer 3)."""
+        self._sync_state_to_layers()
+        return await self.execution.try_click_with_fallbacks(selector, action)
 
     async def _try_input_with_fallbacks(
         self,
@@ -4625,229 +4200,36 @@ class BrowserAgent:
         value: str,
         action: Optional[BrowserAction] = None,
     ) -> bool:
-        tk = self.toolkit
-        strategies: List[Tuple[str, Any]] = []
-        if action and action.target_ref:
-            strategies.append((f"ref:{action.target_ref}", lambda r=action.target_ref: tk.input_ref(r, value)))
-        if selector:
-            strategies.append(("direct_fill", lambda: tk.input_text(selector, value)))
-        element = self._get_cached_element_by_ref(action.target_ref) if action and action.target_ref else None
-        if element is None and selector:
-            element = self._get_cached_element_by_selector(selector)
-        if element:
-            attrs = element.attributes or {}
-            if attrs.get("placeholder"):
-                ph = attrs["placeholder"].strip()[:60]
-                strategies.append((f"placeholder:{ph}", lambda p=ph: tk.fill_by_placeholder(p, value)))
-            for label in [attrs.get("labelText", ""), attrs.get("ariaLabel", "")]:
-                if label and label.strip():
-                    strategies.append((f"label:{label[:30]}", lambda l=label.strip()[:60]: tk.fill_by_label(l, value)))
-        if selector:
-            async def _clear_then_type(s=selector):
-                await tk.clear_input(s)
-                return await tk.type_text(s, value, delay=20)
-            strategies.append(("direct_type", _clear_then_type))
-
-        # 焦点元素策略：如果前面都失败了，尝试直接往当前焦点元素输入
-        # 对于刚用快捷键打开的搜索弹窗等场景非常有效
-        async def _try_focused_input():
-            focused_r = await tk.evaluate_js(
-                r"""() => {
-                    const el = document.activeElement;
-                    if (!el || el === document.body) return null;
-                    const tag = el.tagName.toLowerCase();
-                    if (!['input', 'textarea'].includes(tag) && el.contentEditable !== 'true') return null;
-                    if (el.id) return '#' + el.id;
-                    const name = el.getAttribute('name');
-                    if (name) return tag + '[name="' + name + '"]';
-                    const ph = el.getAttribute('placeholder');
-                    if (ph) return tag + '[placeholder="' + ph + '"]';
-                    return ':focus';
-                }"""
-            )
-            if focused_r.success and focused_r.data:
-                focused_selector = str(focused_r.data)
-                fill_r = await tk.input_text(focused_selector, value)
-                if isinstance(fill_r, ToolkitResult) and fill_r.success:
-                    return fill_r
-                # fill 失败时用 type，但先清空避免追加
-                await tk.clear_input(focused_selector)
-                type_r = await tk.type_text(focused_selector, value, delay=20)
-                return type_r
-            return ToolkitResult(success=False, error="no focused input")
-        strategies.append(("focused_input", _try_focused_input))
-
-        # 最终策略：直接用 keyboard.type 输入（不指定目标元素）
-        async def _try_keyboard_type():
-            return await tk.evaluate_js(
-                r"""(text) => {
-                    const el = document.activeElement;
-                    if (el && el !== document.body && (el.tagName === 'INPUT' || el.tagName === 'TEXTAREA' || el.contentEditable === 'true')) {
-                        // 使用 InputEvent 模拟输入
-                        el.value = text;
-                        el.dispatchEvent(new Event('input', { bubbles: true }));
-                        el.dispatchEvent(new Event('change', { bubbles: true }));
-                        return true;
-                    }
-                    return false;
-                }""",
-                value,
-            )
-        strategies.append(("keyboard_type_js", _try_keyboard_type))
-
-        for name, handler in strategies:
-            try:
-                r = await handler()
-                if isinstance(r, ToolkitResult) and r.success:
-                    # 对 keyboard_type_js，还需检查返回值
-                    if name == "keyboard_type_js" and r.data is False:
-                        continue
-                    log_agent_action(self.name, "input", name)
-                    return True
-            except Exception:
-                continue
-        return False
+        """Input with fallback strategies. Delegates to execution layer (Layer 3)."""
+        self._sync_state_to_layers()
+        return await self.execution.try_input_with_fallbacks(selector, value, action)
 
     async def _fill_form(self, form_data_json: str) -> bool:
-        try:
-            form_data = json.loads(form_data_json) if isinstance(form_data_json, str) else form_data_json
-        except json.JSONDecodeError:
-            log_error("invalid form payload")
-            return False
-        if not isinstance(form_data, dict) or not form_data:
-            return False
-
-        tk = self.toolkit
-        success_count = 0
-        for field_key, value in form_data.items():
-            # Support ref-based keys: if key looks like a ref (e.g. "el_3", "1:el_3"),
-            # resolve to selector first
-            selector = field_key
-            if field_key.startswith("el_") or field_key.startswith("ctl_") or ":" in field_key:
-                # Try to resolve ref to selector via toolkit
-                bare_ref = field_key.split(":", 1)[-1] if ":" in field_key else field_key
-                ref_info = tk.resolve_ref(field_key) or tk.resolve_ref(bare_ref)
-                if ref_info and ref_info.get("selector"):
-                    selector = ref_info["selector"]
-
-            try:
-                exists = await tk.element_exists(selector)
-                if exists.data:
-                    # detect element type via JS
-                    info = await tk.evaluate_js(
-                        "(sel) => { const el = document.querySelector(sel); if (!el) return {}; return {tag: el.tagName.toLowerCase(), type: (el.type||'').toLowerCase()}; }",
-                        selector,
-                    )
-                    tag = (info.data or {}).get("tag", "")
-                    input_type = (info.data or {}).get("type", "")
-                    if tag == "select":
-                        await tk.select_option(selector, str(value))
-                    elif input_type in {"checkbox", "radio"}:
-                        should_check = str(value).lower() in {"true", "1", "yes", "on"}
-                        checked_r = await tk.evaluate_js("(sel) => document.querySelector(sel)?.checked", selector)
-                        if bool(checked_r.data) != should_check:
-                            await tk.click(selector)
-                    elif input_type == "file":
-                        await tk.upload_file(selector, str(value))
-                    else:
-                        if not await self._try_input_with_fallbacks(selector, str(value)):
-                            await tk.input_text(selector, str(value))
-                else:
-                    if not await self._try_input_with_fallbacks(selector, str(value)):
-                        continue
-                success_count += 1
-                await tk.human_delay(50, 120)
-            except Exception as exc:
-                log_warning(f"fill field failed for {selector}: {exc}")
-        return success_count > 0
+        """Fill form fields. Delegates to execution layer (Layer 3)."""
+        self._sync_state_to_layers()
+        return await self.execution.fill_form(form_data_json)
 
     # ── thin _execute_action mapping ───────────────────────────
 
     async def _execute_action(self, action: BrowserAction) -> bool:
-        # Invalidate snapshot cache on state-changing actions
-        if action.action_type in {ActionType.CLICK, ActionType.INPUT, ActionType.NAVIGATE,
-                                   ActionType.PRESS_KEY, ActionType.FILL_FORM, ActionType.SELECT}:
+        """Execute a browser action. Delegates to the execution layer (Layer 3)."""
+        self._sync_state_to_layers()
+
+        def _invalidate_perception_cache():
             self._last_snapshot_hash = ""
             self._last_observation = None
+            self.perception.invalidate_cache()
 
-        tk = self.toolkit
-        if action.action_type == ActionType.CLICK:
-            return await self._try_click_with_fallbacks(action.target_selector, action)
-        if action.action_type == ActionType.INPUT:
-            success = await self._try_input_with_fallbacks(action.target_selector, action.value, action)
-            if success and action.use_keyboard_fallback and action.keyboard_key:
-                await tk.press_key(action.keyboard_key)
-            return success
-        if action.action_type == ActionType.FILL_FORM:
-            return await self._fill_form(action.value)
-        if action.action_type == ActionType.SELECT:
-            r = await tk.select_option(action.target_selector, action.value)
-            return r.success
-        if action.action_type == ActionType.SCROLL:
-            r = await tk.scroll_down(int(action.value or 800))
-            return r.success
-        if action.action_type == ActionType.WAIT:
-            await asyncio.sleep(max(float(action.value or 1), 0.2))
-            return True
-        if action.action_type == ActionType.NAVIGATE:
-            await tk.exit_iframe()
-            r = await tk.goto(action.value, timeout=20000)
-            return r.success
-        if action.action_type == ActionType.PRESS_KEY:
-            r = await tk.press_key(action.value or action.keyboard_key or "Enter")
-            return r.success
-        if action.action_type == ActionType.CONFIRM:
-            return not settings.REQUIRE_HUMAN_CONFIRM
-        if action.action_type == ActionType.SWITCH_TAB:
-            idx = -1 if action.value == "last" else int(action.value or 0)
-            r = await tk.switch_tab(idx)
-            return r.success
-        if action.action_type == ActionType.CLOSE_TAB:
-            r = await tk.close_tab()
-            return r.success
-        if action.action_type == ActionType.DOWNLOAD:
-            if not action.target_selector:
-                return False
-            r = await tk.expect_download(action.target_selector, save_path=action.value or "")
-            if r.success:
-                return True
-            return await self._try_click_with_fallbacks(action.target_selector, action)
-        if action.action_type == ActionType.SWITCH_IFRAME:
-            r = await tk.switch_to_iframe(action.target_selector)
-            return r.success
-        if action.action_type == ActionType.EXIT_IFRAME:
-            await tk.exit_iframe()
-            return True
-        if action.action_type == ActionType.UPLOAD_FILE:
-            r = await tk.upload_file(action.target_selector, action.value)
-            return r.success
-        if action.action_type == ActionType.DONE:
-            return True
-        return False
+        result = await self.execution.execute(action, invalidate_cache_fn=_invalidate_perception_cache)
+        # Sync element cache back
+        self._element_cache = self.execution.element_cache
+        return result
 
-    # ── verification (Agent-level, calls toolkit) ────────────
+    # ── verification (delegates to execution layer) ──────────
 
     async def _snapshot_page_state(self) -> Dict[str, Any]:
-        url = await self._get_current_url_value()
-        title = await self._get_title_value()
-        html = await self._get_page_html_value()
-        semantic_snapshot = await self._get_semantic_snapshot()
-        return {
-            "url": url,
-            "title": title,
-            "content_len": len(html),
-            "content_hash": hashlib.sha1(html[:12000].encode("utf-8", errors="ignore")).hexdigest() if html else "",
-            "page_type": str(semantic_snapshot.get("page_type", "") or ""),
-            "page_stage": str(semantic_snapshot.get("page_stage", "") or ""),
-            "card_count": len(semantic_snapshot.get("cards", []) or []),
-            "item_count": self._get_snapshot_item_count(semantic_snapshot),
-            "has_modal": self._snapshot_has_actionable_modal(semantic_snapshot),
-            "has_pagination": bool(self._get_snapshot_affordances(semantic_snapshot).get("has_pagination")),
-            "has_load_more": bool(self._get_snapshot_affordances(semantic_snapshot).get("has_load_more")),
-            "blocked_signals": self._get_snapshot_blocked_signals(semantic_snapshot),
-            "main_text_len": len(self._get_snapshot_main_text(semantic_snapshot)),
-            "visible_text_block_count": len(self._get_snapshot_visible_text_blocks(semantic_snapshot)),
-        }
+        """Capture lightweight page state for before/after comparison. Delegates to execution layer."""
+        return await self.execution.snapshot_page_state(self._get_semantic_snapshot)
 
     def _action_must_change_state(self, action: BrowserAction) -> bool:
         return action.action_type in {
@@ -4857,80 +4239,12 @@ class BrowserAgent:
         }
 
     async def _verify_action_effect(self, before: Dict[str, Any], action: BrowserAction) -> bool:
-        if not self._action_must_change_state(action):
-            return True
-        # 对可能触发导航的操作（如按 Enter），先等待导航完成
-        if action.action_type == ActionType.PRESS_KEY and action.keyboard_key in ("Enter", "Return"):
-            try:
-                await asyncio.sleep(1.5)
-                await self._wait_for_page_ready()
-            except Exception:
-                pass
-        after = await self._snapshot_page_state()
-        result = False
-        # 1) 优先检查：期望的页面类型或文本匹配
-        if action.expected_page_type and after.get("page_type") == action.expected_page_type:
-            result = True
-        elif action.expected_text:
-            text_wait = await self.toolkit.wait_for_text_appear(action.expected_text, timeout=3000)
-            if text_wait.success:
-                result = True
-        # 2) 回退：即使期望指标未匹配，也检测通用页面变化
-        if not result:
-            if after["url"] != before["url"]:
-                result = True
-            elif after["title"] != before["title"]:
-                result = True
-            elif before.get("page_type") and after.get("page_type") and before.get("page_type") != after.get("page_type"):
-                result = True
-            elif int(after.get("card_count", 0) or 0) > int(before.get("card_count", 0) or 0):
-                result = True
-            elif int(after.get("item_count", 0) or 0) > int(before.get("item_count", 0) or 0):
-                result = True
-            elif bool(before.get("has_modal")) and not bool(after.get("has_modal")):
-                result = True
-            elif abs(after["content_len"] - before["content_len"]) > 80:
-                result = True
-            elif after.get("content_hash") and after.get("content_hash") != before.get("content_hash"):
-                result = True
-        # 3) 特定动作类型验证
-        if not result:
-            if action.action_type == ActionType.INPUT:
-                if action.target_ref:
-                    ref_info = self.toolkit.resolve_ref(action.target_ref)
-                    selector = str(ref_info.get("selector", "") or "")
-                else:
-                    selector = action.target_selector
-                if selector:
-                    r = await self.toolkit.get_input_value(selector)
-                    if r.success:
-                        result = self._normalize_text(r.data) == self._normalize_text(action.value)
-            elif action.action_type == ActionType.FILL_FORM:
-                result = await self._verify_form_values(action.value)
-        web_debug_recorder.write_json(
-            "browser_action_verification",
-            {
-                "before": before,
-                "after": after,
-                "action": self._action_to_debug_payload(action),
-                "result": result,
-            },
-        )
-        return result
+        """Verify action effect. Delegates to execution layer (Layer 3)."""
+        return await self.execution.verify_action_effect(before, action, self._get_semantic_snapshot)
 
     async def _verify_form_values(self, form_payload: str) -> bool:
-        try:
-            form_data = json.loads(form_payload) if isinstance(form_payload, str) else form_payload
-        except Exception:
-            return False
-        if not isinstance(form_data, dict) or not form_data:
-            return False
-        matched = 0
-        for selector, expected in form_data.items():
-            r = await self.toolkit.get_input_value(str(selector))
-            if r.success and self._normalize_text(r.data) == self._normalize_text(str(expected)):
-                matched += 1
-        return matched > 0
+        """Verify form values. Delegates to execution layer (Layer 3)."""
+        return await self.execution._verify_form_values(form_payload)
 
     async def _extract_search_results_data(self) -> List[Dict[str, str]]:
         current_url_r = await self.toolkit.get_current_url()
@@ -5081,7 +4395,7 @@ class BrowserAgent:
 
     # ── data extraction ────────────────────────────────────────
 
-    async def _maybe_extract_data(
+    async def _maybe_extract_data_legacy(
         self,
         *,
         prefer_content: bool = False,
@@ -5190,6 +4504,8 @@ class BrowserAgent:
         return r.data or [] if r.success else []
 
     async def _extract_data_for_intent(self, intent: Optional[TaskIntent] = None) -> List[Dict[str, str]]:
+        """Extract data based on task intent. Delegates to execution layer (Layer 3),
+        but falls back to snapshot-based search results first."""
         active_intent = intent or TaskIntent(intent_type="read", query="", confidence=0.0)
         current_url_r = await self.toolkit.get_current_url()
         current_url = current_url_r.data or ""
@@ -5198,7 +4514,7 @@ class BrowserAgent:
             if serp_data:
                 return serp_data
         prefer_links = active_intent.intent_type == "search" or self._is_search_engine_url(current_url)
-        return await self._maybe_extract_data(
+        return await self.execution.extract_data(
             prefer_content=not prefer_links,
             prefer_links=prefer_links,
         )
@@ -5424,11 +4740,8 @@ class BrowserAgent:
         return False
 
     async def _wait_for_page_ready(self) -> None:
-        tk = self.toolkit
-        await tk.wait_for_load("domcontentloaded", timeout=10000)
-        if not tk.fast_mode:
-            await tk.wait_for_load("networkidle", timeout=3000)
-        await tk.human_delay(40, 80)
+        """Wait for page to be ready. Delegates to execution layer (Layer 3)."""
+        await self.execution.wait_for_page_ready()
 
     def _snapshot_is_transient_loading(self, snapshot: Optional[Dict[str, Any]]) -> bool:
         active_snapshot = snapshot or {}

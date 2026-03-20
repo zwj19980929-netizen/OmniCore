@@ -1,13 +1,25 @@
 """
-OmniCore 核心常量定义
-统一管理枚举类型和常量，替代散落各处的魔法字符串
+OmniCore core constants.
+
+Centralized enum types and constants, replacing scattered magic strings.
 """
+from __future__ import annotations
+
+import logging
 from enum import Enum
-from typing import Dict, List
+from typing import Dict, FrozenSet, List
+
+logger = logging.getLogger(__name__)
 
 
 class TaskType(str, Enum):
-    """任务类型枚举"""
+    """Task type enum.
+
+    .. deprecated::
+        Prefer :class:`core.agent_registry.AgentRegistry` for checking valid
+        agent/task types.  This enum is kept for backward compatibility with
+        existing code that imports ``TaskType`` members directly.
+    """
     WEB_WORKER = "web_worker"
     BROWSER_AGENT = "browser_agent"
     FILE_WORKER = "file_worker"
@@ -128,13 +140,19 @@ HIGH_RISK_OPERATIONS = frozenset([
     "post_to_social",
 ])
 
-# 支持的任务类型集合
-SUPPORTED_TASK_TYPES = frozenset([
+# Supported task types - static fallback set.
+# Prefer ``get_supported_task_types()`` which merges this with AgentRegistry.
+_STATIC_TASK_TYPES: FrozenSet[str] = frozenset([
     TaskType.WEB_WORKER,
     TaskType.BROWSER_AGENT,
     TaskType.FILE_WORKER,
     TaskType.SYSTEM_WORKER,
 ])
+
+# Keep the original name as a module-level constant for backward compatibility.
+# Code that only reads this constant will still work; new code should call
+# ``get_supported_task_types()`` instead to include dynamically registered types.
+SUPPORTED_TASK_TYPES: FrozenSet[str] = _STATIC_TASK_TYPES
 
 # PAOD 常量
 MAX_STEPS_PER_TASK = 6
@@ -143,6 +161,44 @@ MAX_REPLAN_ATTEMPTS = 3
 
 # 浏览器重试次数
 BROWSER_RETRIES = 2
+
+
+def get_supported_task_types() -> FrozenSet[str]:
+    """Return the full set of supported task types.
+
+    Merges the static ``_STATIC_TASK_TYPES`` with any types registered in the
+    :class:`~core.agent_registry.AgentRegistry`.  Falls back gracefully to the
+    static set if the registry is not yet initialised.
+    """
+    try:
+        from core.agent_registry import AgentRegistry
+        registry = AgentRegistry.get_instance()
+        return _STATIC_TASK_TYPES | registry.get_supported_types()
+    except Exception:
+        return _STATIC_TASK_TYPES
+
+
+def is_valid_task_type(task_type: str) -> bool:
+    """Check whether *task_type* is a recognised task/agent type.
+
+    Checks the :class:`~core.agent_registry.AgentRegistry` first (which
+    includes dynamically registered plugin types), then falls back to the
+    static :class:`TaskType` enum for backward compatibility.
+    """
+    try:
+        from core.agent_registry import AgentRegistry
+        registry = AgentRegistry.get_instance()
+        if registry.is_valid_type(task_type):
+            return True
+    except Exception:
+        pass
+
+    # Fallback: check the legacy enum
+    try:
+        TaskType(task_type)
+        return True
+    except ValueError:
+        return False
 
 
 def classify_failure_type(error_msg: str) -> FailureType:

@@ -1,0 +1,48 @@
+# Agent type definitions - add new agents here instead of modifying code
+# Each agent type maps to an adapter class that handles execution
+
+agents:
+  web_worker:
+    adapter: "web_worker"
+    description: "HTTP-based web scraping, search, and content extraction"
+    description_zh: "基于 HTTP 的网页抓取、搜索与内容提取"
+    capabilities:
+      - web_scraping
+      - search
+      - content_extraction
+    max_parallelism: 3
+    risk_level: "low"
+
+  browser_agent:
+    adapter: "browser_agent"
+    description: "Interactive browser automation with vision capabilities"
+    description_zh: "支持视觉感知的交互式浏览器自动化"
+    capabilities:
+      - browser_interaction
+      - form_fill
+      - vision
+      - screenshot
+    max_parallelism: 1
+    risk_level: "medium"
+
+  file_worker:
+    adapter: "file_worker"
+    description: "File read/write, report generation, data export"
+    description_zh: "文件读写、报告生成、数据导出"
+    capabilities:
+      - file_read
+      - file_write
+      - report_generation
+    max_parallelism: 5
+    risk_level: "medium"
+
+  system_worker:
+    adapter: "system_worker"
+    description: "System command execution, screenshots, keyboard/mouse control"
+    description_zh: "系统命令执行、截图、键盘鼠标控制"
+    capabilities:
+      - system_command
+      - screenshot
+      - input_control
+    max_parallelism: 1
+    risk_level: "high"

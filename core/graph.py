@@ -19,6 +19,7 @@ from agents.critic import CriticAgent
 from agents.validator import Validator
 from core.llm import LLMClient
 from core.task_executor import collect_ready_task_indexes, run_ready_batch
+from core.stage_registry import register_stage, StageRegistry
 from utils.logger import log_agent_action, log_success, log_error, log_warning
 from utils.human_confirm import HumanConfirm
 from utils.prompt_manager import get_prompt
@@ -657,8 +658,9 @@ def _mark_confirmation_required_tasks_waiting(state: OmniCoreState) -> None:
         state["execution_status"] = WAITING_FOR_APPROVAL
 
 
+@register_stage(name="router", order=10, required=True)
 def route_node(state: OmniCoreState) -> OmniCoreState:
-    """路由节点：分析意图并拆解任务"""
+    """Route user request: analyze intent and decompose into sub-tasks."""
     if _should_skip_for_resume(state, "route"):
         return state
     state = router_agent.route(state)
@@ -666,8 +668,9 @@ def route_node(state: OmniCoreState) -> OmniCoreState:
     return state
 
 
+@register_stage(name="parallel_executor", order=30, required=True, depends_on=("router",))
 def parallel_executor_node(state: OmniCoreState) -> OmniCoreState:
-    """批次执行节点：执行当前批次所有 ready 任务。"""
+    """Batch executor: run all ready tasks in the current batch."""
     if _should_skip_for_resume(state, "parallel_executor"):
         return state
     if collect_ready_task_indexes(state):
@@ -1096,8 +1099,13 @@ def _legacy_replanner_node(state: OmniCoreState) -> OmniCoreState:
 
 
 # encoding-health: ignore-end
+@register_stage(
+    name="critic", order=50, required=False,
+    depends_on=("validator",),
+    skip_condition="state.get('validator_passed') == False",
+)
 def critic_node(state: OmniCoreState) -> OmniCoreState:
-    """Critic 审查节点"""
+    """Critic review node: evaluate task output quality."""
     if _should_skip_for_resume(state, "critic"):
         return state
     state = critic_agent.review(state)
@@ -1105,8 +1113,9 @@ def critic_node(state: OmniCoreState) -> OmniCoreState:
     return state
 
 
+@register_stage(name="validator", order=40, required=False, depends_on=("parallel_executor",))
 def validator_node(state: OmniCoreState) -> OmniCoreState:
-    """Validator 硬规则验证节点"""
+    """Hard-rule validation node."""
     if _should_skip_for_resume(state, "validator"):
         return state
     state = validator_agent.validate(state)
@@ -1159,6 +1168,11 @@ def _sync_policy_decisions_after_confirmation(
     state["policy_decisions"] = decisions
 
 
+@register_stage(
+    name="human_confirm", order=20, required=False,
+    depends_on=("router",),
+    skip_condition="not state.get('needs_human_confirm')",
+)
 def human_confirm_node_v2(state: OmniCoreState) -> OmniCoreState:
     """Deterministic-policy aware human confirmation node."""
     if _should_skip_for_resume(state, "human_confirm"):
@@ -1956,6 +1970,11 @@ def _synthesize_user_facing_answer(
     return delivery_summary
 
 
+@register_stage(
+    name="replanner", order=35, required=False,
+    depends_on=("parallel_executor",),
+    skip_condition="state.get('replan_count', 0) >= 3",
+)
 def replanner_node(state: OmniCoreState) -> OmniCoreState:
     """Reflect on failed execution and produce a better next plan."""
     if _should_skip_for_resume(state, "replanner"):
@@ -2133,6 +2152,7 @@ def replanner_node(state: OmniCoreState) -> OmniCoreState:
     return state
 
 
+@register_stage(name="finalize", order=90, required=True, depends_on=("router",))
 def finalize_node(state: OmniCoreState) -> OmniCoreState:
     """Build the final user-facing output from direct answers or executed tasks."""
     if _should_skip_for_resume(state, "finalize"):
@@ -2291,18 +2311,259 @@ def build_graph() -> StateGraph:
 
 
 def compile_graph():
-    """编译并返回可执行的图"""
+    """Compile and return the legacy hardcoded graph (backward compat)."""
     graph = build_graph()
     return graph.compile()
 
 
-# 全局编译好的图实例
+# ---------------------------------------------------------------------------
+# Adaptive Re-routing (Direction 7)
+# ---------------------------------------------------------------------------
+
+def should_skip_remaining_tasks(state: OmniCoreState) -> bool:
+    """Lightweight post-batch check: should remaining tasks be skipped?
+
+    Rules (no LLM call needed):
+    1. Single-answer task + answer already found -> skip remaining
+    2. Accumulated data meets or exceeds the requested item count -> skip remaining
+    3. All remaining tasks depend on a failed prerequisite -> stop
+    """
+    task_queue = state.get("task_queue") or []
+    if not task_queue:
+        return False
+
+    completed = [t for t in task_queue if str(t.get("status", "")) == "completed"]
+    pending = [t for t in task_queue if str(t.get("status", "")) == "pending"]
+
+    if not pending:
+        return False
+
+    # Rule 1: single-answer intent already answered
+    intent = str(state.get("current_intent", "") or "").lower()
+    single_answer_intents = ("direct_answer", "simple_query", "factual_question")
+    if any(tok in intent for tok in single_answer_intents):
+        if completed:
+            return True
+
+    # Rule 2: requested item count already met
+    user_input = str(state.get("user_input", "") or "")
+    requested_count = _extract_requested_item_count(user_input)
+    if requested_count > 0 and completed:
+        total_items = 0
+        for task in completed:
+            result = task.get("result")
+            if isinstance(result, dict):
+                for key in ("data", "items", "content"):
+                    payload = result.get(key)
+                    if isinstance(payload, list):
+                        total_items += len(payload)
+        if total_items >= requested_count:
+            return True
+
+    # Rule 3: all remaining tasks depend on a failed task
+    failed_ids = {
+        str(t.get("task_id", ""))
+        for t in task_queue
+        if str(t.get("status", "")) == "failed"
+    }
+    if failed_ids and pending:
+        all_blocked = True
+        for task in pending:
+            deps = list(task.get("depends_on") or [])
+            if not deps or not any(dep in failed_ids for dep in deps):
+                all_blocked = False
+                break
+        if all_blocked:
+            return True
+
+    return False
+
+
+def _apply_adaptive_skip(state: OmniCoreState) -> OmniCoreState:
+    """Mark remaining pending tasks as skipped when adaptive re-routing triggers."""
+    task_queue = state.get("task_queue") or []
+    skipped_count = 0
+    for task in task_queue:
+        if str(task.get("status", "")) == "pending":
+            task["status"] = "completed"
+            task.setdefault("result", {})
+            if isinstance(task["result"], dict):
+                task["result"]["skipped_by_adaptive_reroute"] = True
+            skipped_count += 1
+    if skipped_count:
+        log_agent_action(
+            "AdaptiveReroute",
+            f"Skipped {skipped_count} remaining task(s) — goal already satisfied",
+        )
+    return state
+
+
+# ---------------------------------------------------------------------------
+# Dynamic graph builder (Direction 1)
+# ---------------------------------------------------------------------------
+
+def build_graph_from_registry(registry: StageRegistry = None):
+    """Build the LangGraph DAG dynamically from the StageRegistry.
+
+    This replaces hardcoded graph construction with a data-driven approach.
+    Stages register themselves via the ``@register_stage`` decorator, and this
+    function wires them together based on order and dependency declarations.
+
+    The complex routing logic (executor self-loop, critic->replanner loop,
+    router->finalize shortcut) is preserved by reusing the same conditional
+    edge functions that the legacy ``build_graph()`` uses.
+    """
+    if registry is None:
+        registry = StageRegistry.get_instance()
+
+    graph = StateGraph(OmniCoreState)
+    stages = registry.get_ordered_stages()
+    stage_names = {s.name for s in stages}
+
+    if not stages:
+        raise RuntimeError("No stages registered in the StageRegistry")
+
+    # Add all registered nodes
+    for stage in stages:
+        graph.add_node(stage.name, stage.node_fn)
+
+    # Entry point is always the first stage by order (router)
+    graph.set_entry_point(stages[0].name)
+
+    # ---------------------------------------------------------------
+    # Wire conditional edges.
+    #
+    # We reuse the existing hand-written routing functions because they
+    # encode important domain logic (direct_answer shortcut, executor
+    # self-loop, critic->replanner retry, etc.).  The registry tells us
+    # which stages exist so we can gracefully degrade when a stage is
+    # removed.
+    # ---------------------------------------------------------------
+
+    def _safe_targets(*names):
+        """Filter target names to only those actually registered."""
+        return {n: n for n in names if n in stage_names or n == END}
+
+    # Router -> human_confirm | finalize
+    if "router" in stage_names:
+        targets = {}
+        if "human_confirm" in stage_names:
+            targets["human_confirm"] = "human_confirm"
+        if "finalize" in stage_names:
+            targets["finalize"] = "finalize"
+        if targets:
+            graph.add_conditional_edges("router", should_continue_after_route, targets)
+
+    # human_confirm -> parallel_executor | validator | END
+    if "human_confirm" in stage_names:
+        targets = {}
+        if "parallel_executor" in stage_names:
+            targets["parallel_executor"] = "parallel_executor"
+        if "validator" in stage_names:
+            targets["validator"] = "validator"
+        targets["end"] = END
+        graph.add_conditional_edges("human_confirm", get_first_executor, targets)
+
+    # parallel_executor -> parallel_executor (self-loop) | validator
+    if "parallel_executor" in stage_names:
+        targets = {}
+        targets["parallel_executor"] = "parallel_executor"
+        if "validator" in stage_names:
+            targets["validator"] = "validator"
+        graph.add_conditional_edges(
+            "parallel_executor",
+            _after_parallel_executor_adaptive,
+            targets,
+        )
+
+    # validator -> critic | replanner | finalize
+    if "validator" in stage_names:
+        targets = {}
+        if "critic" in stage_names:
+            targets["critic"] = "critic"
+        if "replanner" in stage_names:
+            targets["replanner"] = "replanner"
+        if "finalize" in stage_names:
+            targets["finalize"] = "finalize"
+        if targets:
+            graph.add_conditional_edges("validator", after_validator, targets)
+
+    # replanner -> parallel_executor | validator | END
+    if "replanner" in stage_names:
+        targets = {}
+        if "parallel_executor" in stage_names:
+            targets["parallel_executor"] = "parallel_executor"
+        if "validator" in stage_names:
+            targets["validator"] = "validator"
+        targets["end"] = END
+        graph.add_conditional_edges("replanner", get_first_executor, targets)
+
+    # critic -> finalize | replanner
+    if "critic" in stage_names:
+        targets = {}
+        if "finalize" in stage_names:
+            targets["finalize"] = "finalize"
+        if "replanner" in stage_names:
+            targets["replanner"] = "replanner"
+        if targets:
+            graph.add_conditional_edges("critic", should_retry_or_finish, targets)
+
+    # finalize -> END
+    if "finalize" in stage_names:
+        graph.add_edge("finalize", END)
+
+    return graph.compile()
+
+
+def _after_parallel_executor_adaptive(
+    state: OmniCoreState,
+) -> Literal["parallel_executor", "validator"]:
+    """Post-executor routing with adaptive re-routing check (Direction 7).
+
+    Before checking for more ready tasks, evaluate whether the execution
+    goal has already been met.  If so, skip remaining tasks and proceed
+    to validation.
+    """
+    if should_skip_remaining_tasks(state):
+        _apply_adaptive_skip(state)
+        return "validator"
+    return after_parallel_executor(state)
+
+
+# ---------------------------------------------------------------------------
+# Global compiled graph singleton
+# ---------------------------------------------------------------------------
+
+_USE_REGISTRY_GRAPH = True  # flip to False to fall back to legacy build_graph()
+
 omnicore_graph = None
 
 
-def get_graph():
-    """获取编译好的图（单例）"""
+def get_graph(use_registry: bool = None):
+    """Return the compiled graph singleton.
+
+    By default uses ``build_graph_from_registry()`` (Direction 1).
+    Pass ``use_registry=False`` or set module-level ``_USE_REGISTRY_GRAPH = False``
+    to fall back to the legacy ``build_graph()``.
+    """
     global omnicore_graph
-    if omnicore_graph is None:
+    if omnicore_graph is not None:
+        return omnicore_graph
+
+    should_use_registry = use_registry if use_registry is not None else _USE_REGISTRY_GRAPH
+
+    if should_use_registry:
+        try:
+            omnicore_graph = build_graph_from_registry()
+            log_agent_action(
+                "GraphBuilder",
+                "Built graph from StageRegistry",
+                f"{len(StageRegistry.get_instance().list_names())} stages",
+            )
+        except Exception as exc:
+            log_warning(f"Registry graph build failed, falling back to legacy: {exc}")
+            omnicore_graph = compile_graph()
+    else:
         omnicore_graph = compile_graph()
+
     return omnicore_graph
