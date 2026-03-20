@@ -5329,6 +5329,15 @@ class BrowserAgent:
                     "result": "success" if success else "failed",
                     "url": url_r.data or "",
                 })
+                from utils.structured_logger import get_structured_logger, LogContext
+                _sl = get_structured_logger()
+                with LogContext(agent="browser_agent", step_no=step_no):
+                    _sl.log_action(
+                        action_type=action.action_type.value,
+                        target=action.target_selector or "",
+                        confidence=action.confidence,
+                        result="success" if success else "failed",
+                    )
                 web_debug_recorder.write_json(
                     f"browser_step_{step_no}_result",
                     steps[-1],

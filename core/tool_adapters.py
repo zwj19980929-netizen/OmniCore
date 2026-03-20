@@ -30,15 +30,18 @@ _capability_detector = CapabilityDetector()
 
 
 class WorkerPool:
-    """Lazy singleton that owns long-lived worker instances."""
+    """Lazy singleton that owns long-lived worker instances.
+
+    Uses a factory pattern backed by the AgentRegistry. Known worker types
+    are created via explicit imports; unknown types fall back to registry
+    metadata for future plugin support.
+    """
 
     _instance: Optional["WorkerPool"] = None
     _lock = asyncio.Lock()
 
     def __init__(self):
-        self._web_worker = None
-        self._file_worker = None
-        self._system_worker = None
+        self._workers: Dict[str, Any] = {}
 
     @classmethod
     async def get_instance(cls) -> "WorkerPool":
@@ -48,29 +51,46 @@ class WorkerPool:
                     cls._instance = cls()
         return cls._instance
 
+    def get_worker(self, adapter_name: str):
+        """Factory method: lazy-load worker by adapter name."""
+        if adapter_name not in self._workers:
+            self._workers[adapter_name] = self._create_worker(adapter_name)
+        return self._workers[adapter_name]
+
+    def _create_worker(self, adapter_name: str):
+        """Create worker instance based on adapter name."""
+        if adapter_name == "web_worker":
+            from agents.web_worker import WebWorker
+            return WebWorker()
+        elif adapter_name == "file_worker":
+            from agents.file_worker import FileWorker
+            return FileWorker()
+        elif adapter_name == "system_worker":
+            from agents.system_worker import SystemWorker
+            return SystemWorker()
+        elif adapter_name == "browser_agent":
+            # browser_agent is stateful per-task; return None here,
+            # callers use create_browser_agent() instead.
+            return None
+        else:
+            from core.agent_registry import get_agent_registry
+            agent_def = get_agent_registry().get(adapter_name)
+            if agent_def:
+                log_warning(f"Plugin agent '{adapter_name}' detected but dynamic loading not yet implemented")
+            raise ValueError(f"Unknown adapter: {adapter_name}")
+
+    # Backward-compatible property accessors
     @property
     def web_worker(self):
-        if self._web_worker is None:
-            from agents.web_worker import WebWorker
-
-            self._web_worker = WebWorker()
-        return self._web_worker
+        return self.get_worker("web_worker")
 
     @property
     def file_worker(self):
-        if self._file_worker is None:
-            from agents.file_worker import FileWorker
-
-            self._file_worker = FileWorker()
-        return self._file_worker
+        return self.get_worker("file_worker")
 
     @property
     def system_worker(self):
-        if self._system_worker is None:
-            from agents.system_worker import SystemWorker
-
-            self._system_worker = SystemWorker()
-        return self._system_worker
+        return self.get_worker("system_worker")
 
     def create_browser_agent(self, llm_client=None, headless: bool = True, toolkit=None):
         from agents.browser_agent import BrowserAgent

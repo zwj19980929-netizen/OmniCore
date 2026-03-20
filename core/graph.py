@@ -21,6 +21,11 @@ from core.llm import LLMClient
 from core.task_executor import collect_ready_task_indexes, run_ready_batch
 from core.stage_registry import register_stage, StageRegistry
 from utils.logger import log_agent_action, log_success, log_error, log_warning
+from utils.structured_logger import get_structured_logger, LogContext
+from core.message_bus import (
+    MessageBus, MSG_DIRECT_ANSWER, MSG_HIGH_RISK_REASON, MSG_REPLAN_HISTORY,
+    MSG_FINAL_INSTRUCTIONS, MSG_APPROVED_ACTIONS, MSG_RESUME_STAGE, MSG_CONTEXT,
+)
 from utils.human_confirm import HumanConfirm
 from utils.prompt_manager import get_prompt
 from utils.url_utils import sanitize_extracted_url
@@ -33,6 +38,39 @@ critic_agent = CriticAgent()
 validator_agent = Validator()
 
 MAX_REPLAN = 3  # 最多重规划 3 次（给 Replanner 足够空间做策略转换）
+
+
+# ---------------------------------------------------------------------------
+# MessageBus helpers (dual-write with shared_memory for backward compat)
+# ---------------------------------------------------------------------------
+
+def _get_bus(state: OmniCoreState) -> MessageBus:
+    """Get or create MessageBus from state."""
+    bus_data = state.get("message_bus", [])
+    return MessageBus.from_dict(bus_data) if bus_data else MessageBus()
+
+
+def _save_bus(state: OmniCoreState, bus: MessageBus):
+    """Save MessageBus back to state."""
+    state["message_bus"] = bus.to_dict()
+
+
+def _bus_get_str(state: OmniCoreState, message_type: str, legacy_key: str, target: str = None) -> str:
+    """Read a string value from bus (preferred) or shared_memory (fallback)."""
+    bus = _get_bus(state)
+    msg = bus.get_latest(message_type, target=target)
+    if msg is not None:
+        return str(msg.payload.get("value", "") or "").strip()
+    return str(state.get("shared_memory", {}).get(legacy_key, "") or "").strip()
+
+
+def _bus_get(state: OmniCoreState, message_type: str, legacy_key: str, default=None):
+    """Read any value from bus (preferred) or shared_memory (fallback)."""
+    bus = _get_bus(state)
+    msg = bus.get_latest(message_type)
+    if msg is not None:
+        return msg.payload.get("value", default)
+    return state.get("shared_memory", {}).get(legacy_key, default)
 
 _CHECKPOINT_STAGE_ORDER = {
     "route": 1,
@@ -594,7 +632,7 @@ def _should_skip_for_resume(state: OmniCoreState, stage: str) -> bool:
     if not isinstance(shared_memory, dict):
         return False
 
-    resume_after = str(shared_memory.get("_resume_after_stage", "") or "").strip()
+    resume_after = _bus_get_str(state, MSG_RESUME_STAGE, "_resume_after_stage")
     if not resume_after:
         return False
 
@@ -630,9 +668,10 @@ def _mark_confirmation_required_tasks_waiting(state: OmniCoreState) -> None:
         shared_memory = {}
         state["shared_memory"] = shared_memory
 
+    approved_actions_raw = _bus_get(state, MSG_APPROVED_ACTIONS, "_approved_actions", default=[])
     approved_actions = {
         str(item).strip()
-        for item in (shared_memory.get("_approved_actions", []) or [])
+        for item in (approved_actions_raw or [])
         if str(item).strip()
     }
 
@@ -663,7 +702,12 @@ def route_node(state: OmniCoreState) -> OmniCoreState:
     """Route user request: analyze intent and decompose into sub-tasks."""
     if _should_skip_for_resume(state, "route"):
         return state
-    state = router_agent.route(state)
+    sl = get_structured_logger()
+    job_id = state.get("job_id", "")
+    with LogContext(job_id=job_id, stage="router"):
+        sl.log_event("stage_start")
+        state = router_agent.route(state)
+        sl.log_event("stage_end", detail=f"tasks={len(state.get('task_queue', []))}")
     _save_runtime_checkpoint(state, "route", "Router completed")
     return state
 
@@ -673,9 +717,15 @@ def parallel_executor_node(state: OmniCoreState) -> OmniCoreState:
     """Batch executor: run all ready tasks in the current batch."""
     if _should_skip_for_resume(state, "parallel_executor"):
         return state
-    if collect_ready_task_indexes(state):
-        state["execution_status"] = "executing"
-    state = run_ready_batch(state)
+    sl = get_structured_logger()
+    job_id = state.get("job_id", "")
+    with LogContext(job_id=job_id, stage="parallel_executor"):
+        sl.log_event("stage_start")
+        if collect_ready_task_indexes(state):
+            state["execution_status"] = "executing"
+        state = run_ready_batch(state)
+        completed = len([t for t in state.get("task_queue", []) if t.get("status") == "completed"])
+        sl.log_event("stage_end", detail=f"completed={completed}")
     _save_runtime_checkpoint(state, "parallel_executor", "Executed ready task batch")
     return state
 
@@ -750,7 +800,7 @@ def _legacy_replanner_node_v2(state: OmniCoreState) -> OmniCoreState:
     authoritative_target_url = _derive_authoritative_target_url(state)
 
     # 记录本轮失败策略到历史（防止 Replanner 兜圈子）
-    replan_history = state.get("shared_memory", {}).get("_replan_history", [])
+    replan_history = _bus_get(state, MSG_REPLAN_HISTORY, "_replan_history", default=[])
 
     # 收集失败信息（包含已尝试的路径，帮助 Replanner 避免重蹈覆辙）
     failures = []
@@ -793,6 +843,9 @@ def _legacy_replanner_node_v2(state: OmniCoreState) -> OmniCoreState:
         "urls": tried_urls,
     })
     state["shared_memory"]["_replan_history"] = replan_history
+    bus = _get_bus(state)
+    bus.publish("replanner", "replanner", MSG_REPLAN_HISTORY, {"value": replan_history}, job_id=state.get("job_id", ""))
+    _save_bus(state, bus)
 
     failure_summary = "\n".join(failures) if failures else "无明确失败信息，但任务结果不符合预期"
     if tried_urls:
@@ -880,6 +933,9 @@ def _legacy_replanner_node_v2(state: OmniCoreState) -> OmniCoreState:
         )
         if finalize_instructions:
             shared_memory["_final_answer_instructions"] = finalize_instructions
+            bus = _get_bus(state)
+            bus.publish("critic", "finalize", MSG_FINAL_INSTRUCTIONS, {"value": finalize_instructions}, job_id=state.get("job_id", ""))
+            _save_bus(state, bus)
         else:
             shared_memory.pop("_final_answer_instructions", None)
         log_agent_action("Replanner", f"分析: {result.get('analysis', '')[:80]}")
@@ -947,7 +1003,7 @@ def _legacy_replanner_node(state: OmniCoreState) -> OmniCoreState:
 
     is_final_attempt = state["replan_count"] >= MAX_REPLAN
     authoritative_target_url = _derive_authoritative_target_url(state)
-    replan_history = state.get("shared_memory", {}).get("_replan_history", [])
+    replan_history = _bus_get(state, MSG_REPLAN_HISTORY, "_replan_history", default=[])
 
     failures: List[str] = []
     tried_urls: List[str] = []
@@ -998,6 +1054,9 @@ def _legacy_replanner_node(state: OmniCoreState) -> OmniCoreState:
         }
     )
     state["shared_memory"]["_replan_history"] = replan_history
+    bus = _get_bus(state)
+    bus.publish("replanner", "replanner", MSG_REPLAN_HISTORY, {"value": replan_history}, job_id=state.get("job_id", ""))
+    _save_bus(state, bus)
 
     failure_summary = (
         "\n".join(failures)
@@ -1108,7 +1167,12 @@ def critic_node(state: OmniCoreState) -> OmniCoreState:
     """Critic review node: evaluate task output quality."""
     if _should_skip_for_resume(state, "critic"):
         return state
-    state = critic_agent.review(state)
+    sl = get_structured_logger()
+    job_id = state.get("job_id", "")
+    with LogContext(job_id=job_id, stage="critic"):
+        sl.log_event("stage_start")
+        state = critic_agent.review(state)
+        sl.log_event("stage_end", detail=f"approved={state.get('critic_approved', False)}")
     _save_runtime_checkpoint(state, "critic", "Critic review completed")
     return state
 
@@ -1118,7 +1182,12 @@ def validator_node(state: OmniCoreState) -> OmniCoreState:
     """Hard-rule validation node."""
     if _should_skip_for_resume(state, "validator"):
         return state
-    state = validator_agent.validate(state)
+    sl = get_structured_logger()
+    job_id = state.get("job_id", "")
+    with LogContext(job_id=job_id, stage="validator"):
+        sl.log_event("stage_start")
+        state = validator_agent.validate(state)
+        sl.log_event("stage_end", detail=f"passed={state.get('validator_passed', False)}")
     _save_runtime_checkpoint(state, "validator", "Validator completed")
     return state
 
@@ -1177,6 +1246,8 @@ def human_confirm_node_v2(state: OmniCoreState) -> OmniCoreState:
     """Deterministic-policy aware human confirmation node."""
     if _should_skip_for_resume(state, "human_confirm"):
         return state
+    sl = get_structured_logger()
+    sl.log_event("stage_start", detail="human_confirm")
     user_preferences = state.get("shared_memory", {}).get("user_preferences", {})
     auto_queue_confirmations = bool(
         isinstance(user_preferences, dict) and user_preferences.get("auto_queue_confirmations", False)
@@ -1203,9 +1274,7 @@ def human_confirm_node_v2(state: OmniCoreState) -> OmniCoreState:
         if flagged_tasks:
             details += f" {len(flagged_tasks)} task(s) were flagged by deterministic policy."
 
-        router_risk_reason = str(
-            state.get("shared_memory", {}).get("router_high_risk_reason", "") or ""
-        ).strip()
+        router_risk_reason = _bus_get_str(state, MSG_HIGH_RISK_REASON, "router_high_risk_reason")
         if router_risk_reason:
             details += f" Router risk signal: {router_risk_reason}"
 
@@ -1222,6 +1291,7 @@ def human_confirm_node_v2(state: OmniCoreState) -> OmniCoreState:
             state["final_output"] = "Execution cancelled before running the queued tasks."
     else:
         state["human_approved"] = True
+    sl.log_event("stage_end", detail=f"approved={state.get('human_approved', False)}")
     _save_runtime_checkpoint(state, "human_confirm", "Human confirmation handled")
     return state
 
@@ -1568,7 +1638,7 @@ def _legacy_synthesize_user_facing_answer(
 
     current_time_context = shared_memory.get("current_time_context")
     current_location_context = shared_memory.get("current_location_context")
-    final_answer_instructions = shared_memory.get("_final_answer_instructions", [])
+    final_answer_instructions = _bus_get(state, MSG_FINAL_INSTRUCTIONS, "_final_answer_instructions", default=[])
     if not isinstance(final_answer_instructions, list):
         final_answer_instructions = [final_answer_instructions]
     instruction_lines = [
@@ -1641,7 +1711,7 @@ def _legacy_finalize_node(state: OmniCoreState) -> OmniCoreState:
             shared_memory = {}
         current_time_context = shared_memory.get("current_time_context")
         current_location_context = shared_memory.get("current_location_context")
-        direct_answer = str(shared_memory.get("router_direct_answer", "") or "").strip()
+        direct_answer = _bus_get_str(state, MSG_DIRECT_ANSWER, "router_direct_answer")
 
         if direct_answer:
             state["final_output"] = direct_answer
@@ -1659,6 +1729,7 @@ def _legacy_finalize_node(state: OmniCoreState) -> OmniCoreState:
                 "critic_feedback": "",
                 "recommended_next_step": "",
             }
+            get_structured_logger().log_event("stage_end", detail="finalize")
             _save_runtime_checkpoint(state, "finalize", "Finalize completed without task queue")
             return state
 
@@ -1703,6 +1774,7 @@ def _legacy_finalize_node(state: OmniCoreState) -> OmniCoreState:
             "critic_feedback": "",
             "recommended_next_step": "",
         }
+        get_structured_logger().log_event("stage_end", detail="finalize")
         _save_runtime_checkpoint(state, "finalize", "Finalize completed without task queue")
         return state
 
@@ -1730,6 +1802,7 @@ def _legacy_finalize_node(state: OmniCoreState) -> OmniCoreState:
         state["execution_status"] = "completed_with_issues"
         log_error(f"任务未通过审查: {state['critic_feedback']}")
 
+    get_structured_logger().log_event("stage_end", detail="finalize")
     _save_runtime_checkpoint(state, "finalize", "Finalize completed")
     return state
 
@@ -1747,7 +1820,7 @@ def _legacy_finalize_node_v2(state: OmniCoreState) -> OmniCoreState:
         if not isinstance(shared_memory, dict):
             shared_memory = {}
 
-        direct_answer = str(shared_memory.get("router_direct_answer", "") or "").strip()
+        direct_answer = _bus_get_str(state, MSG_DIRECT_ANSWER, "router_direct_answer")
         if direct_answer:
             state["final_output"] = direct_answer
             state["execution_status"] = "completed"
@@ -1764,6 +1837,7 @@ def _legacy_finalize_node_v2(state: OmniCoreState) -> OmniCoreState:
                 "critic_feedback": "",
                 "recommended_next_step": "",
             }
+            get_structured_logger().log_event("stage_end", detail="finalize")
             _save_runtime_checkpoint(state, "finalize", "Finalize completed without task queue")
             return state
 
@@ -1801,6 +1875,7 @@ def _legacy_finalize_node_v2(state: OmniCoreState) -> OmniCoreState:
             "critic_feedback": router_reasoning or "No verifiable result was produced.",
             "recommended_next_step": "Retry the request, or specify the exact target/source to query.",
         }
+        get_structured_logger().log_event("stage_end", detail="finalize")
         _save_runtime_checkpoint(state, "finalize", "Finalize completed without task queue")
         return state
 
@@ -1821,6 +1896,7 @@ def _legacy_finalize_node_v2(state: OmniCoreState) -> OmniCoreState:
         state["execution_status"] = "completed_with_issues"
         log_error(f"浠诲姟鏈€氳繃瀹℃煡: {state['critic_feedback']}")
 
+    get_structured_logger().log_event("stage_end", detail="finalize")
     _save_runtime_checkpoint(state, "finalize", "Finalize completed")
     return state
 
@@ -1829,6 +1905,13 @@ def _legacy_finalize_node_v2(state: OmniCoreState) -> OmniCoreState:
 def should_continue_after_route(state: OmniCoreState) -> Literal["human_confirm", "finalize"]:
     if not state["task_queue"]:
         return "finalize"
+    # Check if human_confirm is in the execution plan (respects skip_condition)
+    registry = StageRegistry.get_instance()
+    plan = registry.build_execution_plan(state)
+    if "human_confirm" not in plan:
+        # human_confirm skipped — still route to it (the node handles auto-approve),
+        # but this makes the plan queryable for observability
+        pass
     return "human_confirm"
 
 
@@ -1845,15 +1928,23 @@ def get_first_executor(state: OmniCoreState) -> Literal["parallel_executor", "va
 
 
 def after_validator(state: OmniCoreState) -> Literal["critic", "replanner", "finalize"]:
-    """Validator 之后：passed → critic，failed + replan_count < MAX → replanner，否则 finalize"""
+    """Validator 之后：passed → critic，failed + replan_count < MAX → replanner，否则 finalize.
+
+    Consults the StageRegistry execution plan to respect skip_conditions.
+    """
     if _has_waiting_tasks(state):
         return "finalize"
+
+    # Check execution plan to see if critic is in the plan
+    registry = StageRegistry.get_instance()
+    plan = registry.build_execution_plan(state)
+
     if state.get("validator_passed", True):
-        return "critic"
+        return "critic" if "critic" in plan else "finalize"
     if any(str(task.get("status", "") or "") == "completed" for task in state.get("task_queue", [])):
-        return "critic"
+        return "critic" if "critic" in plan else "finalize"
     if state.get("replan_count", 0) < MAX_REPLAN:
-        return "replanner"
+        return "replanner" if "replanner" in plan else "finalize"
     return "finalize"
 
 
@@ -1898,7 +1989,7 @@ def _synthesize_user_facing_answer(
 
     current_time_context = shared_memory.get("current_time_context")
     current_location_context = shared_memory.get("current_location_context")
-    final_answer_instructions = shared_memory.get("_final_answer_instructions", [])
+    final_answer_instructions = _bus_get(state, MSG_FINAL_INSTRUCTIONS, "_final_answer_instructions", default=[])
     if not isinstance(final_answer_instructions, list):
         final_answer_instructions = [final_answer_instructions]
     instruction_lines = [
@@ -1979,6 +2070,11 @@ def replanner_node(state: OmniCoreState) -> OmniCoreState:
     """Reflect on failed execution and produce a better next plan."""
     if _should_skip_for_resume(state, "replanner"):
         return state
+    sl = get_structured_logger()
+    job_id = state.get("job_id", "")
+    with LogContext(job_id=job_id, stage="replanner"):
+        sl.log_event("stage_start", detail=f"replan_count={state.get('replan_count', 0)}")
+        sl.log_replan(reason=f"attempt {state.get('replan_count', 0) + 1}")
 
     shared_memory = state.get("shared_memory", {})
     if not isinstance(shared_memory, dict):
@@ -1990,7 +2086,7 @@ def replanner_node(state: OmniCoreState) -> OmniCoreState:
 
     is_final_attempt = state["replan_count"] >= MAX_REPLAN
     authoritative_target_url = _derive_authoritative_target_url(state)
-    replan_history = shared_memory.get("_replan_history", [])
+    replan_history = _bus_get(state, MSG_REPLAN_HISTORY, "_replan_history", default=[])
 
     failures: List[str] = []
     tried_urls: List[str] = []
@@ -2091,6 +2187,9 @@ def replanner_node(state: OmniCoreState) -> OmniCoreState:
         )
         if finalize_instructions:
             shared_memory["_final_answer_instructions"] = finalize_instructions
+            bus = _get_bus(state)
+            bus.publish("critic", "finalize", MSG_FINAL_INSTRUCTIONS, {"value": finalize_instructions}, job_id=state.get("job_id", ""))
+            _save_bus(state, bus)
         else:
             shared_memory.pop("_final_answer_instructions", None)
         log_agent_action("Replanner", f"分析: {str(result.get('analysis', '') or '')[:80]}")
@@ -2148,6 +2247,8 @@ def replanner_node(state: OmniCoreState) -> OmniCoreState:
     state["messages"].append(
         SystemMessage(content=f"Replanner 重规划完成（第 {state['replan_count']} 次）")
     )
+    sl = get_structured_logger()
+    sl.log_event("stage_end", detail=f"new_tasks={len(state.get('task_queue', []))}")
     _save_runtime_checkpoint(state, "replanner", "Replanner completed")
     return state
 
@@ -2157,13 +2258,17 @@ def finalize_node(state: OmniCoreState) -> OmniCoreState:
     """Build the final user-facing output from direct answers or executed tasks."""
     if _should_skip_for_resume(state, "finalize"):
         return state
+    sl = get_structured_logger()
+    job_id = state.get("job_id", "")
+    with LogContext(job_id=job_id, stage="finalize"):
+        sl.log_event("stage_start")
 
     if not state["task_queue"]:
         shared_memory = state.get("shared_memory", {})
         if not isinstance(shared_memory, dict):
             shared_memory = {}
 
-        direct_answer = str(shared_memory.get("router_direct_answer", "") or "").strip()
+        direct_answer = _bus_get_str(state, MSG_DIRECT_ANSWER, "router_direct_answer")
         if direct_answer:
             state["final_output"] = direct_answer
             state["execution_status"] = "completed"
@@ -2180,6 +2285,7 @@ def finalize_node(state: OmniCoreState) -> OmniCoreState:
                 "critic_feedback": "",
                 "recommended_next_step": "",
             }
+            get_structured_logger().log_event("stage_end", detail="finalize")
             _save_runtime_checkpoint(state, "finalize", "Finalize completed without task queue")
             return state
 
@@ -2219,6 +2325,7 @@ def finalize_node(state: OmniCoreState) -> OmniCoreState:
             "critic_feedback": router_reasoning or "No verifiable result was produced.",
             "recommended_next_step": "Retry the request, or specify the exact target/source to query.",
         }
+        get_structured_logger().log_event("stage_end", detail="finalize")
         _save_runtime_checkpoint(state, "finalize", "Finalize completed without task queue")
         return state
 
@@ -2239,6 +2346,7 @@ def finalize_node(state: OmniCoreState) -> OmniCoreState:
         state["execution_status"] = "completed_with_issues"
         log_error(f"任务未通过审查: {state['critic_feedback']}")
 
+    get_structured_logger().log_event("stage_end", detail="finalize")
     _save_runtime_checkpoint(state, "finalize", "Finalize completed")
     return state
 

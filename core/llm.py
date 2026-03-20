@@ -11,9 +11,12 @@ from typing import Optional, List, Dict, Any, Union
 from pathlib import Path
 import os
 
+import time as _time
+
 from config.settings import settings
 from utils.logger import logger, log_agent_action
 from utils.text import sanitize_text, sanitize_value
+from utils.structured_logger import get_structured_logger
 from litellm import completion, acompletion
 import litellm
 import yaml
@@ -468,6 +471,7 @@ class LLMClient:
 
             # 🔥 添加调用开始日志
             logger.info(f"LLM 调用开始: model={kwargs['model']}, max_tokens={kwargs['max_tokens']}, timeout=120s")
+            _call_start = _time.time()
 
             # 🔥 添加网络错误重试机制（最多重试 3 次）
             max_retries = 3
@@ -543,6 +547,14 @@ class LLMClient:
                 else:
                     logger.error(f"LLM 返回空内容, finish_reason: {response.choices[0].finish_reason}")
                     content = '{"intent": "unknown", "confidence": 0, "reasoning": "模型返回空内容", "tasks": [], "is_high_risk": false}'
+
+            _call_duration_ms = (_time.time() - _call_start) * 1000
+            get_structured_logger().log_llm_call(
+                model=response.model or kwargs.get("model", "unknown"),
+                tokens_in=response.usage.prompt_tokens,
+                tokens_out=response.usage.completion_tokens,
+                duration_ms=_call_duration_ms,
+            )
 
             return LLMResponse(
                 content=content,

@@ -26,6 +26,7 @@ from core.graph import get_graph  # noqa: F401 – also exposes build_graph_from
 from memory.manager import MemoryManager, build_memory_scope
 from utils.logger import console, log_agent_action, log_debug_metrics, log_error, log_warning
 from utils.text import sanitize_text, sanitize_value
+from utils.structured_logger import get_structured_logger, LogContext
 
 if TYPE_CHECKING:
     from memory.scoped_chroma_store import ChromaMemory
@@ -452,6 +453,11 @@ def _short_preview(text: str, limit: int = 220) -> str:
 
 def _finalize_runtime_result(result: Dict[str, Any], user_input: str) -> Dict[str, Any]:
     finalized = dict(result)
+    _sl = get_structured_logger()
+    job_id = finalized.get("job_id", "")
+    success = bool(finalized.get("success", False))
+    with LogContext(job_id=job_id):
+        _sl.log_event("job_end", detail=f"success={success}")
     runtime_metrics = sanitize_value(finalized.get("runtime_metrics") or _collect_runtime_metrics())
     finalized["runtime_metrics"] = runtime_metrics
 
@@ -634,6 +640,47 @@ def _finalize_runtime_result(result: Dict[str, Any], user_input: str) -> Dict[st
             log_warning(f"Memory persistence failed: {e}")
 
     _create_job_notification(finalized)
+
+    # Persistence Coordinator: async unified write (non-blocking best-effort)
+    if lifecycle_status not in WAITING_JOB_STATUSES and session_id and job_id:
+        try:
+            from core.persistence_coordinator import PersistenceCoordinator
+            coordinator = PersistenceCoordinator()
+            import asyncio as _aio
+
+            async def _coord_complete():
+                return await coordinator.complete_job(
+                    job_id=job_id,
+                    result={
+                        "session_id": session_id,
+                        "user_input": user_input,
+                        "status": lifecycle_status,
+                        "success": bool(finalized.get("success", False)),
+                        "output": sanitize_text(finalized.get("output") or ""),
+                        "error": sanitize_text(finalized.get("error") or ""),
+                        "intent": sanitize_text(finalized.get("intent") or ""),
+                        "tasks": tasks,
+                        "policy_decisions": policy_decisions,
+                        "artifacts": sanitize_value(finalized.get("artifacts") or []),
+                        "is_special_command": bool(finalized.get("is_special_command", False)),
+                    },
+                    scope={
+                        "session_id": session_id,
+                        "goal_id": goal_id,
+                        "project_id": project_id,
+                        "todo_id": todo_id,
+                    },
+                )
+
+            try:
+                loop = _aio.get_running_loop()
+                # Already in async context — schedule as task
+                loop.create_task(_coord_complete())
+            except RuntimeError:
+                # No running loop — run synchronously in a new loop
+                _aio.run(_coord_complete())
+        except Exception as e:
+            log_warning(f"PersistenceCoordinator failed (non-critical): {e}")
 
     return finalized
 
@@ -1691,6 +1738,10 @@ def _execute_submitted_job(
     clean_history: Optional[List[Dict[str, Any]]] = None,
     initial_state_override: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
+    _job_start_time = time.time()
+    _sl = get_structured_logger()
+    with LogContext(job_id=runtime_job_id):
+        _sl.log_event("job_start", detail=clean_user_input[:200])
     user_preferences = _load_effective_user_preferences(runtime_session_id)
     current_time_context = _build_current_time_context()
     current_location_context = _build_current_location_context(

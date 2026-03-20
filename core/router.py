@@ -1022,7 +1022,14 @@ class RouterAgent:
     @staticmethod
     def _build_router_system_prompt() -> str:
         dynamic_catalog = "\n".join(build_dynamic_tool_prompt_lines())
-        return f"{ROUTER_SYSTEM_PROMPT}\n\n{ROUTER_OUTPUT_APPENDIX}\n{dynamic_catalog}"
+        base_prompt = ROUTER_SYSTEM_PROMPT
+        # Inject agent descriptions from registry if placeholder exists
+        if "{{AGENT_CAPABILITIES}}" in base_prompt:
+            from core.agent_registry import get_agent_registry
+            registry = get_agent_registry()
+            agent_descriptions = registry.build_router_agent_descriptions(lang="zh")
+            base_prompt = base_prompt.replace("{{AGENT_CAPABILITIES}}", agent_descriptions)
+        return f"{base_prompt}\n\n{ROUTER_OUTPUT_APPENDIX}\n{dynamic_catalog}"
 
     @classmethod
     def _build_deterministic_tool_hints(
@@ -1430,6 +1437,17 @@ class RouterAgent:
         )
         state["shared_memory"]["router_high_risk_reason"] = analysis.get("high_risk_reason", "")
         state["shared_memory"]["router_direct_answer"] = str(analysis.get("direct_answer", "") or "").strip()
+        # Dual-write to MessageBus
+        from core.message_bus import MessageBus, MSG_DIRECT_ANSWER, MSG_HIGH_RISK_REASON
+        bus_data = state.get("message_bus", [])
+        bus = MessageBus.from_dict(bus_data) if bus_data else MessageBus()
+        direct_answer = state["shared_memory"]["router_direct_answer"]
+        if direct_answer:
+            bus.publish("router", "finalize", MSG_DIRECT_ANSWER, {"value": direct_answer}, job_id=state.get("job_id", ""))
+        high_risk_reason = state["shared_memory"]["router_high_risk_reason"]
+        if high_risk_reason:
+            bus.publish("router", "executor", MSG_HIGH_RISK_REASON, {"value": high_risk_reason}, job_id=state.get("job_id", ""))
+        state["message_bus"] = bus.to_dict()
         state["execution_status"] = "routing"
 
         # 添加系统消息到 messages

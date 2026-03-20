@@ -21,10 +21,7 @@
 在 fallbacks 中也要体现这种思维：第一层 fallback 可以是换参数重试，但至少有一层 fallback 应该是"换一条完全不同的路径"——比如换信息来源、换搜索方式、或者让 Worker 自己去搜索。
 
 ## 可用的 Worker
-- web_worker: 网页数据抓取（打开网页、提取内容，只读操作）
-- browser_agent: 智能浏览器代理（需要交互的任务：购物、登录、填表、搜索等）
-- file_worker: 本地文件读写（保存数据、读取文件、生成报告）
-- system_worker: 系统级操作（执行命令、操作应用程序）
+{{AGENT_CAPABILITIES}}
 
 ## Worker 选择原则
 - 只需要看网页、抓数据 → web_worker
