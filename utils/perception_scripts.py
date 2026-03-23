@@ -714,10 +714,112 @@ SCRIPT_TEXT_CONTENT = r"""
       return document.querySelector('main, [role="main"]') || document.body;
     };
     const contentRoot = findContentRoot();
-    const mainText = normalize(
-      contentRoot ? (contentRoot.innerText || contentRoot.textContent || document.body?.innerText || document.body?.textContent || '')
-                  : (document.body?.innerText || document.body?.textContent || '')
-    ).slice(0, 10000);
+
+    // ── Structure-aware text extraction ──
+    // Preserves table/list/heading structure so downstream chunking
+    // and embedding can match on individual items rather than flattened blobs.
+    const extractStructuredText = (root) => {
+      if (!root) return '';
+      const parts = [];
+      const walk = (node) => {
+        if (!node) return;
+        // Skip invisible / script / style
+        if (node.nodeType === 1) {
+          const tag = node.tagName;
+          if (tag === 'SCRIPT' || tag === 'STYLE' || tag === 'NOSCRIPT') return;
+          if (!isVisible(node)) return;
+        }
+        // Text node
+        if (node.nodeType === 3) {
+          const t = (node.textContent || '').replace(/\s+/g, ' ').trim();
+          if (t) parts.push(t);
+          return;
+        }
+        if (node.nodeType !== 1) return;
+        const tag = node.tagName;
+        // Headings → markdown-style prefix
+        if (/^H[1-4]$/.test(tag)) {
+          const level = parseInt(tag.charAt(1), 10);
+          const prefix = '#'.repeat(level) + ' ';
+          const t = normalize(node.innerText || node.textContent || '');
+          if (t) parts.push('\n' + prefix + t + '\n');
+          return;  // don't recurse into heading children
+        }
+        // Table → tab-separated columns, newline per row
+        if (tag === 'TABLE') {
+          const rows = node.querySelectorAll('tr');
+          for (const row of rows) {
+            const cells = row.querySelectorAll('th, td');
+            const cellTexts = Array.from(cells).map(c => normalize(c.innerText || c.textContent || ''));
+            if (cellTexts.some(c => c.length > 0)) parts.push(cellTexts.join('\t'));
+          }
+          parts.push('');  // blank line after table
+          return;
+        }
+        // Ordered list → numbered items
+        if (tag === 'OL') {
+          let idx = 1;
+          for (const li of node.children) {
+            if (li.tagName === 'LI') {
+              const t = normalize(li.innerText || li.textContent || '');
+              if (t) parts.push(idx + '. ' + t);
+              idx++;
+            }
+          }
+          parts.push('');
+          return;
+        }
+        // Unordered list → dash-prefixed items
+        if (tag === 'UL') {
+          for (const li of node.children) {
+            if (li.tagName === 'LI') {
+              const t = normalize(li.innerText || li.textContent || '');
+              if (t) parts.push('- ' + t);
+            }
+          }
+          parts.push('');
+          return;
+        }
+        // Definition list → key: value
+        if (tag === 'DL') {
+          let lastDt = '';
+          for (const child of node.children) {
+            if (child.tagName === 'DT') {
+              lastDt = normalize(child.innerText || child.textContent || '');
+            } else if (child.tagName === 'DD') {
+              const dd = normalize(child.innerText || child.textContent || '');
+              if (lastDt && dd) parts.push(lastDt + ': ' + dd);
+              else if (dd) parts.push(dd);
+            }
+          }
+          parts.push('');
+          return;
+        }
+        // Paragraph / blockquote → double newline separation
+        if (tag === 'P' || tag === 'BLOCKQUOTE') {
+          const t = normalize(node.innerText || node.textContent || '');
+          if (t) parts.push('\n' + t + '\n');
+          return;
+        }
+        // Default: recurse into children
+        for (const child of node.childNodes) {
+          walk(child);
+        }
+      };
+      walk(root);
+      // Join and clean up excessive blank lines
+      return parts.join('\n').replace(/\n{3,}/g, '\n\n').trim();
+    };
+
+    let mainText = extractStructuredText(contentRoot || document.body);
+    if (!mainText) {
+      // Fallback to raw innerText if structured extraction yields nothing
+      mainText = normalize(
+        contentRoot ? (contentRoot.innerText || contentRoot.textContent || '')
+                    : (document.body?.innerText || document.body?.textContent || '')
+      );
+    }
+    mainText = mainText.slice(0, 10000);
 
     // Headings with hierarchy (depth tracking)
     const headings = [];

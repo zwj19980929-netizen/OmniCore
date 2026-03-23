@@ -1454,32 +1454,76 @@ class BrowserAgent:
                 tokens.append(token)
         return tokens[:8]
 
+    # ── Unified lightweight relevance scorer (0~1) ──────────────
+
+    @staticmethod
+    def _char_ngrams(text: str, n: int = 2) -> set:
+        """Extract character n-grams from text for fuzzy Chinese matching."""
+        return {text[i:i + n] for i in range(len(text) - n + 1)} if len(text) >= n else set()
+
     def _score_text_relevance(self, query: str, text: str) -> float:
+        """Score relevance of *text* to *query*.  Returns 0.0 ~ 1.0.
+
+        Three signals combined:
+        1. Token exact-match ratio  (are query keywords present?)
+        2. Character bi-gram overlap (fuzzy match for Chinese synonyms)
+        3. Entity/number match bonus (exact figures matter)
+        """
         haystack = self._normalize_text(text)
         if not haystack:
             return 0.0
 
-        score = 0.0
         query_norm = self._normalize_text(query)
-        if query_norm and query_norm in haystack:
-            score += 8.0
+        if not query_norm:
+            return 0.0
 
+        # --- full query substring match → strong signal ---
+        if query_norm in haystack:
+            return 1.0
+
+        tokens = self._extract_query_tokens(query)
+        if not tokens:
+            # No meaningful tokens; fall back to char bi-gram overlap
+            q_ngrams = self._char_ngrams(query_norm)
+            h_ngrams = self._char_ngrams(haystack)
+            if not q_ngrams:
+                return 0.0
+            return len(q_ngrams & h_ngrams) / len(q_ngrams)
+
+        # --- 1. token exact-match ratio (0~1) ---
         token_hits = 0
         strong_hits = 0
-        for token in self._extract_query_tokens(query):
-            if token not in haystack:
-                continue
-            token_hits += 1
-            weight = 2.0 if len(token) >= 5 or any("\u4e00" <= ch <= "\u9fff" for ch in token) else 1.0
-            score += weight
-            if weight >= 2.0:
-                strong_hits += 1
+        for token in tokens:
+            if token in haystack:
+                token_hits += 1
+                if len(token) >= 4 or any("\u4e00" <= ch <= "\u9fff" for ch in token):
+                    strong_hits += 1
+        token_ratio = token_hits / len(tokens) if tokens else 0.0
 
-        if token_hits >= 2:
-            score += 2.0
+        # --- 2. char bi-gram overlap (0~1) — catches partial synonyms ---
+        q_ngrams = self._char_ngrams(query_norm)
+        h_ngrams = self._char_ngrams(haystack[:2000])  # limit for perf
+        ngram_ratio = len(q_ngrams & h_ngrams) / len(q_ngrams) if q_ngrams else 0.0
+
+        # --- 3. entity/number exact match bonus ---
+        numbers_in_query = set(re.findall(r'\d+(?:\.\d+)?', query_norm))
+        number_bonus = 0.0
+        if numbers_in_query:
+            number_hits = sum(1 for n in numbers_in_query if n in haystack)
+            number_bonus = number_hits / len(numbers_in_query)
+
+        # --- combine (weighted) ---
+        score = (
+            0.55 * token_ratio
+            + 0.30 * ngram_ratio
+            + 0.15 * number_bonus
+        )
+
+        # Strong-hit multiplier: if 2+ important tokens hit, boost
         if strong_hits >= 2:
-            score += 2.0
-        return score
+            score = min(1.0, score * 1.25)
+
+        return min(1.0, score)
 
     def _score_source_authority(self, task: str, host: str, source: str) -> float:
         host_norm = self._normalize_text(host)
@@ -1500,13 +1544,17 @@ class BrowserAgent:
 
     def _score_search_result_card(self, task: str, query: str, card: SearchResultCard) -> float:
         haystack = " ".join([card.title, card.snippet, card.source, card.host, card.date])
-        score = self._score_text_relevance(query, haystack)
-        score += self._score_source_authority(task, card.host, card.source)
+        relevance = self._score_text_relevance(query, haystack)  # 0~1
+        authority = self._score_source_authority(task, card.host, card.source)
+        # Normalize authority to 0~1 range (max raw ~6.0)
+        authority_norm = min(1.0, authority / 6.0)
+        rank_bonus = 0.0
         if card.rank > 0:
-            score += max(1.2 - ((card.rank - 1) * 0.1), 0.0)
+            rank_bonus = max(0.12 - ((card.rank - 1) * 0.01), 0.0)
+        official_bonus = 0.0
         if any(token in self._normalize_text(card.title + " " + card.snippet) for token in ["官方", "official", "statement", "press release"]):
-            score += 1.0
-        return score
+            official_bonus = 0.1
+        return min(1.0, 0.65 * relevance + 0.20 * authority_norm + rank_bonus + official_bonus)
 
     def _data_has_substantive_text(self, data: List[Dict[str, str]]) -> bool:
         for item in data[:8]:
@@ -1536,9 +1584,9 @@ class BrowserAgent:
             date_hint = str(item.get("date", "") or "").strip()
             haystack = " ".join(part for part in [title, snippet, source, date_hint] if part)
             score = self._score_text_relevance(query, haystack)
-            if score >= 6.0:
+            if score >= 0.5:
                 relevant_hits += 1
-            elif score >= 4.0 and (len(snippet) >= 40 or len(title) >= 24 or source):
+            elif score >= 0.3 and (len(snippet) >= 40 or len(title) >= 24 or source):
                 relevant_hits += 1
             if relevant_hits >= 1:
                 return True
@@ -3432,14 +3480,13 @@ class BrowserAgent:
                 return False
             if data:
                 return True
-            # 如果 data 为空，但 main_text 与任务语义相关度足够高，
-            # 也视为目标满足。相关度分数由 text_relevance 模块在
-            # 格式化 prompt 时已经计算并缓存，这里直接读取，零额外开销。
+            # 如果 data 为空，但 main_text 与任务语义相关度足够高，也视为目标满足。
+            # 使用统一的 _score_text_relevance（0~1 归一化，含 n-gram）主动评分，
+            # 避免依赖 text_relevance 缓存的竞态问题。
             main_text = self._get_snapshot_main_text(active_snapshot)
             if main_text and len(main_text) >= 100:
-                from utils.text_relevance import get_relevance_score
-                score = get_relevance_score(main_text)
-                if score is not None and score >= 0.45:
+                score = self._score_text_relevance(query, main_text[:3000])
+                if score >= 0.35:
                     return True
             return False
         return self._search_results_have_answer_evidence(query, data)
@@ -3528,7 +3575,7 @@ class BrowserAgent:
                 continue
             haystack = " ".join(str(v) for v in item.values() if v)
             best_score = max(best_score, self._score_text_relevance(query, haystack))
-            if best_score >= 4.0:
+            if best_score >= 0.3:
                 return True
         return False
 
@@ -4564,7 +4611,7 @@ class BrowserAgent:
             ranked_cards: List[Tuple[float, SearchResultCard]] = []
             for card in cards:
                 score = self._score_search_result_card(task, active_intent.query, card)
-                if self._extract_query_tokens(active_intent.query) and score < 4.0:
+                if self._extract_query_tokens(active_intent.query) and score < 0.3:
                     continue
                 ranked_cards.append((score, card))
             ranked_cards.sort(key=lambda item: item[0], reverse=True)
@@ -4575,7 +4622,7 @@ class BrowserAgent:
                     target_selector=best_card.target_selector,
                     target_ref=best_card.target_ref or best_card.ref,
                     description="open the strongest search result card",
-                    confidence=min(best_score / 10.0, 0.9),
+                    confidence=min(best_score, 0.9),
                     expected_page_type="detail",
                 )
 
@@ -4601,9 +4648,7 @@ class BrowserAgent:
                 href,
             ]))
             score = self._score_text_relevance(active_intent.query, haystack)
-            if "天气" in haystack or "weather" in haystack:
-                score += 2.0
-            if query_tokens and score < 4.0:
+            if query_tokens and score < 0.3:
                 continue
             if best_match is None or score > best_match[0]:
                 best_match = (score, element)
@@ -4616,7 +4661,7 @@ class BrowserAgent:
             target_selector=best_match[1].selector,
             target_ref=best_match[1].ref,
             description="open the most relevant detail result",
-            confidence=min(best_match[0] / 10.0, 0.88),
+            confidence=min(best_match[0], 0.88),
             expected_page_type="detail",
         )
 
@@ -4730,7 +4775,7 @@ class BrowserAgent:
                 query = active_intent.query or self._derive_primary_query(task)
                 if query:
                     relevance = self._score_text_relevance(query, main_text[:3000])
-                    if relevance >= 4.0:
+                    if relevance >= 0.3:
                         return True
                 else:
                     # No specific query but page has substantial content

@@ -2,10 +2,10 @@
 文本语义相关度提取模块
 混合评分：Embedding 语义相似度 + 关键词匹配，从大段网页文本中提取与用户任务最相关的部分。
 
-核心改进：
+评分策略：
 1. 混合评分 = α × embedding_sim + (1-α) × keyword_score，解决纯向量区分度不够的问题
 2. 动态 chunk_size：根据 page_type 自适应（list 页更细粒度）
-3. Query 增强：自动扩展跨语言关键词，提升中英混合场景匹配精度
+3. 关键词提取：中文 n-gram + 英文 token + 数字，纯通用，无领域硬编码
 """
 from __future__ import annotations
 
@@ -63,67 +63,18 @@ def _cache_set(key: str, vecs: list[list[float]]) -> None:
         _embedding_cache[key] = (time.time(), vecs)
 
 
-# ── 关键词提取与 Query 增强 ──────────────────────────────────────────────
-
-# 常见中英对照：用户 query 中的中文词 → 扩展英文关键词
-_ZH_EN_MAP: Dict[str, List[str]] = {
-    "价格": ["price", "cost", "$", "¥", "from", "起售", "售价"],
-    "售价": ["price", "cost", "$", "¥", "from"],
-    "多少钱": ["price", "cost", "$", "¥", "how much"],
-    "评价": ["review", "rating", "star", "评分"],
-    "评分": ["rating", "score", "star", "review"],
-    "评测": ["review", "benchmark", "test"],
-    "参数": ["spec", "specification", "parameter", "配置"],
-    "配置": ["spec", "configuration", "config", "参数"],
-    "尺寸": ["size", "dimension", "inch"],
-    "重量": ["weight", "gram", "kg"],
-    "颜色": ["color", "colour"],
-    "库存": ["stock", "availability", "in stock", "out of stock"],
-    "发货": ["shipping", "delivery", "ship"],
-    "地址": ["address", "location"],
-    "电话": ["phone", "tel", "call"],
-    "营业时间": ["hours", "open", "business hours"],
-    "天气": ["weather", "temperature", "forecast", "℃", "°F"],
-    "温度": ["temperature", "℃", "°F", "degree"],
-    "新闻": ["news", "article", "report"],
-    "下载": ["download", "install"],
-    "登录": ["login", "sign in", "log in"],
-    "注册": ["register", "sign up"],
-    "搜索": ["search", "find", "query"],
-    "排名": ["rank", "ranking", "top"],
-    "比较": ["compare", "comparison", "vs"],
-    "优惠": ["deal", "discount", "coupon", "save", "off"],
-    "促销": ["sale", "promotion", "deal"],
-    "型号": ["model", "version", "variant"],
-    "容量": ["capacity", "storage", "GB", "TB"],
-    "内存": ["memory", "RAM", "GB"],
-    "屏幕": ["screen", "display", "inch"],
-    "电池": ["battery", "mAh", "charge"],
-    "摄像头": ["camera", "MP", "megapixel"],
-}
-
-# 价格相关的模式（不依赖语言）
-_PRICE_PATTERNS = re.compile(
-    r'(?:\$[\d,]+(?:\.\d{2})?)|'           # $699, $1,099.00
-    r'(?:¥[\d,]+(?:\.\d{2})?)|'            # ¥6999
-    r'(?:€[\d,]+(?:\.\d{2})?)|'            # €999
-    r'(?:£[\d,]+(?:\.\d{2})?)|'            # £899
-    r'(?:[\d,]+\s*(?:元|円|won))|'          # 6999元
-    r'(?:(?:from|From|FROM)\s+\$[\d,]+)|'   # From $699
-    r'(?:(?:起售价|售价|价格)[：:]?\s*[\d,]+)',  # 起售价6999
-    re.UNICODE,
-)
+# ── 关键词提取 ────────────────────────────────────────────────────────────
 
 # CJK 字符检测
 _CJK_RE = re.compile(r'[\u4e00-\u9fff\u3040-\u309f\u30a0-\u30ff]')
-# 中文分词（简易：按非字母数字分割 + 按连续中文字符提取 2~4 gram）
+# 中文分词（简易：按连续中文字符提取 2~6 gram）
 _ZH_WORD_RE = re.compile(r'[\u4e00-\u9fff]{2,6}')
 _EN_WORD_RE = re.compile(r'[a-zA-Z][a-zA-Z0-9]*(?:\s+[a-zA-Z][a-zA-Z0-9]*)?', re.ASCII)
 _NUM_RE = re.compile(r'\d+(?:\.\d+)?')
 
 
 def _extract_query_keywords(query: str) -> Set[str]:
-    """从 query 中提取关键词集合（中文词 + 英文词 + 数字 + 跨语言扩展）。"""
+    """从 query 中提取关键词集合（中文词 + 英文词 + 数字）。"""
     keywords: Set[str] = set()
 
     # 提取英文词/短语
@@ -133,43 +84,17 @@ def _extract_query_keywords(query: str) -> Set[str]:
             keywords.add(word)
 
     # 提取中文词
-    zh_words: List[str] = []
     for m in _ZH_WORD_RE.finditer(query):
-        zh_words.append(m.group())
         keywords.add(m.group())
 
     # 提取数字
     for m in _NUM_RE.finditer(query):
         keywords.add(m.group())
 
-    # 跨语言扩展：直接匹配 + 子串匹配（"的价格" 中包含 "价格"）
-    expanded: Set[str] = set()
-    for kw in list(keywords):
-        if kw in _ZH_EN_MAP:
-            expanded.update(_ZH_EN_MAP[kw])
-    # 对中文词做子串查找（2~4 字符的子串是否在映射表中）
-    for zh_word in zh_words:
-        for sub_len in range(2, min(len(zh_word) + 1, 5)):
-            for start in range(len(zh_word) - sub_len + 1):
-                sub = zh_word[start:start + sub_len]
-                if sub in _ZH_EN_MAP and sub not in keywords:
-                    keywords.add(sub)
-                    expanded.update(_ZH_EN_MAP[sub])
-    # 对整个 query 中的连续中文字符做 n-gram 扫描（捕获跨词边界的映射词）
-    cjk_runs = re.findall(r'[\u4e00-\u9fff]+', query)
-    for run in cjk_runs:
-        for sub_len in range(2, min(len(run) + 1, 5)):
-            for start in range(len(run) - sub_len + 1):
-                sub = run[start:start + sub_len]
-                if sub in _ZH_EN_MAP and sub not in keywords:
-                    keywords.add(sub)
-                    expanded.update(_ZH_EN_MAP[sub])
-    keywords.update(expanded)
-
     return keywords
 
 
-def _compute_keyword_score(chunk: str, keywords: Set[str], query_has_price_intent: bool) -> float:
+def _compute_keyword_score(chunk: str, keywords: Set[str]) -> float:
     """计算 chunk 的关键词匹配得分 (0~1)。"""
     if not keywords:
         return 0.0
@@ -182,62 +107,7 @@ def _compute_keyword_score(chunk: str, keywords: Set[str], query_has_price_inten
         if kw.lower() in chunk_lower:
             matched += 1
 
-    base_score = matched / total if total > 0 else 0.0
-
-    # 价格意图加分：如果 query 包含价格相关词，chunk 里有价格模式就加分
-    if query_has_price_intent and _PRICE_PATTERNS.search(chunk):
-        base_score = min(1.0, base_score + 0.3)
-
-    return base_score
-
-
-def _has_price_intent(query: str) -> bool:
-    """判断 query 是否包含价格相关意图。"""
-    price_indicators = {"价格", "售价", "多少钱", "price", "cost", "how much", "$", "¥", "€", "£"}
-    q_lower = query.lower()
-    return any(ind in q_lower for ind in price_indicators)
-
-
-def _augment_query(query: str) -> str:
-    """
-    Query 增强：从中文 query 中提取核心意图词，附加英文等价词。
-    不改变原始 query，只追加扩展词帮助 embedding 模型理解跨语言意图。
-    """
-    if not _CJK_RE.search(query):
-        return query  # 纯英文 query 不需要增强
-
-    augments: List[str] = []
-
-    # 直接匹配
-    for m in _ZH_WORD_RE.finditer(query):
-        zh_word = m.group()
-        if zh_word in _ZH_EN_MAP:
-            augments.extend(_ZH_EN_MAP[zh_word][:3])
-
-    # n-gram 子串匹配（捕获 "的价格" 中的 "价格"、"查一下北京天气" 中的 "天气"）
-    cjk_runs = re.findall(r'[\u4e00-\u9fff]+', query)
-    matched_subs: Set[str] = set()
-    for run in cjk_runs:
-        for sub_len in range(2, min(len(run) + 1, 5)):
-            for start in range(len(run) - sub_len + 1):
-                sub = run[start:start + sub_len]
-                if sub in _ZH_EN_MAP and sub not in matched_subs:
-                    matched_subs.add(sub)
-                    augments.extend(_ZH_EN_MAP[sub][:3])
-
-    if not augments:
-        return query
-
-    # 去重，保持顺序
-    seen: Set[str] = set()
-    unique: List[str] = []
-    for w in augments:
-        wl = w.lower()
-        if wl not in seen:
-            seen.add(wl)
-            unique.append(w)
-
-    return f"{query} ({' '.join(unique[:8])})"
+    return matched / total if total > 0 else 0.0
 
 
 # ── 文本分块 ─────────────────────────────────────────────────────────────
@@ -424,7 +294,6 @@ def _extract_with_embeddings(
     top_k: int,
     max_chars: Optional[int],
     keywords: Optional[Set[str]] = None,
-    price_intent: bool = False,
 ) -> str:
     query_vec = embeddings[0]
     chunk_vecs = embeddings[1:]
@@ -435,7 +304,7 @@ def _extract_with_embeddings(
 
         kw_score = 0.0
         if keywords:
-            kw_score = _compute_keyword_score(chunks[i], keywords, price_intent)
+            kw_score = _compute_keyword_score(chunks[i], keywords)
 
         # 混合得分
         if keywords:
@@ -523,12 +392,9 @@ def extract_relevant_text(
     if early is not None:
         return early
 
-    # 关键词提取 + query 增强
     keywords = _extract_query_keywords(query)
-    price_intent = _has_price_intent(query)
-    augmented_query = _augment_query(query)
 
-    all_texts = [augmented_query] + chunks
+    all_texts = [query] + chunks
     ck = _cache_key(all_texts)
     cached = _cache_get(ck)
 
@@ -536,7 +402,7 @@ def extract_relevant_text(
         logger.info(f"Embedding 缓存命中 ({len(chunks)} 块)")
         return _extract_with_embeddings(
             full_text, query, chunks, cached, top_k, max_chars,
-            keywords=keywords, price_intent=price_intent,
+            keywords=keywords,
         )
 
     t0 = time.time()
@@ -551,7 +417,7 @@ def extract_relevant_text(
     _cache_set(ck, embeddings)
     return _extract_with_embeddings(
         full_text, query, chunks, embeddings, top_k, max_chars,
-        keywords=keywords, price_intent=price_intent,
+        keywords=keywords,
     )
 
 
@@ -585,12 +451,9 @@ async def extract_relevant_text_async(
     if early is not None:
         return early
 
-    # 关键词提取 + query 增强
     keywords = _extract_query_keywords(query)
-    price_intent = _has_price_intent(query)
-    augmented_query = _augment_query(query)
 
-    all_texts = [augmented_query] + chunks
+    all_texts = [query] + chunks
     ck = _cache_key(all_texts)
     cached = _cache_get(ck)
 
@@ -598,7 +461,7 @@ async def extract_relevant_text_async(
         logger.info(f"Embedding 缓存命中 ({len(chunks)} 块)")
         return _extract_with_embeddings(
             full_text, query, chunks, cached, top_k, max_chars,
-            keywords=keywords, price_intent=price_intent,
+            keywords=keywords,
         )
 
     t0 = time.time()
@@ -613,7 +476,7 @@ async def extract_relevant_text_async(
     _cache_set(ck, embeddings)
     return _extract_with_embeddings(
         full_text, query, chunks, embeddings, top_k, max_chars,
-        keywords=keywords, price_intent=price_intent,
+        keywords=keywords,
     )
 
 
