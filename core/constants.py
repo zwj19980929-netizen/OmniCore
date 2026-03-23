@@ -24,6 +24,7 @@ class TaskType(str, Enum):
     BROWSER_AGENT = "browser_agent"
     FILE_WORKER = "file_worker"
     SYSTEM_WORKER = "system_worker"
+    TERMINAL_WORKER = "terminal_worker"
 
     def __str__(self) -> str:
         return self.value
@@ -108,6 +109,31 @@ class SystemAction(str, Enum):
     KEYBOARD = "keyboard"
     MOUSE_CLICK = "mouse_click"
     SCREENSHOT = "screenshot"
+
+    def __str__(self) -> str:
+        return self.value
+
+
+class TerminalAction(str, Enum):
+    """终端操作类型枚举"""
+    SHELL = "shell"           # 执行 shell 命令（完整 shell 语法）
+    READ_FILE = "read_file"   # 读取文件内容
+    WRITE_FILE = "write_file" # 写入文件
+    EDIT_FILE = "edit_file"   # 精确字符串替换
+    GLOB = "glob"             # 文件模式搜索
+    GREP = "grep"             # 内容正则搜索
+    LS = "ls"                 # 列出目录
+    CD = "cd"                 # 切换工作目录
+
+    def __str__(self) -> str:
+        return self.value
+
+
+class TerminalPermissionLevel(str, Enum):
+    """终端命令权限级别"""
+    AUTO_ALLOW = "auto_allow"       # 只读/安全操作，自动放行
+    NOTIFY = "notify"               # 写操作，执行但通知用户
+    REQUIRE_CONFIRM = "confirm"     # 危险操作，必须确认
 
     def __str__(self) -> str:
         return self.value

@@ -219,6 +219,66 @@ def _load_effective_user_preferences(session_id: str) -> Dict[str, Any]:
         }
 
 
+def _build_current_os_context() -> Dict[str, str]:
+    """构建当前操作系统上下文，供 Router LLM 使用正确命令。"""
+    import platform
+    import shutil
+    import os as _os
+
+    system = platform.system()      # Darwin / Linux / Windows
+    release = platform.release()
+    machine = platform.machine()    # arm64 / x86_64 / AMD64
+
+    # 包管理器检测（只列出实际可用的）
+    candidates = {
+        "brew":    "macOS Homebrew",
+        "apt":     "Debian/Ubuntu apt",
+        "apt-get": "Debian/Ubuntu apt-get",
+        "yum":     "RHEL/CentOS yum",
+        "dnf":     "Fedora/RHEL dnf",
+        "pacman":  "Arch Linux pacman",
+        "pip":     "Python pip",
+        "pip3":    "Python pip3",
+        "npm":     "Node.js npm",
+        "cargo":   "Rust cargo",
+        "go":      "Go toolchain",
+    }
+    available_pkgs = [f"{cmd} ({label})" for cmd, label in candidates.items() if shutil.which(cmd)]
+
+    # Shell 检测
+    shell_path = _os.environ.get("SHELL", "")
+    shell_name = _os.path.basename(shell_path) if shell_path else ("cmd" if system == "Windows" else "sh")
+
+    # OS 友好名称 + 包管理器建议
+    if system == "Darwin":
+        mac_ver = platform.mac_ver()[0]
+        os_display = f"macOS {mac_ver} ({machine})"
+        pkg_hint = "Use 'brew' for system packages, 'pip'/'pip3' for Python, 'npm' for Node."
+    elif system == "Linux":
+        try:
+            import distro
+            os_display = f"{distro.name(pretty=True)} ({machine})"
+        except ImportError:
+            os_display = f"Linux {release} ({machine})"
+        pkg_hint = "Use 'apt'/'apt-get' on Debian/Ubuntu, 'yum'/'dnf' on RHEL/Fedora, 'pacman' on Arch."
+    elif system == "Windows":
+        os_display = f"Windows {release} ({machine})"
+        pkg_hint = "Use 'winget' or 'choco' for packages. Prefer PowerShell over cmd."
+    else:
+        os_display = f"{system} {release} ({machine})"
+        pkg_hint = ""
+
+    return {
+        "system": system,
+        "os_display": os_display,
+        "machine": machine,
+        "shell": shell_name,
+        "shell_path": shell_path,
+        "available_package_managers": ", ".join(available_pkgs) if available_pkgs else "unknown",
+        "package_manager_hint": pkg_hint,
+    }
+
+
 def _build_current_time_context() -> Dict[str, str]:
     now = datetime.now().astimezone()
     timezone_name = now.tzname() or str(now.tzinfo or "")
@@ -1744,6 +1804,7 @@ def _execute_submitted_job(
         _sl.log_event("job_start", detail=clean_user_input[:200])
     user_preferences = _load_effective_user_preferences(runtime_session_id)
     current_time_context = _build_current_time_context()
+    current_os_context = _build_current_os_context()
     current_location_context = _build_current_location_context(
         user_preferences,
         current_time_context,
@@ -1791,6 +1852,7 @@ def _execute_submitted_job(
         initial_state["job_id"] = runtime_job_id
         initial_state.setdefault("shared_memory", {})
         initial_state["shared_memory"]["current_time_context"] = current_time_context
+        initial_state["shared_memory"]["current_os_context"] = current_os_context
         initial_state["shared_memory"]["current_location_context"] = current_location_context
         initial_state["shared_memory"]["user_preferences"] = user_preferences
         initial_state["shared_memory"]["work_context"] = work_runtime_context.get("work_context", {})
@@ -1811,6 +1873,7 @@ def _execute_submitted_job(
         if clean_history:
             initial_state["shared_memory"]["conversation_history"] = clean_history
         initial_state["shared_memory"]["current_time_context"] = current_time_context
+        initial_state["shared_memory"]["current_os_context"] = current_os_context
         initial_state["shared_memory"]["current_location_context"] = current_location_context
         initial_state["shared_memory"]["user_preferences"] = user_preferences
         initial_state["shared_memory"]["work_context"] = work_runtime_context.get("work_context", {})
@@ -1861,6 +1924,7 @@ def _execute_submitted_job(
         log_warning(f"Failed to refresh session artifacts: {e}")
 
     initial_state["shared_memory"]["current_time_context"] = current_time_context
+    initial_state["shared_memory"]["current_os_context"] = current_os_context
     initial_state["shared_memory"]["current_location_context"] = current_location_context
     initial_state["shared_memory"]["user_preferences"] = user_preferences
     initial_state["shared_memory"]["work_context"] = work_runtime_context.get("work_context", {})

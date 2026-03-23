@@ -68,6 +68,9 @@ class WorkerPool:
         elif adapter_name == "system_worker":
             from agents.system_worker import SystemWorker
             return SystemWorker()
+        elif adapter_name == "terminal_worker":
+            from agents.terminal_worker import TerminalWorker
+            return TerminalWorker()
         elif adapter_name == "browser_agent":
             # browser_agent is stateful per-task; return None here,
             # callers use create_browser_agent() instead.
@@ -741,6 +744,61 @@ class SystemWorkerAdapter(ExecutorBackedAdapter):
     worker_attr = "system_worker"
 
 
+@tool_adapter("terminal_worker")
+class TerminalWorkerAdapter(ExecutorBackedAdapter):
+    """终端 Worker 适配器（流式输出增强版）"""
+    worker_attr = "terminal_worker"
+
+    async def execute(
+        self,
+        task: Dict[str, Any],
+        shared_memory_snapshot: Dict[str, Any],
+        registered_tool: RegisteredTool,
+    ) -> Dict[str, Any]:
+        pool = await WorkerPool.get_instance()
+        worker = pool.get_worker("terminal_worker")
+        loop = asyncio.get_running_loop()
+
+        # 流式输出回调（通过 shared_memory 传递给调用方）
+        streamed_stdout: list = []
+        streamed_stderr: list = []
+
+        def _stream_cb(line: str, stream_type: str) -> None:
+            if stream_type == "stdout":
+                streamed_stdout.append(line)
+                import sys
+                sys.stdout.write(line)
+                sys.stdout.flush()
+            else:
+                streamed_stderr.append(line)
+                import sys
+                sys.stderr.write(line)
+                sys.stderr.flush()
+
+        params = copy.deepcopy(task.get("params", {}) or {})
+        # 注入流式回调（terminal_worker.execute_shell 支持 stream_callback 参数）
+        action = str(params.get("action", "shell"))
+        if action in ("shell", "execute_command", "cd"):
+            params["_stream_callback"] = _stream_cb
+
+        result = await loop.run_in_executor(None, worker.execute, task, shared_memory_snapshot)
+
+        from utils.tool_evaluation_hook import evaluate_tool_result
+        step_no = len(task.get("execution_trace", [])) + 1
+        evaluate_tool_result("terminal_worker", task, result, step_no)
+
+        status = str(TaskStatus.COMPLETED) if result.get("success") else str(TaskStatus.FAILED)
+        return _base_outcome(
+            task,
+            registered_tool,
+            status=status,
+            result=result,
+            shared_memory=result,
+            error_trace="" if result.get("success") else result.get("error", "Unknown error"),
+            failure_type=task.get("failure_type"),
+        )
+
+
 @tool_adapter("browser_agent")
 class BrowserAgentAdapter(BaseToolAdapter):
     async def execute(
@@ -940,4 +998,5 @@ register_tool_adapter_class("enhanced_web_worker", EnhancedWebWorkerAdapter)
 register_tool_adapter_class("file_worker", FileWorkerAdapter)
 register_tool_adapter_class("api_worker", ApiWorkerAdapter)
 register_tool_adapter_class("system_worker", SystemWorkerAdapter)
+register_tool_adapter_class("terminal_worker", TerminalWorkerAdapter)
 register_tool_adapter_class("browser_agent", BrowserAgentAdapter)

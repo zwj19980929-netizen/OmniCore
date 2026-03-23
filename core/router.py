@@ -1081,6 +1081,7 @@ class RouterAgent:
         resource_memory: list = None,
         successful_paths: list = None,
         failure_patterns: list = None,
+        current_os_context: dict = None,
     ) -> Dict[str, Any]:
         """
         分析用户意图并拆解任务
@@ -1240,6 +1241,28 @@ class RouterAgent:
                 user_message += "\n".join(location_lines)
                 user_message += "\n\n---\n"
 
+        if current_os_context:
+            os_lines = []
+            os_display = str(current_os_context.get("os_display", "") or "").strip()
+            shell = str(current_os_context.get("shell", "") or "").strip()
+            pkg_managers = str(current_os_context.get("available_package_managers", "") or "").strip()
+            pkg_hint = str(current_os_context.get("package_manager_hint", "") or "").strip()
+            if os_display:
+                os_lines.append(f"- OS: {os_display}")
+            if shell:
+                os_lines.append(f"- Shell: {shell}")
+            if pkg_managers:
+                os_lines.append(f"- Available package managers: {pkg_managers}")
+            if pkg_hint:
+                os_lines.append(f"- Package manager guidance: {pkg_hint}")
+            if os_lines:
+                user_message += (
+                    "## Current system environment "
+                    "(IMPORTANT: use OS-appropriate commands when planning terminal tasks):\n"
+                )
+                user_message += "\n".join(os_lines)
+                user_message += "\n\n---\n"
+
         if work_context:
             context_lines = []
             goal = work_context.get("goal") if isinstance(work_context, dict) else {}
@@ -1379,6 +1402,79 @@ class RouterAgent:
                 "is_high_risk": False,
             }
 
+    # ──────────────────────────────────────────────
+    # 终端快速通道（P3）
+    # ──────────────────────────────────────────────
+
+    _TERMINAL_FAST_PATTERNS = re.compile(
+        r"^("
+        r"ls\b|ll\b|la\b|cat\b|head\b|tail\b|grep\b|find\b|rg\b|awk\b|sed\b|"
+        r"echo\b|pwd\b|which\b|wc\b|file\b|less\b|more\b|"
+        r"git\s|python\s|python3\s|node\s|npm\s|pip\s|make\s|"
+        r"cd\s|mkdir\s|touch\s|cp\s|mv\s|rm\s|"
+        r"curl\s|wget\s|ssh\s|scp\s|rsync\s|"
+        r"docker\s|kubectl\s|terraform\s|"
+        r"pytest\s?|jest\s?|cargo\s|go\s|"
+        r"\./|/usr/|/bin/|/opt/"
+        r")",
+        re.IGNORECASE,
+    )
+
+    def _is_terminal_fast_path(self, user_input: str) -> bool:
+        """
+        判断输入是否应该走终端快速通道（跳过 LLM 路由）。
+        快速通道：明确的 shell 命令，直接构建 terminal_worker 任务。
+        """
+        from config.settings import settings
+        if not settings.TERMINAL_ENABLED:
+            return False
+        stripped = user_input.strip()
+        # 以 ! 开头的由 main.py 拦截，这里只处理纯命令模式
+        return bool(self._TERMINAL_FAST_PATTERNS.match(stripped))
+
+    def _build_terminal_fast_task(self, user_input: str, state: OmniCoreState) -> OmniCoreState:
+        """
+        快速构建终端任务，跳过 LLM 路由，不调用 analyze_intent。
+        """
+        import uuid
+        from core.policy_engine import evaluate_task_policy
+
+        task: TaskItem = {
+            "task_id": f"terminal_fast_{uuid.uuid4().hex[:8]}",
+            "task_type": "terminal_worker",
+            "tool_name": "terminal.execute",
+            "description": f"执行终端命令: {user_input[:100]}",
+            "params": {
+                "action": "shell",
+                "command": user_input.strip(),
+            },
+            "status": "pending",
+            "result": None,
+            "priority": 10,
+            "execution_trace": [],
+            "depends_on": [],
+        }
+
+        policy = evaluate_task_policy(task)
+        task["requires_confirmation"] = policy.requires_confirmation
+        task["risk_level"] = policy.risk_level
+        task["policy_reason"] = policy.reason
+        task["affected_resources"] = policy.affected_resources
+
+        state["current_intent"] = "terminal_command"
+        state["intent_confidence"] = 1.0
+        state["task_queue"] = [task]
+        state["policy_decisions"] = [build_policy_decision_from_task(task)]
+        state["needs_human_confirm"] = policy.requires_confirmation
+        state["shared_memory"]["router_direct_answer"] = ""
+        state["shared_memory"]["router_high_risk_reason"] = (
+            policy.reason if policy.requires_confirmation else ""
+        )
+        state["execution_status"] = "routing"
+
+        log_agent_action("Router", "终端快速通道", f"$ {user_input[:60]}")
+        return state
+
     def route(self, state: OmniCoreState) -> OmniCoreState:
         """
         LangGraph 节点函数：执行路由逻辑
@@ -1391,6 +1487,10 @@ class RouterAgent:
         """
         user_input = state["user_input"]
 
+        # 终端快速通道：明确的 shell 命令跳过 LLM 路由
+        if self._is_terminal_fast_path(user_input):
+            return self._build_terminal_fast_task(user_input, state)
+
         # 分析意图（传入对话历史）
         conversation_history = state.get("shared_memory", {}).get("conversation_history")
         related_history = state.get("shared_memory", {}).get("related_history")
@@ -1398,6 +1498,7 @@ class RouterAgent:
         user_preferences = state.get("shared_memory", {}).get("user_preferences")
         current_time_context = state.get("shared_memory", {}).get("current_time_context")
         current_location_context = state.get("shared_memory", {}).get("current_location_context")
+        current_os_context = state.get("shared_memory", {}).get("current_os_context")
         work_context = state.get("shared_memory", {}).get("work_context")
         resource_memory = state.get("shared_memory", {}).get("resource_memory")
         successful_paths = state.get("shared_memory", {}).get("successful_paths")
@@ -1414,6 +1515,7 @@ class RouterAgent:
             resource_memory,
             successful_paths,
             failure_patterns,
+            current_os_context,
         )
 
         # 构建任务队列

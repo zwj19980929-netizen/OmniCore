@@ -367,6 +367,108 @@ def _register_builtin_tools(registry: ToolRegistry) -> None:
             serialized=True,
         )
     )
+    # 终端执行工具（Claude Code 级别的 shell 能力）
+    registry.register(
+        RegisteredTool(
+            spec=ToolSpec(
+                name="terminal.execute",
+                task_type=str(TaskType.TERMINAL_WORKER),
+                description="Execute shell commands with full syntax support (pipes, chaining, redirection). Use for running scripts, build commands, git operations, file management, etc.",
+                risk_level="medium",
+                tags=["terminal", "shell", "commands", "cli"],
+                input_schema={
+                    "type": "object",
+                    "properties": {
+                        "action": {"type": "string", "enum": ["shell", "cd", "ls"]},
+                        "command": {"type": "string", "description": "Shell command to execute (full syntax supported)"},
+                        "working_dir": {"type": "string"},
+                        "timeout": {"type": "integer", "description": "Timeout in seconds (max 600)"},
+                        "env": {"type": "object", "description": "Extra environment variables"},
+                    },
+                    "required": ["command"],
+                },
+            ),
+            adapter_name="terminal_worker",
+            max_parallelism=1,
+            serialized=True,
+        )
+    )
+    registry.register(
+        RegisteredTool(
+            spec=ToolSpec(
+                name="terminal.read_file",
+                task_type=str(TaskType.TERMINAL_WORKER),
+                description="Read file contents with line numbers and pagination support.",
+                risk_level="low",
+                tags=["terminal", "file", "read"],
+                input_schema={
+                    "type": "object",
+                    "properties": {
+                        "action": {"type": "string", "enum": ["read_file"]},
+                        "file_path": {"type": "string"},
+                        "offset": {"type": "integer", "description": "Start line number (1-based)"},
+                        "limit": {"type": "integer", "description": "Max lines to read"},
+                        "encoding": {"type": "string"},
+                    },
+                    "required": ["file_path"],
+                },
+            ),
+            adapter_name="terminal_worker",
+            max_parallelism=4,
+        )
+    )
+    registry.register(
+        RegisteredTool(
+            spec=ToolSpec(
+                name="terminal.edit_file",
+                task_type=str(TaskType.TERMINAL_WORKER),
+                description="Write or edit files. Use write_file to create/overwrite, edit_file for precise string replacements.",
+                risk_level="medium",
+                tags=["terminal", "file", "write", "edit"],
+                input_schema={
+                    "type": "object",
+                    "properties": {
+                        "action": {"type": "string", "enum": ["write_file", "edit_file"]},
+                        "file_path": {"type": "string"},
+                        "content": {"type": "string", "description": "File content (for write_file)"},
+                        "old_string": {"type": "string", "description": "Exact string to replace (for edit_file)"},
+                        "new_string": {"type": "string", "description": "Replacement string (for edit_file)"},
+                        "replace_all": {"type": "boolean", "default": False},
+                        "encoding": {"type": "string"},
+                    },
+                    "required": ["file_path"],
+                },
+            ),
+            adapter_name="terminal_worker",
+            max_parallelism=1,
+        )
+    )
+    registry.register(
+        RegisteredTool(
+            spec=ToolSpec(
+                name="terminal.search",
+                task_type=str(TaskType.TERMINAL_WORKER),
+                description="Search files by pattern (glob) or content (grep/regex). Use for finding files or searching code.",
+                risk_level="low",
+                tags=["terminal", "search", "glob", "grep"],
+                input_schema={
+                    "type": "object",
+                    "properties": {
+                        "action": {"type": "string", "enum": ["glob", "grep"]},
+                        "pattern": {"type": "string", "description": "Glob pattern (e.g. **/*.py) or regex pattern"},
+                        "path": {"type": "string", "description": "Base directory or file to search"},
+                        "include": {"type": "string", "description": "File filter glob for grep (e.g. *.py)"},
+                        "case_insensitive": {"type": "boolean", "default": False},
+                        "max_results": {"type": "integer", "default": 50},
+                        "context_lines": {"type": "integer", "default": 0},
+                    },
+                    "required": ["pattern"],
+                },
+            ),
+            adapter_name="terminal_worker",
+            max_parallelism=4,
+        )
+    )
 
 
 def _sync_plugin_tools(registry: ToolRegistry) -> ToolRegistry:

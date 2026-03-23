@@ -9,7 +9,8 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any, Dict, List
 
-from core.constants import TaskType
+from config.settings import settings
+from core.constants import TaskType, TerminalPermissionLevel
 from core.tool_registry import get_builtin_tool_registry
 
 
@@ -91,6 +92,41 @@ def evaluate_task_policy(task: Dict[str, Any]) -> PolicyDecision:
     params = task.get("params", {}) or {}
     description = str(task.get("description", "") or "")
     lowered_description = description.lower()
+
+    # Terminal worker：使用三级权限模型，而非始终确认
+    if task_type == str(TaskType.TERMINAL_WORKER) or tool_name in (
+        "terminal.execute", "terminal.read_file", "terminal.edit_file", "terminal.search"
+    ):
+        from agents.terminal_worker import _classify_command_permission
+        command = str(params.get("command", "")).strip()
+        action = str(params.get("action", "shell")).strip()
+        perm = _classify_command_permission(
+            command or action,
+            mode=settings.TERMINAL_PERMISSION_MODE,
+            user_auto_allow=settings.TERMINAL_AUTO_ALLOW_PATTERNS,
+            user_always_confirm=settings.TERMINAL_ALWAYS_CONFIRM_PATTERNS,
+        )
+        if perm == TerminalPermissionLevel.REQUIRE_CONFIRM:
+            return PolicyDecision(
+                requires_confirmation=True,
+                reason="terminal command classified as high-risk",
+                risk_level="high",
+                affected_resources=[command] if command else [],
+            )
+        elif perm == TerminalPermissionLevel.NOTIFY:
+            return PolicyDecision(
+                requires_confirmation=False,
+                reason="terminal command notify-level: auto-execute with logging",
+                risk_level="medium",
+                affected_resources=[command] if command else [],
+            )
+        else:
+            return PolicyDecision(
+                requires_confirmation=False,
+                reason="terminal command read-only: auto-allow",
+                risk_level="low",
+                affected_resources=[],
+            )
 
     if task_type == str(TaskType.SYSTEM_WORKER) or tool_name == "system.control":
         command = str(params.get("command", "")).strip()

@@ -128,6 +128,19 @@ class HumanConfirm:
         )
 
     @staticmethod
+    def request_terminal_command_confirmation(
+        command: str,
+        working_dir: str,
+        risk_level: str = "medium",
+    ) -> bool:
+        """终端命令执行确认（三级权限中的 confirm 级别）"""
+        risk_icon = "🔴" if risk_level == "high" else "🟡"
+        return HumanConfirm.request_confirmation(
+            operation=f"{risk_icon} 执行终端命令",
+            details=f"命令: {command}\n工作目录: {working_dir}",
+        )
+
+    @staticmethod
     def request_browser_action_confirmation(
         action: str,
         target: str,

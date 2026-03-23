@@ -1890,17 +1890,19 @@ def test_build_budgeted_browser_prompt_context_respects_budget_and_controls():
         )
         for index in range(1, 9)
     ]
-    rendered, report = agent._build_budgeted_browser_prompt_context(
-        task="extract 5 results and continue pagination if needed",
-        current_url="https://example.com/list",
-        data=[{"title": "Example title", "text": "body " * 80, "link": "https://example.com/a"}],
-        cards=cards,
-        snapshot=snapshot,
-        elements_text="\n".join(
-            f"[{index}] type=link ref=el_{index} selector=a.item-{index} info={'y' * 180}"
-            for index in range(1, 18)
-        ),
-        total_tokens=450,
+    rendered, report = asyncio.run(
+        agent._build_budgeted_browser_prompt_context(
+            task="extract 5 results and continue pagination if needed",
+            current_url="https://example.com/list",
+            data=[{"title": "Example title", "text": "body " * 80, "link": "https://example.com/a"}],
+            cards=cards,
+            snapshot=snapshot,
+            elements_text="\n".join(
+                f"[{index}] type=link ref=el_{index} selector=a.item-{index} info={'y' * 180}"
+                for index in range(1, 18)
+            ),
+            total_tokens=450,
+        )
     )
 
     total_used = sum(

@@ -330,5 +330,29 @@ class Settings:
         "post_to_social",
     ]
 
+    # === 终端执行配置 ===
+    # 是否启用终端 Worker（Claude Code 级别的 shell 执行能力）
+    TERMINAL_ENABLED = os.getenv("TERMINAL_ENABLED", "true").lower() == "true"
+    # 默认执行超时（秒），比 system_worker 的 30s 更宽松
+    TERMINAL_DEFAULT_TIMEOUT = _env_int("TERMINAL_DEFAULT_TIMEOUT", 120)
+    # 最大超时上限（秒）
+    TERMINAL_MAX_TIMEOUT = _env_int("TERMINAL_MAX_TIMEOUT", 600)
+    # 是否启用沙箱目录限制（限制写操作只能在沙箱根目录内）
+    TERMINAL_SANDBOX_ENABLED = os.getenv("TERMINAL_SANDBOX_ENABLED", "false").lower() == "true"
+    # 沙箱根目录（写操作只能在此目录下进行）
+    TERMINAL_SANDBOX_ROOT = os.getenv("TERMINAL_SANDBOX_ROOT", str(Path.cwd()))
+    # 是否实时流式输出命令执行结果
+    TERMINAL_STREAM_OUTPUT = os.getenv("TERMINAL_STREAM_OUTPUT", "true").lower() == "true"
+    # 使用哪个 shell 执行命令
+    TERMINAL_SHELL = os.getenv("TERMINAL_SHELL", os.environ.get("SHELL", "/bin/zsh"))
+    # 权限模式：strict（同 system_worker）/ balanced（三级权限）/ permissive（只确认危险操作）
+    TERMINAL_PERMISSION_MODE = os.getenv("TERMINAL_PERMISSION_MODE", "balanced")
+    # 会话内记住已审批的命令类别，同类操作不重复确认
+    TERMINAL_SESSION_APPROVALS = os.getenv("TERMINAL_SESSION_APPROVALS", "true").lower() == "true"
+    # 用户自定义自动放行的命令前缀（逗号分隔）
+    TERMINAL_AUTO_ALLOW_PATTERNS = _env_csv("TERMINAL_AUTO_ALLOW_PATTERNS")
+    # 用户自定义强制确认的命令前缀（逗号分隔）
+    TERMINAL_ALWAYS_CONFIRM_PATTERNS = _env_csv("TERMINAL_ALWAYS_CONFIRM_PATTERNS")
+
 
 settings = Settings()
