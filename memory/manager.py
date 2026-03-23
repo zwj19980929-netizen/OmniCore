@@ -11,6 +11,7 @@ from utils.text import sanitize_text, sanitize_value
 
 if TYPE_CHECKING:
     from memory.scoped_chroma_store import ChromaMemory
+    from memory.entity_extractor import EntityExtractor
 
 
 _SCOPE_KEYS = ("session_id", "goal_id", "project_id", "todo_id")
@@ -112,8 +113,24 @@ def _extract_artifact_refs(artifacts: List[Dict[str, Any]]) -> List[Dict[str, st
 
 
 class MemoryManager:
-    def __init__(self, chroma_memory: Optional["ChromaMemory"] = None):
+    def __init__(
+        self,
+        chroma_memory: Optional["ChromaMemory"] = None,
+        entity_extractor: Optional["EntityExtractor"] = None,
+    ):
         self.chroma_memory = chroma_memory
+        self._entity_extractor = entity_extractor
+
+    @property
+    def entity_extractor(self) -> Optional["EntityExtractor"]:
+        """Lazy-load EntityExtractor on first use."""
+        if self._entity_extractor is None:
+            try:
+                from memory.entity_extractor import EntityExtractor
+                self._entity_extractor = EntityExtractor()
+            except Exception:
+                pass
+        return self._entity_extractor
 
     def search_related_history(
         self,
@@ -203,17 +220,44 @@ class MemoryManager:
                 "success": bool(success),
                 "summary": summary_text[:400],
             }
+
+            # --- Entity extraction (best-effort) ---
+            entity_metadata: Dict[str, Any] = {}
+            extractor = self.entity_extractor
+            if extractor is not None:
+                try:
+                    extraction = extractor.extract(f"{cleaned_input}\n{summary_text[:2000]}")
+                    entities = extraction.get("entities") or []
+                    if entities:
+                        # Store entity names grouped by type for metadata filtering
+                        by_type: Dict[str, List[str]] = {}
+                        for ent in entities[:20]:
+                            etype = sanitize_text(ent.get("type") or "KEYWORD")
+                            etext = sanitize_text(ent.get("text") or "")
+                            if etext:
+                                by_type.setdefault(etype, []).append(etext)
+                        for etype, texts in by_type.items():
+                            entity_metadata[f"entity_{etype.lower()}"] = ",".join(texts[:10])
+                    entity_summary = sanitize_text(extraction.get("summary") or "")
+                    if entity_summary:
+                        entity_metadata["entity_summary"] = entity_summary[:300]
+                except Exception:
+                    pass  # entity extraction is best-effort
+
+            task_metadata = {
+                "intent": sanitize_text(intent or ""),
+                "tool_sequence": tool_sequence,
+                "visited_urls": visited_urls,
+                "artifact_refs": _safe_json_dumps(artifact_refs[:5]),
+            }
+            task_metadata.update(entity_metadata)
+
             memory_id = self.chroma_memory.save_task_result(
                 task_description=cleaned_input,
                 result=summary_text,
                 success=success,
                 scope=normalized_scope,
-                metadata={
-                    "intent": sanitize_text(intent or ""),
-                    "tool_sequence": tool_sequence,
-                    "visited_urls": visited_urls,
-                    "artifact_refs": _safe_json_dumps(artifact_refs[:5]),
-                },
+                metadata=task_metadata,
                 fingerprint=hashlib.sha1(
                     json.dumps(fingerprint_payload, ensure_ascii=False, sort_keys=True).encode("utf-8")
                 ).hexdigest()[:24],

@@ -6,11 +6,12 @@ from __future__ import annotations
 import hashlib
 import json
 import uuid
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Any, Dict, List, Optional
 
 import chromadb
 from chromadb.config import Settings as ChromaSettings
+from chromadb.utils.embedding_functions import SentenceTransformerEmbeddingFunction
 
 from config.settings import settings
 from utils.logger import log_agent_action, log_success, logger
@@ -18,6 +19,20 @@ from utils.text import sanitize_text, sanitize_value
 
 
 _SCOPE_KEYS = ("session_id", "goal_id", "project_id", "todo_id")
+
+# Multilingual embedding model — much better Chinese support than the default
+# all-MiniLM-L6-v2.  Lazy-loaded once per process.
+_EMBEDDING_MODEL_NAME = "paraphrase-multilingual-MiniLM-L12-v2"
+_embedding_fn: Optional[SentenceTransformerEmbeddingFunction] = None
+
+
+def _get_embedding_fn() -> SentenceTransformerEmbeddingFunction:
+    global _embedding_fn
+    if _embedding_fn is None:
+        _embedding_fn = SentenceTransformerEmbeddingFunction(
+            model_name=_EMBEDDING_MODEL_NAME,
+        )
+    return _embedding_fn
 
 
 class ChromaMemory:
@@ -43,6 +58,7 @@ class ChromaMemory:
         self._collection = self._client.get_or_create_collection(
             name=self.collection_name,
             metadata={"description": "OmniCore scoped memory store"},
+            embedding_function=_get_embedding_fn(),
         )
         log_agent_action(self.name, "Initialize", f"collection: {self.collection_name}")
 
@@ -82,16 +98,32 @@ class ChromaMemory:
         return meta
 
     def _scope_candidates(self, scope: Optional[Dict[str, Any]]) -> List[tuple[str, Dict[str, str]]]:
+        """Build fallback chain: exact → project → goal → session → global.
+
+        Progressively removes the most specific key so that a todo-level
+        query falls back through project → goal → session → global.
+        """
         normalized = self._normalize_scope(scope)
         if not normalized:
             return [("global", {})]
 
         candidates: List[tuple[str, Dict[str, str]]] = [("scope", normalized)]
-        session_only = {}
-        if normalized.get("session_id"):
-            session_only = {"session_id": normalized["session_id"]}
-        if session_only and session_only != normalized:
-            candidates.append(("session", session_only))
+        seen_keys: set[str] = {self._scope_key(normalized)}
+
+        # Keys ordered from most specific to least specific
+        current = dict(normalized)
+        for drop_key in ("todo_id", "project_id", "goal_id"):
+            if drop_key not in current:
+                continue
+            current = {k: v for k, v in current.items() if k != drop_key}
+            if not current:
+                break
+            cache_key = self._scope_key(current)
+            if cache_key not in seen_keys:
+                level = self._scope_level(current)
+                candidates.append((level, dict(current)))
+                seen_keys.add(cache_key)
+
         candidates.append(("global", {}))
         return candidates
 
@@ -169,7 +201,13 @@ class ChromaMemory:
         return items
 
     def _touch_memories(self, memories: List[Dict[str, Any]]) -> None:
+        """Batch-update hit_count and last_accessed_at for retrieved memories."""
+        if not memories:
+            return
         timestamp = datetime.now().isoformat(timespec="seconds")
+        ids: List[str] = []
+        documents: List[str] = []
+        metadatas: List[Dict[str, Any]] = []
         for memory in memories:
             memory_id = sanitize_text(memory.get("id") or "")
             if not memory_id:
@@ -177,14 +215,20 @@ class ChromaMemory:
             metadata = sanitize_value(memory.get("metadata") or {})
             metadata["last_accessed_at"] = timestamp
             metadata["hit_count"] = int(metadata.get("hit_count", 0) or 0) + 1
-            try:
-                self._collection.upsert(
-                    ids=[memory_id],
-                    documents=[sanitize_text(memory.get("content") or "")],
-                    metadatas=[metadata],
-                )
-            except Exception:
-                continue
+            ids.append(memory_id)
+            documents.append(sanitize_text(memory.get("content") or ""))
+            metadatas.append(metadata)
+        if not ids:
+            return
+        try:
+            self._collection.upsert(ids=ids, documents=documents, metadatas=metadatas)
+        except Exception as e:
+            logger.debug("Failed to batch-touch %d memories: %s", len(ids), e)
+
+    # Semantic dedup: below this distance threshold two memories are considered
+    # duplicates.  ChromaDB distances are L2-squared by default; 0.15 is a
+    # conservative threshold (very high similarity).
+    DEDUP_DISTANCE_THRESHOLD = 0.15
 
     def add_memory(
         self,
@@ -195,6 +239,7 @@ class ChromaMemory:
         scope: Optional[Dict[str, Any]] = None,
         fingerprint: str = "",
         allow_update: bool = False,
+        skip_dedup: bool = False,
     ) -> str:
         clean_content = sanitize_text(content or "")
         if not clean_content:
@@ -204,6 +249,24 @@ class ChromaMemory:
         existing: Dict[str, Any] = {}
         memory_id = f"mem_{uuid.uuid4().hex[:12]}"
         clean_fingerprint = sanitize_text(fingerprint or "")
+
+        # --- semantic dedup for memories without fingerprint ---
+        if not clean_fingerprint and not skip_dedup:
+            try:
+                where = self._build_where_filter(memory_type=memory_type, scope=scope)
+                dupes = self._collection.query(
+                    query_texts=[clean_content], n_results=1, where=where,
+                )
+                distances = (dupes.get("distances") or [[]])[0]
+                dupe_ids = (dupes.get("ids") or [[]])[0]
+                if distances and distances[0] < self.DEDUP_DISTANCE_THRESHOLD and dupe_ids:
+                    logger.debug(
+                        "Semantic dedup: skipping near-duplicate (distance=%.4f, existing=%s)",
+                        distances[0], dupe_ids[0],
+                    )
+                    return dupe_ids[0]
+            except Exception:
+                pass  # dedup is best-effort
         if clean_fingerprint:
             memory_id = self._memory_id_from_fingerprint(clean_fingerprint)
             existing = self._get_single_record(memory_id)
@@ -224,6 +287,11 @@ class ChromaMemory:
         payload_metadata.update(self._scope_metadata(scope))
         if metadata:
             payload_metadata.update(sanitize_value(metadata))
+
+        # ChromaDB metadata 只接受标量，将 list/tuple 转为逗号拼接字符串
+        for k, v in list(payload_metadata.items()):
+            if isinstance(v, (list, tuple)):
+                payload_metadata[k] = ",".join(str(x) for x in v)
 
         try:
             if clean_fingerprint and allow_update:
@@ -284,7 +352,7 @@ class ChromaMemory:
             for item in self._query_collection(
                 query=clean_query,
                 where_filter=where_filter,
-                n_results=max(n_results * 2, n_results),
+                n_results=n_results * 2,
                 scope_match=scope_match,
             ):
                 if item["id"] in seen_ids:
@@ -481,6 +549,55 @@ class ChromaMemory:
             fingerprint=fingerprint,
             allow_update=True,
         )
+
+    def evict_stale(
+        self,
+        *,
+        max_age_days: int = 90,
+        min_hit_count: int = 0,
+        scope: Optional[Dict[str, Any]] = None,
+        dry_run: bool = False,
+    ) -> Dict[str, Any]:
+        """
+        Evict memories that are older than *max_age_days* AND have a hit_count
+        at or below *min_hit_count*.  Preferences are never evicted automatically.
+
+        Returns ``{"evicted": int, "scanned": int, "candidates": [ids]}``
+        """
+        where_filter = self._build_where_filter(scope=scope) if scope else None
+        results = self._collection.get(where=where_filter)
+        ids = results.get("ids") or []
+        metadatas = results.get("metadatas") or []
+        cutoff = (datetime.now() - timedelta(days=max_age_days)).isoformat(timespec="seconds")
+
+        candidates: List[str] = []
+        for idx, memory_id in enumerate(ids):
+            meta = sanitize_value(metadatas[idx] if idx < len(metadatas) else {})
+            # Never auto-evict preferences
+            if sanitize_text(meta.get("type") or "") == "preference":
+                continue
+            updated = sanitize_text(meta.get("updated_at") or meta.get("created_at") or "")
+            if not updated or updated >= cutoff:
+                continue
+            hit = int(meta.get("hit_count", 0) or 0)
+            if hit <= min_hit_count:
+                candidates.append(sanitize_text(memory_id))
+
+        evicted = 0
+        if candidates and not dry_run:
+            try:
+                self._collection.delete(ids=candidates)
+                evicted = len(candidates)
+                log_agent_action(self.name, "Evict stale", f"evicted {evicted}/{len(ids)}")
+            except Exception as e:
+                logger.error("Failed to evict stale memories: %s", e)
+
+        return {
+            "scanned": len(ids),
+            "evicted": evicted if not dry_run else 0,
+            "candidates": len(candidates),
+            "dry_run": dry_run,
+        }
 
     def get_stats(self, *, scope: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
         where_filter = self._build_where_filter(scope=scope) if scope else None

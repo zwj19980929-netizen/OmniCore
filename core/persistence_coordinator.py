@@ -105,6 +105,13 @@ class PersistenceCoordinator:
             self._work_context_store = WorkContextStore()
         return self._work_context_store
 
+    def _get_memory_manager(self):
+        """Return a cached MemoryManager instance."""
+        if not hasattr(self, "_memory_manager") or self._memory_manager is None:
+            from memory.manager import MemoryManager
+            self._memory_manager = MemoryManager(chroma_memory=self.memory_store)
+        return self._memory_manager
+
     # -- public API ----------------------------------------------------------
 
     async def complete_job(
@@ -394,8 +401,7 @@ class PersistenceCoordinator:
 
         elif store == "memory":
             # Use MemoryManager.persist_job_outcome for rich memory persistence
-            from memory.manager import MemoryManager
-            mgr = MemoryManager(chroma_memory=self.memory_store)
+            mgr = self._get_memory_manager()
             await loop.run_in_executor(
                 None,
                 lambda: mgr.persist_job_outcome(
