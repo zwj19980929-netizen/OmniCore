@@ -91,7 +91,7 @@ def _make_store():
     store = ChromaMemory.__new__(ChromaMemory)
     store.name = "ChromaMemory"
     store.collection_name = "test_memory"
-    store._collection = collection
+    store._ChromaMemory__collection = collection  # backs the lazy _collection property
     store._client = _FakeClient(collection)
     return store
 

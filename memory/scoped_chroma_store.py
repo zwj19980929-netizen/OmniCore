@@ -11,7 +11,6 @@ from typing import Any, Dict, List, Optional
 
 import chromadb
 from chromadb.config import Settings as ChromaSettings
-from chromadb.utils.embedding_functions import SentenceTransformerEmbeddingFunction
 
 from config.settings import settings
 from utils.logger import log_agent_action, log_success, logger
@@ -21,14 +20,15 @@ from utils.text import sanitize_text, sanitize_value
 _SCOPE_KEYS = ("session_id", "goal_id", "project_id", "todo_id")
 
 # Multilingual embedding model — much better Chinese support than the default
-# all-MiniLM-L6-v2.  Lazy-loaded once per process.
+# all-MiniLM-L6-v2.  Lazy-loaded once per process on first memory operation.
 _EMBEDDING_MODEL_NAME = "paraphrase-multilingual-MiniLM-L12-v2"
-_embedding_fn: Optional[SentenceTransformerEmbeddingFunction] = None
+_embedding_fn = None
 
 
-def _get_embedding_fn() -> SentenceTransformerEmbeddingFunction:
+def _get_embedding_fn():
     global _embedding_fn
     if _embedding_fn is None:
+        from chromadb.utils.embedding_functions import SentenceTransformerEmbeddingFunction
         _embedding_fn = SentenceTransformerEmbeddingFunction(
             model_name=_EMBEDDING_MODEL_NAME,
         )
@@ -38,14 +38,23 @@ def _get_embedding_fn() -> SentenceTransformerEmbeddingFunction:
 class ChromaMemory:
     """
     Persistent vector memory with scoped retrieval and stable upserts.
+
+    The ChromaDB collection is lazily initialized on the first actual
+    memory operation, so constructing this class does NOT block startup.
     """
 
     def __init__(self, collection_name: str = "omnicore_memory"):
         self.name = "ChromaMemory"
         self.collection_name = collection_name
         self._client = None
-        self._collection = None
-        self._init_client()
+        self.__collection = None  # double-underscore to back the property
+
+    @property
+    def _collection(self):
+        """Lazy-init: ChromaDB client + collection created on first access."""
+        if self.__collection is None:
+            self._init_client()
+        return self.__collection
 
     def _init_client(self) -> None:
         persist_dir = settings.CHROMA_PERSIST_DIR
@@ -55,7 +64,7 @@ class ChromaMemory:
             path=str(persist_dir),
             settings=ChromaSettings(anonymized_telemetry=False),
         )
-        self._collection = self._client.get_or_create_collection(
+        self.__collection = self._client.get_or_create_collection(
             name=self.collection_name,
             metadata={"description": "OmniCore scoped memory store"},
             embedding_function=_get_embedding_fn(),
@@ -477,7 +486,10 @@ class ChromaMemory:
     def clear_all(self) -> bool:
         try:
             self._client.delete_collection(self.collection_name)
-            self._collection = self._client.get_or_create_collection(name=self.collection_name)
+            self.__collection = self._client.get_or_create_collection(
+                name=self.collection_name,
+                embedding_function=_get_embedding_fn(),
+            )
             log_success("Memory store cleared")
             return True
         except Exception as e:
