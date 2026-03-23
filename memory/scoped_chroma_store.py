@@ -67,11 +67,22 @@ class ChromaMemory:
             path=str(persist_dir),
             settings=ChromaSettings(anonymized_telemetry=False),
         )
-        self.__collection = self._client.get_or_create_collection(
-            name=self.collection_name,
-            metadata={"description": "OmniCore scoped memory store"},
-            embedding_function=_get_embedding_fn(),
-        )
+        try:
+            self.__collection = self._client.get_or_create_collection(
+                name=self.collection_name,
+                metadata={"description": "OmniCore scoped memory store"},
+                embedding_function=_get_embedding_fn(),
+            )
+        except ValueError:
+            # Collection was created with a different embedding function.
+            # Delete and recreate so the new embedding model is used consistently.
+            logger.warning("Recreating collection %s due to embedding function conflict", self.collection_name)
+            self._client.delete_collection(self.collection_name)
+            self.__collection = self._client.get_or_create_collection(
+                name=self.collection_name,
+                metadata={"description": "OmniCore scoped memory store"},
+                embedding_function=_get_embedding_fn(),
+            )
         log_agent_action(self.name, "Initialize", f"collection: {self.collection_name}")
 
     def _normalize_scope(self, scope: Optional[Dict[str, Any]]) -> Dict[str, str]:
