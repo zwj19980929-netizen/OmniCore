@@ -165,11 +165,23 @@ def interactive_mode():
     """交互式命令行模式 - 支持历史记录和优雅退出"""
     print_banner()
 
-    # 初始化记忆系统
+    # 初始化记忆系统（后台预热，不阻塞启动）
     try:
         memory = ChromaMemory()
-        stats = memory.get_stats()
-        console.print(f"[dim]记忆系统已加载: {stats['total_memories']} 条历史记录[/dim]\n")
+        import threading, os, contextlib
+
+        def _warmup():
+            import warnings
+            with open(os.devnull, "w") as devnull, \
+                 contextlib.redirect_stderr(devnull), \
+                 contextlib.redirect_stdout(devnull), \
+                 warnings.catch_warnings():
+                warnings.simplefilter("ignore")
+                os.environ.setdefault("HF_HUB_DISABLE_PROGRESS_BARS", "1")
+                memory._collection
+
+        threading.Thread(target=_warmup, daemon=True).start()
+        console.print("[dim]记忆系统就绪[/dim]\n")
     except Exception as e:
         console.print(f"[yellow]记忆系统初始化失败: {e}[/yellow]\n")
         memory = None

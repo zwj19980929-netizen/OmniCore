@@ -92,6 +92,7 @@ def _make_store():
     store.name = "ChromaMemory"
     store.collection_name = "test_memory"
     store._ChromaMemory__collection = collection  # backs the lazy _collection property
+    store._ChromaMemory__init_lock = __import__("threading").Lock()
     store._client = _FakeClient(collection)
     return store
 

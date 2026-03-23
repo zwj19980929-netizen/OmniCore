@@ -48,12 +48,15 @@ class ChromaMemory:
         self.collection_name = collection_name
         self._client = None
         self.__collection = None  # double-underscore to back the property
+        self.__init_lock = __import__("threading").Lock()
 
     @property
     def _collection(self):
         """Lazy-init: ChromaDB client + collection created on first access."""
         if self.__collection is None:
-            self._init_client()
+            with self.__init_lock:
+                if self.__collection is None:
+                    self._init_client()
         return self.__collection
 
     def _init_client(self) -> None:
