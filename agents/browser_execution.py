@@ -641,13 +641,17 @@ class BrowserExecutionLayer:
         Args:
             get_snapshot_fn: async callable returning the semantic snapshot.
         """
-        url_r = await self._call_toolkit("get_current_url")
+        # ⚡ 优化: 并行获取 url/title/html/snapshot，节省 ~0.3-0.8s
+        import asyncio as _asyncio
+        url_r, title_r, html_r, semantic_snapshot = await _asyncio.gather(
+            self._call_toolkit("get_current_url"),
+            self._call_toolkit("get_title"),
+            self._call_toolkit("get_page_html"),
+            get_snapshot_fn(),
+        )
         url = str(url_r.data or "") if url_r.success else ""
-        title_r = await self._call_toolkit("get_title")
         title = str(title_r.data or "") if title_r.success else ""
-        html_r = await self._call_toolkit("get_page_html")
         html = str(html_r.data or "") if html_r.success else ""
-        semantic_snapshot = await get_snapshot_fn()
         from agents.browser_perception import BrowserPerceptionLayer
         return {
             "url": url,

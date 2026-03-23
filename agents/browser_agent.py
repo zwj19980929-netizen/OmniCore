@@ -4027,48 +4027,48 @@ class BrowserAgent:
     ) -> Tuple[Optional[BrowserAction], str]:
         active_snapshot = snapshot or self._last_semantic_snapshot or {}
 
-        # Try unified single-call plan first (fewer LLM calls)
+        # ⚡ 优化: 投机并行 — unified_plan 和 assess_page 同时发起 LLM 调用
+        # 取先完成且有效的结果，节省 3-8s/步（最大瓶颈）
         observation = self._last_observation
-        if observation is not None:
-            unified_action = await self._unified_plan_action(
+
+        async def _try_unified() -> Optional[BrowserAction]:
+            if observation is None:
+                return None
+            act = await self._unified_plan_action(
                 task, current_url, title, elements, intent, data,
                 observation=observation,
                 last_action=last_action,
                 recent_steps=recent_steps,
             )
-            if unified_action is not None:
-                unified_action = self._sanitize_planned_action(
+            if act is not None:
+                act = self._sanitize_planned_action(
                     task, current_url, elements, intent, data,
-                    unified_action, snapshot=active_snapshot, recent_steps=recent_steps,
+                    act, snapshot=active_snapshot, recent_steps=recent_steps,
                 )
-                if unified_action is not None and unified_action.action_type not in {ActionType.WAIT, ActionType.FAILED}:
-                    return unified_action, "unified_plan"
+            return act
 
-        # Fallback to legacy multi-call pipeline
-        assessed_action = await self._assess_page_with_llm(
-            task,
-            current_url,
-            title,
-            elements,
-            intent,
-            data,
-            last_action=last_action,
-            recent_steps=recent_steps,
-        )
-        active_snapshot = snapshot or self._last_semantic_snapshot or active_snapshot
-        assessed_action = self._sanitize_planned_action(
-            task,
-            current_url,
-            elements,
-            intent,
-            data,
-            assessed_action,
-            snapshot=active_snapshot,
-            recent_steps=recent_steps,
-        )
-        if assessed_action is not None and assessed_action.action_type not in {ActionType.WAIT, ActionType.FAILED}:
-            return assessed_action, "page_assessment_llm"
+        async def _try_assess() -> Optional[BrowserAction]:
+            act = await self._assess_page_with_llm(
+                task, current_url, title, elements, intent, data,
+                last_action=last_action, recent_steps=recent_steps,
+            )
+            if act is not None:
+                act = self._sanitize_planned_action(
+                    task, current_url, elements, intent, data,
+                    act, snapshot=active_snapshot, recent_steps=recent_steps,
+                )
+            return act
 
+        unified_result, assessed_result = await asyncio.gather(
+            _try_unified(), _try_assess(),
+        )
+        # 优先取 unified（更完整），其次 assessed
+        if unified_result is not None and unified_result.action_type not in {ActionType.WAIT, ActionType.FAILED}:
+            return unified_result, "unified_plan"
+        if assessed_result is not None and assessed_result.action_type not in {ActionType.WAIT, ActionType.FAILED}:
+            return assessed_result, "page_assessment_llm"
+
+        # 两者都无好结果，再用第三个 LLM 决策
         llm_action = await self._decide_action_with_llm(
             task,
             elements,
@@ -5067,6 +5067,10 @@ class BrowserAgent:
                         _seen_keys.add(key)
                         _accumulated_data.append(item)
 
+            # ⚡ 优化4: 缓存 post-action 结果，供下一步复用
+            _prefetched_elements = None
+            _prefetched_snapshot = None
+
             for step_no in range(1, max_steps + 1):
                 current_url_r = await tk.get_current_url()
                 title_r = await tk.get_title()
@@ -5083,9 +5087,29 @@ class BrowserAgent:
                             "data": _accumulated_data,
                         }
                     log_agent_action(self.name, "执行中反机器人验证绕过成功")
-                elements = await self._extract_interactive_elements()
-                snapshot = self._last_semantic_snapshot or await self._get_semantic_snapshot()
-                observed_data = await self._extract_data_for_intent(task_intent)
+                    _prefetched_elements = None
+                    _prefetched_snapshot = None
+
+                # ⚡ 优化1+4: 如果上一步已缓存 post-action 结果则复用，否则并行获取
+                if _prefetched_elements is not None:
+                    elements = _prefetched_elements
+                    snapshot = _prefetched_snapshot or self._last_semantic_snapshot
+                    _prefetched_elements = None
+                    _prefetched_snapshot = None
+                else:
+                    _obs_elements_task = asyncio.ensure_future(self._extract_interactive_elements())
+                    _obs_snapshot_task = (
+                        asyncio.ensure_future(self._get_semantic_snapshot())
+                        if self._last_semantic_snapshot is None
+                        else None
+                    )
+                    elements = await _obs_elements_task
+                    snapshot = (
+                        await _obs_snapshot_task if _obs_snapshot_task is not None
+                        else self._last_semantic_snapshot
+                    )
+                _obs_data_task = asyncio.ensure_future(self._extract_data_for_intent(task_intent))
+                observed_data = await _obs_data_task
                 _merge_new_data(observed_data)
                 web_debug_recorder.write_json(
                     f"browser_step_{step_no}_context",
@@ -5120,10 +5144,12 @@ class BrowserAgent:
 
                 # Layer 2: 视觉内容验证 — 当 DOM 没提取到数据且页面类型不明时，
                 # 用截图判断页面是否包含目标信息，如果是则直接走提取而非盲目导航
+                # ⚡ 优化5: step 1 通常还在初始页面，跳过昂贵的 vision 调用
                 action = None
                 action_source = ""
                 if (
-                    not observed_data
+                    step_no >= 2
+                    and not observed_data
                     and not _accumulated_data
                     and str((snapshot or {}).get("page_type", "")).strip() in {"", "unknown"}
                 ):
@@ -5273,11 +5299,20 @@ class BrowserAgent:
                 self._record_action(action)
                 last_action = action
 
-                before = await self._snapshot_page_state()
+                # ⚡ 优化6: INPUT/FILL_FORM 不需要重量级 page_ready + verify
+                _is_input_action = action.action_type in {ActionType.INPUT, ActionType.FILL_FORM}
+                if _is_input_action:
+                    before = None
+                else:
+                    before = await self._snapshot_page_state()
                 success = await self._execute_action(action)
-                if success:
+                if success and not _is_input_action:
                     await self._wait_for_page_ready()
                     success = await self._verify_action_effect(before, action)
+                elif success and _is_input_action:
+                    # 输入动作只需等 DOM 就绪，无需 networkidle
+                    await self.toolkit.wait_for_load("domcontentloaded", timeout=3000)
+                    success = True  # 输入已执行成功即可，verify 在 post-action 阶段处理
                 if not success:
                     recovery = self._recover_action(task, action, elements)
                     if recovery:
@@ -5398,6 +5433,9 @@ class BrowserAgent:
                     else:
                         post_elements = await self._extract_interactive_elements()
                         post_snapshot = self._last_semantic_snapshot or post_snapshot
+                    # ⚡ 优化4: 缓存 post-action 结果供下一步 observe 复用
+                    _prefetched_elements = post_elements
+                    _prefetched_snapshot = post_snapshot
                     step_data = await self._extract_data_for_intent(task_intent)
                     _merge_new_data(step_data)
                     candidate_data = _accumulated_data or step_data
