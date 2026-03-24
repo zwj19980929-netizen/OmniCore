@@ -165,22 +165,18 @@ def interactive_mode():
     """交互式命令行模式 - 支持历史记录和优雅退出"""
     print_banner()
 
-    # 初始化记忆系统（后台预热，不阻塞启动）
+    # 初始化记忆系统（同步预热，fd 重定向抑制 safetensors 的 LOAD REPORT）
+    # 在进入交互循环之前完成，此时没有 input() 竞争，fd 重定向安全。
     try:
-        memory = ChromaMemory()
-        import threading, os, contextlib
+        import os
+        os.environ.setdefault("HF_HUB_OFFLINE", "1")
+        os.environ.setdefault("TRANSFORMERS_OFFLINE", "1")
+        os.environ["HF_HUB_DISABLE_PROGRESS_BARS"] = "1"
+        os.environ["HF_HUB_VERBOSITY"] = "error"
+        os.environ["TOKENIZERS_PARALLELISM"] = "false"
 
-        def _warmup():
-            import warnings
-            with open(os.devnull, "w") as devnull, \
-                 contextlib.redirect_stderr(devnull), \
-                 contextlib.redirect_stdout(devnull), \
-                 warnings.catch_warnings():
-                warnings.simplefilter("ignore")
-                os.environ.setdefault("HF_HUB_DISABLE_PROGRESS_BARS", "1")
-                memory._collection
-
-        threading.Thread(target=_warmup, daemon=True).start()
+        memory = ChromaMemory(silent=True)
+        memory._collection  # 同步触发模型加载 + ChromaDB 初始化
         console.print("[dim]记忆系统就绪[/dim]\n")
     except Exception as e:
         console.print(f"[yellow]记忆系统初始化失败: {e}[/yellow]\n")

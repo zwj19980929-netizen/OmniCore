@@ -7,6 +7,7 @@ import hashlib
 import json
 import uuid
 from datetime import datetime, timedelta
+from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 import chromadb
@@ -21,7 +22,9 @@ _SCOPE_KEYS = ("session_id", "goal_id", "project_id", "todo_id")
 
 # Multilingual embedding model — much better Chinese support than the default
 # all-MiniLM-L6-v2.  Lazy-loaded once per process on first memory operation.
+# Prefer a local snapshot to avoid network downloads on every startup.
 _EMBEDDING_MODEL_NAME = "paraphrase-multilingual-MiniLM-L12-v2"
+_LOCAL_MODEL_PATH = Path.home() / ".local" / "share" / "omnicore" / "models" / _EMBEDDING_MODEL_NAME
 _embedding_fn = None
 
 
@@ -29,8 +32,9 @@ def _get_embedding_fn():
     global _embedding_fn
     if _embedding_fn is None:
         from chromadb.utils.embedding_functions import SentenceTransformerEmbeddingFunction
+        model_id = str(_LOCAL_MODEL_PATH) if _LOCAL_MODEL_PATH.exists() else _EMBEDDING_MODEL_NAME
         _embedding_fn = SentenceTransformerEmbeddingFunction(
-            model_name=_EMBEDDING_MODEL_NAME,
+            model_name=model_id,
         )
     return _embedding_fn
 
@@ -43,9 +47,10 @@ class ChromaMemory:
     memory operation, so constructing this class does NOT block startup.
     """
 
-    def __init__(self, collection_name: str = "omnicore_memory"):
+    def __init__(self, collection_name: str = "omnicore_memory", silent: bool = False):
         self.name = "ChromaMemory"
         self.collection_name = collection_name
+        self._silent = silent
         self._client = None
         self.__collection = None  # double-underscore to back the property
         self.__init_lock = __import__("threading").Lock()
@@ -60,6 +65,38 @@ class ChromaMemory:
         return self.__collection
 
     def _init_client(self) -> None:
+        if self._silent:
+            self._init_client_silent()
+        else:
+            self._do_init_client()
+            log_agent_action(self.name, "Initialize", f"collection: {self.collection_name}")
+
+    def _init_client_silent(self) -> None:
+        """静默初始化：抑制 safetensors 的 BertModel LOAD REPORT 和 logger 输出。
+
+        safetensors 通过 rich.Console 写输出，可能走 stdout 或 stderr，
+        必须用 OS 级 fd 重定向同时抑制两者。仅在交互模式后台预热时使用，
+        此时主线程阻塞在 input() 等待用户输入，不存在 fd 竞争风险。
+        """
+        import os, logging
+        for _name in ("transformers", "sentence_transformers", "safetensors"):
+            logging.getLogger(_name).setLevel(logging.ERROR)
+        # OS 级重定向 fd 1 (stdout) + fd 2 (stderr) → /dev/null
+        devnull_fd = os.open(os.devnull, os.O_WRONLY)
+        orig_stdout_fd = os.dup(1)
+        orig_stderr_fd = os.dup(2)
+        os.dup2(devnull_fd, 1)
+        os.dup2(devnull_fd, 2)
+        try:
+            self._do_init_client()
+        finally:
+            os.dup2(orig_stdout_fd, 1)
+            os.dup2(orig_stderr_fd, 2)
+            os.close(devnull_fd)
+            os.close(orig_stdout_fd)
+            os.close(orig_stderr_fd)
+
+    def _do_init_client(self) -> None:
         persist_dir = settings.CHROMA_PERSIST_DIR
         persist_dir.mkdir(parents=True, exist_ok=True)
 
@@ -74,8 +111,6 @@ class ChromaMemory:
                 embedding_function=_get_embedding_fn(),
             )
         except ValueError:
-            # Collection was created with a different embedding function.
-            # Delete and recreate so the new embedding model is used consistently.
             logger.warning("Recreating collection %s due to embedding function conflict", self.collection_name)
             self._client.delete_collection(self.collection_name)
             self.__collection = self._client.get_or_create_collection(
@@ -83,7 +118,6 @@ class ChromaMemory:
                 metadata={"description": "OmniCore scoped memory store"},
                 embedding_function=_get_embedding_fn(),
             )
-        log_agent_action(self.name, "Initialize", f"collection: {self.collection_name}")
 
     def _normalize_scope(self, scope: Optional[Dict[str, Any]]) -> Dict[str, str]:
         normalized: Dict[str, str] = {}

@@ -225,13 +225,20 @@ class BrowserExecutionLayer:
 
     # ── Form filling ─────────────────────────────────────────
 
-    async def fill_form(self, form_data_json: str) -> bool:
+    async def fill_form(self, form_data_json: str, fallback_selector: str = "") -> bool:
         try:
             form_data = json.loads(form_data_json) if isinstance(form_data_json, str) else form_data_json
         except json.JSONDecodeError:
-            log_error("invalid form payload")
-            return False
+            form_data = None
+        # 兼容模型返回纯字符串（非 JSON）的情况：
+        # 如果有 target_selector，降级为单字段输入，而不是直接报错。
+        # 这样无论模型聪明与否，fill_form 都能正确执行。
         if not isinstance(form_data, dict) or not form_data:
+            raw_value = str(form_data_json or "").strip() if not isinstance(form_data, dict) else ""
+            if raw_value and fallback_selector:
+                return await self.try_input_with_fallbacks(fallback_selector, raw_value)
+            if raw_value:
+                log_warning(f"fill_form: 非结构化 value 且无 selector，无法执行: {raw_value[:80]}")
             return False
 
         tk = self.toolkit
@@ -299,7 +306,7 @@ class BrowserExecutionLayer:
                 await tk.press_key(action.keyboard_key)
             return success
         if action.action_type == ActionType.FILL_FORM:
-            return await self.fill_form(action.value)
+            return await self.fill_form(action.value, fallback_selector=action.target_selector or "")
         if action.action_type == ActionType.SELECT:
             r = await tk.select_option(action.target_selector, action.value)
             return r.success

@@ -18,6 +18,7 @@ Page stage: {page_stage}
 Last action: {last_action}
 Recent execution history:
 {recent_steps}
+{data_progress}
 Context coverage: {context_coverage}
 Visible data:
 {data}
@@ -49,4 +50,5 @@ Rules:
 - Choose "input" only if the current page is not already showing relevant results or the search box clearly needs a different query.
 - For `form` or `auth` tasks, use `Structured fields` and the visible elements to decide whether the page still needs user interaction.
 - Do not choose `done` or `extract` for an active `form` or `auth` page that still shows editable inputs or a plausible submit action.
+- Check the "Data progress" line: if the collected count already meets or exceeds the target, prefer "done" or "extract" over further navigation.
 - If you cannot justify a meaningful action from the evidence, choose "wait".

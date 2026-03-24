@@ -774,6 +774,10 @@ class BrowserAgent:
             return None
 
         if action.action_type == ActionType.DONE:
+            # 当 LLM 以较高置信度判断任务完成时，信任 LLM 的判断，
+            # 不再让粗糙的启发式否决。这是导致"明明到了目标页却继续搜索"的根本原因。
+            if action.confidence >= 0.7:
+                return action
             if self._task_looks_satisfied(
                 task,
                 current_url,
@@ -786,6 +790,9 @@ class BrowserAgent:
             return None
 
         if action.action_type == ActionType.EXTRACT:
+            # 同理：高置信度的 EXTRACT 判断应被信任
+            if action.confidence >= 0.65:
+                return action
             if active_intent.intent_type in {"form", "auth"} and self._interaction_requires_follow_up(
                 task,
                 active_intent,
@@ -2091,6 +2098,18 @@ class BrowserAgent:
                 total_tokens=settings.PAGE_ASSESSMENT_CONTEXT_TOKENS,
             )
             llm = self._get_llm()
+            # 构建数据进度信息，让 LLM 知道已收集多少数据
+            data_collected = len(data or [])
+            target_match = re.search(r'(\d+)\s*(?:个|条|款|项|条数据|items?|results?)', task or "")
+            if target_match:
+                data_target = int(target_match.group(1))
+                data_progress = f"Data progress: collected {data_collected} / target {data_target}"
+                if data_collected >= data_target:
+                    data_progress += " (ENOUGH - consider using DONE or EXTRACT)"
+            else:
+                data_progress = f"Data collected: {data_collected} items"
+                if data_collected > 0:
+                    data_progress += " — judge whether the task goal is already satisfied based on the task description and current page content, not an arbitrary count."
             prompt = PAGE_ASSESSMENT_PROMPT.format(
                 task=task or "",
                 intent=active_intent.intent_type,
@@ -2102,6 +2121,7 @@ class BrowserAgent:
                 page_stage=page_state.stage,
                 last_action=(last_action.description or last_action.action_type.value) if last_action else "none",
                 recent_steps=self._format_recent_steps_for_llm(recent_steps),
+                data_progress=data_progress,
                 context_coverage=prompt_context.get("context_coverage", ""),
                 data=prompt_context.get("data", "(no visible data)"),
                 cards=prompt_context.get("cards", "(no cards)"),
@@ -2716,7 +2736,20 @@ class BrowserAgent:
                 target_text=target_text,
             )
         else:
-            fallback = TaskIntent(intent_type="search", query=query, confidence=0.35, target_text=target_text)
+            # 数据收集类任务应偏向 read 意图，而非 search。
+            # search 意图的 _task_looks_satisfied 在离开 SERP 后过于依赖 URL 匹配，
+            # 导致已到达目标页面的情况无法被正确识别。
+            _task_lower = self._normalize_text(task)
+            _data_collection_signals = (
+                "收集", "获取", "查询", "列出", "对比", "价格", "信息",
+                "数据", "查看", "了解", "分析", "统计", "排名", "排行",
+                "collect", "find", "get", "list", "compare", "price",
+                "info", "data", "check", "look up", "analyze", "rank",
+            )
+            if any(s in _task_lower for s in _data_collection_signals):
+                fallback = TaskIntent(intent_type="read", query=query, confidence=0.45, target_text=target_text)
+            else:
+                fallback = TaskIntent(intent_type="search", query=query, confidence=0.35, target_text=target_text)
 
         try:
             llm = self._get_llm()
@@ -3503,6 +3536,16 @@ class BrowserAgent:
         active_intent = intent or TaskIntent(intent_type="read", query="", confidence=0.0)
         query = active_intent.query or self._derive_primary_query(task)
 
+        # 先检查目标是否已满足——提取优先于导航。
+        # 之前的逻辑是导航动作无条件覆盖提取，导致明明数据已经在页面上，
+        # 却还要点击更深的链接继续搜索。
+        if data and self._page_data_satisfies_goal(task, current_url, active_intent, data, snapshot=snapshot):
+            return BrowserAction(
+                action_type=ActionType.EXTRACT,
+                description="use current page results",
+                confidence=0.82,
+            )
+
         snapshot_action = self._choose_snapshot_navigation_action(
             task,
             current_url,
@@ -3513,13 +3556,6 @@ class BrowserAgent:
         )
         if snapshot_action is not None and snapshot_action.action_type != ActionType.EXTRACT:
             return snapshot_action
-
-        if data and self._page_data_satisfies_goal(task, current_url, active_intent, data, snapshot=snapshot):
-            return BrowserAction(
-                action_type=ActionType.EXTRACT,
-                description="use current page results",
-                confidence=0.82,
-            )
 
         if not self._is_search_engine_url(current_url):
             return snapshot_action
@@ -4714,6 +4750,23 @@ class BrowserAgent:
                     if self._search_results_have_answer_evidence(query, current_data):
                         return True
                 return False
+            # 离开搜索引擎后（已点击某个搜索结果），不能只检查 URL，
+            # 还要检查页面内容是否已包含答案。这是"到了目标页却不认为是结果"的核心原因。
+            active_snapshot = snapshot or self._last_semantic_snapshot or {}
+            current_data = data or []
+            if self._page_data_satisfies_goal(
+                task, current_url, active_intent, current_data, snapshot=active_snapshot,
+            ):
+                return True
+            # 即使结构化数据为空，main_text 相关也算满足
+            main_text = self._get_snapshot_main_text(active_snapshot)
+            if main_text and len(main_text) >= 120:
+                query = active_intent.query or self._derive_primary_query(task)
+                if query:
+                    relevance = self._score_text_relevance(query, main_text[:3000])
+                    if relevance >= 0.3:
+                        return True
+            # URL token 匹配作为最后的备用判断
             parsed = urlparse(current_url or "")
             query_string = " ".join(
                 value

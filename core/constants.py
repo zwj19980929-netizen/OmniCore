@@ -63,6 +63,7 @@ class FailureType(str, Enum):
     BLOCKED_OR_CAPTCHA = "blocked_or_captcha"
     PERMISSION_DENIED = "permission_denied"
     INVALID_INPUT = "invalid_input"
+    EXECUTION_ERROR = "execution_error"
     UNKNOWN = "unknown"
 
     def __str__(self) -> str:
