@@ -62,6 +62,7 @@ Decision rules:
 - SCROLL value should be pixels (e.g. "800" for one screen).
 - If vision_description is provided, cross-reference it with elements to resolve ambiguity.
 - For forms with multiple fields, prefer `fill_form` with all field values in one action.
+- SEARCH INPUT RULE: When typing into a search box, use the shortest effective query — typically just the core entity name. Extra words reduce recall on most search engines. Use the Query field above as a starting point; shorten it further if possible. BAD: "meta开源模型地址", "pytorch installation guide". GOOD: "meta", "pytorch".
 
 Return keys: thinking, action, confidence, requires_human_confirm.
 The action object should contain:
