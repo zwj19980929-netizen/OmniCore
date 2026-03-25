@@ -114,22 +114,6 @@ def test_static_fetch_rejects_link_only_weather_payload(monkeypatch):
     assert "usable detail data" in result["error"]
 
 
-def test_validate_data_quality_accepts_weather_detail_blocks():
-    worker = WebWorker()
-
-    data = [
-        {"text": "今天 多云 18℃ / 11℃"},
-        {"text": "湿度 67%"},
-        {"text": "东北风 3-4级"},
-        {"text": "空气质量 AQI 52 良"},
-    ]
-
-    result = worker.validate_data_quality(data, "抓取今天的天气详情", limit=8)
-
-    assert result["valid"] is True
-    assert "天气详情" in result["reason"]
-
-
 def test_validate_data_quality_accepts_detail_summary_without_llm():
     worker = WebWorker()
 
@@ -144,25 +128,6 @@ def test_validate_data_quality_accepts_detail_summary_without_llm():
 
     assert result["valid"] is True
     assert "详情页正文或摘要信号" in result["reason"]
-
-
-def test_determine_target_url_uses_direct_weather_url_without_llm():
-    worker = WebWorker(llm_client=_FailIfCalledLLM())
-
-    result = asyncio.run(
-        worker.determine_target_url(
-            "Use https://www.weather.com.cn/weather/101220101.shtml to read Hefei weather after rendering"
-        )
-    )
-
-    assert result["url"] == "https://www.weather.com.cn/weather/101220101.shtml"
-    assert result["need_search"] is False
-    assert result["search_query"] == ""
-    assert result["backup_urls"] == [
-        "https://m.weather.com.cn/weather/101220101.shtml",
-        "https://www.weather.com.cn/weather1d/101220101.shtml",
-        "https://www.weather.com.cn/weather15d/101220101.shtml",
-    ]
 
 
 def test_extract_direct_urls_strips_fullwidth_punctuation():
@@ -664,19 +629,6 @@ def test_static_fetch_can_follow_next_page_for_list_tasks():
     assert [item["title"] for item in result["data"]] == ["Story 1", "Story 2", "Story 3"]
 
 
-def test_determine_target_url_builds_natural_weather_query_without_llm():
-    worker = WebWorker(llm_client=_FailIfCalledLLM())
-
-    result = asyncio.run(
-        worker.determine_target_url(
-            "Directly obtain 合肥的明天（2026-03-07）天气 from weather.com.cn as the primary weather source."
-        )
-    )
-
-    assert result["url"] == ""
-    assert result["need_search"] is True
-    assert result["search_query"] == "合肥 明天 天气"
-
 def test_fallback_search_queries_trust_explicit_base_query_for_weather_tasks():
     worker = WebWorker()
 
@@ -973,7 +925,6 @@ def test_smart_scrape_retries_next_search_candidate_from_same_search_page(monkey
     monkeypatch.setattr(worker, "analyze_page_structure", _fake_analyze_page_structure)
     monkeypatch.setattr(worker, "extract_data_with_selectors", _fake_extract_data)
     monkeypatch.setattr(worker, "extract_detail_text_blocks", _empty_async)
-    monkeypatch.setattr(worker, "extract_weather_text_blocks", _empty_async)
     monkeypatch.setattr(worker, "extract_news_links_fallback", _empty_async)
     monkeypatch.setattr(worker, "extract_table_links_fallback", _empty_async)
     monkeypatch.setattr(worker, "explore_for_data_page", _no_navigation)
@@ -1253,26 +1204,6 @@ class _HTMLToolkit:
 
     async def get_title(self):
         return type("Result", (), {"success": True, "data": self.title})()
-
-
-def test_extract_weather_text_blocks_normalizes_browser_html():
-    worker = WebWorker()
-    html = """
-    <html><body>
-      <main>
-        <p>周一 3月16日 多云 17/8°C 东北风3-4级 湿度65% AQI 72</p>
-        <p>生活指数 穿衣建议</p>
-      </main>
-    </body></html>
-    """
-
-    results = asyncio.run(
-        worker.extract_weather_text_blocks(_HTMLToolkit(html), "帮我查一下明天的合肥天气（2026-03-16）", limit=3)
-    )
-
-    assert results
-    assert results[0]["temperature"] == "17/8°C"
-    assert results[0]["weather"] in {"多云", "cloudy"}
 
 
 def test_extract_detail_text_blocks_normalizes_browser_html():

@@ -124,25 +124,6 @@ class _CriticLLMGuard:
         return {}
 
 
-def test_critic_short_circuits_weather_results_with_signals():
-    critic = CriticAgent(llm_client=_CriticLLMGuard())
-
-    result = critic.review_task_result(
-        "去 https://www.weather.com.cn/weather/101220101.shtml 抓取今天的天气情况",
-        {
-            "success": True,
-            "data": [
-                {"text": "今天 多云 12℃~19℃ 东风3级"},
-                {"humidity": "湿度 61%"},
-                {"aqi": "空气质量 82 良"},
-            ],
-        },
-    )
-
-    assert result["approved"] is True
-    assert result["score"] >= 0.9
-
-
 def test_critic_short_circuits_explicit_url_list_extraction_results():
     critic = CriticAgent(llm_client=_CriticLLMGuard())
 

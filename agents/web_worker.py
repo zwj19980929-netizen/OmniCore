@@ -631,7 +631,7 @@ class WebWorker:
             flags=re.IGNORECASE,
         )
         cleaned = re.sub(
-            r"\b(?:city|weather|forecast|detail)\b\s+\b(?:page|site|source)\b",
+            r"\b(?:city|detail)\b\s+\b(?:page|site|source)\b",
             " ",
             cleaned,
             flags=re.IGNORECASE,
@@ -653,14 +653,10 @@ class WebWorker:
     def _normalize_search_query_for_dedup(self, text: str) -> str:
         normalized = self._strip_search_query_noise(text).lower()
         replacements = {
-            "weather forecast": "weather",
-            "forecast": "weather",
             "headlines": "headline",
             "links": "link",
             "sources": "source",
             "results": "result",
-            "天气预报": "天气",
-            "气象预报": "天气",
             "新闻头条": "头条",
             "链接列表": "链接",
             "来源列表": "来源",
@@ -707,25 +703,6 @@ class WebWorker:
 
     def _build_natural_search_query(self, task_description: str, max_terms: int = 8) -> str:
         cleaned = self._strip_search_query_noise(task_description)
-        if self._task_mentions_weather(task_description):
-            weather_patterns = (
-                r"([\u4e00-\u9fff]{2,12})的(今天|明天|后天|当前|本周末|本周)(?:（\d{4}-\d{2}-\d{2}）)?天气",
-                r"(今天|明天|后天|当前|本周末|本周)(?:（\d{4}-\d{2}-\d{2}）)?的([\u4e00-\u9fff]{2,12})天气",
-                r"(?:查询|查|搜索|搜|获取|看看)?\s*([\u4e00-\u9fff]{2,12}?)(?:(今天|明天|后天|当前|本周末|本周))?(?:的)?(?:天气|天气预报|气温|空气质量)",
-            )
-            for pattern in weather_patterns:
-                weather_match = re.search(pattern, cleaned)
-                if not weather_match:
-                    continue
-                group_1 = str(weather_match.group(1) or "").strip()
-                group_2 = str(weather_match.group(2) or "").strip()
-                if pattern.startswith(r"(今天"):
-                    timeframe, location = group_1, group_2
-                else:
-                    location, timeframe = group_1, group_2
-                query = " ".join(part for part in [location, timeframe, "天气"] if part).strip()
-                if query:
-                    return query
         compact = self._compact_query_text(cleaned, max_terms=max_terms)
         if compact:
             return compact
@@ -811,13 +788,6 @@ class WebWorker:
             }
 
         domain_hints = self._extract_domain_hints(task_description)
-        if self._task_mentions_weather(task_description):
-            return {
-                "url": "",
-                "backup_urls": [],
-                "need_search": True,
-                "search_query": self._build_natural_search_query(task_description),
-            }
 
         task_signature = self.cache.build_task_signature(task_description)
         cache_key = self.cache.build_key(
@@ -933,10 +903,9 @@ class WebWorker:
         desc = (task_description or "").lower()
         text_keywords = [
             "read", "summary", "summarize", "extract text", "article", "content",
-            "weather", "forecast", "temperature", "humidity", "air quality", "wind",
             "读取", "总结", "概述", "正文", "文章", "内容",
         ]
-        return any(k in desc for k in text_keywords) or self._task_mentions_weather(task_description)
+        return any(k in desc for k in text_keywords)
 
     def _should_try_detail_text_fallback(self, task_description: str, page_type: str = "") -> bool:
         normalized_page_type = str(page_type or "").strip().lower()
@@ -956,14 +925,6 @@ class WebWorker:
         if any(keyword in desc for keyword in list_keywords):
             return True
         return bool(re.search(r"\b\d+\s*(?:items?|results?|links?|headlines?|stories|repos)\b", desc))
-
-    def _task_mentions_weather(self, task_description: str) -> bool:
-        desc = (task_description or "").lower()
-        weather_keywords = [
-            "weather", "forecast", "temperature", "humidity", "air quality", "aqi", "wind",
-            "天气", "预报", "气温", "湿度", "空气质量", "风力",
-        ]
-        return any(keyword in desc for keyword in weather_keywords)
 
     def _task_allows_serp_answer(self, task_description: str, limit: int = 0) -> bool:
         if self._prefers_static_text(task_description):
@@ -988,68 +949,6 @@ class WebWorker:
 
         return False
 
-    def _looks_like_weather_text(self, text: str) -> bool:
-        value = (text or "").lower()
-        weather_signals = [
-            "°c", "℃", "temperature", "humidity", "air quality", "aqi", "wind",
-            "weather", "forecast", "today", "tomorrow",
-            "气温", "湿度", "空气质量", "风力", "天气", "预报", "今天", "明天",
-        ]
-        return any(signal in value for signal in weather_signals) or bool(re.search(r"\b\d{1,2}\s*(?:°c|℃)\b", value))
-
-    def _weather_signal_categories(self, data: List[Dict[str, Any]]) -> Set[str]:
-        categories: Set[str] = set()
-        for item in data[:8]:
-            if not isinstance(item, dict):
-                continue
-
-            parts: List[str] = []
-            for key, value in item.items():
-                if key.startswith("_"):
-                    continue
-                key_text = str(key or "").strip().lower()
-                if key_text in {"temperature", "temp", "humidity", "aqi", "air_quality", "wind", "weather"}:
-                    mapped = {
-                        "temperature": "temperature",
-                        "temp": "temperature",
-                        "humidity": "humidity",
-                        "aqi": "aqi",
-                        "air_quality": "aqi",
-                        "wind": "wind",
-                        "weather": "condition",
-                    }
-                    categories.add(mapped[key_text])
-                if isinstance(value, (str, int, float)):
-                    text = str(value).strip()
-                    if text:
-                        parts.append(text)
-
-            haystack = " ".join(parts).lower()
-            if not haystack:
-                continue
-            if (
-                re.search(r"\d{1,2}\s*(?:°c|℃|度)\b", haystack)
-                or any(token in haystack for token in ("temperature", "气温", "温度", "最高", "最低"))
-            ):
-                categories.add("temperature")
-            if any(token in haystack for token in ("humidity", "湿度")):
-                categories.add("humidity")
-            if any(token in haystack for token in ("aqi", "air quality", "空气质量")):
-                categories.add("aqi")
-            if any(token in haystack for token in ("wind", "风力", "风向")) or re.search(r"\d+\s*级", haystack):
-                categories.add("wind")
-            if any(token in haystack for token in ("weather", "forecast", "天气", "晴", "阴", "多云", "雨", "雪", "雷")):
-                categories.add("condition")
-        return categories
-
-    def _weather_data_has_required_signals(self, data: List[Dict[str, Any]]) -> bool:
-        categories = self._weather_signal_categories(data)
-        if len(categories) >= 3:
-            return True
-        if len(categories) >= 2 and len(data) >= 4:
-            return True
-        return False
-
     def _primary_task_url(self, task_description: str) -> str:
         direct_urls = self._extract_direct_urls(task_description)
         if direct_urls:
@@ -1070,7 +969,7 @@ class WebWorker:
                 if looks_like_detail_list_item(item, reference_url=reference_url):
                     usable_items += 1
             return usable_items >= required_count
-        detail_task = self._prefers_static_text(task_description) or self._task_mentions_weather(task_description)
+        detail_task = self._prefers_static_text(task_description)
         if not detail_task:
             return True
         text_items = [
@@ -1080,10 +979,6 @@ class WebWorker:
         ]
         if not text_items:
             return False
-        if self._task_mentions_weather(task_description):
-            return self._weather_data_has_required_signals(data) or any(
-                self._looks_like_weather_text(item) for item in text_items[:8]
-            )
         return True
 
     def _extract_static_links(self, html: str, base_url: str, task_description: str, limit: int) -> List[Dict[str, Any]]:
@@ -1132,14 +1027,10 @@ class WebWorker:
         blocks: List[Dict[str, Any]] = []
         seen = set()
         patterns = [RE_PARAGRAPH_BLOCK, RE_CONTENT_BLOCK]
-        weather_task = self._task_mentions_weather(task_description)
         for pattern in patterns:
             for match in pattern.finditer(cleaned):
                 text = self._strip_tags(match.group(2))
-                min_length = 12 if weather_task else 40
-                if len(text) < min_length:
-                    continue
-                if weather_task and not self._looks_like_weather_text(text) and len(text) < 40:
+                if len(text) < 40:
                     continue
                 key = RE_WHITESPACE.sub(" ", text).strip().lower()[:120]
                 if key in seen:
@@ -1154,16 +1045,6 @@ class WebWorker:
         normalized = str(url or "").strip()
         if not normalized:
             return []
-        if self._task_mentions_weather(task_description):
-            match = re.search(r"https?://(?:www\.)?weather\.com\.cn/weather/(\d{9})\.shtml", normalized, re.IGNORECASE)
-            if match:
-                city_code = match.group(1)
-                candidates = [
-                    f"https://m.weather.com.cn/weather/{city_code}.shtml",
-                    f"https://www.weather.com.cn/weather1d/{city_code}.shtml",
-                    f"https://www.weather.com.cn/weather15d/{city_code}.shtml",
-                ]
-                return [item for item in candidates if item != normalized]
         return []
 
     def _extract_static_next_page_url(self, html: str, base_url: str) -> str:
@@ -1306,18 +1187,6 @@ class WebWorker:
         if not data:
             return {"valid": False, "reason": "数据为空", "suggestion": "换页面或换选择器"}
         normalized_task = str(task_description or "").lower()
-        if self._task_mentions_weather(task_description):
-            if self._weather_data_has_required_signals(data):
-                return {
-                    "valid": True,
-                    "reason": "天气详情已包含足够的关键字段信号",
-                    "suggestion": "",
-                }
-            return {
-                "valid": False,
-                "reason": "天气数据缺少足够的温度、天气状况、湿度、风力或空气质量信号",
-                "suggestion": "优先保留天气详情文本块或切换到更完整的天气详情页",
-            }
         requires_rich_metadata = any(
             token in normalized_task
             for token in (
@@ -2517,7 +2386,6 @@ class WebWorker:
             ".result__a",
             "main a[href]",
             "a[href]",
-            "天气", "预报", "气温", "湿度", "空气质量", "风力",
         ]
         urls: List[str] = []
         seen = set()
@@ -3233,27 +3101,7 @@ class WebWorker:
             understanding={"page_type": "detail"},
         )
 
-    async def extract_weather_text_blocks(self, tk: BrowserToolkit, task_description: str, limit: int = 10) -> List[Dict[str, Any]]:
-        html_r = await tk.get_page_html()
-        html = str(html_r.data or "") if html_r.success else ""
-        if not html:
-            return []
-        blocks = self._extract_static_text_blocks(
-            html,
-            limit=max(limit * 6, 24),
-            task_description=task_description,
-        )
-        page_text = self._strip_tags(self._clean_html_text(html))
-        if page_text and self._looks_like_weather_text(page_text):
-            blocks = [{"text": page_text[:4000]}] + blocks
-        if not blocks:
-            return []
-        return normalize_web_results(
-            blocks,
-            task_description,
-            limit=limit,
-            understanding={"page_type": "detail"},
-        )
+
 
     # ── smart_scrape (main entry, uses toolkit) ────────────────
 
@@ -3636,9 +3484,6 @@ class WebWorker:
                         if not retry_data and self._should_try_detail_text_fallback(task_description, observed_page_type):
                             retry_data = await self.extract_detail_text_blocks(tk, task_description, limit=limit)
 
-                        if not retry_data and self._task_mentions_weather(task_description):
-                            retry_data = await self.extract_weather_text_blocks(tk, task_description, limit=limit)
-
                         if not retry_data and api_responses:
                             best_api = max(api_responses, key=lambda item: len(item["data"]))
                             retry_data = best_api["data"][:limit]
@@ -3881,12 +3726,6 @@ class WebWorker:
                             data = detail_blocks
                             log_success(f"详情文本块提取成功，获取 {len(data)} 条数据")
 
-                    if not data and self._task_mentions_weather(task_description):
-                        weather_blocks = await self.extract_weather_text_blocks(tk, task_description, limit=limit)
-                        if weather_blocks:
-                            data = weather_blocks
-                            log_success(f"天气文本块提取成功，获取 {len(data)} 条数据")
-
                     if not data:
                         # 尝试通用选择器
                         common_selectors = [
@@ -3939,14 +3778,6 @@ class WebWorker:
                                 if detail_quality.get("valid"):
                                     data = detail_blocks
                                     log_success(f"详情文本块兜底修正成功，获取 {len(data)} 条数据")
-                                    break
-                        if self._task_mentions_weather(task_description):
-                            weather_blocks = await self.extract_weather_text_blocks(tk, task_description, limit=limit)
-                            if weather_blocks and weather_blocks != data:
-                                weather_quality = self.validate_data_quality(weather_blocks, task_description, limit)
-                                if weather_quality.get("valid"):
-                                    data = weather_blocks
-                                    log_success(f"天气文本块兜底修正成功，获取 {len(data)} 条数据")
                                     break
                         table_links = await self.extract_table_links_fallback(tk, task_description, limit=limit)
                         if table_links and table_links != data:

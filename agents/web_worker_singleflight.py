@@ -12,7 +12,6 @@ from typing import Any, Dict, List, Tuple
 from config.settings import settings
 from utils.logger import log_agent_action, log_debug_metrics, log_error
 from utils.browser_toolkit import BrowserToolkit
-from utils.url_utils import extract_first_url
 from utils.web_prompt_budget import (
     BudgetSection,
     extract_anchor_terms,
@@ -21,29 +20,6 @@ from utils.web_prompt_budget import (
 )
 import utils.web_debug_recorder as web_debug_recorder
 
-_extract_first_url = extract_first_url
-
-_WEATHER_TOKENS = (
-    "weather",
-    "forecast",
-    "temperature",
-    "humidity",
-    "aqi",
-    "air quality",
-    "wind",
-    "天气",
-    "天气预报",
-    "气温",
-    "空气质量",
-    "风力",
-    "湿度",
-)
-
-_WEATHER_DOMAINS = (
-    "weather.com.cn",
-    "moji.com",
-    "tianqi.com",
-)
 _PAGE_ANALYSIS_PROMPT_BUDGET_TOKENS = 2200
 
 _REGION_TASK_STOPWORDS = {
@@ -93,107 +69,6 @@ def _score_candidate_region(task_description: str, kind: str, *texts: Any, item_
     score += min(int(control_count or 0), 3)
     return score
 
-
-def _build_weather_backup_urls(direct_url: str) -> list[str]:
-    normalized = str(direct_url or "").strip()
-    if not normalized:
-        return []
-    match = re.search(r"/weather/(\d{9})\.shtml", normalized)
-    if not match:
-        return []
-
-    city_code = match.group(1)
-    candidates = [
-        normalized,
-        f"https://m.weather.com.cn/weather/{city_code}.shtml",
-        f"https://www.weather.com.cn/weather1d/{city_code}.shtml",
-        f"https://www.weather.com.cn/weather15d/{city_code}.shtml",
-    ]
-    seen: set[str] = set()
-    ordered: list[str] = []
-    for candidate in candidates:
-        value = str(candidate or "").strip()
-        if not value or value in seen:
-            continue
-        seen.add(value)
-        ordered.append(value)
-    return ordered
-
-def _looks_like_weather_task(task_description: str) -> bool:
-    lowered = str(task_description or "").lower()
-    if not lowered:
-        return False
-    return any(token in lowered for token in _WEATHER_TOKENS) or any(
-        domain in lowered for domain in _WEATHER_DOMAINS
-    )
-
-
-def _strip_search_query_noise(task_description: str) -> str:
-    cleaned = str(task_description or "")
-    cleaned = re.sub(r"https?://\S+", " ", cleaned)
-    cleaned = re.sub(r"\bsite:\s*[^\s]+", " ", cleaned, flags=re.IGNORECASE)
-    for domain in _WEATHER_DOMAINS:
-        cleaned = cleaned.replace(domain, " ")
-    cleaned = re.sub(
-        r"\b(?:from|use|using|via|prefer|preferred|primary|secondary)\b\s+[^\n,.;，。；]{0,120}\b(?:source|site|domain|url)\b",
-        " ",
-        cleaned,
-        flags=re.IGNORECASE,
-    )
-    cleaned = re.sub(
-        r"(?:作为|用作)?(?:主要|首选|次要|备用)?(?:来源|站点|域名)[^\n,.;，。；]{0,80}",
-        " ",
-        cleaned,
-        flags=re.IGNORECASE,
-    )
-    cleaned = re.sub(
-        r"\b(?:extract|retrieve|obtain|collect|scrape|read|get|fetch|open|visit|navigate|click|input|submit|report|show|display|return|for)\b",
-        " ",
-        cleaned,
-        flags=re.IGNORECASE,
-    )
-    cleaned = re.sub(
-        r"(?:抓取|提取|获取|读取|打开|访问|进入|点击|输入|填写|提交|展示|显示|返回|汇总|总结|报告|使用|通过)",
-        " ",
-        cleaned,
-    )
-    cleaned = re.sub(r"\s+", " ", cleaned)
-    return cleaned.strip()
-
-
-def _build_weather_search_query(task_description: str) -> str:
-    description = _strip_search_query_noise(task_description)
-    patterns = (
-        r"([\u4e00-\u9fff]{2,12})的(今天|明天|后天|当前|本周末|本周)(?:（\d{4}-\d{2}-\d{2}）)?(?:天气|天气详情|天气预报|气温|空气质量)",
-        r"(今天|明天|后天|当前|本周末|本周)(?:（\d{4}-\d{2}-\d{2}）)?的([\u4e00-\u9fff]{2,12})(?:天气|天气详情|天气预报|气温|空气质量)",
-        r"(?:查询|查|搜索|搜|获取|看看)?\s*([\u4e00-\u9fff]{2,12}?)(?:(今天|明天|后天|当前|本周末|本周))?(?:的)?(?:天气|天气详情|天气预报|气温|空气质量)",
-        r"(?P<location>[\u4e00-\u9fffA-Za-z][\u4e00-\u9fffA-Za-z .'\-]{1,31})的(?P<timeframe>今天|明天|后天|当前|本周末|本周)(?:（\d{4}-\d{2}-\d{2}）)?(?:天气|天气详情|天气预报|气温|空气质量)",
-        r"(?P<timeframe>今天|明天|后天|当前|本周末|本周)(?:（\d{4}-\d{2}-\d{2}）)?(?:天气|天气详情|天气预报|气温|空气质量)",
-    )
-    for pattern in patterns:
-        match = re.search(pattern, description)
-        if not match:
-            continue
-        if match.lastindex == 2 and not match.groupdict():
-            first = str(match.group(1) or "").strip()
-            second = str(match.group(2) or "").strip()
-            if pattern.startswith(r"(今天"):
-                timeframe, location = first, second
-            else:
-                location, timeframe = first, second
-        else:
-            location = str(match.groupdict().get("location", "") or "").strip()
-            timeframe = str(match.groupdict().get("timeframe", "") or "").strip()
-        parts = []
-        if location:
-            parts.append(location)
-        if timeframe:
-            parts.append(timeframe)
-        parts.append("天气")
-        return " ".join(parts).strip()
-
-    compact = re.sub(r"\s+", " ", description)
-    return compact[:120].strip()
 
 
 def _format_candidate_regions_for_llm(
@@ -392,29 +267,6 @@ async def determine_target_url_with_singleflight(self, task_description: str) ->
     from agents.web_worker import URL_ANALYSIS_PROMPT
 
     log_agent_action(self.name, "Analyze target URL", task_description[:50])
-
-    if _looks_like_weather_task(task_description):
-        direct_url = _extract_first_url(task_description)
-        if direct_url and any(domain in direct_url.lower() for domain in _WEATHER_DOMAINS):
-            backup_urls = _build_weather_backup_urls(direct_url)
-            result = {
-                "url": direct_url,
-                "backup_urls": backup_urls[1:],
-                "need_search": False,
-                "search_query": "",
-            }
-            log_agent_action(self.name, "Resolved target URL", direct_url)
-            return result
-
-        query = _build_weather_search_query(task_description)
-        result = {
-            "url": "",
-            "backup_urls": [],
-            "need_search": True,
-            "search_query": query,
-        }
-        log_agent_action(self.name, "Resolved target URL", query)
-        return result
 
     task_signature = self.cache.build_task_signature(task_description)
     cache_key = self.cache.build_key(

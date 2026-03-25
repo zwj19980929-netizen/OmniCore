@@ -15,6 +15,8 @@ Use `python main.py` for the interactive CLI, `python main.py "task"` for one-of
 ## Coding Style & Naming Conventions
 Follow existing Python style: 4-space indentation, `snake_case` for functions, modules, and tests, `CamelCase` for classes, and concise docstrings only when behavior is non-obvious. Keep modules aligned to the current layer boundaries: orchestration in `core/`, tool-specific behavior in `agents/`, shared helpers in `utils/`. Prefer UTF-8 text files and descriptive prompt/config names such as `browser_page_assessment.txt`.
 
+**禁止使用 `print()`**：代码中不允许使用 `print()` 输出信息。所有日志输出必须使用项目的日志系统（`utils/logger.py` 中的 `log_agent_action`、`log_error`、`log_warning`、`log_debug_metrics` 等，或 `utils/structured_logger.py` 中的 `get_structured_logger()`）。
+
 ## Testing Guidelines
 Pytest is configured in `pytest.ini` with `tests/` as the main test root and temp output under `data/test-runtime/`. Add unit tests as `tests/test_<feature>_unit.py` when changing isolated behavior, and extend existing integration-style tests when touching browser/runtime flows. Cover both success paths and guardrail or failure paths.
 

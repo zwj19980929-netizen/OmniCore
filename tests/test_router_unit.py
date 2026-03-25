@@ -187,11 +187,6 @@ class _FakeLLM:
         }
 
 
-class _FailIfCalledLLM(_FakeLLM):
-    def chat_with_system(self, *, system_prompt, user_message, **kwargs):
-        raise AssertionError("LLM should not be called for deterministic weather routing")
-
-
 class _QueuedLLM(_FakeLLM):
     def __init__(self, payloads):
         super().__init__()
@@ -267,82 +262,6 @@ def test_router_includes_current_time_context_from_state():
     assert "Current local time" in fake_llm.last_user_message
     assert "2026-03-04T18:30:00+08:00" in fake_llm.last_user_message
     assert "Wednesday" in fake_llm.last_user_message
-
-
-def test_router_uses_current_location_context_in_deterministic_weather_route():
-    router = RouterAgent(llm_client=_FailIfCalledLLM())
-    state = create_initial_state("what's the weather like near me?")
-    state["shared_memory"]["current_location_context"] = {
-        "location": "Shanghai, China",
-        "timezone": "CST",
-        "source": "user_preference",
-    }
-
-    router.route(state)
-
-    assert state["current_intent"] == "weather_query"
-    assert len(state["task_queue"]) == 1
-    assert "Shanghai, China" in state["task_queue"][0]["description"]
-    assert state["task_queue"][0]["tool_name"] == "web.fetch_and_extract"
-
-
-def test_router_short_circuits_weather_query_to_deterministic_sources():
-    router = RouterAgent(llm_client=_FailIfCalledLLM())
-
-    result = router.analyze_intent(
-        "帮我查一下明天的合肥天气",
-        current_time_context={"local_date": "2026-03-06"},
-    )
-
-    assert result["intent"] == "weather_query"
-    assert len(result["tasks"]) == 1
-    assert result["tasks"][0]["tool_name"] == "web.fetch_and_extract"
-    assert result["tasks"][0]["params"]["query"] == "合肥 明天 天气"
-    assert "weather.com.cn" not in result["tasks"][0]["description"]
-    assert "moji.com" not in result["tasks"][0]["description"]
-    assert "2026-03-07" in result["tasks"][0]["description"]
-
-
-def test_router_uses_browser_route_for_weather_browser_demo():
-    router = RouterAgent(llm_client=_FailIfCalledLLM())
-
-    result = router.analyze_intent("给我查查合肥的天气，我想看看你是怎么操作浏览器的")
-
-    assert result["intent"] == "weather_query_with_browser_demo"
-    assert len(result["tasks"]) == 2
-    assert result["tasks"][0]["tool_name"] == "browser.interact"
-    assert result["tasks"][0]["params"]["headless"] is False
-    assert result["tasks"][0]["params"]["query"] == "合肥 当前 天气"
-    assert result["tasks"][0]["params"]["start_url"] == "https://www.bing.com/"
-    assert "合肥" in result["tasks"][0]["description"]
-    assert "weather.com.cn" not in result["tasks"][0]["description"]
-    assert result["tasks"][1]["tool_name"] == "web.fetch_and_extract"
-
-
-def test_router_keeps_direct_weather_url_authoritative_in_deterministic_route():
-    router = RouterAgent(llm_client=_FailIfCalledLLM())
-
-    result = router.analyze_intent(
-        "https://www.weather.com.cn/weather/101220101.shtml 有啊，你通过网页有头操作渲染完成之后就有数据了"
-    )
-
-    assert result["intent"] == "weather_query_with_browser_demo"
-    assert result["tasks"][0]["params"]["start_url"] == "https://www.weather.com.cn/weather/101220101.shtml"
-    assert result["tasks"][1]["params"]["url"] == "https://www.weather.com.cn/weather/101220101.shtml"
-
-
-def test_router_does_not_treat_action_phrase_as_weather_location_for_direct_url():
-    router = RouterAgent(llm_client=_FailIfCalledLLM())
-
-    result = router.analyze_intent(
-        "去 https://www.weather.com.cn/weather/101220101.shtml 抓取今天的天气详情",
-        current_time_context={"local_date": "2026-03-15"},
-    )
-
-    task = result["tasks"][0]
-    assert task["params"]["url"] == "https://www.weather.com.cn/weather/101220101.shtml"
-    assert "抓取今天的" not in task["description"]
-    assert "https://www.weather.com.cn/weather/101220101.shtml" in task["description"]
 
 
 def test_router_skips_current_location_context_for_non_geographic_task():

@@ -13,7 +13,6 @@ from utils.logger import log_agent_action, logger
 from utils.prompt_manager import get_prompt
 from utils.url_utils import extract_all_urls
 from utils.web_result_normalizer import looks_like_detail_list_item
-from config.domain_keywords import WEATHER_KEYWORDS_TUPLE, WEATHER_CONDITIONS_TUPLE
 
 
 class CriticAgent:
@@ -30,11 +29,6 @@ class CriticAgent:
     @staticmethod
     def _task_has_direct_url(task_description: str) -> bool:
         return bool(re.search(r"https?://\S+", str(task_description or "")))
-
-    @staticmethod
-    def _looks_like_weather_task(task_description: str) -> bool:
-        lowered = str(task_description or "").lower()
-        return any(token in lowered for token in WEATHER_KEYWORDS_TUPLE)
 
     @staticmethod
     def _looks_like_list_extraction_task(task_description: str) -> bool:
@@ -116,39 +110,6 @@ class CriticAgent:
             return False
         return len(data) >= target_count
 
-    @staticmethod
-    def _result_has_weather_signals(task_result: Any) -> bool:
-        if not isinstance(task_result, dict):
-            return False
-        data = task_result.get("data")
-        if not isinstance(data, list) or not data:
-            return False
-
-        categories = set()
-        for item in data[:10]:
-            haystacks = []
-            if isinstance(item, dict):
-                haystacks.extend(str(value or "") for value in item.values())
-                keys = " ".join(str(key or "") for key in item.keys())
-                haystacks.append(keys)
-            else:
-                haystacks.append(str(item or ""))
-            for value in haystacks:
-                lowered = value.lower()
-                if any(token in lowered for token in ("temperature", "气温", "℃", "°c")):
-                    categories.add("temperature")
-                if any(token in lowered for token in ("humidity", "湿度")):
-                    categories.add("humidity")
-                if any(token in lowered for token in ("wind", "风力", "风向")):
-                    categories.add("wind")
-                if any(token in lowered for token in ("aqi", "air quality", "空气质量")):
-                    categories.add("aqi")
-                if any(token in lowered for token in WEATHER_KEYWORDS_TUPLE):
-                    categories.add("condition")
-            if len(categories) >= 2:
-                return True
-        return False
-
     def _deterministic_review_result(
         self,
         task_description: str,
@@ -160,15 +121,6 @@ class CriticAgent:
             return None
         if str(task_result.get("message", "") or "").lower().find("blocked page") >= 0:
             return None
-
-        if self._looks_like_weather_task(task_description) and self._result_has_weather_signals(task_result):
-            return {
-                "approved": True,
-                "score": 0.95,
-                "issues": [],
-                "suggestions": [],
-                "summary": "天气任务已提取到足够的关键字段信号",
-            }
 
         if (
             self._task_has_direct_url(task_description)
