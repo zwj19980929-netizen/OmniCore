@@ -25,6 +25,8 @@ from pydantic import BaseModel
 
 # 自动丢弃模型不支持的参数（如 GPT-5 不支持 temperature）
 litellm.drop_params = True
+# 抑制 litellm 对未知模型的 "Provider List" 调试输出
+litellm.suppress_debug_info = True
 
 
 class LLMResponse(BaseModel):
@@ -179,7 +181,11 @@ class LLMClient:
         provider = self._get_provider_from_model()
         model_id = self.model.split("/")[-1] if "/" in self.model else self.model
 
-        if provider in ("openai", "kimi", "moonshot", "minimax"):
+        # OpenAI 原生模型不加前缀（litellm 直接认识 gpt-* 系列）
+        # 只有 kimi/moonshot/minimax 等 OpenAI 兼容 API 才加 openai/ 前缀
+        if provider == "openai":
+            return model_id
+        if provider in ("kimi", "moonshot", "minimax"):
             return f"openai/{model_id}"
         if provider == "gemini":
             return f"gemini/{model_id}"
