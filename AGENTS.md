@@ -46,3 +46,22 @@ All 7 directions of the architecture upgrade are now integrated into the runtime
 - **JSONL structured logs**: use `get_structured_logger()` + `LogContext` for any new instrumentation. Logs rotate daily in `data/logs/`.
 
 **Known test state**: 304 passed, 24 failed (pre-existing failures in `test_web_worker_unit.py` and `test_web_worker_perception.py`, unrelated to the upgrade).
+
+## Current Work In Progress
+
+### 已完成: 天气硬编码清理 (2026-03-24)
+移除了所有天气领域硬编码（router 确定性路由、web_worker 天气特殊路径、critic 天气验证），通用智能体不做领域特化。天气查询现统一走 LLM 路由。
+
+### 已完成: LiteLLM 模型名修复 (2026-03-24)
+- `core/llm.py`: OpenAI 原生模型不再加 `openai/` 前缀（litellm 直接认识 `gpt-*` 系列），修复了 `Provider List` 报错导致视觉模型调用失败的问题
+- 新增 `litellm.suppress_debug_info = True` 抑制未知模型的调试噪音
+
+### 已完成: 视觉模型优化 (2026-03-24)
+详细计划见 `docs/视觉模型优化计划.md`。共 4 个优化项，全部已完成：
+
+| 优化项 | 优先级 | 状态 |
+|--------|--------|------|
+| 新页面自动视觉感知 | P0 | ✅ 已完成 |
+| 操作后视觉验证 | P0 | ✅ 已完成 |
+| WAIT 视觉变化检测 | P1 | ✅ 已完成 |
+| 连续截图进度感知 | P2 | ✅ 已完成 |

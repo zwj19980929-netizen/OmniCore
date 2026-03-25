@@ -66,6 +66,9 @@ class BrowserPerceptionLayer:
         self._last_observation: Optional[PageObservation] = None
         self._last_semantic_snapshot: Dict[str, Any] = {}
 
+        # Track URL for new-page vision trigger
+        self._last_vision_url: str = ""
+
     # ── toolkit call helper ──────────────────────────────────
 
     async def _call_toolkit(self, method_name: str, *args: Any, **kwargs: Any) -> ToolkitResult:
@@ -251,6 +254,22 @@ class BrowserPerceptionLayer:
 
         if page_content.page_summary:
             snapshot["page_summary"] = page_content.page_summary
+
+    # ── URL comparison for new-page detection ───────────────
+
+    @staticmethod
+    def _normalize_url_for_compare(url: str) -> str:
+        """Strip fragment and trailing slash for URL comparison."""
+        import re
+        normalized = re.sub(r"#.*$", "", str(url or "").strip())
+        return normalized.rstrip("/").lower()
+
+    def _is_new_url(self, current_url: str) -> bool:
+        """Check if current URL differs from last URL where vision was triggered."""
+        if not current_url:
+            return False
+        normalized = self._normalize_url_for_compare(current_url)
+        return normalized != self._last_vision_url
 
     # ── Complexity score ─────────────────────────────────────
 
@@ -468,11 +487,22 @@ class BrowserPerceptionLayer:
         if settings.VISION_PERCEPTION_ENABLED and page:
             complexity = self.compute_complexity_score(snapshot, a11y_elements)
             page_type = str(snapshot.get("page_type", "") or "")
-            if complexity > settings.VISION_PERCEPTION_COMPLEXITY_THRESHOLD or page_type == "unknown":
+            # Detect new page by comparing current URL with last vision URL
+            current_url = str(snapshot.get("url", "") or "")
+            is_new_page = settings.VISION_ON_NEW_PAGE and self._is_new_url(current_url)
+            need_vision = (
+                is_new_page
+                or complexity > settings.VISION_PERCEPTION_COMPLEXITY_THRESHOLD
+                or page_type == "unknown"
+            )
+            if need_vision:
                 try:
                     vision_description = await self.get_vision_description(page)
                     if vision_description:
-                        log_agent_action(self.name, "observe", f"vision_len={len(vision_description)}")
+                        if current_url:
+                            self._last_vision_url = self._normalize_url_for_compare(current_url)
+                        trigger = "new_page" if is_new_page else ("complexity" if complexity > settings.VISION_PERCEPTION_COMPLEXITY_THRESHOLD else "unknown_type")
+                        log_agent_action(self.name, "observe", f"vision_len={len(vision_description)} trigger={trigger}")
                 except Exception as exc:
                     log_warning(f"vision perception failed: {exc}")
 

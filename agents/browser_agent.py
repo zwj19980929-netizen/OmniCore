@@ -353,6 +353,7 @@ class BrowserAgent:
         self._vision_llm: Optional[LLMClient] = None
         self._vision_llm_attempted = False
         self._vision_llm_unavailable_logged = False
+        self._before_action_screenshot: Optional[bytes] = None
 
         # Perception subsystems
         self.a11y_extractor = AccessibilityTreeExtractor()
@@ -4322,8 +4323,23 @@ class BrowserAgent:
         }
 
     async def _verify_action_effect(self, before: Dict[str, Any], action: BrowserAction) -> bool:
-        """Verify action effect. Delegates to execution layer (Layer 3)."""
-        return await self.execution.verify_action_effect(before, action, self._get_semantic_snapshot)
+        """Verify action effect. Delegates to execution layer, with visual fallback."""
+        dom_verified = await self.execution.verify_action_effect(before, action, self._get_semantic_snapshot)
+        if dom_verified:
+            return True
+        # DOM diff inconclusive — try visual comparison if enabled
+        if settings.VISION_VERIFY_ACTION and self._before_action_screenshot is not None:
+            try:
+                page = getattr(self.toolkit, '_page', None)
+                if page:
+                    after_screenshot = await page.screenshot(type="jpeg", quality=50, full_page=False)
+                    from utils.image_diff import screenshots_differ
+                    if screenshots_differ(self._before_action_screenshot, after_screenshot, threshold=settings.VISION_PIXEL_DIFF_THRESHOLD):
+                        log_agent_action(self.name, "verify", "visual_diff_detected")
+                        return True
+            except Exception:
+                pass
+        return False
 
     async def _verify_form_values(self, form_payload: str) -> bool:
         """Verify form values. Delegates to execution layer (Layer 3)."""
@@ -5169,6 +5185,10 @@ class BrowserAgent:
             _prefetched_elements = None
             _prefetched_snapshot = None
 
+            # 视觉进度追踪器 — 检测连续截图无变化（Agent 卡住）
+            from utils.image_diff import VisualProgressTracker
+            _visual_tracker = VisualProgressTracker(window_size=settings.VISION_PROGRESS_WINDOW)
+
             for step_no in range(1, max_steps + 1):
                 current_url_r = await tk.get_current_url()
                 title_r = await tk.get_title()
@@ -5397,14 +5417,38 @@ class BrowserAgent:
                 self._record_action(action)
                 last_action = action
 
+                # Capture screenshot before action for visual verification
+                self._before_action_screenshot = None
+                if settings.VISION_VERIFY_ACTION:
+                    try:
+                        page = getattr(self.toolkit, '_page', None)
+                        if page:
+                            self._before_action_screenshot = await page.screenshot(type="jpeg", quality=50, full_page=False)
+                    except Exception:
+                        pass
+
                 # ⚡ 优化6: INPUT/FILL_FORM 不需要重量级 page_ready + verify
                 _is_input_action = action.action_type in {ActionType.INPUT, ActionType.FILL_FORM}
+                _is_wait_action = action.action_type == ActionType.WAIT
                 if _is_input_action:
                     before = None
                 else:
                     before = await self._snapshot_page_state()
                 success = await self._execute_action(action)
-                if success and not _is_input_action:
+
+                # 优化3: WAIT 视觉变化检测 — 检测等待期间页面是否有变化
+                if success and _is_wait_action and settings.VISION_WAIT_CHANGE_DETECT:
+                    try:
+                        page = getattr(self.toolkit, '_page', None)
+                        if page and self._before_action_screenshot is not None:
+                            after_wait_img = await page.screenshot(type="jpeg", quality=50, full_page=False)
+                            from utils.image_diff import screenshots_differ
+                            if not screenshots_differ(self._before_action_screenshot, after_wait_img, threshold=settings.VISION_PIXEL_DIFF_THRESHOLD):
+                                log_agent_action(self.name, "wait", "no_visual_change_during_wait")
+                    except Exception:
+                        pass
+
+                if success and not _is_input_action and not _is_wait_action:
                     await self._wait_for_page_ready()
                     success = await self._verify_action_effect(before, action)
                 elif success and _is_input_action:
@@ -5476,14 +5520,35 @@ class BrowserAgent:
                     steps[-1],
                 )
 
-                # 每步执行后保存截图供调试
+                # 每步执行后保存截图供调试 + 视觉进度追踪
+                _step_screenshot_bytes: Optional[bytes] = None
                 if web_debug_recorder.is_enabled():
                     try:
                         _sc = await self.toolkit.screenshot(full_page=False)
                         if _sc.success and _sc.data:
+                            _step_screenshot_bytes = _sc.data
                             web_debug_recorder.write_binary(
                                 f"browser_step_{step_no}_screenshot", _sc.data, ".png"
                             )
+                    except Exception:
+                        pass
+
+                # 优化4: 视觉进度感知 — 检测连续截图无变化
+                if success and action.action_type not in {ActionType.DONE, ActionType.EXTRACT}:
+                    try:
+                        if _step_screenshot_bytes is None:
+                            page = getattr(self.toolkit, '_page', None)
+                            if page:
+                                _step_screenshot_bytes = await page.screenshot(type="jpeg", quality=50, full_page=False)
+                        if _step_screenshot_bytes and not _visual_tracker.record(_step_screenshot_bytes):
+                            log_agent_action(self.name, "progress", f"visual_stuck_detected_at_step_{step_no}")
+                            if self._is_read_only_task(task, task_intent):
+                                _merge_new_data(await self._extract_data_for_intent(task_intent))
+                                _final_screenshot = await self._capture_final_screenshot()
+                                url_r = await tk.get_current_url()
+                                return {"success": True, "message": "visually stuck, extracted current page",
+                                        "url": url_r.data or "", "steps": steps, "data": _accumulated_data,
+                                        "_page_screenshot": _final_screenshot}
                     except Exception:
                         pass
 
