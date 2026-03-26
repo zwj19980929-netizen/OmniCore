@@ -227,10 +227,6 @@ class FileWorker:
 
         return "\n".join(lines)
 
-    def format_news_data(self, news_data: List[Dict[str, Any]]) -> str:
-        """兼容旧测试/旧调用方的新闻格式化入口。"""
-        return self.format_data_to_text(news_data, title="Hacker News Top Stories")
-
     def _write_excel(self, file_path: str, data_items: List[Dict[str, Any]], title: str = "Data Report") -> Dict[str, Any]:
         """将数据写入 Excel (.xlsx) 文件"""
         path = self._resolve_path(file_path)

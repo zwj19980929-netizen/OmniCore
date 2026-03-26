@@ -252,29 +252,11 @@ class DirectURLSearchEngine(SearchEngine):
         )
 
     def _infer_target_site(self, query: str) -> Optional[str]:
-        """根据查询内容推断目标网站"""
+        """根据查询内容推断目标网站（仅匹配用户明确提及的站名）"""
         query_lower = query.lower()
-
-        # GitHub 相关关键词
-        if any(kw in query_lower for kw in ["github", "repository", "repo", "开源项目", "源码"]):
-            return "github"
-
-        # Stack Overflow 相关
-        if any(kw in query_lower for kw in ["stackoverflow", "error", "exception", "how to", "报错"]):
-            return "stackoverflow"
-
-        # Wikipedia 相关
-        if any(kw in query_lower for kw in ["wikipedia", "wiki", "百科", "定义", "是什么"]):
-            return "wikipedia"
-
-        # PyPI 相关
-        if any(kw in query_lower for kw in ["pypi", "python package", "pip install"]):
-            return "pypi"
-
-        # NPM 相关
-        if any(kw in query_lower for kw in ["npm", "node package", "npm install"]):
-            return "npm"
-
+        for site in self.url_templates:
+            if site in query_lower:
+                return site
         return None
 
 

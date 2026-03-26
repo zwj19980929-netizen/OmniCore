@@ -81,8 +81,8 @@ def render_sidebar():
         # 快捷任务
         st.subheader("⚡ 快捷任务")
 
-        if st.button("📰 抓取 Hacker News", use_container_width=True):
-            return "去 Hacker News 抓取排名前 5 的新闻标题和链接，然后把结果保存到我桌面的 news_summary.txt 文件里"
+        if st.button("🔍 搜索示例任务", use_container_width=True):
+            return "搜索最新的 AI 进展，整理前 5 条结果的标题和链接"
 
         if st.button("📊 系统状态", use_container_width=True):
             return "memory stats"

@@ -1540,14 +1540,7 @@ class BrowserAgent:
         score = 0.0
 
         if any(host_norm.endswith(suffix) for suffix in [".gov", ".edu", ".org"]):
-            score += 2.2
-        if any(token in host_norm for token in ["reuters", "apnews", "bloomberg", "wsj", "ft.com", "bbc", "nytimes"]):
-            score += 2.4
-        if any(token in source_norm for token in ["reuters", "associated press", "ap ", "bloomberg", "bbc"]):
-            score += 1.6
-        if any(token in task_norm for token in ["official", "announcement", "statement", "verify", "核实", "声明", "官方"]):
-            if any(token in host_norm for token in [".gov", ".edu", ".org", "official", "gov.cn", "state.gov"]):
-                score += 1.8
+            score += 2.0
         return score
 
     def _score_search_result_card(self, task: str, query: str, card: SearchResultCard) -> float:
@@ -1559,10 +1552,7 @@ class BrowserAgent:
         rank_bonus = 0.0
         if card.rank > 0:
             rank_bonus = max(0.12 - ((card.rank - 1) * 0.01), 0.0)
-        official_bonus = 0.0
-        if any(token in self._normalize_text(card.title + " " + card.snippet) for token in ["官方", "official", "statement", "press release"]):
-            official_bonus = 0.1
-        return min(1.0, 0.65 * relevance + 0.20 * authority_norm + rank_bonus + official_bonus)
+        return min(1.0, 0.65 * relevance + 0.20 * authority_norm + rank_bonus)
 
     def _data_has_substantive_text(self, data: List[Dict[str, str]]) -> bool:
         for item in data[:8]:
@@ -4608,16 +4598,6 @@ class BrowserAgent:
             prefer_content=not prefer_links,
             prefer_links=prefer_links,
         )
-
-    def _task_requires_detail_page_legacy(self, task: str, intent: Optional[TaskIntent] = None) -> bool:
-        normalized = self._normalize_text(task)
-        active_intent = intent or TaskIntent(intent_type="read", query="", confidence=0.0)
-        detail_tokens = (
-            "detail", "details", "news", "article", "articles", "report", "reports", "source", "sources",
-            "statement", "speech", "fact", "verify",
-            "详情", "具体", "新闻", "报道", "来源", "声明", "讲话", "核实",
-        )
-        return active_intent.intent_type in {"search", "navigate"} and any(token in normalized for token in detail_tokens)
 
     def _task_requires_detail_page(self, task: str, intent: Optional[TaskIntent] = None) -> bool:
         active_intent = intent or TaskIntent(intent_type="read", query="", confidence=0.0)
