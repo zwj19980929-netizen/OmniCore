@@ -173,19 +173,20 @@ class BrowserToolkit:
             self._context = await self._browser.new_context(**context_kwargs)
 
             if self.block_heavy_resources:
-                async def _route_handler(route):
+                # 只按 URL 模式拦截图片/字体/媒体，不拦截其他请求
+                # 避免 route("**/*") 导致所有请求都经过 handler，
+                # 在 SPA 点击导航时与 continue_() 产生竞态引发页面崩溃
+                async def _abort_route(route):
                     try:
-                        if route.request.resource_type in {"image", "font", "media"}:
-                            await route.abort()
-                        else:
-                            await route.continue_()
+                        await route.abort()
                     except Exception:
-                        try:
-                            await route.continue_()
-                        except Exception:
-                            pass
+                        pass
 
-                await self._context.route("**/*", _route_handler)
+                _IMG_PATTERN = "**/*.{png,jpg,jpeg,gif,webp,svg,ico,bmp,avif,tiff}"
+                _FONT_PATTERN = "**/*.{woff,woff2,ttf,eot,otf}"
+                _MEDIA_PATTERN = "**/*.{mp4,mp3,webm,ogg,wav,avi,flv,m4a,aac}"
+                for pattern in (_IMG_PATTERN, _FONT_PATTERN, _MEDIA_PATTERN):
+                    await self._context.route(pattern, _abort_route)
 
             self._page = await self._context.new_page()
 

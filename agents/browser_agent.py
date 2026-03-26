@@ -5335,14 +5335,12 @@ class BrowserAgent:
                 if action.action_type == ActionType.DONE:
                     data = await self._extract_data_for_intent(task_intent)
                     _merge_new_data(data)
-                    # 回退1: main_text
-                    if not _accumulated_data and not data:
-                        snapshot = self._last_semantic_snapshot or {}
-                        main_text = self._get_snapshot_main_text(snapshot)
-                        if main_text and len(main_text) >= 50:
-                            data = [{"text": main_text, "source": "page_main_text"}]
-                            _merge_new_data(data)
-                    # 回退2: 视觉提取
+                    # 补充: 始终追加 snapshot main_text（感知层比 extract_data 更可靠）
+                    snapshot = self._last_semantic_snapshot or {}
+                    main_text = self._get_snapshot_main_text(snapshot)
+                    if main_text and len(main_text) >= 50:
+                        _merge_new_data([{"text": main_text, "source": "page_main_text"}])
+                    # 回退: 视觉提取
                     if not _accumulated_data:
                         vision_data = await self._extract_data_with_vision(task, task_intent, snapshot)
                         if vision_data:
@@ -5359,14 +5357,12 @@ class BrowserAgent:
                 if action.action_type == ActionType.EXTRACT:
                     data = await self._extract_data_for_intent(task_intent)
                     _merge_new_data(data)
-                    # 回退1: main_text
-                    if not _accumulated_data and not data:
-                        snapshot = self._last_semantic_snapshot or {}
-                        main_text = self._get_snapshot_main_text(snapshot)
-                        if main_text and len(main_text) >= 50:
-                            data = [{"text": main_text, "source": "page_main_text"}]
-                            _merge_new_data(data)
-                    # 回退2: 视觉提取
+                    # 补充: 始终追加 snapshot main_text（感知层比 extract_data 更可靠）
+                    snapshot = self._last_semantic_snapshot or {}
+                    main_text = self._get_snapshot_main_text(snapshot)
+                    if main_text and len(main_text) >= 50:
+                        _merge_new_data([{"text": main_text, "source": "page_main_text"}])
+                    # 回退: 视觉提取
                     if not _accumulated_data:
                         vision_data = await self._extract_data_with_vision(task, task_intent, snapshot)
                         if vision_data:
@@ -5632,13 +5628,12 @@ class BrowserAgent:
 
             # max steps reached
             _merge_new_data(await self._extract_data_for_intent(task_intent))
-            # 回退1: main_text
-            if not _accumulated_data:
-                snapshot = self._last_semantic_snapshot or {}
-                main_text = self._get_snapshot_main_text(snapshot)
-                if main_text and len(main_text) >= 50:
-                    _merge_new_data([{"text": main_text, "source": "page_main_text"}])
-            # 回退2: 视觉提取
+            # 补充: 始终追加 snapshot main_text
+            snapshot = self._last_semantic_snapshot or {}
+            main_text = self._get_snapshot_main_text(snapshot)
+            if main_text and len(main_text) >= 50:
+                _merge_new_data([{"text": main_text, "source": "page_main_text"}])
+            # 回退: 视觉提取
             if not _accumulated_data:
                 vision_data = await self._extract_data_with_vision(task, task_intent, self._last_semantic_snapshot)
                 if vision_data:

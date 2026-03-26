@@ -395,14 +395,15 @@ class BrowserExecutionLayer:
 
               const contentSelectors = [
                 'main li', 'article li', '[role="main"] li', 'section li',
-                '#7d li', '#15d li', '.forecast li', '.weather li',
+                '.forecast li', '.weather li',
                 'main p', 'article p', '[role="main"] p', 'section p',
                 'main h1', 'article h1', 'main h2', 'article h2',
                 'main h3', 'article h3', 'tr',
                 'main div', 'article div', '[role="main"] div', 'section div',
                 '.today div', '.forecast div', '.weather div',
-                '[class*="weather"] div', '[class*="temp"] div',
                 '[class*="detail"] div', '[class*="info"] div',
+                '[class*="list"] div', '[class*="item"] div',
+                '[class*="card"] div', '[class*="content"] div',
               ].join(', ');
 
               const denseContent = dedupe(
@@ -412,23 +413,27 @@ class BrowserExecutionLayer:
                     index: index + 1,
                     text: normalize(element.innerText || element.textContent || ''),
                   }))
-                  .filter(item => item.text.length >= 4 && item.text.length <= 240),
+                  .filter(item => item.text.length >= 4 && item.text.length <= 300),
                 (item) => item.text
-              ).slice(0, 12);
+              ).slice(0, 20);
 
-              const bodyText = normalize(document.body ? document.body.innerText : '');
+              const rawBodyText = (document.body ? document.body.innerText : '');
               const bodyLines = dedupe(
-                bodyText
+                rawBodyText
                   .split(/\n+/)
                   .map((text, index) => ({
                     index: index + 1,
                     text: normalize(text),
                   }))
-                  .filter(item => item.text.length >= 8 && item.text.length <= 240),
+                  .filter(item => item.text.length >= 4 && item.text.length <= 300),
                 (item) => item.text
-              ).slice(0, 12);
+              ).slice(0, 20);
 
-              const contentBlocks = denseContent.length >= 3 ? denseContent : bodyLines;
+              // 合并两个来源，去重后返回——不再二选一
+              const merged = dedupe(
+                [...denseContent, ...bodyLines],
+                (item) => item.text
+              ).slice(0, 30);
 
               const links = dedupe(
                 Array.from(document.querySelectorAll('a[href]'))
@@ -450,13 +455,13 @@ class BrowserExecutionLayer:
                     item.title.length >= 2
                   )),
                 (item) => `${item.title}|${item.link}`
-              ).slice(0, 10);
+              ).slice(0, 15);
 
-              if (mode === 'content') return contentBlocks.length ? contentBlocks : links;
-              if (mode === 'links') return links.length ? links : contentBlocks;
-              if (contentBlocks.length >= 4) return contentBlocks;
+              if (mode === 'content') return merged.length ? merged : links;
+              if (mode === 'links') return links.length ? links : merged;
+              if (merged.length >= 3) return merged;
               if (links.length) return links;
-              return contentBlocks;
+              return merged;
             }
             """,
             mode,
@@ -636,9 +641,14 @@ class BrowserExecutionLayer:
     async def wait_for_page_ready(self) -> None:
         tk = self.toolkit
         await tk.wait_for_load("domcontentloaded", timeout=10000)
-        if not tk.fast_mode:
-            await tk.wait_for_load("networkidle", timeout=3000)
-        await tk.human_delay(40, 80)
+        # 始终等待 networkidle 以确保 AJAX 数据加载完成
+        # fast_mode 下用更短的超时，避免慢站点阻塞
+        idle_timeout = 2000 if tk.fast_mode else 3000
+        await tk.wait_for_load("networkidle", timeout=idle_timeout)
+        # SPA 点击后需要额外等待：路由切换 + API 请求 + DOM 渲染
+        # 不用 human_delay 因为 fast_mode 会缩短到不够用
+        import asyncio as _asyncio
+        await _asyncio.sleep(3.0)
 
     # ── Action verification ──────────────────────────────────
 
