@@ -10,7 +10,6 @@ from typing import Dict, Any, List, Optional, Tuple
 from pathlib import Path
 
 from config.settings import settings
-from core.llm import LLMClient
 from utils.logger import log_agent_action, log_success, log_error, log_warning
 
 
@@ -153,6 +152,7 @@ class CaptchaSolver:
             try:
                 if model_name != self.vision_model:
                     log_warning(f"验证码视觉模型回退: {self.vision_model} -> {model_name}")
+                from core.llm import LLMClient
                 llm = LLMClient(model=model_name)
                 response = llm.chat_with_image(prompt, image_bytes)
                 result_text = response.content
