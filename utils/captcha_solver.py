@@ -9,8 +9,8 @@ import random
 from typing import Dict, Any, List, Optional, Tuple
 from pathlib import Path
 
-from openai import OpenAI
 from config.settings import settings
+from core.llm import LLMClient
 from utils.logger import log_agent_action, log_success, log_error, log_warning
 
 
@@ -24,12 +24,13 @@ class CaptchaSolver:
 
     def __init__(self, toolkit=None):
         self.name = "CaptchaSolver"
-        self.client = OpenAI(api_key=settings.OPENAI_API_KEY)
         self.vision_model = settings.VISION_MODEL
         self.toolkit = toolkit  # BrowserToolkit instance
 
     def _vision_model_candidates(self) -> List[str]:
-        candidates = [self.vision_model, "gpt-4o", "gpt-4o-mini"]
+        # 主模型 + 兜底（仅当主模型不是 OpenAI 时才追加 OpenAI 备选）
+        fallbacks = ["gpt-4o", "gpt-4o-mini"]
+        candidates = [self.vision_model] + fallbacks
         ordered: List[str] = []
         seen: set[str] = set()
         for item in candidates:
@@ -143,25 +144,18 @@ class CaptchaSolver:
 - 如果是数学算式，写出计算结果
 - confidence 表示识别把握度"""
 
+        import json
+        import re
+
         last_error = ""
+        image_bytes = base64.b64decode(screenshot_base64)
         for model_name in self._vision_model_candidates():
             try:
                 if model_name != self.vision_model:
                     log_warning(f"验证码视觉模型回退: {self.vision_model} -> {model_name}")
-                response = self.client.chat.completions.create(
-                    model=model_name,
-                    messages=[{
-                        "role": "user",
-                        "content": [
-                            {"type": "text", "text": prompt},
-                            {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{screenshot_base64}"}},
-                        ],
-                    }],
-                )
-
-                result_text = response.choices[0].message.content
-                import json
-                import re
+                llm = LLMClient(model=model_name)
+                response = llm.chat_with_image(prompt, image_bytes)
+                result_text = response.content
 
                 result = None
                 json_match = re.search(r'```json\s*(.*?)\s*```', result_text, re.DOTALL)

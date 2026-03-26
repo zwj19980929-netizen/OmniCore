@@ -120,6 +120,9 @@ class LLMClient:
         minimax_key = getattr(settings, "MINIMAX_API_KEY", "")
         if minimax_key:
             os.environ["MINIMAX_API_KEY"] = minimax_key
+        zhipu_key = getattr(settings, "ZHIPU_API_KEY", "")
+        if zhipu_key:
+            os.environ["ZHIPU_API_KEY"] = zhipu_key
 
     def _load_provider_config(self) -> Dict[str, Any]:
         """从 models.yaml 加载 provider_config"""
@@ -154,6 +157,10 @@ class LLMClient:
             minimax_key = getattr(settings, "MINIMAX_API_KEY", "")
             if minimax_key:
                 return minimax_key
+        elif provider == "zhipu":
+            zhipu_key = getattr(settings, "ZHIPU_API_KEY", "")
+            if zhipu_key:
+                return zhipu_key
 
         cfg = self.provider_config.get(provider, {})
         env_name = cfg.get("api_key_env", "")
@@ -174,6 +181,8 @@ class LLMClient:
             return "deepseek"
         if "minimax" in model_lower or model_lower.startswith("abab"):
             return "minimax"
+        if "glm" in model_lower or "zhipu" in model_lower:
+            return "zhipu"
         return "openai"
 
     def _get_litellm_model(self) -> str:
@@ -185,7 +194,7 @@ class LLMClient:
         # 只有 kimi/moonshot/minimax 等 OpenAI 兼容 API 才加 openai/ 前缀
         if provider == "openai":
             return model_id
-        if provider in ("kimi", "moonshot", "minimax"):
+        if provider in ("kimi", "moonshot", "minimax", "zhipu"):
             return f"openai/{model_id}"
         if provider == "gemini":
             return f"gemini/{model_id}"

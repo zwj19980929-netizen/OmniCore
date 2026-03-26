@@ -107,6 +107,33 @@ capability_overrides:
       max_tokens: 64000
       cost_tier: medium
 
+  zhipu:
+    glm-4v-plus:
+      type: llm
+      capabilities: [text_chat, text_long, vision, code]
+      cost_tier: high
+      max_tokens: 128000
+    glm-4v:
+      type: llm
+      capabilities: [text_chat, vision]
+      cost_tier: medium
+      max_tokens: 8192
+    glm-4v-flash:
+      type: llm
+      capabilities: [text_chat, vision]
+      cost_tier: low
+      max_tokens: 8192
+    glm-4-plus:
+      type: llm
+      capabilities: [text_chat, text_long, code, reasoning]
+      cost_tier: high
+      max_tokens: 128000
+    glm-4:
+      type: llm
+      capabilities: [text_chat, text_long, code]
+      cost_tier: medium
+      max_tokens: 128000
+
   minimax:
     MiniMax-M2.5:
       capabilities: [text_chat, text_long, code, reasoning]
@@ -142,7 +169,7 @@ capability_overrides:
 capability_defaults:
   text_chat: ["openai/gpt-5.4", "minimax/MiniMax-M2.5", "deepseek/deepseek-chat", "kimi/moonshot-v1-32k", "gemini/gemini-2.0-flash"]
   text_long: ["openai/gpt-5.4", "minimax/MiniMax-M2.5", "gemini/gemini-2.5-pro", "kimi/moonshot-v1-128k", "deepseek/deepseek-chat"]
-  vision: ["openai/gpt-5.4", "gemini/gemini-2.5-pro", "openai/gpt-4o", "kimi/kimi-latest"]
+  vision: ["openai/gpt-5.4", "gemini/gemini-2.5-pro", "openai/gpt-4o", "kimi/kimi-latest", "zhipu/glm-4v-plus", "zhipu/glm-4v"]
   image_gen: ["openai/dall-e-3", "gemini/imagen-3.0-generate"]
   stt: ["openai/whisper-1"]
   tts: ["openai/tts-1", "openai/tts-1-hd"]
@@ -168,6 +195,17 @@ provider_config:
     api_key_env: "DEEPSEEK_API_KEY"
     auth_mode: "bearer"
     api_base: "https://api.deepseek.com"
+  zhipu:
+    api_key_env: "ZHIPU_API_KEY"
+    auth_mode: "bearer"
+    api_base: "https://open.bigmodel.cn/api/paas/v4"
+    disable_model_discovery: true
+    static_models:
+      - glm-4v-plus
+      - glm-4v
+      - glm-4v-flash
+      - glm-4-plus
+      - glm-4
   minimax:
     api_key_env: "MINIMAX_API_KEY"
     auth_mode: "bearer"

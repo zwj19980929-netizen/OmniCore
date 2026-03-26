@@ -37,7 +37,7 @@ class ModelRegistry:
     - 根据能力需求智能选择模型
     """
 
-    SUPPORTED_PROVIDERS = ["gemini", "kimi", "openai", "deepseek", "minimax"]
+    SUPPORTED_PROVIDERS = ["gemini", "kimi", "openai", "deepseek", "minimax", "zhipu"]
 
     def __init__(self, config_path: str = None):
         self.config_path = Path(config_path or settings.MODELS_CONFIG_PATH)
@@ -79,6 +79,7 @@ class ModelRegistry:
             "openai": settings.OPENAI_API_KEY,
             "deepseek": settings.DEEPSEEK_API_KEY,
             "minimax": getattr(settings, "MINIMAX_API_KEY", ""),
+            "zhipu": getattr(settings, "ZHIPU_API_KEY", ""),
         }
 
         provider_cfg = self.config.get("provider_config", {})
