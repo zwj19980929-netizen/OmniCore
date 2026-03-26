@@ -2756,34 +2756,21 @@ class WebWorker:
         if not r.success or not isinstance(r.data, list):
             return []
 
+        # 过滤表头行和无效项（通用，不针对特定领域）
         header_tokens = {
-            "仅标题", "标题", "漏洞编号", "编号", "cve", "cnnvd", "cnvd", "bid",
-            "发布日期", "提交时间", "等级", "危害级别", "操作", "序号",
+            "仅标题", "标题", "编号", "序号", "操作",
+            "发布日期", "提交时间", "等级",
         }
-        task_mentions_vulnerability = "漏洞" in str(task_description or "")
         filtered: List[Dict[str, Any]] = []
         for item in r.data:
             if not isinstance(item, dict):
                 continue
             title = str(item.get("title", "") or "").strip()
             link = str(item.get("link", "") or "").strip()
-            row_text = str(item.get("row_text", "") or "").strip()
             if not title or not link:
                 continue
-            normalized_title = title.lower()
-            if normalized_title in header_tokens:
+            if title.lower() in header_tokens:
                 continue
-            if task_mentions_vulnerability:
-                vulnerability_signals = (
-                    "漏洞" in title
-                    or "CNVD-" in row_text
-                    or "CNNVD-" in row_text
-                    or "CVE-" in row_text
-                    or "/flaw/show" in link
-                    or "/show/" in link
-                )
-                if not vulnerability_signals and len(filtered) >= max(2, limit // 2):
-                    continue
             filtered.append({"title": title, "link": link})
             if len(filtered) >= limit:
                 break

@@ -1334,7 +1334,7 @@ class BrowserAgent:
 
     def _extract_target_result_count(self, task: str) -> int:
         match = re.search(
-            r'(\d+)\s*(?:个|条|款|项|条数据|items?|results?|records?|articles?|stories|news|vulnerabilities?|条漏洞)',
+            r'(\d+)\s*(?:个|条|款|项|条数据|items?|results?|records?|articles?|entries|pieces?)',
             task or "",
             flags=re.IGNORECASE,
         )

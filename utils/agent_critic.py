@@ -203,7 +203,7 @@ class AgentCritic:
         if attempt_count >= 3:
             report_lines.extend([
                 "⚠️ **警告**: 已经失败 3 次了！如果再不改进，建议：",
-                "   1. 完全换一个策略（比如直接访问 CNNVD 官网而不是搜索）",
+                "   1. 完全换一个策略（比如直接访问目标网站而不是搜索）",
                 "   2. 使用三层感知架构重新理解页面",
                 "   3. 降低任务复杂度，分步验证",
                 ""
@@ -319,7 +319,7 @@ if __name__ == "__main__":
         "error": "repeated action loop detected at step 3",
         "completed_tasks": 0,
         "total_tasks": 3,
-        "task": "使用 Google 搜索 CNNVD",
+        "task": "使用 Google 搜索目标网站",
         "output": "Clicked Google 搜索 button 3 times"
     }
 
@@ -327,5 +327,5 @@ if __name__ == "__main__":
     report = critic.generate_pua_report(issues, attempt_count=3)
     print(report)
 
-    alternative = critic.suggest_alternative_strategy("搜索 CNNVD 漏洞", 3)
+    alternative = critic.suggest_alternative_strategy("搜索目标网站数据", 3)
     print(alternative)
