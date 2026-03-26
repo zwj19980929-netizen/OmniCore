@@ -17,11 +17,6 @@ FIELD_ALIASES: Dict[str, Set[str]] = {
     "author": {"author", "owner", "creator", "publisher", "by", "作者", "发布者", "所有者"},
     "source": {"source", "site", "host", "domain", "来源", "站点", "网站", "域名"},
     "location": {"location", "city", "country", "place", "region", "地点", "城市", "国家", "地区"},
-    "temperature": {"temperature", "temp", "degree", "温度", "气温"},
-    "weather": {"weather", "forecast", "condition", "天气", "天气状况", "预报"},
-    "humidity": {"humidity", "湿度"},
-    "wind": {"wind", "wind_speed", "wind_force", "风力", "风速"},
-    "aqi": {"aqi", "air_quality", "空气质量"},
     "price": {"price", "cost", "amount", "价格", "金额", "售价"},
     "rating": {"rating", "score", "stars", "评分", "分数", "星级"},
     "comments": {"comments", "comment_count", "评论", "评论数"},
@@ -145,164 +140,9 @@ NAV_PATH_SEGMENTS = {
 }
 
 CONTENT_FIELDS = {
-    "title", "summary", "date", "author", "source", "location", "temperature",
-    "weather", "humidity", "wind", "aqi", "price", "rating", "comments", "points",
+    "title", "summary", "date", "author", "source", "location",
+    "price", "rating", "comments", "points",
 }
-
-WEATHER_FIELDS = {"temperature", "weather", "humidity", "wind", "aqi"}
-WEATHER_CONDITION_PATTERNS = (
-    "晴", "多云", "阴", "小雨", "中雨", "大雨", "暴雨", "雷阵雨", "阵雨", "雨夹雪", "小雪", "中雪", "大雪", "雾", "霾", "扬沙", "浮尘",
-    "sunny", "cloudy", "overcast", "rain", "shower", "thunderstorm", "snow", "fog", "haze",
-)
-WEEKDAY_ZH = {0: "周一", 1: "周二", 2: "周三", 3: "周四", 4: "周五", 5: "周六", 6: "周日"}
-WEEKDAY_EN = {0: "monday", 1: "tuesday", 2: "wednesday", 3: "thursday", 4: "friday", 5: "saturday", 6: "sunday"}
-
-
-def _weather_requested(task_description: str, requested_fields: List[str]) -> bool:
-    requested = {canonical_field_name(field) for field in (requested_fields or [])}
-    if requested & WEATHER_FIELDS:
-        return True
-    text = normalize_text(task_description).lower()
-    return any(token in text for token in ("weather", "forecast", "天气", "预报", "气温", "湿度", "风力", "空气质量", "aqi"))
-
-
-def _weather_target_tokens(task_description: str) -> Set[str]:
-    text = normalize_text(task_description)
-    lower = text.lower()
-    tokens: Set[str] = set()
-    for token in ("今天", "明天", "后天", "当前"):
-        if token in text:
-            tokens.add(token)
-    for token in ("today", "tomorrow", "current"):
-        if token in lower:
-            tokens.add(token)
-    match = re.search(r"(\d{4})-(\d{2})-(\d{2})", text)
-    if match:
-        year, month, day = [int(part) for part in match.groups()]
-        tokens.add(f"{year:04d}-{month:02d}-{day:02d}")
-        tokens.add(f"{month:02d}-{day:02d}")
-        tokens.add(f"{month}月{day}日")
-        tokens.add(f"{day}日")
-        try:
-            from datetime import date as _date
-            weekday = _date(year, month, day).weekday()
-            tokens.add(WEEKDAY_ZH[weekday])
-            tokens.add(WEEKDAY_EN[weekday])
-        except Exception:
-            pass
-    return {token for token in tokens if token}
-
-
-def _weather_signal_score(text: str, target_tokens: Set[str]) -> int:
-    value = normalize_text(text)
-    lower = value.lower()
-    score = 0
-    if re.search(r"-?\d{1,2}\s*(?:°\s*(?:c|f)|℃|°?\s*摄氏度|°?\s*华氏度|度)", lower):
-        score += 3
-    if re.search(r"-?\d{1,2}\s*(?:°\s*(?:c|f)|℃|°?\s*摄氏度|°?\s*华氏度|度)?\s*/\s*-?\d{1,2}\s*(?:°\s*(?:c|f)|℃|°?\s*摄氏度|°?\s*华氏度|度)?", lower):
-        score += 3
-    if any(pattern.lower() in lower for pattern in WEATHER_CONDITION_PATTERNS):
-        score += 3
-    if any(token in lower for token in ("湿度", "humidity")):
-        score += 2
-    if any(token in lower for token in ("风力", "风速", "wind", "风向")) or re.search(r"\d+\s*级", value):
-        score += 2
-    if any(token in lower for token in ("aqi", "空气质量")):
-        score += 2
-    if target_tokens and any(token.lower() in lower for token in target_tokens):
-        score += 4
-    return score
-
-
-def _extract_weather_fields_from_text(text: str, task_description: str) -> Dict[str, str]:
-    value = normalize_text(text)
-    if not value:
-        return {}
-    target_tokens = _weather_target_tokens(task_description)
-    fragments = [value]
-    fragments.extend(
-        normalize_text(part)
-        for part in re.split(r"[\n\r]+|(?<=[。；;!！?？])", value)
-        if normalize_text(part)
-    )
-    best_fragment = max(fragments, key=lambda item: _weather_signal_score(item, target_tokens))
-    if _weather_signal_score(best_fragment, target_tokens) <= 0:
-        return {}
-
-    best_lower = best_fragment.lower()
-    fields: Dict[str, str] = {}
-
-    date_match = re.search(r"\b\d{4}-\d{2}-\d{2}\b|\b\d{2}-\d{2}\b|\d{1,2}月\d{1,2}日|\d{1,2}日|周[一二三四五六日天]|今天|明天|后天|today|tomorrow|current", best_fragment, re.IGNORECASE)
-    if date_match:
-        fields["date"] = normalize_text(date_match.group(0))
-    elif target_tokens:
-        preferred = next(iter(sorted(target_tokens, key=len, reverse=True)), "")
-        if preferred:
-            fields["date"] = preferred
-
-    range_match = re.search(r"(-?\d{1,2})\s*(?:°\s*(?:c|f)|℃|°?\s*摄氏度|°?\s*华氏度|度)?\s*/\s*(-?\d{1,2})\s*(?:°\s*(?:c|f)|℃|°?\s*摄氏度|°?\s*华氏度|度)?", best_fragment, re.IGNORECASE)
-    if range_match:
-        high, low = range_match.groups()
-        fields["temperature"] = f"{high}/{low}°C"
-    else:
-        high_low_match = re.search(r"(?:高温|最高)\s*(-?\d{1,2})\s*(?:°\s*(?:c|f)|℃|°?\s*摄氏度|°?\s*华氏度|度).{0,12}(?:低温|最低)\s*(-?\d{1,2})\s*(?:°\s*(?:c|f)|℃|°?\s*摄氏度|°?\s*华氏度|度)", best_fragment, re.IGNORECASE)
-        if high_low_match:
-            high, low = high_low_match.groups()
-            fields["temperature"] = f"{high}/{low}°C"
-        else:
-            temps = re.findall(r"-?\d{1,2}\s*(?:°\s*(?:c|f)|℃|°?\s*摄氏度|°?\s*华氏度|度)", best_fragment, re.IGNORECASE)
-            if temps:
-                fields["temperature"] = normalize_text(" / ".join(temps[:2]))
-
-    for condition in WEATHER_CONDITION_PATTERNS:
-        if condition.lower() in best_lower:
-            fields["weather"] = condition
-            break
-
-    humidity_match = re.search(r"(?:湿度|humidity)\s*[:：]?\s*(\d{1,3}\s*%)", best_fragment, re.IGNORECASE)
-    if humidity_match:
-        fields["humidity"] = normalize_text(humidity_match.group(1))
-
-    wind_match = re.search(r"(?:风力|风速|风向|wind|风)\s*[:：]?\s*([^\s,，。;；]{1,20})", best_fragment, re.IGNORECASE)
-    if wind_match:
-        fields["wind"] = normalize_text(wind_match.group(1))
-    else:
-        level_match = re.search(r"\d+(?:-\d+)?\s*级", best_fragment)
-        if level_match:
-            fields["wind"] = normalize_text(level_match.group(0))
-
-    aqi_match = re.search(r"(?:aqi|空气质量)\s*[:：]?\s*([A-Za-z]*\d{1,3}|优|良|轻度污染|中度污染|重度污染)", best_fragment, re.IGNORECASE)
-    if aqi_match:
-        fields["aqi"] = normalize_text(aqi_match.group(1))
-
-    if len(fields) >= 2:
-        fields["summary"] = best_fragment[:240]
-    return fields
-
-
-def enrich_weather_item(item: Dict[str, Any], task_description: str) -> Dict[str, Any]:
-    combined_text = " ".join(
-        normalize_text(item.get(key))
-        for key in ("title", "summary", "text", "content", "details", "description")
-        if normalize_text(item.get(key))
-    )
-    fields = _extract_weather_fields_from_text(combined_text, task_description)
-    if not fields:
-        return item
-
-    enriched = dict(item)
-    for key, value in fields.items():
-        if value and not normalize_text(enriched.get(key)):
-            enriched[key] = value
-
-    if not normalize_text(enriched.get("title")):
-        title_parts = [fields.get("date", ""), fields.get("weather", ""), fields.get("temperature", "")]
-        title = " ".join(part for part in title_parts if part).strip()
-        if title:
-            enriched["title"] = title
-    if not normalize_text(enriched.get("summary")) and normalize_text(fields.get("summary")):
-        enriched["summary"] = fields["summary"]
-    return enriched
 
 
 def normalize_text(value: Any) -> str:
@@ -705,8 +545,6 @@ def normalize_web_results(
         if not isinstance(raw_item, dict):
             continue
         item = canonicalize_item(raw_item, requested_fields)
-        if _weather_requested(task_description, requested_fields):
-            item = enrich_weather_item(item, task_description)
         if not item:
             continue
         if is_noise_item(item, requested_fields):

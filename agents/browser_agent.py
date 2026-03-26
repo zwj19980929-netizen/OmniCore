@@ -1654,15 +1654,6 @@ class BrowserAgent:
         if not normalized:
             return ""
 
-        weather_match = re.search(
-            r"(?:查询|查|搜索|搜|获取|看看)?\s*([\u4e00-\u9fff]{2,12}?)(?:(今天|明天|后天|当前))?(?:的)?(?:天气|天气预报|气温|空气质量)",
-            normalized,
-        )
-        if weather_match:
-            location = weather_match.group(1)
-            timeframe = weather_match.group(2) or ""
-            return " ".join(part for part in [location, timeframe, "天气"] if part).strip()
-
         for pattern in (
             r"(?:搜索|查询|查找|查一下|查查|搜一下|搜|获取)([^。！？\n]{2,80})",
             r"(?:search|find|get|look up|query)\s+([^\n.?!]{2,80})",
@@ -4622,11 +4613,9 @@ class BrowserAgent:
         normalized = self._normalize_text(task)
         active_intent = intent or TaskIntent(intent_type="read", query="", confidence=0.0)
         detail_tokens = (
-            "weather", "forecast", "temperature", "humidity", "wind", "aqi", "air quality",
             "detail", "details", "news", "article", "articles", "report", "reports", "source", "sources",
-            "statement", "speech", "fact", "verify", "death", "died", "killed", "alive",
-            "详情", "具体", "温度", "湿度", "风力", "空气质量", "天气", "天气预报",
-            "新闻", "报道", "来源", "声明", "讲话", "死亡", "死了", "是否", "核实", "公开露面",
+            "statement", "speech", "fact", "verify",
+            "详情", "具体", "新闻", "报道", "来源", "声明", "讲话", "核实",
         )
         return active_intent.intent_type in {"search", "navigate"} and any(token in normalized for token in detail_tokens)
 

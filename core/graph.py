@@ -470,8 +470,6 @@ def _derive_authoritative_target_url(state: OmniCoreState) -> str:
             return True
         if host in {"google.com", "bing.com", "baidu.com", "duckduckgo.com", "sogou.com"}:
             return True
-        if host in {"weather.com.cn", "moji.com", "tianqi.com"} and path in {"", "/index", "/index.html"}:
-            return True
         return False
 
     direct_url = RouterAgent._extract_first_url(str(state.get("user_input", "") or ""))

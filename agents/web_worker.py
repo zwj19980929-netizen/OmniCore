@@ -2895,14 +2895,6 @@ class WebWorker:
         config.setdefault("page_stage", str(snapshot.get("page_stage", "") or "unknown"))
         config.setdefault("observed_page_stage", str(snapshot.get("page_stage", "") or "unknown"))
 
-        host = str(urlparse(url).netloc or "").lower()
-        item_selector = str(config.get("item_selector", "") or "").strip()
-        if host.endswith("news.ycombinator.com") and item_selector in {"tr", "table tr"}:
-            config["item_selector"] = "tr.athing"
-            fields = dict(config.get("fields", {}) or {})
-            fields["title"] = fields.get("title") or ".titleline > a"
-            fields["id"] = fields.get("id") or "@id"
-            config["fields"] = fields
         return config
 
     async def _resolve_field_target(self, item, selector: str):
