@@ -45,6 +45,13 @@ Copy-Item .env.example .env
 # cp .env.example .env
 ```
 
+Windows 下清理测试残留目录：
+
+```powershell
+.\scripts\cleanup_test_artifacts.ps1
+.\scripts\cleanup_test_artifacts.ps1 -IncludeDebug -IncludeLogs
+```
+
 至少补上你要使用的模型 API Key，例如：
 
 - `OPENAI_API_KEY`
