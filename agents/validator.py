@@ -192,6 +192,7 @@ class Validator:
                 log_warning(f"Validator FAIL: {task['task_id']} — {vr['issues']}")
                 state["task_queue"][idx]["status"] = "failed"
                 state["task_queue"][idx]["failure_type"] = vr["failure_type"]
+                state["task_queue"][idx]["failure_source"] = "validator"
 
         if state.get("task_queue") and completed_count == 0:
             # Keep waiting queues untouched; only fail fast when there are failed tasks

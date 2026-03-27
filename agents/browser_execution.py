@@ -22,6 +22,7 @@ from utils.search_engine_profiles import (
     build_direct_search_urls,
     decode_search_redirect_url,
     get_search_result_selectors,
+    is_search_engine_domain,
 )
 import utils.web_debug_recorder as web_debug_recorder
 
@@ -367,9 +368,15 @@ class BrowserExecutionLayer:
         elif prefer_links:
             mode = "links"
 
+        current_url_r = await self.toolkit.get_current_url()
+        current_url = current_url_r.data or ""
+        on_search_engine = is_search_engine_domain(current_url)
+
         r = await self.toolkit.evaluate_js(
             r"""
-            (mode) => {
+            (payload) => {
+              const mode = payload.mode;
+              const onSearchEngine = payload.onSearchEngine;
               const normalize = (value) => (value || '').replace(/\s+/g, ' ').trim();
               const isVisible = (element) => {
                 if (!element) return false;
@@ -379,7 +386,7 @@ class BrowserExecutionLayer:
                 return rect.width > 0 && rect.height > 0;
               };
               const isExcluded = (element) => Boolean(
-                element.closest('nav, header, footer, aside, form, [role="navigation"], script, style, noscript')
+                element.closest('nav, header, footer, aside, form, [role="navigation"], [role="banner"], [role="contentinfo"], script, style, noscript')
               );
               const dedupe = (items, keyFactory) => {
                 const seen = new Set();
@@ -393,21 +400,17 @@ class BrowserExecutionLayer:
                 return result;
               };
 
+              // 通用主内容区检测：优先用语义标签，降级到 body
+              const mainArea = document.querySelector(
+                'main, [role="main"], article, #content, .content, #main'
+              ) || document.body;
+
               const contentSelectors = [
-                'main li', 'article li', '[role="main"] li', 'section li',
-                '.forecast li', '.weather li',
-                'main p', 'article p', '[role="main"] p', 'section p',
-                'main h1', 'article h1', 'main h2', 'article h2',
-                'main h3', 'article h3', 'tr',
-                'main div', 'article div', '[role="main"] div', 'section div',
-                '.today div', '.forecast div', '.weather div',
-                '[class*="detail"] div', '[class*="info"] div',
-                '[class*="list"] div', '[class*="item"] div',
-                '[class*="card"] div', '[class*="content"] div',
+                'li', 'p', 'h1', 'h2', 'h3', 'tr', 'div',
               ].join(', ');
 
               const denseContent = dedupe(
-                Array.from(document.querySelectorAll(contentSelectors))
+                Array.from(mainArea.querySelectorAll(contentSelectors))
                   .filter(element => !isExcluded(element) && isVisible(element))
                   .map((element, index) => ({
                     index: index + 1,
@@ -417,7 +420,7 @@ class BrowserExecutionLayer:
                 (item) => item.text
               ).slice(0, 20);
 
-              const rawBodyText = (document.body ? document.body.innerText : '');
+              const rawBodyText = normalize(mainArea.innerText || '');
               const bodyLines = dedupe(
                 rawBodyText
                   .split(/\n+/)
@@ -429,14 +432,14 @@ class BrowserExecutionLayer:
                 (item) => item.text
               ).slice(0, 20);
 
-              // 合并两个来源，去重后返回——不再二选一
               const merged = dedupe(
                 [...denseContent, ...bodyLines],
                 (item) => item.text
               ).slice(0, 30);
 
+              // 链接也从主内容区提取，而非整个 document
               const links = dedupe(
-                Array.from(document.querySelectorAll('a[href]'))
+                Array.from(mainArea.querySelectorAll('a[href]'))
                   .filter(element => !isExcluded(element) && isVisible(element))
                   .map((element) => ({
                     title: normalize(
@@ -448,12 +451,19 @@ class BrowserExecutionLayer:
                     ),
                     link: element.href || element.getAttribute('href') || '',
                   }))
-                  .filter(item => (
-                    item.link &&
-                    item.title &&
-                    !/^javascript:/i.test(item.link) &&
-                    item.title.length >= 2
-                  )),
+                  .filter(item => {
+                    if (!item.link || !item.title) return false;
+                    if (/^javascript:/i.test(item.link)) return false;
+                    if (item.title.length < 4) return false;
+                    if (onSearchEngine) {
+                      try {
+                        const linkHost = new URL(item.link, location.href).hostname.replace(/^www\./, '').toLowerCase();
+                        const currentHost = location.hostname.replace(/^www\./, '').toLowerCase();
+                        if (linkHost === currentHost) return false;
+                      } catch (_e) { /* ignore */ }
+                    }
+                    return true;
+                  }),
                 (item) => `${item.title}|${item.link}`
               ).slice(0, 15);
 
@@ -464,7 +474,7 @@ class BrowserExecutionLayer:
               return merged;
             }
             """,
-            mode,
+            {"mode": mode, "onSearchEngine": on_search_engine},
         )
         return r.data or [] if r.success else []
 

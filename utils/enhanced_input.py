@@ -26,6 +26,16 @@ class EnhancedInput:
         try:
             import readline
 
+            # pyreadline3 on Windows can raise TypeError/AttributeError during
+            # initialization when the console size cannot be determined.
+            # Trigger a lightweight probe to surface any such crash early.
+            if sys.platform == "win32":
+                try:
+                    readline.get_current_history_length()
+                except Exception:
+                    self.has_readline = False
+                    return
+
             self.readline = readline
             self.has_readline = True
 
@@ -48,7 +58,7 @@ class EnhancedInput:
             # 设置补全函数
             readline.set_completer(self._completer)
 
-        except ImportError:
+        except (ImportError, Exception):
             self.has_readline = False
 
     def _completer(self, text: str, state: int) -> Optional[str]:
@@ -67,7 +77,19 @@ class EnhancedInput:
 
     def input(self, prompt: str = "> ") -> str:
         """增强的输入函数"""
-        return input(prompt).strip()
+        try:
+            return input(prompt).strip()
+        except TypeError:
+            # pyreadline3 on Windows can crash inside input() when the console
+            # size cannot be determined (size() returns None). Disable readline
+            # and fall back to plain input for the rest of the session.
+            self.has_readline = False
+            try:
+                import readline as _rl
+                _rl.set_completer(None)
+            except Exception:
+                pass
+            return input(prompt).strip()
 
     def save_history(self):
         """保存历史记录"""

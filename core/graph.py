@@ -29,7 +29,8 @@ from core.message_bus import (
 from utils.human_confirm import HumanConfirm
 from utils.prompt_manager import get_prompt
 from utils.url_utils import sanitize_extracted_url
-from utils.web_result_normalizer import canonicalize_item, infer_requested_fields
+from utils.web_result_normalizer import canonicalize_item, infer_requested_fields, normalize_web_results
+from core.plan_validator import validate_plan
 
 
 # 初始化所有 Agent
@@ -347,6 +348,71 @@ def _collect_best_completed_record_list(state: OmniCoreState) -> List[Dict[str, 
     return best_records
 
 
+_LLM_FILTER_PROMPT = """You are filtering extracted web data for a user task.
+
+Given a task description and a list of extracted items, return ONLY the indexes of items
+that are genuine content results (articles, papers, products, entries, etc.).
+Remove items that are clearly website UI elements, navigation links, page chrome,
+pagination controls, or unrelated boilerplate.
+
+Return JSON: {"keep": [1, 3, 5]}
+Use the 1-based indexes from the provided list. If all items look legitimate, return all indexes.
+"""
+
+
+def _llm_filter_noisy_results(
+    records: List[Dict[str, Any]],
+    task_description: str,
+) -> List[Dict[str, Any]]:
+    """When results look noisy, use a lightweight LLM call to filter out UI junk."""
+    if len(records) < 4:
+        return records
+
+    # 启发式判断质量：超过 40% 的条目没有摘要且标题很短 → 可能噪音多
+    short_no_summary = sum(
+        1 for r in records
+        if len(str(r.get("title", "") or "")) <= 10
+        and not str(r.get("summary", "") or "").strip()
+    )
+    if short_no_summary <= len(records) * 0.4:
+        return records
+
+    payload_items = []
+    for idx, record in enumerate(records[:30], 1):
+        payload_items.append({
+            "index": idx,
+            "title": str(record.get("title", "") or "")[:200],
+            "url": str(record.get("url", record.get("link", "")) or "")[:200],
+        })
+
+    try:
+        llm = LLMClient()
+        response = llm.chat_with_system(
+            system_prompt=_LLM_FILTER_PROMPT,
+            user_message=json.dumps(
+                {"task": task_description[:500], "items": payload_items},
+                ensure_ascii=False,
+            ),
+            temperature=0.0,
+            json_mode=True,
+        )
+        parsed = llm.parse_json_response(response)
+        keep_indexes = parsed.get("keep", [])
+        if not keep_indexes:
+            return records
+        filtered = []
+        for idx_val in keep_indexes:
+            try:
+                i = int(idx_val) - 1
+            except (TypeError, ValueError):
+                continue
+            if 0 <= i < len(records):
+                filtered.append(records[i])
+        return filtered if len(filtered) >= 2 else records
+    except Exception:
+        return records
+
+
 def _build_deterministic_list_answer(state: OmniCoreState, package: Dict[str, Any]) -> str:
     if not bool(state.get("critic_approved", False)):
         return ""
@@ -370,20 +436,16 @@ def _build_deterministic_list_answer(state: OmniCoreState, package: Dict[str, An
     if len(raw_records) < 2:
         return ""
 
-    requested_fields = infer_requested_fields(request_context, {"page_type": "list"})
-    normalized_records: List[Dict[str, Any]] = []
-    for raw in raw_records:
-        item = canonicalize_item(raw, requested_fields)
-        if not item:
-            continue
-        if not item.get("title") and not item.get("url") and not item.get("link"):
-            continue
-        normalized_records.append(item)
+    requested_count = _extract_requested_item_count(request_context)
+    normalize_limit = max(requested_count, 100) if requested_count > 0 else 100
+    normalized_records = normalize_web_results(raw_records, request_context, limit=normalize_limit)
+
+    # 第三层防线：LLM 过滤——当结果质量低时触发
+    normalized_records = _llm_filter_noisy_results(normalized_records, request_context)
 
     if len(normalized_records) < 2:
         return ""
 
-    requested_count = _extract_requested_item_count(request_context)
     render_count = len(normalized_records)
     if requested_count > 0:
         if len(normalized_records) < requested_count:
@@ -394,6 +456,7 @@ def _build_deterministic_list_answer(state: OmniCoreState, package: Dict[str, An
     if not rows:
         return ""
 
+    requested_fields = infer_requested_fields(request_context, {"page_type": "list"})
     preferred_columns = ["title", "url", "date", "summary", "author", "source", "location"]
     column_labels = {
         "title": "标题",
@@ -616,12 +679,21 @@ def _build_replan_failure_record(task: Dict[str, Any]) -> Dict[str, Any]:
     if expected_url and visited_url and visited_url != expected_url:
         url = f"{visited_url} (expected {expected_url})"
 
+    # failure_source: "validator"=结构性失败(可重试), "critic"=语义性失败(需换策略)
+    failure_source = str(task.get("failure_source", "") or "")
+    if not failure_source:
+        if failure_type == "critic_rejected":
+            failure_source = "critic"
+        else:
+            failure_source = "validator"
+
     return {
         "url": url,
         "expected_url": str(expected_url or "").strip(),
         "visited_url": str(visited_url or "").strip(),
         "error": str(error),
         "failure_type": failure_type,
+        "failure_source": failure_source,
     }
 
 
@@ -710,6 +782,30 @@ def route_node(state: OmniCoreState) -> OmniCoreState:
     return state
 
 
+@register_stage(name="plan_validator", order=15, required=False, depends_on=("router",))
+def plan_validator_node(state: OmniCoreState) -> OmniCoreState:
+    """Plan pre-validation: detect structural issues before execution."""
+    if _should_skip_for_resume(state, "plan_validator"):
+        return state
+    task_queue = state.get("task_queue", [])
+    if not task_queue:
+        return state
+
+    sl = get_structured_logger()
+    job_id = state.get("job_id", "")
+    with LogContext(job_id=job_id, stage="plan_validator"):
+        sl.log_event("stage_start")
+        result = validate_plan(task_queue)
+        if result.auto_fixes:
+            log_agent_action("PlanValidator", f"自动修复 {len(result.auto_fixes)} 项问题")
+        if not result.passed:
+            log_warning(f"PlanValidator 预检未通过: {result.issues}")
+            state["error_trace"] = f"Plan validation failed: {'; '.join(result.issues)}"
+        sl.log_event("stage_end", detail=f"passed={result.passed}, fixes={len(result.auto_fixes)}")
+    _save_runtime_checkpoint(state, "plan_validator", "Plan pre-validation completed")
+    return state
+
+
 @register_stage(name="parallel_executor", order=30, required=True, depends_on=("router",))
 def parallel_executor_node(state: OmniCoreState) -> OmniCoreState:
     """Batch executor: run all ready tasks in the current batch."""
@@ -728,434 +824,6 @@ def parallel_executor_node(state: OmniCoreState) -> OmniCoreState:
     return state
 
 
-def _legacy_replanner_node_v2(state: OmniCoreState) -> OmniCoreState:
-    """反思重规划节点：分析失败原因，制定新策略"""
-    if _should_skip_for_resume(state, "replanner"):
-        return state
-    state["replan_count"] = state.get("replan_count", 0) + 1
-    log_agent_action("Replanner", f"开始反思重规划（第 {state['replan_count']} 次）")
-
-    # 🔥 加入鞭策机制：分析失败并给予严厉反馈
-    from utils.agent_critic import AgentCritic
-    from utils.logger import console
-
-    critic = AgentCritic()
-
-    # 收集失败信息用于批评
-    failure_result = {
-        "success": False,
-        "completed_tasks": len([t for t in state["task_queue"] if t.get("status") == "completed"]),
-        "total_tasks": len(state["task_queue"]),
-        "task": state.get("user_input", ""),
-        "output": "",
-        "error": ""
-    }
-
-    # 从任务队列中提取错误信息
-    for task in state["task_queue"]:
-        result = task.get("result", {})
-        if task.get("status") == "failed":
-            failure_result["error"] += str(result.get("error", "")) + " "
-            failure_result["output"] += str(result.get("output", "")) + " "
-        # 也检查执行轨迹中的错误
-        for step in task.get("execution_trace", []):
-            if step.get("observation"):
-                failure_result["output"] += str(step.get("observation", "")) + " "
-
-    # 🔥 无论如何都要显示批评！
-    issues = critic.analyze_failure(failure_result)
-
-    # 强制显示批评报告
-    console.print("\n" + "="*80)
-    console.print("[bold red]🚨 AGENT 性能审查报告 🚨[/bold red]")
-    console.print("="*80 + "\n")
-
-    if issues:
-        pua_report = critic.generate_pua_report(issues, state["replan_count"])
-        console.print(f"[red]{pua_report}[/red]\n")
-    else:
-        # 即使没有检测到具体问题，也要批评
-        console.print("[red]💩 **又失败了！** 虽然我不知道你具体哪里搞砸了，但失败就是失败！[/red]")
-        console.print(f"[red]📊 完成进度: {failure_result['completed_tasks']}/{failure_result['total_tasks']} 任务[/red]")
-        console.print(f"[red]🤦 这是第 {state['replan_count']} 次重试了，能不能争点气？[/red]\n")
-
-    # 如果失败 3 次，给出替代策略建议
-    if state["replan_count"] >= 3:
-        # 传入 LLM 客户端，让 critic 动态生成建议
-        from core.llm import LLMClient
-        llm_client = LLMClient()
-        alternative = critic.suggest_alternative_strategy(
-            state.get("user_input", ""),
-            state["replan_count"],
-            llm_client=llm_client
-        )
-        console.print(f"[yellow]{alternative}[/yellow]\n")
-
-    console.print("="*80 + "\n")
-
-    # 如果已经是最后一次重规划，标记为"必须给出答案"模式
-    is_final_attempt = state["replan_count"] >= MAX_REPLAN
-    authoritative_target_url = _derive_authoritative_target_url(state)
-
-    # 记录本轮失败策略到历史（防止 Replanner 兜圈子）
-    replan_history = _bus_get(state, MSG_REPLAN_HISTORY, "_replan_history", default=[])
-
-    # 收集失败信息（包含已尝试的路径，帮助 Replanner 避免重蹈覆辙）
-    failures = []
-    tried_urls = []
-    current_strategies = []
-    preserved_tasks = []
-    for task in state["task_queue"]:
-        if _is_task_preservable_for_replan(task):
-            preserved_tasks.append(task)
-            continue
-
-        if task["status"] == "failed" or (
-            task["status"] == "completed" and not bool(task.get("critic_approved", False))
-        ):
-            failure_record = _build_replan_failure_record(task)
-            url = failure_record["url"]
-            error = failure_record["error"]
-            failure_type = failure_record["failure_type"]
-            error = result.get("error", "未知错误")
-            url = result.get("url") or task.get("params", {}).get("url") or task.get("params", {}).get("start_url") or ""
-            error = result.get("error") or result.get("message") or error
-            url = expected_url or visited_url or url
-            if expected_url and visited_url and visited_url != expected_url:
-                url = f"{visited_url} (expected {expected_url})"
-            failure_type = task.get("failure_type", "unknown")
-            trace_summary = ""
-            for step in task.get("execution_trace", [])[-3:]:
-                trace_summary += f"\n    step {step.get('step_no')}: {step.get('plan')} → {step.get('observation', '')[:80]}"
-            failures.append(
-                f"- 任务: {task['description']}\n  访问的URL: {url}\n  失败类型: {failure_type}\n  失败原因: {error}{trace_summary}"
-            )
-            if url:
-                tried_urls.append(expected_url or visited_url or url)
-            current_strategies.append(f"{task['task_type']}: {task['description'][:80]}")
-
-    # 把本轮策略加入历史
-    replan_history.append({
-        "round": state["replan_count"],
-        "strategies": current_strategies,
-        "urls": tried_urls,
-    })
-    state["shared_memory"]["_replan_history"] = replan_history
-    bus = _get_bus(state)
-    bus.publish("replanner", "replanner", MSG_REPLAN_HISTORY, {"value": replan_history}, job_id=state.get("job_id", ""))
-    _save_bus(state, bus)
-
-    failure_summary = "\n".join(failures) if failures else "无明确失败信息，但任务结果不符合预期"
-    if tried_urls:
-        failure_summary += f"\n\n已尝试过的URL（不要再访问）：{', '.join(tried_urls)}"
-
-    # 构建历史策略摘要，让 Replanner 知道之前都试过什么
-    if authoritative_target_url:
-        failure_summary += (
-            f"\n\nAuthoritative target URL: {authoritative_target_url}"
-            "\nIf this is still the user's target page, preserve this URL and change the extraction or waiting strategy before changing sites."
-        )
-
-    history_summary = ""
-    if len(replan_history) > 1:
-        history_summary = "\n\n## 之前已经尝试过的策略（绝对不要重复）：\n"
-        for h in replan_history[:-1]:
-            history_summary += f"第 {h['round']} 轮：\n"
-            for s in h["strategies"]:
-                history_summary += f"  - {s}\n"
-            if h["urls"]:
-                history_summary += f"  访问过的URL: {', '.join(h['urls'])}\n"
-
-    # 🔥 先让 AI PUA Coach 喷一顿，指出问题
-    from utils.ai_pua_coach import get_ai_coach
-    from utils.logger import console
-
-    coach = get_ai_coach()
-
-    # 构建失败任务的描述
-    failed_task_description = f"重规划第 {state['replan_count']} 次"
-    failed_action = "执行任务并尝试访问网页"
-    expected_result = "成功获取数据并完成用户需求"
-
-    # 构建实际结果
-    actual_result = {
-        "success": False,
-        "error": failure_summary,
-        "output": f"失败次数: {len(failures)}, 尝试过的URL: {', '.join(tried_urls) if tried_urls else '无'}"
-    }
-
-    # 让 PUA Coach 评估并生成批评
-    pua_comment = coach.evaluate_step(
-        step_no=state['replan_count'],
-        action=failed_action,
-        expected=expected_result,
-        actual_result=actual_result,
-        task_context=state.get('user_input', '')
-    )
-
-    # 显示 PUA 批评
-    console.print(f"\n{pua_comment}\n")
-
-    # 让 LLM 分析失败原因并重新规划
-    from utils.prompt_manager import get_prompt
-    llm = LLMClient()
-    replanner_prompt = get_prompt("replanner_system")
-
-    # 🔥 将 PUA Coach 的批评传递给 Replanner，让它知道问题所在
-    user_message_with_pua = f"""用户原始需求：{state['user_input']}
-
-失败的任务：
-{failure_summary}{history_summary}
-
-## AI PUA Coach 的失败分析：
-{pua_comment}
-
-这是第 {state['replan_count']} 次重规划（{'最后一次，必须给出明确答案' if is_final_attempt else '请提出和之前所有尝试都不同的新策略'}）。
-请根据 PUA Coach 指出的问题，制定新的策略。"""
-
-    response = llm.chat_with_system(
-        system_prompt=replanner_prompt,
-        user_message=user_message_with_pua,
-        temperature=0.3,
-        json_mode=True,
-    )
-
-    try:
-        result = llm.parse_json_response(response)
-        repaired_tasks = _repair_replan_task_params(
-            result.get("tasks", []),
-            authoritative_target_url,
-        )
-        result["tasks"], finalize_instructions = _extract_finalize_instructions_from_replan_tasks(
-            repaired_tasks
-        )
-        if finalize_instructions:
-            shared_memory["_final_answer_instructions"] = finalize_instructions
-            bus = _get_bus(state)
-            bus.publish("critic", "finalize", MSG_FINAL_INSTRUCTIONS, {"value": finalize_instructions}, job_id=state.get("job_id", ""))
-            _save_bus(state, bus)
-        else:
-            shared_memory.pop("_final_answer_instructions", None)
-        log_agent_action("Replanner", f"分析: {result.get('analysis', '')[:80]}")
-
-        # 检查是否应该放弃并直接回答用户
-        if result.get("should_give_up", False):
-            log_warning(f"Replanner 决定放弃: {result.get('give_up_reason', '')}")
-            state["final_output"] = result.get("direct_answer", "抱歉，无法完成您的请求。")
-            state["execution_status"] = "completed"
-            state["critic_approved"] = True
-            state["task_queue"] = []  # 清空任务队列，直接结束
-            return state
-
-        log_agent_action("Replanner", f"新策略: {result.get('new_strategy', '')[:80]}")
-
-        # 用新任务替换失败的任务
-        new_tasks = []
-        for task_data in result.get("tasks", []):
-            new_tasks.append(
-                build_task_item_from_plan(
-                    task_data,
-                    task_id_prefix="replan",
-                    default_priority=10,
-                )
-            )
-
-        if new_tasks:
-            # 不保留之前的任务，因为既然触发了 Replanner，说明之前的任务都不满足要求
-            # 保留它们只会导致 Critic 重复审查并持续失败
-            state["task_queue"] = new_tasks
-            state["policy_decisions"] = [
-                build_policy_decision_from_task(task)
-                for task in new_tasks
-            ]
-            state["needs_human_confirm"] = any(
-                task.get("requires_confirmation", False) for task in new_tasks
-            )
-            state["human_approved"] = not state["needs_human_confirm"]
-            _mark_confirmation_required_tasks_waiting(state)
-            state["error_trace"] = ""
-            log_success(f"重规划完成，新增 {len(new_tasks)} 个任务（已清空旧任务）")
-        else:
-            log_warning("重规划未产生新任务")
-
-    except Exception as e:
-        log_error(f"重规划失败: {e}")
-
-    from langchain_core.messages import SystemMessage
-    state["messages"].append(
-        SystemMessage(content=f"Replanner 重规划完成（第 {state['replan_count']} 次）")
-    )
-    _save_runtime_checkpoint(state, "replanner", "Replanner completed")
-
-    return state
-
-
-# encoding-health: ignore-start
-def _legacy_replanner_node(state: OmniCoreState) -> OmniCoreState:
-    """Reflect on failed execution and produce a better next plan."""
-    if _should_skip_for_resume(state, "replanner"):
-        return state
-
-    state["replan_count"] = state.get("replan_count", 0) + 1
-    log_agent_action("Replanner", f"寮€濮嬪弽鎬濋噸瑙勫垝锛堢 {state['replan_count']} 娆★級")
-
-    is_final_attempt = state["replan_count"] >= MAX_REPLAN
-    authoritative_target_url = _derive_authoritative_target_url(state)
-    replan_history = _bus_get(state, MSG_REPLAN_HISTORY, "_replan_history", default=[])
-
-    failures: List[str] = []
-    tried_urls: List[str] = []
-    current_strategies: List[str] = []
-    preserved_tasks: List[Dict[str, Any]] = []
-
-    for task in state.get("task_queue", []) or []:
-        if _is_task_preservable_for_replan(task):
-            preserved_tasks.append(task)
-            continue
-
-        status = str(task.get("status", "") or "")
-        critic_rejected = status == "completed" and not bool(task.get("critic_approved", False))
-        if status not in {"failed", "completed"} or (status == "completed" and not critic_rejected):
-            continue
-
-        failure_record = _build_replan_failure_record(task)
-        trace_summary = ""
-        for step in task.get("execution_trace", [])[-3:]:
-            trace_summary += (
-                f"\n    step {step.get('step_no')}: {step.get('plan')} "
-                f"鈫?{step.get('observation', '')[:80]}"
-            )
-
-        failures.append(
-            f"- 浠诲姟: {task['description']}\n"
-            f"  璁块棶鐨刄RL: {failure_record['url']}\n"
-            f"  澶辫触绫诲瀷: {failure_record['failure_type']}\n"
-            f"  澶辫触鍘熷洜: {failure_record['error']}{trace_summary}"
-        )
-
-        tried_url = (
-            failure_record["expected_url"]
-            or failure_record["visited_url"]
-            or failure_record["url"]
-        )
-        if tried_url:
-            tried_urls.append(tried_url)
-        current_strategies.append(
-            f"{task.get('task_type', '')}: {str(task.get('description', '') or '')[:80]}"
-        )
-
-    replan_history.append(
-        {
-            "round": state["replan_count"],
-            "strategies": current_strategies,
-            "urls": tried_urls,
-        }
-    )
-    state["shared_memory"]["_replan_history"] = replan_history
-    bus = _get_bus(state)
-    bus.publish("replanner", "replanner", MSG_REPLAN_HISTORY, {"value": replan_history}, job_id=state.get("job_id", ""))
-    _save_bus(state, bus)
-
-    failure_summary = (
-        "\n".join(failures)
-        if failures
-        else "鏃犳槑纭け璐ヤ俊鎭紝浣嗙幇鏈夌粨鏋滀笉绗﹀悎棰勬湡"
-    )
-    if tried_urls:
-        failure_summary += f"\n\n宸插皾璇曡繃鐨刄RL锛堜笉瑕佸啀璁块棶锛夛細{', '.join(tried_urls)}"
-    if authoritative_target_url:
-        failure_summary += (
-            f"\n\nAuthoritative target URL: {authoritative_target_url}"
-            "\nIf the user still wants this page, keep the URL and change extraction, waiting, or navigation strategy before switching sites."
-        )
-
-    history_summary = ""
-    if len(replan_history) > 1:
-        history_summary = "\n\n## Previous failed strategies (do not repeat)\n"
-        for item in replan_history[:-1]:
-            history_summary += f"Round {item['round']}:\n"
-            for strategy in item.get("strategies", []):
-                history_summary += f"- {strategy}\n"
-            if item.get("urls"):
-                history_summary += f"Visited URLs: {', '.join(item['urls'])}\n"
-
-    llm = LLMClient()
-    replanner_en_prompt = get_prompt("replanner_system_en")
-    response = llm.chat_with_system(
-        system_prompt=replanner_en_prompt,
-        user_message=(
-            f"User request: {state['user_input']}\n\n"
-            f"Failure summary:\n{failure_summary}{history_summary}\n\n"
-            f"Replan round: {state['replan_count']} "
-            f"({'final attempt' if is_final_attempt else 'more retries allowed'})"
-        ),
-        temperature=0.3,
-        json_mode=True,
-    )
-
-    try:
-        result = llm.parse_json_response(response)
-        result["tasks"] = _repair_replan_task_params(
-            result.get("tasks", []),
-            authoritative_target_url,
-        )
-        log_agent_action("Replanner", f"鍒嗘瀽: {str(result.get('analysis', '') or '')[:80]}")
-
-        if result.get("should_give_up", False):
-            log_warning(f"Replanner 鍐冲畾鏀惧純: {result.get('give_up_reason', '')}")
-            state["final_output"] = result.get("direct_answer", "鎶辨瓑锛屾棤娉曞畬鎴愭偍鐨勮姹傘€?")
-            state["execution_status"] = "completed_with_issues"
-            state["critic_approved"] = False
-            state["task_queue"] = preserved_tasks
-            state["policy_decisions"] = [
-                build_policy_decision_from_task(task)
-                for task in state["task_queue"]
-            ]
-            return state
-
-        log_agent_action("Replanner", f"鏂扮瓥鐣? {str(result.get('new_strategy', '') or '')[:80]}")
-
-        new_tasks = [
-            build_task_item_from_plan(
-                task_data,
-                task_id_prefix="replan",
-                default_priority=10,
-            )
-            for task_data in result.get("tasks", [])
-        ]
-
-        if new_tasks or preserved_tasks:
-            state["task_queue"] = preserved_tasks + new_tasks
-            state["policy_decisions"] = [
-                build_policy_decision_from_task(task)
-                for task in state["task_queue"]
-            ]
-            state["needs_human_confirm"] = any(
-                task.get("requires_confirmation", False)
-                for task in state["task_queue"]
-            )
-            state["human_approved"] = not state["needs_human_confirm"]
-            _mark_confirmation_required_tasks_waiting(state)
-            state["error_trace"] = ""
-            log_success(
-                f"閲嶈鍒掑畬鎴愶紝淇濈暀 {len(preserved_tasks)} 涓粨鏋滐紝鏂板 {len(new_tasks)} 涓换鍔?"
-            )
-        else:
-            log_warning("閲嶈鍒掓湭浜х敓鏂颁换鍔?")
-
-    except Exception as exc:
-        log_error(f"閲嶈鍒掑け璐? {exc}")
-
-    from langchain_core.messages import SystemMessage
-
-    state["messages"].append(
-        SystemMessage(content=f"Replanner 閲嶈鍒掑畬鎴愶紙绗?{state['replan_count']} 娆★級")
-    )
-    _save_runtime_checkpoint(state, "replanner", "Replanner completed")
-    return state
-
-
-# encoding-health: ignore-end
 @register_stage(
     name="critic", order=50, required=False,
     depends_on=("validator",),
@@ -1900,17 +1568,10 @@ def _legacy_finalize_node_v2(state: OmniCoreState) -> OmniCoreState:
 
 
 # encoding-health: ignore-end
-def should_continue_after_route(state: OmniCoreState) -> Literal["human_confirm", "finalize"]:
+def should_continue_after_route(state: OmniCoreState) -> Literal["plan_validator", "finalize"]:
     if not state["task_queue"]:
         return "finalize"
-    # Check if human_confirm is in the execution plan (respects skip_condition)
-    registry = StageRegistry.get_instance()
-    plan = registry.build_execution_plan(state)
-    if "human_confirm" not in plan:
-        # human_confirm skipped — still route to it (the node handles auto-approve),
-        # but this makes the plan queryable for observability
-        pass
-    return "human_confirm"
+    return "plan_validator"
 
 
 def get_first_executor(state: OmniCoreState) -> Literal["parallel_executor", "validator", "end"]:
@@ -2086,10 +1747,12 @@ def replanner_node(state: OmniCoreState) -> OmniCoreState:
     authoritative_target_url = _derive_authoritative_target_url(state)
     replan_history = _bus_get(state, MSG_REPLAN_HISTORY, "_replan_history", default=[])
 
-    failures: List[str] = []
     tried_urls: List[str] = []
     current_strategies: List[str] = []
+    failure_types: List[str] = []
+    error_summaries: List[str] = []
     preserved_tasks: List[Dict[str, Any]] = []
+    failed_tasks_structured: List[Dict[str, Any]] = []
 
     for task in state.get("task_queue", []) or []:
         if _is_task_preservable_for_replan(task):
@@ -2102,19 +1765,32 @@ def replanner_node(state: OmniCoreState) -> OmniCoreState:
             continue
 
         failure_record = _build_replan_failure_record(task)
-        trace_summary = ""
-        for step in task.get("execution_trace", [])[-3:]:
-            trace_summary += (
-                f"\n    step {step.get('step_no')}: {step.get('plan')} "
-                f"-> {step.get('observation', '')[:80]}"
-            )
 
-        failures.append(
-            f"- 任务: {task['description']}\n"
-            f"  访问 URL: {failure_record['url']}\n"
-            f"  失败类型: {failure_record['failure_type']}\n"
-            f"  失败原因: {failure_record['error']}{trace_summary}"
-        )
+        # 判断失败层级
+        failure_layer = "execution"  # 默认执行层
+        ft = failure_record["failure_type"]
+        if ft == "critic_rejected":
+            failure_layer = "result"  # 结果层（Critic 拒绝）
+        elif ft in ("blocked_or_captcha", "navigation_error"):
+            failure_layer = "path"  # 路径层
+
+        last_steps = []
+        for step in task.get("execution_trace", [])[-3:]:
+            last_steps.append({
+                "step_no": step.get("step_no"),
+                "plan": step.get("plan", ""),
+                "observation": str(step.get("observation", ""))[:120],
+            })
+
+        failed_tasks_structured.append({
+            "description": task.get("description", ""),
+            "worker_type": task.get("task_type", ""),
+            "url": failure_record["url"],
+            "failure_type": ft,
+            "failure_layer": failure_layer,
+            "error": str(failure_record["error"])[:200],
+            "last_steps": last_steps,
+        })
 
         tried_url = (
             failure_record["expected_url"]
@@ -2126,48 +1802,38 @@ def replanner_node(state: OmniCoreState) -> OmniCoreState:
         current_strategies.append(
             f"{task.get('task_type', '')}: {str(task.get('description', '') or '')[:80]}"
         )
+        failure_types.append(ft)
+        error_summaries.append(str(failure_record["error"])[:100])
 
     replan_history.append(
         {
             "round": state["replan_count"],
             "strategies": current_strategies,
             "urls": tried_urls,
+            "failure_types": failure_types,
+            "failure_layer": failed_tasks_structured[0]["failure_layer"] if failed_tasks_structured else "unknown",
+            "error_summaries": error_summaries,
         }
     )
     shared_memory["_replan_history"] = replan_history
 
-    failure_summary = (
-        "\n".join(failures)
-        if failures
-        else "没有拿到明确的失败证据，但当前结果仍然不满足用户需求。"
-    )
-    if tried_urls:
-        failure_summary += f"\n\n已尝试过的 URL（避免重复走相同路径）: {', '.join(tried_urls)}"
-    if authoritative_target_url:
-        failure_summary += (
-            f"\n\nAuthoritative target URL: {authoritative_target_url}"
-            "\nIf the user still wants this page, keep the URL and change extraction, waiting, "
-            "or navigation strategy before switching sites."
-        )
-
-    history_summary = ""
-    if len(replan_history) > 1:
-        history_summary = "\n\n## Previous failed strategies (do not repeat)\n"
-        for item in replan_history[:-1]:
-            history_summary += f"Round {item['round']}:\n"
-            for strategy in item.get("strategies", []):
-                history_summary += f"- {strategy}\n"
-            if item.get("urls"):
-                history_summary += f"Visited URLs: {', '.join(item['urls'])}\n"
+    # 构建结构化重规划上下文
+    structured_context = {
+        "user_request": state.get("user_input", ""),
+        "attempt_number": state["replan_count"],
+        "is_final": is_final_attempt,
+        "failed_tasks": failed_tasks_structured,
+        "history": replan_history[:-1],  # 之前的轮次
+        "authoritative_url": authoritative_target_url,
+        "successful_paths": shared_memory.get("successful_paths", []),
+    }
 
     llm = LLMClient()
     replanner_en_prompt = get_prompt("replanner_system_en")
     response = llm.chat_with_system(
         system_prompt=replanner_en_prompt,
-        user_message=(
-            f"User request: {state['user_input']}\n\n"
-            f"Failure summary:\n{failure_summary}{history_summary}\n\n"
-            f"Replan round: {state['replan_count']} "
+        user_message=json.dumps(structured_context, ensure_ascii=False, indent=2) + (
+            f"\n\nReplan round: {state['replan_count']} "
             f"({'final attempt' if is_final_attempt else 'more retries allowed'})"
         ),
         temperature=0.3,
@@ -2359,8 +2025,9 @@ def build_graph() -> StateGraph:
 
     graph = StateGraph(OmniCoreState)
 
-    # 添加节点（7 个）
+    # 添加节点（8 个）
     graph.add_node("router", route_node)
+    graph.add_node("plan_validator", plan_validator_node)
     graph.add_node("human_confirm", human_confirm_node_v2)
     graph.add_node("parallel_executor", parallel_executor_node)
     graph.add_node("validator", validator_node)
@@ -2371,11 +2038,14 @@ def build_graph() -> StateGraph:
     # 入口
     graph.set_entry_point("router")
 
-    # Router → human_confirm 或 finalize
+    # Router → plan_validator 或 finalize
     graph.add_conditional_edges("router", should_continue_after_route, {
-        "human_confirm": "human_confirm",
+        "plan_validator": "plan_validator",
         "finalize": "finalize",
     })
+
+    # plan_validator → human_confirm
+    graph.add_edge("plan_validator", "human_confirm")
 
     # human_confirm → 执行批次 / validator / end
     graph.add_conditional_edges("human_confirm", get_first_executor, {

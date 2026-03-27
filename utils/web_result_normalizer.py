@@ -24,9 +24,11 @@ FIELD_ALIASES: Dict[str, Set[str]] = {
 }
 
 STRICT_NOISE_TEXTS = {
-    "home", "homepage", "首页", "login", "log in", "sign in", "register", "sign up",
-    "menu", "导航", "next", "previous", "prev", "下一页", "上一页", "privacy", "terms",
-    "contact", "about", "search", "搜索", "more", "更多",
+    "home", "homepage", "login", "log in", "sign in", "register", "sign up",
+    "menu", "next", "previous", "prev", "privacy", "terms",
+    "contact", "about", "search", "more",
+    "首页", "导航", "下一页", "上一页", "搜索", "更多",
+    "登录", "注册", "隐私", "条款", "设置",
 }
 
 NOISE_URL_HINTS = (
@@ -449,6 +451,9 @@ def is_noise_item(item: Dict[str, Any], requested_fields: List[str]) -> bool:
     title_lower = title.lower()
     if title_lower in STRICT_NOISE_TEXTS and not summary:
         return True
+    # 通用特征：标题过短且无摘要，几乎都是 UI 碎片
+    if len(title) <= 3 and not summary:
+        return True
 
     if url:
         if is_search_intermediary_url(url):
@@ -559,6 +564,13 @@ def normalize_web_results(
         cleaned.append((score_item(item, requested_fields, task_description), item))
 
     cleaned.sort(key=lambda entry: entry[0], reverse=True)
+
+    # 通用相关性阈值：砍掉得分 <= 0 的条目（无标题、无URL、或被噪音惩罚的）
+    # 如果砍完不足 2 条则降级保底，避免空结果
+    above_threshold = [(score, item) for score, item in cleaned if score > 0]
+    if len(above_threshold) >= 2:
+        cleaned = above_threshold
+
     final_items = [item for _, item in cleaned[:limit]]
     for idx, item in enumerate(final_items, 1):
         item["index"] = idx

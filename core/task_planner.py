@@ -15,6 +15,20 @@ from core.state import PolicyDecisionItem, TaskItem, ensure_task_defaults
 from core.tool_registry import get_builtin_tool_registry
 
 
+_COST_BY_TASK_TYPE = {
+    "web_worker": "low",
+    "system_worker": "low",
+    "terminal_worker": "low",
+    "file_worker": "medium",
+    "browser_agent": "high",
+}
+
+
+def _infer_estimated_cost(task_type: str) -> str:
+    """根据 task_type 自动推断执行成本。"""
+    return _COST_BY_TASK_TYPE.get(task_type, "medium")
+
+
 def build_task_item_from_plan(
     task_data: Dict[str, Any],
     *,
@@ -55,6 +69,7 @@ def build_task_item_from_plan(
         required_capabilities=task_data.get("required_capabilities", ["text_chat"]),
         tool_name=tool_name,
         risk_level=risk_level,
+        estimated_cost=task_data.get("estimated_cost") or _infer_estimated_cost(task_type),
     )
     ensure_task_defaults(task_item)
 

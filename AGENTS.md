@@ -65,3 +65,14 @@ All 7 directions of the architecture upgrade are now integrated into the runtime
 | 操作后视觉验证 | P0 | ✅ 已完成 |
 | WAIT 视觉变化检测 | P1 | ✅ 已完成 |
 | 连续截图进度感知 | P2 | ✅ 已完成 |
+
+### 待实施: 代码架构重构与网页操作健壮性优化 (2026-03-26)
+
+两份优化方案已完成设计，覆盖 9 个已识别的技术债务项：
+
+| 文档 | 覆盖范围 | 优先级分布 |
+|------|---------|-----------|
+| [`docs/2026-03-26-代码架构重构方案.md`](docs/2026-03-26-代码架构重构方案.md) | graph.py 职责过载、llm.py 重复代码、browser_agent.py 内联 JS、BrowserAgent.run 拆分、router.py 魔法数字 | P0×2, P1×2, P2×1 |
+| [`docs/2026-03-26-网页操作健壮性优化方案.md`](docs/2026-03-26-网页操作健壮性优化方案.md) | Vision 预算限流、像素校验误报、Shadow DOM/iframe 穿透、搜索选择器韧性 | P0×2, P1×1, P2×1 |
+
+问题分析来源：[`问题归类.md`](问题归类.md)

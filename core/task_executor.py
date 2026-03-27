@@ -158,14 +158,23 @@ def is_task_ready(task: Dict[str, Any], task_queue: List[Dict[str, Any]]) -> boo
     return all(dep in completed_ids for dep in depends)
 
 
+_COST_ORDER = {"low": 0, "medium": 1, "high": 2}
+
+
 def collect_ready_task_indexes(state: OmniCoreState) -> List[int]:
-    """Collect indexes of pending tasks that are ready to run."""
+    """Collect indexes of pending tasks that are ready to run, sorted by estimated_cost (low first)."""
     ready_indexes: List[int] = []
     registry = get_builtin_tool_registry()
     for idx, task in enumerate(state["task_queue"]):
         if task["status"] == str(TaskStatus.PENDING) and is_task_ready(task, state["task_queue"]):
             if registry.resolve_task(task) is not None:
                 ready_indexes.append(idx)
+    # 按成本排序：低成本任务优先执行
+    ready_indexes.sort(
+        key=lambda i: _COST_ORDER.get(
+            state["task_queue"][i].get("estimated_cost", "medium"), 1
+        )
+    )
     return ready_indexes
 
 

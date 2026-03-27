@@ -432,6 +432,7 @@ class CriticAgent:
 
                 if not review_result.get("approved"):
                     all_approved = False
+                    task["failure_source"] = "critic"
                     all_issues.extend(review_result.get("issues", []))
                     all_suggestions.extend(review_result.get("suggestions", []))
 

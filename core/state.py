@@ -28,6 +28,7 @@ class TaskItem(_TaskItemRequired, total=False):
     required_capabilities: List[str]      # 所需模型能力 ["text_chat", "vision", "image_gen", ...]
     tool_name: str
     risk_level: str
+    estimated_cost: str                   # "low"/"medium"/"high" — 预估执行成本
     requires_confirmation: bool
     policy_reason: str
     affected_resources: List[str]
@@ -71,6 +72,7 @@ def ensure_task_defaults(task: TaskItem) -> TaskItem:
     task.setdefault("required_capabilities", [])
     task.setdefault("tool_name", "")
     task.setdefault("risk_level", "medium")
+    task.setdefault("estimated_cost", "medium")
     task.setdefault("requires_confirmation", False)
     task.setdefault("policy_reason", "")
     task.setdefault("affected_resources", [])
