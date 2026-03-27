@@ -902,7 +902,27 @@ class BrowserToolkit:
     # ── iframe / tab ─────────────────────────────────────────
 
     async def switch_to_iframe(self, selector: str = "") -> ToolkitResult:
+        """Switch context into an iframe.
+
+        Supports nested iframe traversal using ">>>" as a depth separator.
+        e.g. selector="outer_iframe >>> inner_iframe" drills two levels deep.
+        """
         try:
+            if selector and ">>>" in selector:
+                parts = [s.strip() for s in selector.split(">>>")]
+                current_frame = self._page.main_frame
+                for part in parts:
+                    handle = await current_frame.locator(part).first.element_handle()
+                    if not handle:
+                        return ToolkitResult(success=False, error=f"iframe not found: {part}")
+                    current_frame = await handle.content_frame()
+                    if not current_frame:
+                        return ToolkitResult(success=False, error=f"no content frame for: {part}")
+                self._current_frame = current_frame
+                self._in_iframe = True
+                await self._safe(current_frame.wait_for_load_state("domcontentloaded", timeout=3000))
+                return ToolkitResult(success=True)
+
             frame = None
             if selector:
                 frame_handle = await self._page.locator(selector).first.element_handle()
@@ -918,6 +938,22 @@ class BrowserToolkit:
             self._in_iframe = True
             await self._safe(frame.wait_for_load_state("domcontentloaded", timeout=3000))
             return ToolkitResult(success=True)
+        except Exception as e:
+            return ToolkitResult(success=False, error=str(e))
+
+    async def list_iframes(self) -> ToolkitResult:
+        """List all non-main frames on the current page."""
+        try:
+            frames_info = []
+            for frame in self._page.frames:
+                if frame == self._page.main_frame:
+                    continue
+                frames_info.append({
+                    "url": frame.url,
+                    "name": frame.name,
+                    "is_detached": frame.is_detached(),
+                })
+            return ToolkitResult(success=True, data=frames_info)
         except Exception as e:
             return ToolkitResult(success=False, error=str(e))
 

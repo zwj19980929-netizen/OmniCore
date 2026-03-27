@@ -1,6 +1,6 @@
 import base64
 from dataclasses import dataclass
-from typing import Iterable, List, Optional, Sequence, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 from urllib.parse import parse_qs, quote_plus, unquote, urlparse
 
 
@@ -22,6 +22,8 @@ class SearchEngineProfile:
     redirect_path_exact: Tuple[str, ...] = ()
     redirect_path_prefixes: Tuple[str, ...] = ()
     redirect_query_keys: Tuple[str, ...] = ("uddg", "u", "url", "q", "target", "redirect")
+    fallback_result_selectors: Tuple[str, ...] = ()  # tried when result_selectors all miss
+    last_verified: str = ""  # date string, e.g. "2026-03-26"
 
     def build_search_url(self, query: str) -> str:
         return self.search_url_template.format(query=quote_plus(query))
@@ -88,6 +90,12 @@ SEARCH_ENGINE_PROFILES: Tuple[SearchEngineProfile, ...] = (
             "#b_results .b_algo",
             ".b_algo",
         ),
+        fallback_result_selectors=(
+            "#b_results li",
+            "main ol li",
+            "[data-tag='Organic'] li",
+        ),
+        last_verified="2026-03-26",
         result_path_prefixes=("/search",),
         redirect_path_prefixes=("/ck/a", "/alink/link"),
         redirect_query_keys=("uddg", "u", "url", "target", "redirect", "r"),
@@ -104,6 +112,12 @@ SEARCH_ENGINE_PROFILES: Tuple[SearchEngineProfile, ...] = (
             "#content_left .result-op",
             "#content_left .xpath-log",
         ),
+        fallback_result_selectors=(
+            "#content_left > div",
+            "[tpl] .c-container",
+            "div[class^='result']",
+        ),
+        last_verified="2026-03-26",
         result_path_exact=("/s",),
         result_path_prefixes=("/s/",),
         result_query_keys=("wd", "word"),
@@ -122,6 +136,12 @@ SEARCH_ENGINE_PROFILES: Tuple[SearchEngineProfile, ...] = (
             ".result__body",
             "[data-testid='result']",
         ),
+        fallback_result_selectors=(
+            "article[data-testid]",
+            "ol li[data-layout]",
+            "section ol li",
+        ),
+        last_verified="2026-03-26",
         result_path_exact=("/", "/html/", "/lite/"),
         result_path_prefixes=("/html", "/lite"),
         redirect_path_prefixes=("/l/",),
@@ -140,6 +160,13 @@ SEARCH_ENGINE_PROFILES: Tuple[SearchEngineProfile, ...] = (
             "#search .MjjYud",
             "[data-sokoban-container]",
         ),
+        fallback_result_selectors=(
+            "#rso > div",
+            "main article",
+            "main section > div > div > a",
+            "#search > div > div",
+        ),
+        last_verified="2026-03-26",
         result_path_prefixes=("/search",),
         redirect_path_prefixes=("/url", "/imgres"),
         redirect_query_keys=("q", "url", "imgurl", "target", "redirect"),
@@ -157,6 +184,12 @@ SEARCH_ENGINE_PROFILES: Tuple[SearchEngineProfile, ...] = (
             ".vrwrap",
             ".rb",
         ),
+        fallback_result_selectors=(
+            "#main .results > div",
+            ".results div[class]",
+            "div[id^='sogou_result']",
+        ),
+        last_verified="2026-03-26",
         result_path_prefixes=("/web",),
         result_query_keys=("query", "keyword"),
         redirect_path_prefixes=("/link", "/web"),
@@ -233,6 +266,7 @@ def get_search_result_selectors(url_or_host: str, include_generic: bool = True) 
     profile = find_search_engine_profile(url_or_host)
     if profile:
         selectors.extend(profile.result_selectors)
+        selectors.extend(profile.fallback_result_selectors)
     if include_generic:
         selectors.extend(GENERIC_SEARCH_RESULT_SELECTORS)
     deduped: List[str] = []
@@ -300,4 +334,62 @@ def decode_search_redirect_url(href: str) -> str:
             if decoded:
                 return decoded
     return href
+
+
+async def validate_selectors(toolkit: Any, profile: SearchEngineProfile) -> Dict[str, Any]:
+    """Check which selectors of a profile actually match on the current page.
+
+    Evaluates each primary and fallback selector via the toolkit's JS engine
+    and returns a health report.  Logs a warning when the primary hit-rate
+    drops below 50 %.
+
+    Args:
+        toolkit: A BrowserToolkit instance (must expose ``evaluate_js``).
+        profile: The SearchEngineProfile whose selectors to validate.
+
+    Returns:
+        {
+            "primary_matched": [...],   # primary selectors that found ≥1 element
+            "primary_failed":  [...],   # primary selectors that found 0 elements
+            "fallback_matched": [...],  # fallback selectors that found ≥1 element
+            "health_score": 0.0-1.0,   # fraction of primary selectors matched
+        }
+    """
+    all_selectors = list(profile.result_selectors) + list(profile.fallback_result_selectors)
+    if not all_selectors:
+        return {
+            "primary_matched": [],
+            "primary_failed": [],
+            "fallback_matched": [],
+            "health_score": 1.0,
+        }
+
+    result = await toolkit.evaluate_js(
+        "(selectors) => selectors.map(sel => ({ sel, count: document.querySelectorAll(sel).length }))",
+        all_selectors,
+    )
+    counts: List[Dict[str, Any]] = result.data if (result and result.success and isinstance(result.data, list)) else []
+
+    primary_set = set(profile.result_selectors)
+    primary_matched: List[str] = []
+    primary_failed: List[str] = []
+    fallback_matched: List[str] = []
+
+    for item in counts:
+        sel = item.get("sel", "")
+        count = int(item.get("count", 0) or 0)
+        if sel in primary_set:
+            (primary_matched if count > 0 else primary_failed).append(sel)
+        elif count > 0:
+            fallback_matched.append(sel)
+
+    total_primary = len(profile.result_selectors)
+    health_score = len(primary_matched) / total_primary if total_primary else 1.0
+
+    return {
+        "primary_matched": primary_matched,
+        "primary_failed": primary_failed,
+        "fallback_matched": fallback_matched,
+        "health_score": health_score,
+    }
 

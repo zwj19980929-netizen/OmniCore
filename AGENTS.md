@@ -66,7 +66,7 @@ All 7 directions of the architecture upgrade are now integrated into the runtime
 | WAIT 视觉变化检测 | P1 | ✅ 已完成 |
 | 连续截图进度感知 | P2 | ✅ 已完成 |
 
-### 待实施: 代码架构重构与网页操作健壮性优化 (2026-03-26)
+### 已完成: 代码架构重构 (2026-03-27)
 
 两份优化方案已完成设计，覆盖 9 个已识别的技术债务项：
 
@@ -76,3 +76,22 @@ All 7 directions of the architecture upgrade are now integrated into the runtime
 | [`docs/2026-03-26-网页操作健壮性优化方案.md`](docs/2026-03-26-网页操作健壮性优化方案.md) | Vision 预算限流、像素校验误报、Shadow DOM/iframe 穿透、搜索选择器韧性 | P0×2, P1×1, P2×1 |
 
 问题分析来源：[`问题归类.md`](问题归类.md)
+
+#### 实施进度（代码架构重构）
+
+| 任务 | 状态 | 说明 |
+|------|------|------|
+| P0: graph.py 删除 legacy 函数 | ✅ 已完成 (2026-03-27) | 删除 `_legacy_synthesize_user_facing_answer`、`_legacy_finalize_node`、`_legacy_finalize_node_v2`，共 ~285 行；2345→2060 行 |
+| P0: llm.py 重复代码消除 | ✅ 已完成 (2026-03-27) | 提取 `_build_chat_kwargs` + `_build_llm_response`；简化 `parse_json_response` 删除 46 行重复外层逻辑；修复 `achat` 缺失的结构化日志和拒绝处理；990→929 行 |
+| P1: browser_agent.py 内联 JS 分离 | ✅ 已完成 (2026-03-27) | 提取 2 个大 JS 块（~255行）到 `utils/perception_scripts.py` 的 `SCRIPT_FALLBACK_SEMANTIC_SNAPSHOT` / `SCRIPT_EXTRACT_INTERACTIVE_ELEMENTS`；browser_agent.py 3021→2770 行 |
+| P1: BrowserAgent.run 拆分 | ✅ 已完成 (2026-03-27) | 637 行 `run()` 拆为 `_initialize_session` (导航+初始化) + `_execute_step` (单步循环体) + `_build_final_result` (收尾)；`run()` 本身缩至 47 行；browser_agent.py 2770→2856 行（含新方法） |
+| P2: router.py 魔法数字提取 | ✅ 已完成 (2026-03-27) | 10 个硬编码权重提取为 `RouterAgent._SCORE_WEIGHTS` 类常量 |
+
+#### 实施进度（网页操作健壮性优化）
+
+| 任务 | 状态 | 说明 |
+|------|------|------|
+| P0: Vision Fallback 预算限流 | ✅ 已完成 (2026-03-27) | 新增 `VisionBudget` dataclass；`run()` 入口重置预算；`_decide_action_with_vision` / `_vision_check_page_relevance` 调用前检查，超限返回 None；新增配置 `VISION_MAX_CALLS_PER_RUN=5`、`VISION_COOLDOWN_SECONDS=3.0`、`VISION_MAX_TOKENS_PER_RUN=20000`、`VISION_CALL_TIMEOUT=30000` |
+| P0: 像素级视觉校验误报优化 | ✅ 已完成 (2026-03-27) | `utils/image_diff.py` 新增 `compute_pixel_diff_roi`（排除顶/底噪声区域）、`compute_block_diff`（16×16块均值比较）、`screenshots_meaningfully_differ`；`screenshots_differ` 升级为分层策略；阈值从 0.02 → **0.05**；`_verify_action_effect` 改用 `screenshots_meaningfully_differ` |
+| P1: Shadow DOM / iframe 穿透增强 | ✅ 已完成 (2026-03-27) | Shadow DOM: `querySelectorAllDeep`/`querySelectorDeep` 已注入各 JS 脚本；iframe: `BrowserPerceptionLayer._extract_iframe_elements` 遍历所有可见 frame 并合并到 `observe()` 快照；`switch_to_iframe` 支持 `>>>` 嵌套语法；新增 `list_iframes` 枚举接口 |
+| P2: 搜索引擎选择器韧性增强 | ✅ 已完成 (2026-03-27) | `SearchEngineProfile` 含 `fallback_result_selectors`/`last_verified`；新增 `validate_selectors(toolkit, profile)` 异步健康检查（命中率 < 50% 时 log_warning）；`extract_search_results_data` 在 CSS 全失败时调用 `perception.extract_data_with_vision` 视觉兜底；`BrowserExecutionLayer` 新增 `perception` 参数并在 `BrowserAgent` 初始化时注入 |

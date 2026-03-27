@@ -32,6 +32,10 @@ from utils.url_utils import extract_first_url
 from utils.web_prompt_budget import BudgetSection, render_budgeted_sections
 import utils.web_debug_recorder as web_debug_recorder
 from utils.text_relevance import extract_relevant_text_safe_async
+from utils.perception_scripts import (
+    SCRIPT_FALLBACK_SEMANTIC_SNAPSHOT,
+    SCRIPT_EXTRACT_INTERACTIVE_ELEMENTS,
+)
 
 
 class ActionType(Enum):
@@ -335,6 +339,32 @@ _NON_TEXT_INPUT_TYPES = {
 _STRUCTURED_PAIR_SKIP_KEYS = {"http", "https", "ftp", "www", "localhost"}
 
 
+@dataclass
+class VisionBudget:
+    """Per-run token/call budget for vision LLM fallbacks."""
+    max_calls_per_run: int = 5
+    max_total_tokens: int = 20000
+    cooldown_seconds: float = 3.0
+    calls_made: int = 0
+    tokens_used: int = 0
+    last_call_time: float = 0.0
+
+    def can_call(self) -> bool:
+        if self.calls_made >= self.max_calls_per_run:
+            return False
+        if time.time() - self.last_call_time < self.cooldown_seconds:
+            return False
+        return True
+
+    def record_call(self, tokens: int = 0) -> None:
+        self.calls_made += 1
+        self.tokens_used += tokens
+        self.last_call_time = time.time()
+
+    def remaining(self) -> int:
+        return max(0, self.max_calls_per_run - self.calls_made)
+
+
 class BrowserAgent:
     def __init__(
         self,
@@ -354,6 +384,11 @@ class BrowserAgent:
         self._vision_llm_attempted = False
         self._vision_llm_unavailable_logged = False
         self._before_action_screenshot: Optional[bytes] = None
+        self._vision_budget = VisionBudget(
+            max_calls_per_run=settings.VISION_MAX_CALLS_PER_RUN,
+            max_total_tokens=settings.VISION_MAX_TOKENS_PER_RUN,
+            cooldown_seconds=settings.VISION_COOLDOWN_SECONDS,
+        )
 
         # Perception subsystems
         self.a11y_extractor = AccessibilityTreeExtractor()
@@ -402,6 +437,7 @@ class BrowserAgent:
         self.execution = BrowserExecutionLayer(
             toolkit=self.toolkit,
             agent_name=self.name,
+            perception=self.perception,
         )
 
     async def close(self) -> None:
@@ -668,107 +704,7 @@ class BrowserAgent:
         search_input_selector = ""
         evaluate_result = await self._call_toolkit(
             "evaluate_js",
-            r"""() => {
-                const normalize = (v) => String(v || '').replace(/\s+/g, ' ').trim();
-                const bodyText = document.body && document.body.innerText ? document.body.innerText : '';
-                const blockCandidates = Array.from(document.querySelectorAll('main, article, section, [role="main"], [data-testid], p, h1, h2, h3, li'))
-                    .map((node) => {
-                        const text = normalize(node.innerText || node.textContent || '');
-                        if (!text) return null;
-                        const rect = node.getBoundingClientRect ? node.getBoundingClientRect() : { width: 0, height: 0 };
-                        return {
-                            text: text.slice(0, 320),
-                            tag: (node.tagName || '').toLowerCase(),
-                            role: node.getAttribute ? (node.getAttribute('role') || '') : '',
-                            width: Math.round(rect.width || 0),
-                            height: Math.round(rect.height || 0),
-                        };
-                    })
-                    .filter(Boolean)
-                    .slice(0, 16);
-
-                // 提取交互元素（简化版）
-                const isVisible = (el) => {
-                    if (!el) return false;
-                    const rect = el.getBoundingClientRect();
-                    return rect.width > 0 && rect.height > 0;
-                };
-                const selectorOf = (el) => {
-                    if (!el) return '';
-                    if (el.id) return '#' + el.id;
-                    const name = el.getAttribute('name');
-                    if (name) return el.tagName.toLowerCase() + '[name="' + name + '"]';
-                    const ph = el.getAttribute('placeholder');
-                    if (ph) return el.tagName.toLowerCase() + '[placeholder="' + ph + '"]';
-                    const href = el.getAttribute('href');
-                    if (href && href.length <= 120) return el.tagName.toLowerCase() + '[href="' + href + '"]';
-                    return el.tagName.toLowerCase();
-                };
-
-                const interactiveNodes = Array.from(document.querySelectorAll(
-                    'a[href], button, input:not([type="hidden"]), textarea, select, [role="button"], [role="link"], [contenteditable="true"]'
-                )).filter(isVisible).slice(0, 60);
-
-                const elements = interactiveNodes.map((el, idx) => {
-                    const tag = el.tagName.toLowerCase();
-                    const inputType = normalize(el.getAttribute('type') || '').toLowerCase();
-                    let role = normalize(el.getAttribute('role') || '').toLowerCase();
-                    if (!role) {
-                        if (tag === 'a') role = 'link';
-                        else if (tag === 'button') role = 'button';
-                        else if (tag === 'input') role = (inputType === 'search') ? 'searchbox' : 'textbox';
-                        else if (tag === 'textarea') role = 'textbox';
-                        else if (tag === 'select') role = 'combobox';
-                        else role = tag;
-                    }
-                    return {
-                        ref: 'el_' + (idx + 1),
-                        role: role,
-                        tag: tag,
-                        type: inputType || tag,
-                        text: normalize(el.innerText || el.textContent || el.value || el.getAttribute('aria-label') || el.getAttribute('placeholder') || '').slice(0, 160),
-                        href: el.href || el.getAttribute('href') || '',
-                        value: typeof el.value === 'string' ? String(el.value || '').slice(0, 160) : '',
-                        label: '',
-                        placeholder: normalize(el.getAttribute('placeholder') || '').slice(0, 120),
-                        selector: selectorOf(el),
-                        visible: true,
-                        enabled: !el.disabled,
-                        region: 'body',
-                    };
-                });
-
-                // 检测 modal
-                const hasModal = !!document.querySelector('dialog[open], [role="dialog"], [aria-modal="true"], .modal.show');
-
-                // 检测搜索框
-                const searchInput = document.querySelector('input[type="search"], input[name*="search"], input[placeholder*="search" i], input[placeholder*="搜索"]');
-                const hasSearchBox = !!searchInput;
-                const searchSelector = searchInput ? selectorOf(searchInput) : '';
-
-                // 检测当前焦点元素（对于刚打开的 modal 很重要）
-                const focused = document.activeElement;
-                let focusedInfo = null;
-                if (focused && focused !== document.body && isVisible(focused)) {
-                    focusedInfo = {
-                        tag: focused.tagName.toLowerCase(),
-                        type: normalize(focused.getAttribute('type') || '').toLowerCase(),
-                        selector: selectorOf(focused),
-                        placeholder: normalize(focused.getAttribute('placeholder') || ''),
-                        role: normalize(focused.getAttribute('role') || ''),
-                    };
-                }
-
-                return {
-                    bodyText: bodyText.slice(0, 6000),
-                    visibleTextBlocks: blockCandidates,
-                    elements: elements,
-                    hasModal: hasModal,
-                    hasSearchBox: hasSearchBox,
-                    searchSelector: searchSelector,
-                    focusedElement: focusedInfo,
-                };
-            }""",
+            SCRIPT_FALLBACK_SEMANTIC_SNAPSHOT,
         )
         if evaluate_result.success and isinstance(evaluate_result.data, dict):
             body_text = str(evaluate_result.data.get("bodyText", "") or "").strip()
@@ -947,8 +883,15 @@ class BrowserAgent:
         snapshot: Optional[Dict[str, Any]] = None,
     ) -> Tuple[bool, str]:
         """Screenshot -> vision model -> check page relevance. Delegates to perception layer."""
+        if not self._vision_budget.can_call():
+            log_warning(
+                "vision budget exhausted, skipping page relevance check",
+                extra={"remaining": self._vision_budget.remaining()},
+            )
+            return False, ""
         self._sync_state_to_layers()
         result = await self.perception.check_relevance(task, query, snapshot)
+        self._vision_budget.record_call()
         self._sync_perception_state()
         return result
 
@@ -1133,162 +1076,7 @@ class BrowserAgent:
 
         r = await self._call_toolkit(
             "evaluate_js",
-            r"""
-            () => {
-              // 🔥 扩展选择器：同时提取交互元素和内容元素
-              const interactiveNodes = Array.from(document.querySelectorAll('a, button, input, textarea, select, [role="button"], [role="link"], [contenteditable="true"]'));
-
-              function textOf(el) {
-                return (el.innerText || el.textContent || '').replace(/\s+/g, ' ').trim();
-              }
-              function isVisible(el) {
-                const rects = el.getClientRects();
-                return !!(el.offsetWidth || el.offsetHeight || rects.length);
-              }
-              function labelOf(el) {
-                if (el.labels && el.labels.length) {
-                  return Array.from(el.labels).map(x => textOf(x)).filter(Boolean).join(' ');
-                }
-                const id = el.getAttribute('id');
-                if (id) {
-                  const label = document.querySelector(`label[for="${id}"]`);
-                  if (label) return textOf(label);
-                }
-                const parent = el.closest('label');
-                return parent ? textOf(parent) : '';
-              }
-              function selectorOf(el) {
-                if (el.id) return `#${CSS.escape(el.id)}`;
-                const name = el.getAttribute('name');
-                if (name) return `${el.tagName.toLowerCase()}[name="${CSS.escape(name)}"]`;
-                const placeholder = el.getAttribute('placeholder');
-                if (placeholder) return `${el.tagName.toLowerCase()}[placeholder="${CSS.escape(placeholder)}"]`;
-                const parts = [];
-                let cur = el;
-                while (cur && cur.nodeType === 1 && parts.length < 4) {
-                  let part = cur.tagName.toLowerCase();
-                  const parent = cur.parentElement;
-                  if (parent) {
-                    const siblings = Array.from(parent.children).filter(x => x.tagName === cur.tagName);
-                    if (siblings.length > 1) {
-                      part += `:nth-of-type(${siblings.indexOf(cur) + 1})`;
-                    }
-                  }
-                  parts.unshift(part);
-                  cur = parent;
-                }
-                return parts.join(' > ');
-              }
-              function normalizedType(el) {
-                const tag = el.tagName.toLowerCase();
-                const inputType = (el.getAttribute('type') || '').toLowerCase();
-                if (tag === 'a') return 'link';
-                if (tag === 'button') return 'button';
-                if (tag === 'input' && ['submit', 'button', 'reset'].includes(inputType)) return 'button';
-                if (tag === 'input' && inputType) return inputType;
-                return (inputType || tag);
-              }
-
-              // 🔥 新增：提取元素周围的上下文文本
-              function extractContext(el) {
-                const contextBefore = [];
-                const contextAfter = [];
-
-                // 向前查找文本节点（最多3个兄弟节点）
-                let prev = el.previousSibling;
-                let count = 0;
-                while (prev && count < 3) {
-                  if (prev.nodeType === Node.TEXT_NODE) {
-                    const text = textOf(prev);
-                    if (text.length > 0) {
-                      contextBefore.unshift(text);
-                      count++;
-                    }
-                  } else if (prev.nodeType === Node.ELEMENT_NODE) {
-                    const text = textOf(prev);
-                    if (text.length > 0 && text.length < 200) {
-                      contextBefore.unshift(text);
-                      count++;
-                    }
-                  }
-                  prev = prev.previousSibling;
-                }
-
-                // 向后查找文本节点（最多3个兄弟节点）
-                let next = el.nextSibling;
-                count = 0;
-                while (next && count < 3) {
-                  if (next.nodeType === Node.TEXT_NODE) {
-                    const text = textOf(next);
-                    if (text.length > 0) {
-                      contextAfter.push(text);
-                      count++;
-                    }
-                  } else if (next.nodeType === Node.ELEMENT_NODE) {
-                    const text = textOf(next);
-                    if (text.length > 0 && text.length < 200) {
-                      contextAfter.push(text);
-                      count++;
-                    }
-                  }
-                  next = next.nextSibling;
-                }
-
-                // 如果兄弟节点没有上下文，尝试从父元素提取
-                if (contextBefore.length === 0 && contextAfter.length === 0) {
-                  const parent = el.parentElement;
-                  if (parent) {
-                    const parentText = textOf(parent);
-                    const elementText = textOf(el);
-                    // 提取父元素中不属于当前元素的文本
-                    const beforeText = parentText.split(elementText)[0];
-                    const afterText = parentText.split(elementText)[1];
-                    if (beforeText && beforeText.length > 0) {
-                      contextBefore.push(beforeText.slice(-100));
-                    }
-                    if (afterText && afterText.length > 0) {
-                      contextAfter.push(afterText.slice(0, 100));
-                    }
-                  }
-                }
-
-                return {
-                  before: contextBefore.join(' ').slice(0, 150),
-                  after: contextAfter.join(' ').slice(0, 150)
-                };
-              }
-
-              return interactiveNodes
-                .filter(el => isVisible(el))
-                .slice(0, 60)
-                .map((el, idx) => {
-                  const context = extractContext(el);
-                  return {
-                    index: idx,
-                    tag: el.tagName.toLowerCase(),
-                    text: textOf(el).slice(0, 160),
-                    element_type: normalizedType(el),
-                    selector: selectorOf(el),
-                    attributes: {
-                      id: el.getAttribute('id') || '',
-                      name: el.getAttribute('name') || '',
-                      type: el.getAttribute('type') || '',
-                      role: el.getAttribute('role') || '',
-                      href: el.getAttribute('href') || '',
-                      value: (typeof el.value === 'string' ? el.value : '') || '',
-                      placeholder: el.getAttribute('placeholder') || '',
-                      ariaLabel: el.getAttribute('aria-label') || '',
-                      title: el.getAttribute('title') || '',
-                      labelText: labelOf(el).slice(0, 120),
-                    },
-                    is_visible: true,
-                    is_clickable: !el.disabled,
-                    context_before: context.before,
-                    context_after: context.after,
-                  };
-                });
-            }
-            """
+            SCRIPT_EXTRACT_INTERACTIVE_ELEMENTS,
         )
         raw = r.data if r.success and isinstance(r.data, list) else []
         elements: List[PageElement] = []
@@ -1654,6 +1442,12 @@ class BrowserAgent:
         snapshot: Optional[Dict[str, Any]] = None,
         last_action: Optional[BrowserAction] = None,
     ) -> Optional[BrowserAction]:
+        if not self._vision_budget.can_call():
+            log_warning(
+                "vision budget exhausted, skipping vision fallback",
+                extra={"remaining": self._vision_budget.remaining(), "calls_made": self._vision_budget.calls_made},
+            )
+            return None
         vision_llm = self._get_vision_llm()
         if vision_llm is None:
             return None
@@ -1684,6 +1478,11 @@ class BrowserAgent:
                 screenshot_r.data,
                 0.1,
                 1200,
+            )
+            self._vision_budget.record_call(
+                tokens=(response.usage or {}).get("total_tokens", 0)
+                if hasattr(response, "usage") and response.usage
+                else 0
             )
             web_debug_recorder.write_binary("browser_vision_screenshot", screenshot_r.data, ".png")
             web_debug_recorder.write_text("browser_vision_prompt", prompt)
@@ -1875,8 +1674,8 @@ class BrowserAgent:
                 page = getattr(self.toolkit, '_page', None)
                 if page:
                     after_screenshot = await page.screenshot(type="jpeg", quality=50, full_page=False)
-                    from utils.image_diff import screenshots_differ
-                    if screenshots_differ(self._before_action_screenshot, after_screenshot, threshold=settings.VISION_PIXEL_DIFF_THRESHOLD):
+                    from utils.image_diff import screenshots_meaningfully_differ
+                    if screenshots_meaningfully_differ(self._before_action_screenshot, after_screenshot):
                         log_agent_action(self.name, "verify", "visual_diff_detected")
                         return True
             except Exception:
@@ -2382,7 +2181,687 @@ class BrowserAgent:
 
     # ── main run loop ────────────────────────────────────────
 
+    async def _initialize_session(
+        self,
+        task: str,
+        expected_url: str,
+        steps: List[Dict[str, Any]],
+    ) -> Dict[str, Any]:
+        """
+        Phase 1 of run(): page creation, navigation, blocked-page bypass, URL
+        validation, intent inference, search bootstrap, and read-only early-return
+        check.
+
+        Returns one of:
+          {"ok": False, "result": dict}       -- unrecoverable failure
+          {"ok": True, "early_result": dict}  -- read-only task satisfied immediately
+          {"ok": True, "current_url": str, "page_title": str,
+           "task_intent": TaskIntent, "initial_data": list}
+        """
+        tk = self.toolkit
+
+        r = await tk.create_page()
+        if not r.success:
+            web_debug_recorder.record_event("browser_create_page_failed", error=r.error)
+            return {"ok": False, "result": {"success": False, "message": f"浏览器启动失败: {r.error}", "steps": []}}
+
+        url = expected_url or "about:blank"
+        self._action_history = []
+        self._page_assessment_cache.clear()
+
+        async def _initial_goto():
+            page = tk.page
+            if page and page.is_closed():
+                await tk.create_page()
+            return await tk.goto(url, timeout=30000)
+
+        try:
+            await async_retry(
+                _initial_goto, max_attempts=3, base_delay=2.0, caller_name=self.name,
+            )
+        except Exception as nav_err:
+            return {"ok": False, "result": {"success": False, "message": f"初始导航失败: {str(nav_err)[:200]}", "url": url, "steps": steps}}
+
+        await self._wait_for_page_ready()
+        await self._wait_for_interactive_hydration()
+        current_url_r = await tk.get_current_url()
+        current_url = current_url_r.data or ""
+        title_r = await tk.get_title()
+        page_title = title_r.data or ""
+        web_debug_recorder.record_event(
+            "browser_initial_navigation",
+            expected_url=expected_url,
+            current_url=current_url,
+            title=page_title,
+        )
+
+        if web_debug_recorder.is_enabled():
+            log_warning(f"[DEBUG] ========== 初始导航完成 ==========")
+            log_warning(f"[DEBUG] 目标URL: {expected_url}")
+            log_warning(f"[DEBUG] 当前URL: {current_url}")
+            log_warning(f"[DEBUG] 页面标题: {page_title}")
+            log_warning(f"[DEBUG] ====================================")
+
+        if self._looks_like_blocked_page(current_url, page_title):
+            bypass_r = await tk.bypass_robot_challenge(max_retries=3)
+            if not bypass_r.success:
+                return {
+                    "ok": False,
+                    "result": {
+                        "success": False,
+                        "message": f"navigation landed on blocked page: {page_title or current_url}",
+                        "url": current_url,
+                        "expected_url": expected_url,
+                        "title": page_title,
+                        "steps": steps,
+                    },
+                }
+            url_r = await tk.get_current_url()
+            current_url = (url_r.data or current_url) if url_r.success else current_url
+            title_r = await tk.get_title()
+            page_title = (title_r.data or "") if title_r.success else page_title
+            log_agent_action(self.name, "反机器人验证绕过成功", current_url[:80])
+
+        if expected_url and current_url and not self._urls_look_related(expected_url, current_url):
+            return {
+                "ok": False,
+                "result": {
+                    "success": False,
+                    "message": f"navigation landed on unexpected page: expected {expected_url}, got {current_url}",
+                    "url": current_url,
+                    "expected_url": expected_url,
+                    "title": page_title,
+                    "steps": steps,
+                },
+            }
+
+        task_intent = await self._infer_task_intent(task)
+        task_intent = self._coerce_intent_for_direct_page(task, task_intent, expected_url)
+        if (
+            task_intent.intent_type == "search"
+            and not self._extract_url_from_task(task)
+            and not expected_url
+        ):
+            await self._bootstrap_search_results(task_intent.query or self._derive_primary_query(task))
+            current_url_r = await tk.get_current_url()
+            current_url = current_url_r.data or ""
+
+        initial_data = await self._extract_data_for_intent(task_intent)
+        if self._is_read_only_task(task, task_intent):
+            if initial_data and len(initial_data) >= 3 and self._page_data_satisfies_goal(
+                task,
+                current_url or "",
+                task_intent,
+                initial_data,
+                snapshot=self._last_semantic_snapshot,
+            ):
+                title_r = await tk.get_title()
+                url_r = await tk.get_current_url()
+                _final_screenshot = await self._capture_final_screenshot()
+                return {
+                    "ok": True,
+                    "early_result": {
+                        "success": True,
+                        "message": "read-only task satisfied from initial page",
+                        "url": url_r.data or "",
+                        "title": title_r.data or "",
+                        "expected_url": expected_url,
+                        "steps": steps,
+                        "data": initial_data,
+                        "_page_screenshot": _final_screenshot,
+                    },
+                }
+            else:
+                log_warning(f"初始数据不足（{len(initial_data)} 条），继续执行步骤")
+
+        return {
+            "ok": True,
+            "current_url": current_url,
+            "page_title": page_title,
+            "task_intent": task_intent,
+            "initial_data": initial_data,
+        }
+
+    async def _execute_step(
+        self,
+        step_no: int,
+        task: str,
+        task_intent,
+        expected_url: str,
+        steps: List[Dict[str, Any]],
+        accumulated_data: List[Dict[str, str]],
+        seen_keys: set,
+        prefetched: Dict[str, Any],
+        visual_tracker,
+        last_action,
+    ) -> Dict[str, Any]:
+        """
+        Execute one iteration of the main step loop.
+
+        accumulated_data and seen_keys are mutated in-place.
+        prefetched dict (keys: "elements", "snapshot") is mutated in-place.
+
+        Returns one of:
+          {"status": "exit", "result": dict}                   -- return to run() caller
+          {"status": "continue", "last_action": last_action}   -- next iteration
+          {"status": "ok", "last_action": action}              -- normal completion
+        """
+        tk = self.toolkit
+
+        def _merge_new_data(new_items: List[Dict[str, str]]):
+            for item in (new_items or []):
+                vals = [str(v)[:80] for v in list(item.values())[:2] if v]
+                key = "|".join(vals)
+                if key and key not in seen_keys:
+                    seen_keys.add(key)
+                    accumulated_data.append(item)
+
+        current_url_r = await tk.get_current_url()
+        title_r = await tk.get_title()
+        if self._looks_like_blocked_page(current_url_r.data or "", title_r.data or ""):
+            bypass_r = await tk.bypass_robot_challenge(max_retries=3)
+            if not bypass_r.success:
+                return {
+                    "status": "exit",
+                    "result": {
+                        "success": False,
+                        "message": f"browser landed on blocked page during execution: {title_r.data or current_url_r.data or ''}",
+                        "url": current_url_r.data or "",
+                        "title": title_r.data or "",
+                        "expected_url": expected_url,
+                        "steps": steps,
+                        "data": accumulated_data,
+                    },
+                }
+            log_agent_action(self.name, "执行中反机器人验证绕过成功")
+            prefetched["elements"] = None
+            prefetched["snapshot"] = None
+
+        if prefetched["elements"] is not None:
+            elements = prefetched["elements"]
+            snapshot = prefetched["snapshot"] or self._last_semantic_snapshot
+            prefetched["elements"] = None
+            prefetched["snapshot"] = None
+        else:
+            _obs_elements_task = asyncio.ensure_future(self._extract_interactive_elements())
+            _obs_snapshot_task = (
+                asyncio.ensure_future(self._get_semantic_snapshot())
+                if self._last_semantic_snapshot is None
+                else None
+            )
+            elements = await _obs_elements_task
+            snapshot = (
+                await _obs_snapshot_task if _obs_snapshot_task is not None
+                else self._last_semantic_snapshot
+            )
+        _obs_data_task = asyncio.ensure_future(self._extract_data_for_intent(task_intent))
+        observed_data = await _obs_data_task
+        _merge_new_data(observed_data)
+        web_debug_recorder.write_json(
+            f"browser_step_{step_no}_context",
+            {
+                "step": step_no,
+                "url": current_url_r.data or "",
+                "title": title_r.data or "",
+                "intent": {
+                    "intent_type": task_intent.intent_type,
+                    "query": task_intent.query,
+                    "confidence": task_intent.confidence,
+                    "fields": task_intent.fields,
+                    "requires_interaction": task_intent.requires_interaction,
+                    "target_text": task_intent.target_text,
+                },
+                "elements": self._elements_to_debug_payload(elements),
+                "snapshot": snapshot,
+                "observed_data": observed_data,
+                "accumulated_data": list(accumulated_data),
+                "last_action": self._action_to_debug_payload(last_action),
+            },
+        )
+
+        if web_debug_recorder.is_enabled():
+            log_warning(f"[DEBUG] ========== Step {step_no} 开始 ==========")
+            log_warning(f"[DEBUG] 当前URL: {current_url_r.data or ''}")
+            log_warning(f"[DEBUG] 页面标题: {title_r.data or ''}")
+            log_warning(f"[DEBUG] 可交互元素数量: {len(elements)}")
+            log_warning(f"[DEBUG] 已收集数据: {len(accumulated_data)} 条")
+            log_warning(f"[DEBUG] ====================================")
+
+        action = None
+        action_source = ""
+        if (
+            step_no >= 2
+            and not observed_data
+            and not accumulated_data
+            and str((snapshot or {}).get("page_type", "")).strip() in {"", "unknown"}
+        ):
+            relevant, vision_summary = await self._vision_check_page_relevance(
+                task, task_intent.query or self._derive_primary_query(task), snapshot,
+            )
+            if relevant:
+                action = BrowserAction(
+                    action_type=ActionType.EXTRACT,
+                    description=f"vision detected relevant content: {vision_summary[:100]}",
+                    confidence=0.7,
+                )
+                action_source = "vision_relevance"
+
+        if action is None:
+            action, action_source = await self._plan_next_action(
+                task,
+                current_url_r.data or "",
+                title_r.data or "",
+                elements,
+                task_intent,
+                accumulated_data or observed_data,
+                snapshot=snapshot,
+                last_action=last_action,
+                recent_steps=steps,
+            )
+        if action is None or action.action_type == ActionType.WAIT:
+            visual_action = await self._decide_action_with_vision(
+                task,
+                current_url_r.data or "",
+                title_r.data or "",
+                elements,
+                task_intent,
+                accumulated_data or observed_data,
+                snapshot=snapshot,
+                last_action=last_action,
+            )
+            if visual_action is not None:
+                action = visual_action
+                action_source = "vision_fallback"
+        if action is None:
+            action = BrowserAction(
+                action_type=ActionType.WAIT,
+                value="1",
+                description="no actionable elements",
+                confidence=0.05,
+            )
+            action_source = "implicit_wait"
+        web_debug_recorder.write_json(
+            f"browser_step_{step_no}_action",
+            {
+                **self._action_to_debug_payload(action),
+                "source": action_source,
+            },
+        )
+
+        if web_debug_recorder.is_enabled():
+            log_warning(f"[DEBUG] Step {step_no} 决策动作: {action.action_type.value}")
+            log_warning(f"[DEBUG] 动作描述: {action.description}")
+            log_warning(f"[DEBUG] 目标选择器: {action.target_selector[:100] if action.target_selector else 'N/A'}")
+            log_warning(f"[DEBUG] 置信度: {action.confidence}")
+
+        if action.action_type == ActionType.DONE:
+            data = await self._extract_data_for_intent(task_intent)
+            _merge_new_data(data)
+            snapshot = self._last_semantic_snapshot or {}
+            main_text = self._get_snapshot_main_text(snapshot)
+            if main_text and len(main_text) >= 50:
+                _merge_new_data([{"text": main_text, "source": "page_main_text"}])
+            if not accumulated_data:
+                vision_data = await self._extract_data_with_vision(task, task_intent, snapshot)
+                if vision_data:
+                    _merge_new_data(vision_data)
+            log_success("browser task completed")
+            url_r = await tk.get_current_url()
+            title_r = await tk.get_title()
+            _final_screenshot = await self._capture_final_screenshot()
+            return {
+                "status": "exit",
+                "result": {
+                    "success": True, "message": "task completed",
+                    "url": url_r.data or "", "title": title_r.data or "",
+                    "expected_url": expected_url, "steps": steps,
+                    "data": accumulated_data or data,
+                    "_page_screenshot": _final_screenshot,
+                },
+            }
+
+        if action.action_type == ActionType.EXTRACT:
+            data = await self._extract_data_for_intent(task_intent)
+            _merge_new_data(data)
+            snapshot = self._last_semantic_snapshot or {}
+            main_text = self._get_snapshot_main_text(snapshot)
+            if main_text and len(main_text) >= 50:
+                _merge_new_data([{"text": main_text, "source": "page_main_text"}])
+            if not accumulated_data:
+                vision_data = await self._extract_data_with_vision(task, task_intent, snapshot)
+                if vision_data:
+                    _merge_new_data(vision_data)
+            url_r = await tk.get_current_url()
+            title_r = await tk.get_title()
+            _final_screenshot = await self._capture_final_screenshot()
+            return {
+                "status": "exit",
+                "result": {
+                    "success": True, "message": "data extracted",
+                    "url": url_r.data or "", "title": title_r.data or "",
+                    "expected_url": expected_url, "steps": steps,
+                    "data": accumulated_data or data,
+                    "_page_screenshot": _final_screenshot,
+                },
+            }
+
+        if action.requires_confirmation and settings.REQUIRE_HUMAN_CONFIRM:
+            from utils.human_confirm import HumanConfirm
+            confirmed = await asyncio.to_thread(
+                HumanConfirm.request_browser_action_confirmation,
+                action=action.action_type.value,
+                target=action.target_selector[:80],
+                value=action.value[:80],
+                description=action.description,
+            )
+            if not confirmed:
+                return {
+                    "status": "exit",
+                    "result": {
+                        "success": False, "message": "user declined action confirmation",
+                        "requires_confirmation": True, "steps": steps,
+                    },
+                }
+
+        if self._is_action_looping(action):
+            url_r = await tk.get_current_url()
+            title_r = await tk.get_title()
+            if self._looks_like_blocked_page(url_r.data or "", title_r.data or ""):
+                bypass_r = await tk.bypass_robot_challenge(max_retries=2)
+                if not bypass_r.success:
+                    return {
+                        "status": "exit",
+                        "result": {
+                            "success": False,
+                            "message": f"browser stuck on blocked page: {title_r.data or url_r.data or ''}",
+                            "url": url_r.data or "", "title": title_r.data or "",
+                            "expected_url": expected_url, "steps": steps, "data": accumulated_data,
+                        },
+                    }
+                log_agent_action(self.name, "循环检测中反机器人验证绕过成功")
+            if self._is_read_only_task(task, task_intent):
+                _merge_new_data(await self._extract_data_for_intent(task_intent))
+                _final_screenshot = await self._capture_final_screenshot()
+                return {
+                    "status": "exit",
+                    "result": {
+                        "success": True, "message": "repeated action avoided; extracted current page",
+                        "url": url_r.data or "", "title": title_r.data or "",
+                        "expected_url": expected_url, "steps": steps, "data": accumulated_data,
+                        "_page_screenshot": _final_screenshot,
+                    },
+                }
+            return {
+                "status": "exit",
+                "result": {
+                    "success": False,
+                    "message": f"repeated action loop detected at step {step_no}",
+                    "url": url_r.data or "", "title": title_r.data or "",
+                    "expected_url": expected_url, "steps": steps, "data": accumulated_data,
+                },
+            }
+
+        self._record_action(action)
+        last_action = action
+
+        self._before_action_screenshot = None
+        if settings.VISION_VERIFY_ACTION:
+            try:
+                page = getattr(self.toolkit, '_page', None)
+                if page:
+                    self._before_action_screenshot = await page.screenshot(type="jpeg", quality=50, full_page=False)
+            except Exception:
+                pass
+
+        _is_input_action = action.action_type in {ActionType.INPUT, ActionType.FILL_FORM}
+        _is_wait_action = action.action_type == ActionType.WAIT
+        if _is_input_action:
+            before = None
+        else:
+            before = await self._snapshot_page_state()
+        success = await self._execute_action(action)
+
+        if success and _is_wait_action and settings.VISION_WAIT_CHANGE_DETECT:
+            try:
+                page = getattr(self.toolkit, '_page', None)
+                if page and self._before_action_screenshot is not None:
+                    after_wait_img = await page.screenshot(type="jpeg", quality=50, full_page=False)
+                    from utils.image_diff import screenshots_differ
+                    if not screenshots_differ(self._before_action_screenshot, after_wait_img, threshold=settings.VISION_PIXEL_DIFF_THRESHOLD):
+                        log_agent_action(self.name, "wait", "no_visual_change_during_wait")
+            except Exception:
+                pass
+
+        if success and not _is_input_action and not _is_wait_action:
+            await self._wait_for_page_ready()
+            success = await self._verify_action_effect(before, action)
+        elif success and _is_input_action:
+            await self.toolkit.wait_for_load("domcontentloaded", timeout=3000)
+            success = True
+        if not success:
+            recovery = self._recover_action(task, action, elements)
+            if recovery:
+                recovery_before = await self._snapshot_page_state()
+                success = await self._execute_action(recovery)
+                if success:
+                    await self._wait_for_page_ready()
+                    success = await self._verify_action_effect(recovery_before, recovery)
+                if success:
+                    action = recovery
+                    self._record_action(action)
+                    last_action = action
+                    action_source = "local_recovery"
+        if not success:
+            visual_recovery = await self._decide_action_with_vision(
+                task,
+                current_url_r.data or "",
+                title_r.data or "",
+                elements,
+                task_intent,
+                accumulated_data or observed_data,
+                snapshot=snapshot,
+                last_action=action,
+            )
+            if visual_recovery and self._action_signature(visual_recovery) != self._action_signature(action):
+                visual_before = await self._snapshot_page_state()
+                success = await self._execute_action(visual_recovery)
+                if success:
+                    await self._wait_for_page_ready()
+                    success = await self._verify_action_effect(visual_before, visual_recovery)
+                if success:
+                    action = visual_recovery
+                    self._record_action(action)
+                    last_action = action
+                    action_source = "vision_recovery"
+
+        url_r = await tk.get_current_url()
+        steps.append({
+            "step": step_no,
+            "plan": action.description or action.action_type.value,
+            "action": action.target_selector or action.action_type.value,
+            "source": action_source,
+            "observation": "success" if success else "failed",
+            "decision": "continue" if success else "retry_or_fail",
+            "action_type": action.action_type.value,
+            "selector": action.target_selector,
+            "value": action.value,
+            "description": action.description,
+            "result": "success" if success else "failed",
+            "url": url_r.data or "",
+        })
+        from utils.structured_logger import get_structured_logger, LogContext
+        _sl = get_structured_logger()
+        with LogContext(agent="browser_agent", step_no=step_no):
+            _sl.log_action(
+                action_type=action.action_type.value,
+                target=action.target_selector or "",
+                confidence=action.confidence,
+                result="success" if success else "failed",
+            )
+        web_debug_recorder.write_json(f"browser_step_{step_no}_result", steps[-1])
+
+        _step_screenshot_bytes: Optional[bytes] = None
+        if web_debug_recorder.is_enabled():
+            try:
+                _sc = await self.toolkit.screenshot(full_page=False)
+                if _sc.success and _sc.data:
+                    _step_screenshot_bytes = _sc.data
+                    web_debug_recorder.write_binary(f"browser_step_{step_no}_screenshot", _sc.data, ".png")
+            except Exception:
+                pass
+
+        if success and action.action_type not in {ActionType.DONE, ActionType.EXTRACT}:
+            try:
+                if _step_screenshot_bytes is None:
+                    page = getattr(self.toolkit, '_page', None)
+                    if page:
+                        _step_screenshot_bytes = await page.screenshot(type="jpeg", quality=50, full_page=False)
+                if _step_screenshot_bytes and not visual_tracker.record(_step_screenshot_bytes):
+                    log_agent_action(self.name, "progress", f"visual_stuck_detected_at_step_{step_no}")
+                    if self._is_read_only_task(task, task_intent):
+                        _merge_new_data(await self._extract_data_for_intent(task_intent))
+                        _final_screenshot = await self._capture_final_screenshot()
+                        url_r = await tk.get_current_url()
+                        return {
+                            "status": "exit",
+                            "result": {
+                                "success": True, "message": "visually stuck, extracted current page",
+                                "url": url_r.data or "", "steps": steps, "data": accumulated_data,
+                                "_page_screenshot": _final_screenshot,
+                            },
+                        }
+            except Exception:
+                pass
+
+        if not success:
+            if action.action_type == ActionType.WAIT:
+                return {"status": "continue", "last_action": last_action}
+            _consecutive_fails = 0
+            for _s in reversed(steps):
+                if _s.get("result") == "failed":
+                    _consecutive_fails += 1
+                else:
+                    break
+            _max_fails = settings.BROWSER_MAX_CONSECUTIVE_FAILS
+            if _consecutive_fails == 1:
+                log_warning(f"step {step_no} 失败，将在下一步重新评估页面状态")
+                await asyncio.sleep(1)
+                return {"status": "continue", "last_action": last_action}
+            elif _consecutive_fails == 2:
+                log_warning(f"连续2步失败，尝试刷新页面恢复")
+                await tk.refresh()
+                await self._wait_for_page_ready()
+                return {"status": "continue", "last_action": last_action}
+            elif _consecutive_fails >= _max_fails:
+                title_r = await tk.get_title()
+                return {
+                    "status": "exit",
+                    "result": {
+                        "success": False,
+                        "message": f"连续 {_consecutive_fails} 步失败，已尝试恢复但仍失败 (最后在 step {step_no})",
+                        "url": url_r.data or "", "title": title_r.data or "",
+                        "expected_url": expected_url,
+                        "steps": steps, "data": accumulated_data or await self._extract_data_for_intent(task_intent),
+                    },
+                }
+            else:
+                log_warning(f"连续{_consecutive_fails}步失败 (容忍上限{_max_fails})，继续尝试")
+                return {"status": "continue", "last_action": last_action}
+
+        if action.action_type in {ActionType.CLICK, ActionType.INPUT, ActionType.FILL_FORM, ActionType.PRESS_KEY}:
+            post_snapshot = await self._get_semantic_snapshot()
+            post_elements = self._filter_noise_elements(self._elements_from_snapshot(post_snapshot))
+            if post_elements:
+                self._element_cache = post_elements[:40]
+            else:
+                post_elements = await self._extract_interactive_elements()
+                post_snapshot = self._last_semantic_snapshot or post_snapshot
+            prefetched["elements"] = post_elements
+            prefetched["snapshot"] = post_snapshot
+            step_data = await self._extract_data_for_intent(task_intent)
+            _merge_new_data(step_data)
+            candidate_data = accumulated_data or step_data
+            requires_data = self._is_read_only_task(task, task_intent) or task_intent.intent_type == "search"
+            has_sufficient_data = bool(candidate_data)
+            if task_intent.intent_type == "search" and candidate_data:
+                has_sufficient_data = self._is_data_relevant(task_intent.query, candidate_data)
+            if (
+                self._task_looks_satisfied(
+                    task,
+                    url_r.data or "",
+                    task_intent,
+                    target_url=expected_url,
+                    snapshot=post_snapshot,
+                    elements=post_elements,
+                    data=candidate_data,
+                )
+                and (has_sufficient_data or not requires_data)
+            ):
+                title_r = await tk.get_title()
+                _final_screenshot = await self._capture_final_screenshot()
+                return {
+                    "status": "exit",
+                    "result": {
+                        "success": True, "message": "task reached target page",
+                        "url": url_r.data or "", "title": title_r.data or "",
+                        "expected_url": expected_url,
+                        "steps": steps, "data": candidate_data or await self._extract_data_for_intent(task_intent),
+                        "_page_screenshot": _final_screenshot,
+                    },
+                }
+
+        if action.action_type == ActionType.SCROLL:
+            step_data = await self._extract_data_for_intent(task_intent)
+            _merge_new_data(step_data)
+
+        return {"status": "ok", "last_action": last_action}
+
+    async def _build_final_result(
+        self,
+        task: str,
+        task_intent,
+        expected_url: str,
+        steps: List[Dict[str, Any]],
+        accumulated_data: List[Dict[str, str]],
+        seen_keys: set,
+    ) -> Dict[str, Any]:
+        """Assemble the final result dict after max_steps is reached."""
+        def _merge_new_data(new_items):
+            for item in (new_items or []):
+                vals = [str(v)[:80] for v in list(item.values())[:2] if v]
+                key = "|".join(vals)
+                if key and key not in seen_keys:
+                    seen_keys.add(key)
+                    accumulated_data.append(item)
+
+        _merge_new_data(await self._extract_data_for_intent(task_intent))
+        snapshot = self._last_semantic_snapshot or {}
+        main_text = self._get_snapshot_main_text(snapshot)
+        if main_text and len(main_text) >= 50:
+            _merge_new_data([{"text": main_text, "source": "page_main_text"}])
+        if not accumulated_data:
+            vision_data = await self._extract_data_with_vision(task, task_intent, self._last_semantic_snapshot)
+            if vision_data:
+                _merge_new_data(vision_data)
+        url_r = await self.toolkit.get_current_url()
+        title_r = await self.toolkit.get_title()
+        _final_screenshot = await self._capture_final_screenshot()
+        return {
+            "success": len(accumulated_data) > 0,
+            "message": "max steps reached" + (f", but collected {len(accumulated_data)} items" if accumulated_data else ""),
+            "url": url_r.data or "", "title": title_r.data or "",
+            "expected_url": expected_url,
+            "steps": steps, "data": accumulated_data,
+            "_page_screenshot": _final_screenshot,
+        }
+
     async def run(self, task: str, start_url: Optional[str] = None, max_steps: int = 8) -> Dict[str, Any]:
+        # Reset per-run vision budget
+        self._vision_budget = VisionBudget(
+            max_calls_per_run=settings.VISION_MAX_CALLS_PER_RUN,
+            max_total_tokens=settings.VISION_MAX_TOKENS_PER_RUN,
+            cooldown_seconds=settings.VISION_COOLDOWN_SECONDS,
+        )
         tk = self.toolkit
         expected_url = start_url or self._extract_url_from_task(task) or ""
         steps: List[Dict[str, Any]] = []
@@ -2397,613 +2876,39 @@ class BrowserAgent:
         token = web_debug_recorder.activate_trace(trace)
         if trace:
             log_agent_action(self.name, "网页调试记录已开启", str(trace.root_dir))
-            # 🔥 新增：明确告诉用户调试文件的位置
             log_warning(f"[DEBUG] 调试文件保存在: {trace.root_dir}")
             log_warning(f"[DEBUG] 你可以查看该目录下的HTML、prompt和response文件来分析感知差异")
         try:
-            r = await tk.create_page()
-            if not r.success:
-                web_debug_recorder.record_event("browser_create_page_failed", error=r.error)
-                return {"success": False, "message": f"浏览器启动失败: {r.error}", "steps": []}
+            init = await self._initialize_session(task, expected_url, steps)
+            if not init["ok"]:
+                return init["result"]
+            if init.get("early_result"):
+                return init["early_result"]
 
-            url = expected_url or "about:blank"
-            self._action_history = []
-            self._page_assessment_cache.clear()
-
-            # 初始导航
-            async def _initial_goto():
-                page = tk.page
-                if page and page.is_closed():
-                    await tk.create_page()
-                return await tk.goto(url, timeout=30000)
-
-            try:
-                await async_retry(
-                    _initial_goto, max_attempts=3, base_delay=2.0, caller_name=self.name,
-                )
-            except Exception as nav_err:
-                return {"success": False, "message": f"初始导航失败: {str(nav_err)[:200]}", "url": url, "steps": steps}
-
-            await self._wait_for_page_ready()
-            await self._wait_for_interactive_hydration()
-            current_url_r = await tk.get_current_url()
-            current_url = current_url_r.data or ""
-            title_r = await tk.get_title()
-            page_title = title_r.data or ""
-            web_debug_recorder.record_event(
-                "browser_initial_navigation",
-                expected_url=expected_url,
-                current_url=current_url,
-                title=page_title,
-            )
-
-            # 🔥 新增：输出初始页面信息到控制台
-            if web_debug_recorder.is_enabled():
-                log_warning(f"[DEBUG] ========== 初始导航完成 ==========")
-                log_warning(f"[DEBUG] 目标URL: {expected_url}")
-                log_warning(f"[DEBUG] 当前URL: {current_url}")
-                log_warning(f"[DEBUG] 页面标题: {page_title}")
-                log_warning(f"[DEBUG] ====================================")
-
-            if self._looks_like_blocked_page(current_url, page_title):
-                # 尝试绕过反机器人验证
-                bypass_r = await tk.bypass_robot_challenge(max_retries=3)
-                if not bypass_r.success:
-                    return {
-                        "success": False,
-                        "message": f"navigation landed on blocked page: {page_title or current_url}",
-                        "url": current_url,
-                        "expected_url": expected_url,
-                        "title": page_title,
-                        "steps": steps,
-                    }
-                # 绕过成功，刷新页面信息
-                url_r = await tk.get_current_url()
-                current_url = (url_r.data or current_url) if url_r.success else current_url
-                title_r = await tk.get_title()
-                page_title = (title_r.data or "") if title_r.success else page_title
-                log_agent_action(self.name, "反机器人验证绕过成功", current_url[:80])
-
-            if expected_url and current_url and not self._urls_look_related(expected_url, current_url) and (start_url or self._extract_url_from_task(task)):
-                return {
-                    "success": False,
-                    "message": f"navigation landed on unexpected page: expected {expected_url}, got {current_url}",
-                    "url": current_url,
-                    "expected_url": expected_url,
-                    "title": page_title,
-                    "steps": steps,
-                }
-            if expected_url and current_url and not self._urls_look_related(expected_url, current_url):
-                # 不要立即退出，记录警告但继续执行
-                log_warning(f"URL 不匹配: 期望 {expected_url}, 实际 {current_url}, 但继续尝试执行")
-                # return {
-                #     "success": False,
-                #     "message": f"navigation landed on unexpected page: expected {expected_url}, got {current_url}",
-                #     "url": current_url,
-                #     "expected_url": expected_url,
-                #     "title": page_title,
-                #     "steps": steps,
-                # }
-            task_intent = await self._infer_task_intent(task)
-            task_intent = self._coerce_intent_for_direct_page(task, task_intent, expected_url)
-            if (
-                task_intent.intent_type == "search"
-                and not start_url
-                and not self._extract_url_from_task(task)
-            ):
-                await self._bootstrap_search_results(task_intent.query or self._derive_primary_query(task))
-                current_url_r = await tk.get_current_url()
-                current_url = current_url_r.data or ""
-
-            initial_data = await self._extract_data_for_intent(task_intent)
-            if self._is_read_only_task(task, task_intent):
-                if initial_data and len(initial_data) >= 3 and self._page_data_satisfies_goal(
-                    task,
-                    current_url or "",
-                    task_intent,
-                    initial_data,
-                    snapshot=self._last_semantic_snapshot,
-                ):
-                    # 只有在数据足够多（至少3条）且确实满足目标时才提前返回
-                    title_r = await tk.get_title()
-                    url_r = await tk.get_current_url()
-                    _final_screenshot = await self._capture_final_screenshot()
-                    return {"success": True, "message": "read-only task satisfied from initial page",
-                            "url": url_r.data or "", "title": title_r.data or "",
-                            "expected_url": expected_url, "steps": steps, "data": initial_data,
-                            "_page_screenshot": _final_screenshot}
-                else:
-                    # 数据不够或不满足，继续执行步骤
-                    log_warning(f"初始数据不足（{len(initial_data)} 条），继续执行步骤")
-
-            # 累积数据容器
-            _accumulated_data: List[Dict[str, str]] = []
-            _seen_keys: set = set()
+            task_intent = init["task_intent"]
+            accumulated_data: List[Dict[str, str]] = []
+            seen_keys: set = set()
             last_action: Optional[BrowserAction] = None
-
-            def _merge_new_data(new_items: List[Dict[str, str]]):
-                for item in (new_items or []):
-                    vals = [str(v)[:80] for v in list(item.values())[:2] if v]
-                    key = "|".join(vals)
-                    if key and key not in _seen_keys:
-                        _seen_keys.add(key)
-                        _accumulated_data.append(item)
-
-            # ⚡ 优化4: 缓存 post-action 结果，供下一步复用
-            _prefetched_elements = None
-            _prefetched_snapshot = None
-
-            # 视觉进度追踪器 — 检测连续截图无变化（Agent 卡住）
+            prefetched: Dict[str, Any] = {"elements": None, "snapshot": None}
             from utils.image_diff import VisualProgressTracker
-            _visual_tracker = VisualProgressTracker(window_size=settings.VISION_PROGRESS_WINDOW)
+            visual_tracker = VisualProgressTracker(window_size=settings.VISION_PROGRESS_WINDOW)
 
             for step_no in range(1, max_steps + 1):
-                current_url_r = await tk.get_current_url()
-                title_r = await tk.get_title()
-                if self._looks_like_blocked_page(current_url_r.data or "", title_r.data or ""):
-                    bypass_r = await tk.bypass_robot_challenge(max_retries=3)
-                    if not bypass_r.success:
-                        return {
-                            "success": False,
-                            "message": f"browser landed on blocked page during execution: {title_r.data or current_url_r.data or ''}",
-                            "url": current_url_r.data or "",
-                            "title": title_r.data or "",
-                            "expected_url": expected_url,
-                            "steps": steps,
-                            "data": _accumulated_data,
-                        }
-                    log_agent_action(self.name, "执行中反机器人验证绕过成功")
-                    _prefetched_elements = None
-                    _prefetched_snapshot = None
-
-                # ⚡ 优化1+4: 如果上一步已缓存 post-action 结果则复用，否则并行获取
-                if _prefetched_elements is not None:
-                    elements = _prefetched_elements
-                    snapshot = _prefetched_snapshot or self._last_semantic_snapshot
-                    _prefetched_elements = None
-                    _prefetched_snapshot = None
-                else:
-                    _obs_elements_task = asyncio.ensure_future(self._extract_interactive_elements())
-                    _obs_snapshot_task = (
-                        asyncio.ensure_future(self._get_semantic_snapshot())
-                        if self._last_semantic_snapshot is None
-                        else None
-                    )
-                    elements = await _obs_elements_task
-                    snapshot = (
-                        await _obs_snapshot_task if _obs_snapshot_task is not None
-                        else self._last_semantic_snapshot
-                    )
-                _obs_data_task = asyncio.ensure_future(self._extract_data_for_intent(task_intent))
-                observed_data = await _obs_data_task
-                _merge_new_data(observed_data)
-                web_debug_recorder.write_json(
-                    f"browser_step_{step_no}_context",
-                    {
-                        "step": step_no,
-                        "url": current_url_r.data or "",
-                        "title": title_r.data or "",
-                        "intent": {
-                            "intent_type": task_intent.intent_type,
-                            "query": task_intent.query,
-                            "confidence": task_intent.confidence,
-                            "fields": task_intent.fields,
-                            "requires_interaction": task_intent.requires_interaction,
-                            "target_text": task_intent.target_text,
-                        },
-                        "elements": self._elements_to_debug_payload(elements),
-                        "snapshot": snapshot,
-                        "observed_data": observed_data,
-                        "accumulated_data": list(_accumulated_data),
-                        "last_action": self._action_to_debug_payload(last_action),
-                    },
+                step_result = await self._execute_step(
+                    step_no, task, task_intent, expected_url, steps,
+                    accumulated_data, seen_keys, prefetched, visual_tracker, last_action,
                 )
+                if step_result["status"] == "exit":
+                    return step_result["result"]
+                last_action = step_result.get("last_action", last_action)
 
-                # 🔥 新增：输出每步的关键信息到控制台
-                if web_debug_recorder.is_enabled():
-                    log_warning(f"[DEBUG] ========== Step {step_no} 开始 ==========")
-                    log_warning(f"[DEBUG] 当前URL: {current_url_r.data or ''}")
-                    log_warning(f"[DEBUG] 页面标题: {title_r.data or ''}")
-                    log_warning(f"[DEBUG] 可交互元素数量: {len(elements)}")
-                    log_warning(f"[DEBUG] 已收集数据: {len(_accumulated_data)} 条")
-                    log_warning(f"[DEBUG] ====================================")
-
-                # Layer 2: 视觉内容验证 — 当 DOM 没提取到数据且页面类型不明时，
-                # 用截图判断页面是否包含目标信息，如果是则直接走提取而非盲目导航
-                # ⚡ 优化5: step 1 通常还在初始页面，跳过昂贵的 vision 调用
-                action = None
-                action_source = ""
-                if (
-                    step_no >= 2
-                    and not observed_data
-                    and not _accumulated_data
-                    and str((snapshot or {}).get("page_type", "")).strip() in {"", "unknown"}
-                ):
-                    relevant, vision_summary = await self._vision_check_page_relevance(
-                        task, task_intent.query or self._derive_primary_query(task), snapshot,
-                    )
-                    if relevant:
-                        action = BrowserAction(
-                            action_type=ActionType.EXTRACT,
-                            description=f"vision detected relevant content: {vision_summary[:100]}",
-                            confidence=0.7,
-                        )
-                        action_source = "vision_relevance"
-
-                if action is None:
-                    action, action_source = await self._plan_next_action(
-                        task,
-                        current_url_r.data or "",
-                        title_r.data or "",
-                        elements,
-                        task_intent,
-                        _accumulated_data or observed_data,
-                        snapshot=snapshot,
-                        last_action=last_action,
-                        recent_steps=steps,
-                    )
-                if action is None or action.action_type == ActionType.WAIT:
-                    visual_action = await self._decide_action_with_vision(
-                        task,
-                        current_url_r.data or "",
-                        title_r.data or "",
-                        elements,
-                        task_intent,
-                        _accumulated_data or observed_data,
-                        snapshot=snapshot,
-                        last_action=last_action,
-                    )
-                    if visual_action is not None:
-                        action = visual_action
-                        action_source = "vision_fallback"
-                if action is None:
-                    action = BrowserAction(
-                        action_type=ActionType.WAIT,
-                        value="1",
-                        description="no actionable elements",
-                        confidence=0.05,
-                    )
-                    action_source = "implicit_wait"
-                web_debug_recorder.write_json(
-                    f"browser_step_{step_no}_action",
-                    {
-                        **self._action_to_debug_payload(action),
-                        "source": action_source,
-                    },
-                )
-
-                # 🔥 新增：输出决策的动作到控制台
-                if web_debug_recorder.is_enabled():
-                    log_warning(f"[DEBUG] Step {step_no} 决策动作: {action.action_type.value}")
-                    log_warning(f"[DEBUG] 动作描述: {action.description}")
-                    log_warning(f"[DEBUG] 目标选择器: {action.target_selector[:100] if action.target_selector else 'N/A'}")
-                    log_warning(f"[DEBUG] 置信度: {action.confidence}")
-
-
-                if action.action_type == ActionType.DONE:
-                    data = await self._extract_data_for_intent(task_intent)
-                    _merge_new_data(data)
-                    # 补充: 始终追加 snapshot main_text（感知层比 extract_data 更可靠）
-                    snapshot = self._last_semantic_snapshot or {}
-                    main_text = self._get_snapshot_main_text(snapshot)
-                    if main_text and len(main_text) >= 50:
-                        _merge_new_data([{"text": main_text, "source": "page_main_text"}])
-                    # 回退: 视觉提取
-                    if not _accumulated_data:
-                        vision_data = await self._extract_data_with_vision(task, task_intent, snapshot)
-                        if vision_data:
-                            _merge_new_data(vision_data)
-                    log_success("browser task completed")
-                    url_r = await tk.get_current_url()
-                    title_r = await tk.get_title()
-                    _final_screenshot = await self._capture_final_screenshot()
-                    return {"success": True, "message": "task completed",
-                            "url": url_r.data or "", "title": title_r.data or "",
-                            "expected_url": expected_url, "steps": steps, "data": _accumulated_data or data,
-                            "_page_screenshot": _final_screenshot}
-
-                if action.action_type == ActionType.EXTRACT:
-                    data = await self._extract_data_for_intent(task_intent)
-                    _merge_new_data(data)
-                    # 补充: 始终追加 snapshot main_text（感知层比 extract_data 更可靠）
-                    snapshot = self._last_semantic_snapshot or {}
-                    main_text = self._get_snapshot_main_text(snapshot)
-                    if main_text and len(main_text) >= 50:
-                        _merge_new_data([{"text": main_text, "source": "page_main_text"}])
-                    # 回退: 视觉提取
-                    if not _accumulated_data:
-                        vision_data = await self._extract_data_with_vision(task, task_intent, snapshot)
-                        if vision_data:
-                            _merge_new_data(vision_data)
-                    url_r = await tk.get_current_url()
-                    title_r = await tk.get_title()
-                    _final_screenshot = await self._capture_final_screenshot()
-                    return {"success": True, "message": "data extracted",
-                            "url": url_r.data or "", "title": title_r.data or "",
-                            "expected_url": expected_url, "steps": steps, "data": _accumulated_data or data,
-                            "_page_screenshot": _final_screenshot}
-
-                if action.requires_confirmation and settings.REQUIRE_HUMAN_CONFIRM:
-                    # 🔥 修复：不要直接退出，而是询问用户
-                    from utils.human_confirm import HumanConfirm
-                    confirmed = await asyncio.to_thread(
-                        HumanConfirm.request_browser_action_confirmation,
-                        action=action.action_type.value,
-                        target=action.target_selector[:80],
-                        value=action.value[:80],
-                        description=action.description
-                    )
-                    if not confirmed:
-                        return {"success": False, "message": "user declined action confirmation",
-                                "requires_confirmation": True, "steps": steps}
-                    # 用户确认了，继续执行
-
-                if self._is_action_looping(action):
-                    url_r = await tk.get_current_url()
-                    title_r = await tk.get_title()
-                    if self._looks_like_blocked_page(url_r.data or "", title_r.data or ""):
-                        bypass_r = await tk.bypass_robot_challenge(max_retries=2)
-                        if not bypass_r.success:
-                            return {"success": False, "message": f"browser stuck on blocked page: {title_r.data or url_r.data or ''}",
-                                    "url": url_r.data or "", "title": title_r.data or "",
-                                    "expected_url": expected_url, "steps": steps, "data": _accumulated_data}
-                        log_agent_action(self.name, "循环检测中反机器人验证绕过成功")
-                    if self._is_read_only_task(task, task_intent):
-                        _merge_new_data(await self._extract_data_for_intent(task_intent))
-                        _final_screenshot = await self._capture_final_screenshot()
-                        return {"success": True, "message": "repeated action avoided; extracted current page",
-                                "url": url_r.data or "", "title": title_r.data or "",
-                                "expected_url": expected_url, "steps": steps, "data": _accumulated_data,
-                                "_page_screenshot": _final_screenshot}
-                    return {"success": False, "message": f"repeated action loop detected at step {step_no}",
-                            "url": url_r.data or "", "title": title_r.data or "",
-                            "expected_url": expected_url, "steps": steps, "data": _accumulated_data}
-                self._record_action(action)
-                last_action = action
-
-                # Capture screenshot before action for visual verification
-                self._before_action_screenshot = None
-                if settings.VISION_VERIFY_ACTION:
-                    try:
-                        page = getattr(self.toolkit, '_page', None)
-                        if page:
-                            self._before_action_screenshot = await page.screenshot(type="jpeg", quality=50, full_page=False)
-                    except Exception:
-                        pass
-
-                # ⚡ 优化6: INPUT/FILL_FORM 不需要重量级 page_ready + verify
-                _is_input_action = action.action_type in {ActionType.INPUT, ActionType.FILL_FORM}
-                _is_wait_action = action.action_type == ActionType.WAIT
-                if _is_input_action:
-                    before = None
-                else:
-                    before = await self._snapshot_page_state()
-                success = await self._execute_action(action)
-
-                # 优化3: WAIT 视觉变化检测 — 检测等待期间页面是否有变化
-                if success and _is_wait_action and settings.VISION_WAIT_CHANGE_DETECT:
-                    try:
-                        page = getattr(self.toolkit, '_page', None)
-                        if page and self._before_action_screenshot is not None:
-                            after_wait_img = await page.screenshot(type="jpeg", quality=50, full_page=False)
-                            from utils.image_diff import screenshots_differ
-                            if not screenshots_differ(self._before_action_screenshot, after_wait_img, threshold=settings.VISION_PIXEL_DIFF_THRESHOLD):
-                                log_agent_action(self.name, "wait", "no_visual_change_during_wait")
-                    except Exception:
-                        pass
-
-                if success and not _is_input_action and not _is_wait_action:
-                    await self._wait_for_page_ready()
-                    success = await self._verify_action_effect(before, action)
-                elif success and _is_input_action:
-                    # 输入动作只需等 DOM 就绪，无需 networkidle
-                    await self.toolkit.wait_for_load("domcontentloaded", timeout=3000)
-                    success = True  # 输入已执行成功即可，verify 在 post-action 阶段处理
-                if not success:
-                    recovery = self._recover_action(task, action, elements)
-                    if recovery:
-                        recovery_before = await self._snapshot_page_state()
-                        success = await self._execute_action(recovery)
-                        if success:
-                            await self._wait_for_page_ready()
-                            success = await self._verify_action_effect(recovery_before, recovery)
-                        if success:
-                            action = recovery
-                            self._record_action(action)
-                            last_action = action
-                            action_source = "local_recovery"
-                if not success:
-                    visual_recovery = await self._decide_action_with_vision(
-                        task,
-                        current_url_r.data or "",
-                        title_r.data or "",
-                        elements,
-                        task_intent,
-                        _accumulated_data or observed_data,
-                        snapshot=snapshot,
-                        last_action=action,
-                    )
-                    if visual_recovery and self._action_signature(visual_recovery) != self._action_signature(action):
-                        visual_before = await self._snapshot_page_state()
-                        success = await self._execute_action(visual_recovery)
-                        if success:
-                            await self._wait_for_page_ready()
-                            success = await self._verify_action_effect(visual_before, visual_recovery)
-                        if success:
-                            action = visual_recovery
-                            self._record_action(action)
-                            last_action = action
-                            action_source = "vision_recovery"
-
-                url_r = await tk.get_current_url()
-                steps.append({
-                    "step": step_no,
-                    "plan": action.description or action.action_type.value,
-                    "action": action.target_selector or action.action_type.value,
-                    "source": action_source,
-                    "observation": "success" if success else "failed",
-                    "decision": "continue" if success else "retry_or_fail",
-                    "action_type": action.action_type.value,
-                    "selector": action.target_selector,
-                    "value": action.value,
-                    "description": action.description,
-                    "result": "success" if success else "failed",
-                    "url": url_r.data or "",
-                })
-                from utils.structured_logger import get_structured_logger, LogContext
-                _sl = get_structured_logger()
-                with LogContext(agent="browser_agent", step_no=step_no):
-                    _sl.log_action(
-                        action_type=action.action_type.value,
-                        target=action.target_selector or "",
-                        confidence=action.confidence,
-                        result="success" if success else "failed",
-                    )
-                web_debug_recorder.write_json(
-                    f"browser_step_{step_no}_result",
-                    steps[-1],
-                )
-
-                # 每步执行后保存截图供调试 + 视觉进度追踪
-                _step_screenshot_bytes: Optional[bytes] = None
-                if web_debug_recorder.is_enabled():
-                    try:
-                        _sc = await self.toolkit.screenshot(full_page=False)
-                        if _sc.success and _sc.data:
-                            _step_screenshot_bytes = _sc.data
-                            web_debug_recorder.write_binary(
-                                f"browser_step_{step_no}_screenshot", _sc.data, ".png"
-                            )
-                    except Exception:
-                        pass
-
-                # 优化4: 视觉进度感知 — 检测连续截图无变化
-                if success and action.action_type not in {ActionType.DONE, ActionType.EXTRACT}:
-                    try:
-                        if _step_screenshot_bytes is None:
-                            page = getattr(self.toolkit, '_page', None)
-                            if page:
-                                _step_screenshot_bytes = await page.screenshot(type="jpeg", quality=50, full_page=False)
-                        if _step_screenshot_bytes and not _visual_tracker.record(_step_screenshot_bytes):
-                            log_agent_action(self.name, "progress", f"visual_stuck_detected_at_step_{step_no}")
-                            if self._is_read_only_task(task, task_intent):
-                                _merge_new_data(await self._extract_data_for_intent(task_intent))
-                                _final_screenshot = await self._capture_final_screenshot()
-                                url_r = await tk.get_current_url()
-                                return {"success": True, "message": "visually stuck, extracted current page",
-                                        "url": url_r.data or "", "steps": steps, "data": _accumulated_data,
-                                        "_page_screenshot": _final_screenshot}
-                    except Exception:
-                        pass
-
-                if not success:
-                    if action.action_type == ActionType.WAIT:
-                        continue
-                    _consecutive_fails = 0
-                    for _s in reversed(steps):
-                        if _s.get("result") == "failed":
-                            _consecutive_fails += 1
-                        else:
-                            break
-
-                    # 改进：不要立即跳过，先尝试恢复
-                    _max_fails = settings.BROWSER_MAX_CONSECUTIVE_FAILS
-                    if _consecutive_fails == 1:
-                        # 第一次失败：记录警告，但继续尝试（可能是临时问题）
-                        log_warning(f"step {step_no} 失败，将在下一步重新评估页面状态")
-                        await asyncio.sleep(1)
-                        continue
-                    elif _consecutive_fails == 2:
-                        # 第二次失败：尝试刷新页面或回退
-                        log_warning(f"连续2步失败，尝试刷新页面恢复")
-                        await tk.refresh()
-                        await self._wait_for_page_ready()
-                        continue
-                    elif _consecutive_fails >= _max_fails:
-                        # 达到容忍上限：放弃
-                        title_r = await tk.get_title()
-                        return {"success": False,
-                                "message": f"连续 {_consecutive_fails} 步失败，已尝试恢复但仍失败 (最后在 step {step_no})",
-                                "url": url_r.data or "", "title": title_r.data or "",
-                                "expected_url": expected_url,
-                                "steps": steps, "data": _accumulated_data or await self._extract_data_for_intent(task_intent)}
-                    else:
-                        # 中间失败：继续尝试，LLM可能换策略
-                        log_warning(f"连续{_consecutive_fails}步失败 (容忍上限{_max_fails})，继续尝试")
-                        continue
-
-                if action.action_type in {ActionType.CLICK, ActionType.INPUT, ActionType.FILL_FORM, ActionType.PRESS_KEY}:
-                    post_snapshot = await self._get_semantic_snapshot()
-                    post_elements = self._filter_noise_elements(self._elements_from_snapshot(post_snapshot))
-                    if post_elements:
-                        self._element_cache = post_elements[:40]
-                    else:
-                        post_elements = await self._extract_interactive_elements()
-                        post_snapshot = self._last_semantic_snapshot or post_snapshot
-                    # ⚡ 优化4: 缓存 post-action 结果供下一步 observe 复用
-                    _prefetched_elements = post_elements
-                    _prefetched_snapshot = post_snapshot
-                    step_data = await self._extract_data_for_intent(task_intent)
-                    _merge_new_data(step_data)
-                    candidate_data = _accumulated_data or step_data
-                    requires_data = self._is_read_only_task(task, task_intent) or task_intent.intent_type == "search"
-                    has_sufficient_data = bool(candidate_data)
-                    if task_intent.intent_type == "search" and candidate_data:
-                        has_sufficient_data = self._is_data_relevant(task_intent.query, candidate_data)
-                    if (
-                        self._task_looks_satisfied(
-                            task,
-                            url_r.data or "",
-                            task_intent,
-                            target_url=expected_url,
-                            snapshot=post_snapshot,
-                            elements=post_elements,
-                            data=candidate_data,
-                        )
-                        and (has_sufficient_data or not requires_data)
-                    ):
-                        title_r = await tk.get_title()
-                        _final_screenshot = await self._capture_final_screenshot()
-                        return {"success": True, "message": "task reached target page",
-                                "url": url_r.data or "", "title": title_r.data or "",
-                                "expected_url": expected_url,
-                                "steps": steps, "data": candidate_data or await self._extract_data_for_intent(task_intent),
-                                "_page_screenshot": _final_screenshot}
-
-                if action.action_type == ActionType.SCROLL:
-                    step_data = await self._extract_data_for_intent(task_intent)
-                    _merge_new_data(step_data)
-
-            # max steps reached
-            _merge_new_data(await self._extract_data_for_intent(task_intent))
-            # 补充: 始终追加 snapshot main_text
-            snapshot = self._last_semantic_snapshot or {}
-            main_text = self._get_snapshot_main_text(snapshot)
-            if main_text and len(main_text) >= 50:
-                _merge_new_data([{"text": main_text, "source": "page_main_text"}])
-            # 回退: 视觉提取
-            if not _accumulated_data:
-                vision_data = await self._extract_data_with_vision(task, task_intent, self._last_semantic_snapshot)
-                if vision_data:
-                    _merge_new_data(vision_data)
-            url_r = await tk.get_current_url()
-            title_r = await tk.get_title()
-            _final_screenshot = await self._capture_final_screenshot()
-            return {
-                "success": len(_accumulated_data) > 0,
-                "message": "max steps reached" + (f", but collected {len(_accumulated_data)} items" if _accumulated_data else ""),
-                "url": url_r.data or "", "title": title_r.data or "",
-                "expected_url": expected_url,
-                "steps": steps, "data": _accumulated_data,
-                "_page_screenshot": _final_screenshot,
-            }
+            return await self._build_final_result(task, task_intent, expected_url, steps, accumulated_data, seen_keys)
         except Exception as exc:
             log_error(f"browser task failed: {exc}")
             url_r = await tk.get_current_url()
             return {"success": False, "message": str(exc), "url": url_r.data or "", "expected_url": expected_url, "steps": steps}
         finally:
             web_debug_recorder.deactivate_trace(token)
-
 
 async def _run_browser_task_async(task: str, start_url: Optional[str] = None, headless: bool = True) -> Dict[str, Any]:
     agent = BrowserAgent(headless=headless)

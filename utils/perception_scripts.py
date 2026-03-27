@@ -125,6 +125,30 @@ const findVisibleAction = (selectors, matcher) => {
 const currentHost = cleanHost(location.hostname || '');
 const searchEngineHosts = ['google.com','bing.com','duckduckgo.com','baidu.com','sogou.com'];
 const isSearchHost = searchEngineHosts.some(h => currentHost === h || currentHost.endsWith('.'+h));
+
+// Shadow DOM deep-traversal helpers
+const querySelectorAllDeep = (selector, root) => {
+  root = root || document;
+  const results = Array.from(root.querySelectorAll(selector));
+  for (const el of Array.from(root.querySelectorAll('*'))) {
+    if (el.shadowRoot) {
+      results.push(...querySelectorAllDeep(selector, el.shadowRoot));
+    }
+  }
+  return results;
+};
+const querySelectorDeep = (selector, root) => {
+  root = root || document;
+  const found = root.querySelector(selector);
+  if (found) return found;
+  for (const el of Array.from(root.querySelectorAll('*'))) {
+    if (el.shadowRoot) {
+      const inner = querySelectorDeep(selector, el.shadowRoot);
+      if (inner) return inner;
+    }
+  }
+  return null;
+};
 """
 
 
@@ -1025,3 +1049,286 @@ def build_content_cards_script(
     script = script.replace("__CARD_SOURCE_CHARS__", str(int(card_source_chars)))
     script = script.replace("__CARD_SNIPPET_CHARS__", str(int(card_snippet_chars)))
     return script
+
+
+# ── Fallback semantic snapshot script (used by BrowserAgent._build_fallback_semantic_snapshot) ──
+
+SCRIPT_FALLBACK_SEMANTIC_SNAPSHOT = r"""() => {
+                const normalize = (v) => String(v || '').replace(/\s+/g, ' ').trim();
+                const bodyText = document.body && document.body.innerText ? document.body.innerText : '';
+                const blockCandidates = Array.from(document.querySelectorAll('main, article, section, [role="main"], [data-testid], p, h1, h2, h3, li'))
+                    .map((node) => {
+                        const text = normalize(node.innerText || node.textContent || '');
+                        if (!text) return null;
+                        const rect = node.getBoundingClientRect ? node.getBoundingClientRect() : { width: 0, height: 0 };
+                        return {
+                            text: text.slice(0, 320),
+                            tag: (node.tagName || '').toLowerCase(),
+                            role: node.getAttribute ? (node.getAttribute('role') || '') : '',
+                            width: Math.round(rect.width || 0),
+                            height: Math.round(rect.height || 0),
+                        };
+                    })
+                    .filter(Boolean)
+                    .slice(0, 16);
+
+                // 提取交互元素（简化版）
+                const isVisible = (el) => {
+                    if (!el) return false;
+                    const rect = el.getBoundingClientRect();
+                    return rect.width > 0 && rect.height > 0;
+                };
+                const selectorOf = (el) => {
+                    if (!el) return '';
+                    if (el.id) return '#' + el.id;
+                    const name = el.getAttribute('name');
+                    if (name) return el.tagName.toLowerCase() + '[name="' + name + '"]';
+                    const ph = el.getAttribute('placeholder');
+                    if (ph) return el.tagName.toLowerCase() + '[placeholder="' + ph + '"]';
+                    const href = el.getAttribute('href');
+                    if (href && href.length <= 120) return el.tagName.toLowerCase() + '[href="' + href + '"]';
+                    return el.tagName.toLowerCase();
+                };
+
+                // Shadow DOM deep-traversal helper (inline for standalone script)
+                const querySelectorAllDeep = (selector, root) => {
+                    root = root || document;
+                    const results = Array.from(root.querySelectorAll(selector));
+                    for (const el of Array.from(root.querySelectorAll('*'))) {
+                        if (el.shadowRoot) results.push(...querySelectorAllDeep(selector, el.shadowRoot));
+                    }
+                    return results;
+                };
+                const interactiveNodes = querySelectorAllDeep(
+                    'a[href], button, input:not([type="hidden"]), textarea, select, [role="button"], [role="link"], [contenteditable="true"]'
+                ).filter(isVisible).slice(0, 60);
+
+                const elements = interactiveNodes.map((el, idx) => {
+                    const tag = el.tagName.toLowerCase();
+                    const inputType = normalize(el.getAttribute('type') || '').toLowerCase();
+                    let role = normalize(el.getAttribute('role') || '').toLowerCase();
+                    if (!role) {
+                        if (tag === 'a') role = 'link';
+                        else if (tag === 'button') role = 'button';
+                        else if (tag === 'input') role = (inputType === 'search') ? 'searchbox' : 'textbox';
+                        else if (tag === 'textarea') role = 'textbox';
+                        else if (tag === 'select') role = 'combobox';
+                        else role = tag;
+                    }
+                    return {
+                        ref: 'el_' + (idx + 1),
+                        role: role,
+                        tag: tag,
+                        type: inputType || tag,
+                        text: normalize(el.innerText || el.textContent || el.value || el.getAttribute('aria-label') || el.getAttribute('placeholder') || '').slice(0, 160),
+                        href: el.href || el.getAttribute('href') || '',
+                        value: typeof el.value === 'string' ? String(el.value || '').slice(0, 160) : '',
+                        label: '',
+                        placeholder: normalize(el.getAttribute('placeholder') || '').slice(0, 120),
+                        selector: selectorOf(el),
+                        visible: true,
+                        enabled: !el.disabled,
+                        region: 'body',
+                    };
+                });
+
+                // 检测 modal
+                const hasModal = !!document.querySelector('dialog[open], [role="dialog"], [aria-modal="true"], .modal.show');
+
+                // 检测搜索框
+                const searchInput = document.querySelector('input[type="search"], input[name*="search"], input[placeholder*="search" i], input[placeholder*="搜索"]');
+                const hasSearchBox = !!searchInput;
+                const searchSelector = searchInput ? selectorOf(searchInput) : '';
+
+                // 检测当前焦点元素（对于刚打开的 modal 很重要）
+                const focused = document.activeElement;
+                let focusedInfo = null;
+                if (focused && focused !== document.body && isVisible(focused)) {
+                    focusedInfo = {
+                        tag: focused.tagName.toLowerCase(),
+                        type: normalize(focused.getAttribute('type') || '').toLowerCase(),
+                        selector: selectorOf(focused),
+                        placeholder: normalize(focused.getAttribute('placeholder') || ''),
+                        role: normalize(focused.getAttribute('role') || ''),
+                    };
+                }
+
+                return {
+                    bodyText: bodyText.slice(0, 6000),
+                    visibleTextBlocks: blockCandidates,
+                    elements: elements,
+                    hasModal: hasModal,
+                    hasSearchBox: hasSearchBox,
+                    searchSelector: searchSelector,
+                    focusedElement: focusedInfo,
+                };
+            }"""
+
+
+# ── Interactive element extraction script (used by BrowserAgent._extract_interactive_elements) ──
+
+SCRIPT_EXTRACT_INTERACTIVE_ELEMENTS = r"""
+            () => {
+              // Shadow DOM deep-traversal helper
+              const querySelectorAllDeep = (selector, root) => {
+                root = root || document;
+                const results = Array.from(root.querySelectorAll(selector));
+                for (const el of Array.from(root.querySelectorAll('*'))) {
+                  if (el.shadowRoot) results.push(...querySelectorAllDeep(selector, el.shadowRoot));
+                }
+                return results;
+              };
+              // 🔥 扩展选择器：同时提取交互元素和内容元素（含 Shadow DOM）
+              const interactiveNodes = querySelectorAllDeep('a, button, input, textarea, select, [role="button"], [role="link"], [contenteditable="true"]');
+
+              function textOf(el) {
+                return (el.innerText || el.textContent || '').replace(/\s+/g, ' ').trim();
+              }
+              function isVisible(el) {
+                const rects = el.getClientRects();
+                return !!(el.offsetWidth || el.offsetHeight || rects.length);
+              }
+              function labelOf(el) {
+                if (el.labels && el.labels.length) {
+                  return Array.from(el.labels).map(x => textOf(x)).filter(Boolean).join(' ');
+                }
+                const id = el.getAttribute('id');
+                if (id) {
+                  const label = document.querySelector(`label[for="${id}"]`);
+                  if (label) return textOf(label);
+                }
+                const parent = el.closest('label');
+                return parent ? textOf(parent) : '';
+              }
+              function selectorOf(el) {
+                if (el.id) return `#${CSS.escape(el.id)}`;
+                const name = el.getAttribute('name');
+                if (name) return `${el.tagName.toLowerCase()}[name="${CSS.escape(name)}"]`;
+                const placeholder = el.getAttribute('placeholder');
+                if (placeholder) return `${el.tagName.toLowerCase()}[placeholder="${CSS.escape(placeholder)}"]`;
+                const parts = [];
+                let cur = el;
+                while (cur && cur.nodeType === 1 && parts.length < 4) {
+                  let part = cur.tagName.toLowerCase();
+                  const parent = cur.parentElement;
+                  if (parent) {
+                    const siblings = Array.from(parent.children).filter(x => x.tagName === cur.tagName);
+                    if (siblings.length > 1) {
+                      part += `:nth-of-type(${siblings.indexOf(cur) + 1})`;
+                    }
+                  }
+                  parts.unshift(part);
+                  cur = parent;
+                }
+                return parts.join(' > ');
+              }
+              function normalizedType(el) {
+                const tag = el.tagName.toLowerCase();
+                const inputType = (el.getAttribute('type') || '').toLowerCase();
+                if (tag === 'a') return 'link';
+                if (tag === 'button') return 'button';
+                if (tag === 'input' && ['submit', 'button', 'reset'].includes(inputType)) return 'button';
+                if (tag === 'input' && inputType) return inputType;
+                return (inputType || tag);
+              }
+
+              // 🔥 新增：提取元素周围的上下文文本
+              function extractContext(el) {
+                const contextBefore = [];
+                const contextAfter = [];
+
+                // 向前查找文本节点（最多3个兄弟节点）
+                let prev = el.previousSibling;
+                let count = 0;
+                while (prev && count < 3) {
+                  if (prev.nodeType === Node.TEXT_NODE) {
+                    const text = textOf(prev);
+                    if (text.length > 0) {
+                      contextBefore.unshift(text);
+                      count++;
+                    }
+                  } else if (prev.nodeType === Node.ELEMENT_NODE) {
+                    const text = textOf(prev);
+                    if (text.length > 0 && text.length < 200) {
+                      contextBefore.unshift(text);
+                      count++;
+                    }
+                  }
+                  prev = prev.previousSibling;
+                }
+
+                // 向后查找文本节点（最多3个兄弟节点）
+                let next = el.nextSibling;
+                count = 0;
+                while (next && count < 3) {
+                  if (next.nodeType === Node.TEXT_NODE) {
+                    const text = textOf(next);
+                    if (text.length > 0) {
+                      contextAfter.push(text);
+                      count++;
+                    }
+                  } else if (next.nodeType === Node.ELEMENT_NODE) {
+                    const text = textOf(next);
+                    if (text.length > 0 && text.length < 200) {
+                      contextAfter.push(text);
+                      count++;
+                    }
+                  }
+                  next = next.nextSibling;
+                }
+
+                // 如果兄弟节点没有上下文，尝试从父元素提取
+                if (contextBefore.length === 0 && contextAfter.length === 0) {
+                  const parent = el.parentElement;
+                  if (parent) {
+                    const parentText = textOf(parent);
+                    const elementText = textOf(el);
+                    // 提取父元素中不属于当前元素的文本
+                    const beforeText = parentText.split(elementText)[0];
+                    const afterText = parentText.split(elementText)[1];
+                    if (beforeText && beforeText.length > 0) {
+                      contextBefore.push(beforeText.slice(-100));
+                    }
+                    if (afterText && afterText.length > 0) {
+                      contextAfter.push(afterText.slice(0, 100));
+                    }
+                  }
+                }
+
+                return {
+                  before: contextBefore.join(' ').slice(0, 150),
+                  after: contextAfter.join(' ').slice(0, 150)
+                };
+              }
+
+              return interactiveNodes
+                .filter(el => isVisible(el))
+                .slice(0, 60)
+                .map((el, idx) => {
+                  const context = extractContext(el);
+                  return {
+                    index: idx,
+                    tag: el.tagName.toLowerCase(),
+                    text: textOf(el).slice(0, 160),
+                    element_type: normalizedType(el),
+                    selector: selectorOf(el),
+                    attributes: {
+                      id: el.getAttribute('id') || '',
+                      name: el.getAttribute('name') || '',
+                      type: el.getAttribute('type') || '',
+                      role: el.getAttribute('role') || '',
+                      href: el.getAttribute('href') || '',
+                      value: (typeof el.value === 'string' ? el.value : '') || '',
+                      placeholder: el.getAttribute('placeholder') || '',
+                      ariaLabel: el.getAttribute('aria-label') || '',
+                      title: el.getAttribute('title') || '',
+                      labelText: labelOf(el).slice(0, 120),
+                    },
+                    is_visible: true,
+                    is_clickable: !el.disabled,
+                    context_before: context.before,
+                    context_after: context.after,
+                  };
+                });
+            }
+            """

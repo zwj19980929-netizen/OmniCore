@@ -440,6 +440,62 @@ class LLMClient:
         current = str(api_base or "").rstrip("/")
         return cls.MINIMAX_ALT_BASE.get(current, "")
 
+    def _build_chat_kwargs(
+        self,
+        clean_messages: list,
+        temperature: float,
+        max_tokens: int,
+        json_mode: bool,
+    ) -> dict:
+        """构建 LLM 调用参数（chat 与 achat 共用）。"""
+        kwargs = {
+            "model": self._get_litellm_model(),
+            "messages": clean_messages,
+            "temperature": temperature,
+            "max_tokens": self._safe_max_tokens(max_tokens),
+            "timeout": 120,
+            **self._get_extra_kwargs(),
+        }
+        if json_mode:
+            kwargs["response_format"] = {"type": "json_object"}
+        return kwargs
+
+    def _build_llm_response(self, response, kwargs: dict, call_start: float) -> "LLMResponse":
+        """从原始 LLM 响应构建 LLMResponse，处理空内容/拒绝，记录结构化日志（chat 与 achat 共用）。"""
+        content = sanitize_text(response.choices[0].message.content or "")
+        if not content:
+            refusal = getattr(response.choices[0].message, "refusal", None)
+            if refusal:
+                logger.error(f"LLM 拒绝回答: {refusal}")
+                content = (
+                    f'{{"intent": "unknown", "confidence": 0, '
+                    f'"reasoning": "模型拒绝: {refusal}", "tasks": [], "is_high_risk": false}}'
+                )
+            else:
+                logger.error(f"LLM 返回空内容, finish_reason: {response.choices[0].finish_reason}")
+                content = (
+                    '{"intent": "unknown", "confidence": 0, '
+                    '"reasoning": "模型返回空内容", "tasks": [], "is_high_risk": false}'
+                )
+
+        call_duration_ms = (_time.time() - call_start) * 1000
+        get_structured_logger().log_llm_call(
+            model=response.model or kwargs.get("model", "unknown"),
+            tokens_in=response.usage.prompt_tokens,
+            tokens_out=response.usage.completion_tokens,
+            duration_ms=call_duration_ms,
+        )
+        return LLMResponse(
+            content=content,
+            model=response.model,
+            usage={
+                "prompt_tokens": response.usage.prompt_tokens,
+                "completion_tokens": response.usage.completion_tokens,
+                "total_tokens": response.usage.total_tokens,
+            },
+            raw_response=response,
+        )
+
     def chat(
         self,
         messages: List[Dict[str, str]],
@@ -473,22 +529,10 @@ class LLMClient:
                     json_mode=json_mode,
                 )
 
-            kwargs = {
-                "model": self._get_litellm_model(),
-                "messages": clean_messages,
-                "temperature": temperature,
-                "max_tokens": self._safe_max_tokens(max_tokens),
-                "timeout": 120,
-                **self._get_extra_kwargs(),
-            }
-            if json_mode:
-                kwargs["response_format"] = {"type": "json_object"}
-
-            # 🔥 添加调用开始日志
+            kwargs = self._build_chat_kwargs(clean_messages, temperature, max_tokens, json_mode)
             logger.info(f"LLM 调用开始: model={kwargs['model']}, max_tokens={kwargs['max_tokens']}, timeout=120s")
             _call_start = _time.time()
 
-            # 🔥 添加网络错误重试机制（最多重试 3 次）
             max_retries = 3
             last_error = None
 
@@ -497,12 +541,11 @@ class LLMClient:
                     if attempt > 0:
                         logger.info(f"LLM 调用重试 {attempt}/{max_retries}...")
                     response = completion(**kwargs)
-                    break  # 成功则跳出重试循环
+                    break
                 except Exception as first_error:
                     last_error = first_error
                     error_str = str(first_error).lower()
 
-                    # 检查是否为网络连接错误
                     is_network_error = any(keyword in error_str for keyword in [
                         "peer closed connection",
                         "incomplete chunked read",
@@ -514,14 +557,13 @@ class LLMClient:
 
                     if is_network_error and attempt < max_retries - 1:
                         import time
-                        wait_time = (attempt + 1) * 2  # 2s, 4s, 6s
+                        wait_time = (attempt + 1) * 2
                         logger.warning(
                             f"LLM 网络连接错误，{wait_time}秒后重试 ({attempt + 1}/{max_retries}): {error_str[:100]}"
                         )
                         time.sleep(wait_time)
                         continue
 
-                    # 尝试 max_tokens 降级
                     retry_kwargs = self._maybe_get_reduced_max_tokens_kwargs(kwargs, first_error)
                     if retry_kwargs is not None:
                         logger.warning(
@@ -531,7 +573,6 @@ class LLMClient:
                         response = completion(**retry_kwargs)
                         break
 
-                    # 尝试 MiniMax fallback
                     fallback_base = self._maybe_get_minimax_fallback_base(
                         provider=self._get_provider_from_model(),
                         api_base=str(kwargs.get("api_base", "") or ""),
@@ -547,40 +588,11 @@ class LLMClient:
                         response = completion(**retry_kwargs)
                         break
 
-                    # 如果不是网络错误或已达最大重试次数，抛出异常
                     raise
             else:
-                # 所有重试都失败
                 raise last_error if last_error else Exception("LLM 调用失败")
 
-            content = sanitize_text(response.choices[0].message.content or "")
-            if not content:
-                refusal = getattr(response.choices[0].message, 'refusal', None)
-                if refusal:
-                    logger.error(f"LLM 拒绝回答: {refusal}")
-                    content = f'{{"intent": "unknown", "confidence": 0, "reasoning": "模型拒绝: {refusal}", "tasks": [], "is_high_risk": false}}'
-                else:
-                    logger.error(f"LLM 返回空内容, finish_reason: {response.choices[0].finish_reason}")
-                    content = '{"intent": "unknown", "confidence": 0, "reasoning": "模型返回空内容", "tasks": [], "is_high_risk": false}'
-
-            _call_duration_ms = (_time.time() - _call_start) * 1000
-            get_structured_logger().log_llm_call(
-                model=response.model or kwargs.get("model", "unknown"),
-                tokens_in=response.usage.prompt_tokens,
-                tokens_out=response.usage.completion_tokens,
-                duration_ms=_call_duration_ms,
-            )
-
-            return LLMResponse(
-                content=content,
-                model=response.model,
-                usage={
-                    "prompt_tokens": response.usage.prompt_tokens,
-                    "completion_tokens": response.usage.completion_tokens,
-                    "total_tokens": response.usage.total_tokens,
-                },
-                raw_response=response,
-            )
+            return self._build_llm_response(response, kwargs, _call_start)
 
         except Exception as e:
             logger.error(f"LLM 调用失败: {e}")
@@ -620,34 +632,21 @@ class LLMClient:
                     json_mode,
                 )
 
-            kwargs = {
-                "model": self._get_litellm_model(),
-                "messages": clean_messages,
-                "temperature": temperature,
-                "max_tokens": self._safe_max_tokens(max_tokens),
-                "timeout": 120,
-                **self._get_extra_kwargs(),
-            }
-
-            if json_mode:
-                kwargs["response_format"] = {"type": "json_object"}
-
-            # 🔥 添加调用开始日志
+            kwargs = self._build_chat_kwargs(clean_messages, temperature, max_tokens, json_mode)
             logger.info(f"LLM 异步调用开始: model={kwargs['model']}, max_tokens={kwargs['max_tokens']}, timeout=120s")
+            _call_start = _time.time()
 
-            # 🔥 添加网络错误重试机制（最多重试 3 次）
             max_retries = 3
             last_error = None
 
             for attempt in range(max_retries):
                 try:
                     response = await acompletion(**kwargs)
-                    break  # 成功则跳出重试循环
+                    break
                 except Exception as first_error:
                     last_error = first_error
                     error_str = str(first_error).lower()
 
-                    # 检查是否为网络连接错误
                     is_network_error = any(keyword in error_str for keyword in [
                         "peer closed connection",
                         "incomplete chunked read",
@@ -658,14 +657,13 @@ class LLMClient:
                     ])
 
                     if is_network_error and attempt < max_retries - 1:
-                        wait_time = (attempt + 1) * 2  # 2s, 4s, 6s
+                        wait_time = (attempt + 1) * 2
                         logger.warning(
                             f"LLM 网络连接错误，{wait_time}秒后重试 ({attempt + 1}/{max_retries}): {error_str[:100]}"
                         )
                         await asyncio.sleep(wait_time)
                         continue
 
-                    # 尝试 max_tokens 降级
                     retry_kwargs = self._maybe_get_reduced_max_tokens_kwargs(kwargs, first_error)
                     if retry_kwargs is not None:
                         logger.warning(
@@ -675,7 +673,6 @@ class LLMClient:
                         response = await acompletion(**retry_kwargs)
                         break
 
-                    # 尝试 MiniMax fallback
                     fallback_base = self._maybe_get_minimax_fallback_base(
                         provider=self._get_provider_from_model(),
                         api_base=str(kwargs.get("api_base", "") or ""),
@@ -691,22 +688,11 @@ class LLMClient:
                         response = await acompletion(**retry_kwargs)
                         break
 
-                    # 如果不是网络错误或已达最大重试次数，抛出异常
                     raise
             else:
-                # 所有重试都失败
                 raise last_error if last_error else Exception("LLM 调用失败")
 
-            return LLMResponse(
-                content=sanitize_text(response.choices[0].message.content or ""),
-                model=response.model,
-                usage={
-                    "prompt_tokens": response.usage.prompt_tokens,
-                    "completion_tokens": response.usage.completion_tokens,
-                    "total_tokens": response.usage.total_tokens,
-                },
-                raw_response=response,
-            )
+            return self._build_llm_response(response, kwargs, _call_start)
 
         except Exception as e:
             logger.error(f"异步 LLM 调用失败: {e}")
@@ -738,9 +724,10 @@ class LLMClient:
 
     def parse_json_response(self, response: LLMResponse) -> Dict[str, Any]:
         """
-        解析 JSON 格式的响应
+        解析 JSON 格式的响应。
+        尝试顺序: Markdown 代码块提取 → 大括号匹配 → 正则提取。
+        对原始内容和双大括号标准化版本各尝试一次。
         """
-        import re
         content = response.content.strip()
         candidates = [content]
         normalized_braces = content.replace("{{", "{").replace("}}", "}")
@@ -795,55 +782,7 @@ class LLMClient:
             if parsed is not None:
                 return parsed
 
-        # 尝试提取 JSON 块
-        if "```json" in content:
-            start = content.find("```json") + 7
-            end = content.find("```", start)
-            content = content[start:end].strip()
-        elif "```" in content:
-            start = content.find("```") + 3
-            end = content.find("```", start)
-            content = content[start:end].strip()
-
-        # 尝试直接解析
-        try:
-            return json.loads(content)
-        except json.JSONDecodeError:
-            pass
-
-        # 尝试提取第一个完整的 JSON 对象
-        try:
-            # 找到第一个 { 和匹配的 }
-            brace_count = 0
-            start_idx = -1
-            end_idx = -1
-
-            for i, char in enumerate(content):
-                if char == '{':
-                    if start_idx == -1:
-                        start_idx = i
-                    brace_count += 1
-                elif char == '}':
-                    brace_count -= 1
-                    if brace_count == 0 and start_idx != -1:
-                        end_idx = i + 1
-                        break
-
-            if start_idx != -1 and end_idx != -1:
-                json_str = content[start_idx:end_idx]
-                return json.loads(json_str)
-        except json.JSONDecodeError:
-            pass
-
-        # 尝试用正则提取
-        try:
-            json_match = re.search(r'\{[\s\S]*\}', content)
-            if json_match:
-                return json.loads(json_match.group(0))
-        except json.JSONDecodeError:
-            pass
-
-        logger.error(f"JSON 解析失败")
+        logger.error("JSON 解析失败")
         logger.error(f"原始内容: {content[:500]}")
         raise ValueError(f"无法解析 JSON: {content[:200]}")
 

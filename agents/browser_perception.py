@@ -21,6 +21,7 @@ from utils.browser_toolkit import BrowserToolkit, ToolkitResult
 from utils.enhanced_page_perceiver import EnhancedPagePerceiver, PageContent
 from utils.logger import log_agent_action, log_warning
 from utils.prompt_manager import get_prompt
+from utils.perception_scripts import SCRIPT_EXTRACT_INTERACTIVE_ELEMENTS
 import utils.web_debug_recorder as web_debug_recorder
 
 from agents.browser_agent import (
@@ -434,6 +435,35 @@ class BrowserPerceptionLayer:
         except Exception:
             return None
 
+    # ── iframe element extraction ────────────────────────────
+
+    async def _extract_iframe_elements(self) -> List[Dict[str, Any]]:
+        """Extract interactive elements from all accessible non-main frames.
+
+        Elements are tagged with region="iframe" and carry a frame_url field
+        so the decision layer can distinguish them from main-frame elements.
+        Cross-origin frames that block JS execution are silently skipped.
+        """
+        page = getattr(self.toolkit, '_page', None)
+        if not page:
+            return []
+        iframe_elements: List[Dict[str, Any]] = []
+        for frame in page.frames:
+            if frame == page.main_frame or frame.is_detached():
+                continue
+            try:
+                raw = await frame.evaluate(SCRIPT_EXTRACT_INTERACTIVE_ELEMENTS)
+                if not isinstance(raw, list):
+                    continue
+                for el in raw:
+                    if isinstance(el, dict):
+                        el["region"] = "iframe"
+                        el["frame_url"] = frame.url
+                        iframe_elements.append(el)
+            except Exception:
+                continue  # cross-origin / detached frames may raise
+        return iframe_elements
+
     # ── Unified observe pipeline ─────────────────────────────
 
     async def observe(self, get_snapshot_fn) -> PageObservation:
@@ -469,6 +499,16 @@ class BrowserPerceptionLayer:
                     log_agent_action(self.name, "observe", f"a11y_elements={len(a11y_elements)}")
             except Exception as exc:
                 log_warning(f"a11y extraction failed: {exc}")
+
+        # iframe element extraction
+        try:
+            iframe_elems = await self._extract_iframe_elements()
+            if iframe_elems:
+                existing = snapshot.get("elements") or []
+                snapshot["elements"] = list(existing) + iframe_elems
+                log_agent_action(self.name, "observe", f"iframe_elements={len(iframe_elems)}")
+        except Exception as exc:
+            log_warning(f"iframe element extraction failed: {exc}")
 
         # Perceiver content
         page_content: Optional[PageContent] = None

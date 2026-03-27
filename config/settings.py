@@ -187,9 +187,14 @@ class Settings:
     VISION_PERCEPTION_COMPLEXITY_THRESHOLD = float(os.getenv("VISION_PERCEPTION_COMPLEXITY_THRESHOLD", "0.4"))
     VISION_ON_NEW_PAGE = os.getenv("VISION_ON_NEW_PAGE", "true").lower() == "true"
     VISION_VERIFY_ACTION = os.getenv("VISION_VERIFY_ACTION", "true").lower() == "true"
-    VISION_PIXEL_DIFF_THRESHOLD = float(os.getenv("VISION_PIXEL_DIFF_THRESHOLD", "0.02"))
+    VISION_PIXEL_DIFF_THRESHOLD = float(os.getenv("VISION_PIXEL_DIFF_THRESHOLD", "0.05"))
     VISION_WAIT_CHANGE_DETECT = os.getenv("VISION_WAIT_CHANGE_DETECT", "true").lower() == "true"
     VISION_PROGRESS_WINDOW = int(os.getenv("VISION_PROGRESS_WINDOW", "3"))
+    # Vision budget / rate-limiting
+    VISION_MAX_CALLS_PER_RUN = int(os.getenv("VISION_MAX_CALLS_PER_RUN", "5"))
+    VISION_COOLDOWN_SECONDS = float(os.getenv("VISION_COOLDOWN_SECONDS", "3.0"))
+    VISION_MAX_TOKENS_PER_RUN = int(os.getenv("VISION_MAX_TOKENS_PER_RUN", "20000"))
+    VISION_CALL_TIMEOUT = int(os.getenv("VISION_CALL_TIMEOUT", "30000"))  # ms, 短于全局超时
 
     # === 页面感知配置 ===
     # 传给 LLM 的主文本字符上限（detail/list/serp 页面）

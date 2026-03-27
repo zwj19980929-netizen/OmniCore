@@ -21,8 +21,10 @@ from utils.logger import log_agent_action, log_error, log_warning
 from utils.search_engine_profiles import (
     build_direct_search_urls,
     decode_search_redirect_url,
+    find_search_engine_profile,
     get_search_result_selectors,
     is_search_engine_domain,
+    validate_selectors,
 )
 import utils.web_debug_recorder as web_debug_recorder
 
@@ -48,9 +50,11 @@ class BrowserExecutionLayer:
         self,
         toolkit: BrowserToolkit,
         agent_name: str = "BrowserAgent",
+        perception=None,
     ):
         self.toolkit = toolkit
         self.name = agent_name
+        self.perception = perception  # Optional[BrowserPerceptionLayer]
 
         # Element cache for fallback strategies
         self._element_cache: List[PageElement] = []
@@ -500,6 +504,21 @@ class BrowserExecutionLayer:
         if not is_search_engine_domain(current_url):
             return []
 
+        # Log selector health when a known profile is active
+        profile = find_search_engine_profile(current_url)
+        if profile:
+            try:
+                health = await validate_selectors(self.toolkit, profile)
+                if health["health_score"] < 0.5:
+                    log_warning(
+                        "search selector health low",
+                        engine=profile.name,
+                        health_score=health["health_score"],
+                        failed=health["primary_failed"],
+                    )
+            except Exception as _exc:
+                pass  # health check is advisory only
+
         # Try cards from semantic snapshot first (handled by orchestrator via perception layer)
         # This method focuses on the JS-based extraction fallback
         selectors = get_search_result_selectors(current_url)
@@ -619,7 +638,22 @@ class BrowserExecutionLayer:
             """,
             {"selectors": selectors},
         )
-        return r.data if r.success and isinstance(r.data, list) else []
+        cards = r.data if r.success and isinstance(r.data, list) else []
+
+        # Vision fallback: when all CSS selectors fail, ask the vision model to extract results
+        if not cards and self.perception is not None:
+            try:
+                vision_cards = await self.perception.extract_data_with_vision(
+                    task="extract search results",
+                    task_intent=TaskIntent(intent_type="search", query="", confidence=0.5),
+                )
+                if vision_cards:
+                    log_warning("CSS selectors failed, fell back to vision extraction")
+                    cards = vision_cards
+            except Exception as _exc:
+                pass  # vision fallback is best-effort
+
+        return cards
 
     # ── Search bootstrap ─────────────────────────────────────
 

@@ -181,6 +181,20 @@ class RouterAgent:
     负责意图识别和任务拆解
     """
 
+    # 工具匹配评分权重 — 调整此处可微调路由准确度，无需改动评分逻辑
+    _SCORE_WEIGHTS = {
+        "exact_tool_name": 10,        # 工具名精确出现在文本中
+        "exact_task_type": 7,         # 任务类型精确出现在文本中
+        "name_token_match": 4,        # 工具名 token 与文本 token 交集
+        "task_type_token_match": 3,   # 任务类型 token 与文本 token 交集
+        "tag_token_match": 2,         # 标签 token 与文本 token 交集
+        "description_token_cap": 6,   # 描述 token 匹配上限
+        "schema_key_exact_match": 6,  # Schema key 与参数 key 精确匹配
+        "schema_token_match": 3,      # Schema token 与参数 token 交集
+        "fallback_param_token_match": 2,  # 无 Schema 时的参数 token 匹配
+        "param_text_overlap": 1,      # 参数 token 与文本 token 交集
+    }
+
     def __init__(self, llm_client: LLMClient = None):
         self.llm = llm_client or LLMClient()
         self.name = "Router"
@@ -421,12 +435,13 @@ class RouterAgent:
         spec = registered_tool.spec
         score = 0
 
+        w = cls._SCORE_WEIGHTS
         tool_name = str(spec.name or "")
         task_type = str(spec.task_type or "")
         if tool_name and tool_name.lower() in lowered:
-            score += 10
+            score += w["exact_tool_name"]
         if task_type and task_type.lower() in lowered:
-            score += 7
+            score += w["exact_task_type"]
 
         name_tokens = cls._tokenize_text(tool_name.replace(".", " ").replace("_", " "))
         task_type_tokens = cls._tokenize_text(task_type.replace(".", " ").replace("_", " "))
@@ -435,18 +450,18 @@ class RouterAgent:
         schema_keys = {item.lower() for item in cls._collect_schema_keys(spec.input_schema)}
         schema_tokens = cls._tokenize_text(" ".join(schema_keys))
 
-        score += 4 * len(text_tokens & name_tokens)
-        score += 3 * len(text_tokens & task_type_tokens)
-        score += 2 * len(text_tokens & tag_tokens)
-        score += min(6, len(text_tokens & description_tokens))
+        score += w["name_token_match"] * len(text_tokens & name_tokens)
+        score += w["task_type_token_match"] * len(text_tokens & task_type_tokens)
+        score += w["tag_token_match"] * len(text_tokens & tag_tokens)
+        score += min(w["description_token_cap"], len(text_tokens & description_tokens))
 
         if schema_keys:
-            score += 6 * len(param_keys & schema_keys)
-            score += 3 * len(param_tokens & schema_tokens)
+            score += w["schema_key_exact_match"] * len(param_keys & schema_keys)
+            score += w["schema_token_match"] * len(param_tokens & schema_tokens)
         else:
-            score += 2 * len(param_tokens & (name_tokens | tag_tokens | description_tokens))
+            score += w["fallback_param_token_match"] * len(param_tokens & (name_tokens | tag_tokens | description_tokens))
 
-        score += len(param_tokens & text_tokens)
+        score += w["param_text_overlap"] * len(param_tokens & text_tokens)
         return score
 
     @classmethod
