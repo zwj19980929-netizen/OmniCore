@@ -283,6 +283,15 @@ def main():
     if quick_task:
         st.session_state.pending_input = quick_task
 
+    # 多模态文件上传区
+    uploaded_file = st.file_uploader(
+        "附件（图片/文档/语音）",
+        type=["png", "jpg", "jpeg", "webp", "gif", "pdf", "docx", "txt", "md", "csv",
+              "mp3", "wav", "m4a", "ogg"],
+        label_visibility="collapsed",
+        key="multimodal_upload",
+    )
+
     # 用户输入
     user_input = st.chat_input("输入你的指令...")
 
@@ -291,8 +300,42 @@ def main():
         user_input = st.session_state.pending_input
         st.session_state.pending_input = None
 
+    # 有上传文件时也触发提交（即使无文字输入）
+    if uploaded_file and not user_input:
+        user_input = f"(附件: {uploaded_file.name})"
+
     if user_input:
         timestamp = datetime.now().strftime("%H:%M:%S")
+
+        # 多模态文件预处理：将附件转换为文本后注入 user_input
+        if uploaded_file:
+            import tempfile
+            import os as _os
+            from utils.multimodal_input import (
+                MultimodalInputProcessor,
+                build_multimodal_input,
+            )
+
+            with tempfile.NamedTemporaryFile(
+                suffix=_os.path.splitext(uploaded_file.name)[1],
+                delete=False,
+            ) as tmp:
+                tmp.write(uploaded_file.read())
+                tmp_path = tmp.name
+
+            try:
+                text_hint = user_input if user_input != f"(附件: {uploaded_file.name})" else ""
+                inp = build_multimodal_input(tmp_path, text_hint)
+                if inp:
+                    processor = MultimodalInputProcessor()
+                    processed = processor.process(inp)
+                    if processed:
+                        user_input = processed
+            finally:
+                try:
+                    _os.unlink(tmp_path)
+                except OSError:
+                    pass
 
         # 添加用户消息
         st.session_state.messages.append({

@@ -47,6 +47,21 @@ All 7 directions of the architecture upgrade are now integrated into the runtime
 
 **Known test state**: 304 passed, 24 failed (pre-existing failures in `test_web_worker_unit.py` and `test_web_worker_perception.py`, unrelated to the upgrade).
 
+## 能力拓展方向（未实施）
+
+详细方案见 [`docs/2026-03-28-能力拓展方向规划.md`](docs/2026-03-28-能力拓展方向规划.md)，共 8 个方向：
+
+| 优先级 | 方向 | 状态 |
+|--------|------|------|
+| P0 | MCP 工具生态接入 | ⬜ 未开始 |
+| P0 | Skill Library 经验复用 | ⬜ 未开始 |
+| P1 | IM Bot 远程访问 | ⬜ 未开始 |
+| P1 | 知识库 RAG 深度集成 | ⬜ 未开始 |
+| P2 | 多模态输入/输出 | ✅ 已完成 (2026-03-28) |
+| P2 | 成本感知智能路由 | ⬜ 未开始 |
+| P3 | 事件驱动信息流 | ⬜ 未开始 |
+| P3 | 多 Agent 协作 | ⬜ 未开始 |
+
 ## Current Work In Progress
 
 ### 已完成: 天气硬编码清理 (2026-03-24)
@@ -66,9 +81,9 @@ All 7 directions of the architecture upgrade are now integrated into the runtime
 | WAIT 视觉变化检测 | P1 | ✅ 已完成 |
 | 连续截图进度感知 | P2 | ✅ 已完成 |
 
-### 已完成: 代码架构重构 (2026-03-27)
+### 已完成: 代码架构重构 + 网页操作健壮性优化 (2026-03-27, 加固 2026-03-28)
 
-两份优化方案已完成设计，覆盖 9 个已识别的技术债务项：
+两份优化方案已全部实施并加固，覆盖 9 个已识别的技术债务项：
 
 | 文档 | 覆盖范围 | 优先级分布 |
 |------|---------|-----------|
@@ -91,7 +106,21 @@ All 7 directions of the architecture upgrade are now integrated into the runtime
 
 | 任务 | 状态 | 说明 |
 |------|------|------|
-| P0: Vision Fallback 预算限流 | ✅ 已完成 (2026-03-27) | 新增 `VisionBudget` dataclass；`run()` 入口重置预算；`_decide_action_with_vision` / `_vision_check_page_relevance` 调用前检查，超限返回 None；新增配置 `VISION_MAX_CALLS_PER_RUN=5`、`VISION_COOLDOWN_SECONDS=3.0`、`VISION_MAX_TOKENS_PER_RUN=20000`、`VISION_CALL_TIMEOUT=30000` |
-| P0: 像素级视觉校验误报优化 | ✅ 已完成 (2026-03-27) | `utils/image_diff.py` 新增 `compute_pixel_diff_roi`（排除顶/底噪声区域）、`compute_block_diff`（16×16块均值比较）、`screenshots_meaningfully_differ`；`screenshots_differ` 升级为分层策略；阈值从 0.02 → **0.05**；`_verify_action_effect` 改用 `screenshots_meaningfully_differ` |
-| P1: Shadow DOM / iframe 穿透增强 | ✅ 已完成 (2026-03-27) | Shadow DOM: `querySelectorAllDeep`/`querySelectorDeep` 已注入各 JS 脚本；iframe: `BrowserPerceptionLayer._extract_iframe_elements` 遍历所有可见 frame 并合并到 `observe()` 快照；`switch_to_iframe` 支持 `>>>` 嵌套语法；新增 `list_iframes` 枚举接口 |
-| P2: 搜索引擎选择器韧性增强 | ✅ 已完成 (2026-03-27) | `SearchEngineProfile` 含 `fallback_result_selectors`/`last_verified`；新增 `validate_selectors(toolkit, profile)` 异步健康检查（命中率 < 50% 时 log_warning）；`extract_search_results_data` 在 CSS 全失败时调用 `perception.extract_data_with_vision` 视觉兜底；`BrowserExecutionLayer` 新增 `perception` 参数并在 `BrowserAgent` 初始化时注入 |
+| P0: Vision Fallback 预算限流 | ✅ 已完成 (2026-03-27) | 新增 `VisionBudget` dataclass；`run()` 入口重置预算；`_decide_action_with_vision` / `_vision_check_page_relevance` 调用前检查，超限返回 None；`can_call()` 同时检查调用次数和 token 累计预算；视觉调用强制 30s 超时（`asyncio.wait_for`），超时后记录调用并返回 None；新增配置 `VISION_MAX_CALLS_PER_RUN=5`、`VISION_COOLDOWN_SECONDS=3.0`、`VISION_MAX_TOKENS_PER_RUN=20000`、`VISION_CALL_TIMEOUT=30000` |
+| P0: 像素级视觉校验误报优化 | ✅ 已完成 (2026-03-27) | `utils/image_diff.py` 新增 `compute_pixel_diff_roi`（按比例排除顶/底 5% 噪声区域，适配各种 viewport）、`compute_block_diff`（16×16块均值比较）、`screenshots_meaningfully_differ`；`screenshots_differ` 升级为分层策略；像素阈值 0.02→**0.05**，块级阈值通过 `VISION_BLOCK_DIFF_THRESHOLD=0.08` 可配置；`_verify_action_effect` 改用 `screenshots_meaningfully_differ` |
+| P1: Shadow DOM / iframe 穿透增强 | ✅ 已完成 (2026-03-27) | Shadow DOM: `querySelectorAllDeep`/`querySelectorDeep` 已注入各 JS 脚本，带 depth=10 递归深度限制防止栈溢出；iframe: `BrowserPerceptionLayer._extract_iframe_elements` 遍历所有可见 frame 并合并到 `observe()` 快照；`switch_to_iframe` 支持 `>>>` 嵌套语法；新增 `list_iframes` 枚举接口 |
+| P2: 搜索引擎选择器韧性增强 | ✅ 已完成 (2026-03-27) | `SearchEngineProfile` 含 `fallback_result_selectors`/`last_verified`；`validate_selectors` 使用 `querySelectorAllDeep` 穿透 Shadow DOM 检测选择器；健康检查主动影响行为：命中率=0 且无 fallback 时跳过 CSS 提取直接走视觉兜底；`BrowserExecutionLayer` 新增 `perception` 参数并在 `BrowserAgent` 初始化时注入 |
+
+#### 加固轮次 (2026-03-28)
+
+对网页操作健壮性优化的 4 个实施项进行 code review 后修复了以下遗漏：
+
+| 修复项 | 涉及文件 | 说明 |
+|--------|---------|------|
+| VisionBudget token 预算未执行 | `agents/browser_agent.py` | `can_call()` 原先只检查调用次数和冷却时间，未检查 `tokens_used >= max_total_tokens`，已补上 |
+| 视觉调用缺少独立超时 | `agents/browser_agent.py` | `_decide_action_with_vision` 用 `asyncio.wait_for` 强制 `VISION_CALL_TIMEOUT`(30s) 超时，超时后记录调用并返回 None |
+| ROI 排除区域不适配不同 viewport | `utils/image_diff.py` | `compute_pixel_diff_roi` 从固定 60px 改为比例制 `exclude_top_frac=0.05` / `exclude_bottom_frac=0.05` |
+| 块级 diff 阈值硬编码 | `utils/image_diff.py`, `config/settings.py` | 新增 `VISION_BLOCK_DIFF_THRESHOLD=0.08` 配置项，`screenshots_differ` 从 settings 读取 |
+| Shadow DOM 递归无深度限制 | `utils/perception_scripts.py` | 3 处 `querySelectorAllDeep`/`querySelectorDeep` 均加 `depth` 参数，上限 10 层 |
+| 健康检查只报不治 | `agents/browser_execution.py` | 命中率=0 且无 fallback 命中时跳过 CSS 提取，直接走视觉兜底 |
+| `validate_selectors` 不穿透 Shadow DOM | `utils/search_engine_profiles.py` | JS 从 `document.querySelectorAll` 改为内联 `querySelectorAllDeep` |

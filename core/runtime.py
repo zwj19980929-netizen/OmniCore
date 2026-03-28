@@ -742,6 +742,31 @@ def _finalize_runtime_result(result: Dict[str, Any], user_input: str) -> Dict[st
         except Exception as e:
             log_warning(f"PersistenceCoordinator failed (non-critical): {e}")
 
+    # 可选语音输出（VOICE_OUTPUT_ENABLED=true 时）
+    if settings.VOICE_OUTPUT_ENABLED and finalized.get("success"):
+        output_text = sanitize_text(finalized.get("output") or "")
+        if output_text and len(output_text) < 500:
+            try:
+                from core.llm import LLMClient
+
+                audio_path = os.path.join(
+                    str(settings.DATA_DIR),
+                    "speech",
+                    f"tts_{job_id or 'tmp'}.mp3",
+                )
+                os.makedirs(os.path.dirname(audio_path), exist_ok=True)
+                llm = LLMClient()
+                llm.speak(
+                    output_text,
+                    output_path=audio_path,
+                    voice=settings.VOICE_OUTPUT_VOICE,
+                    model=settings.VOICE_OUTPUT_MODEL,
+                )
+                finalized["audio_output"] = audio_path
+                log_agent_action("TTS", f"语音输出已生成: {audio_path}")
+            except Exception as e:
+                log_warning(f"TTS failed (non-blocking): {e}")
+
     return finalized
 
 

@@ -2,6 +2,7 @@
 OmniCore - 全栈智能体操作系统核心
 主程序入口
 """
+import os
 import sys
 import time
 import traceback
@@ -147,6 +148,47 @@ def _handle_builtin_command(user_input: str) -> Optional[Dict]:
     return None  # 不是内置命令
 
 
+def _handle_attach_command(raw_input: str) -> Optional[str]:
+    """
+    处理 /attach <file_path> [文字描述] 命令。
+
+    Returns:
+        处理后的文本 user_input，失败时返回 None。
+    """
+    parts = raw_input[7:].strip().split(None, 1)
+    if not parts:
+        console.print("[yellow]用法: /attach <file_path> [描述][/yellow]")
+        return None
+
+    file_path = os.path.expanduser(parts[0])
+    text_hint = parts[1] if len(parts) > 1 else ""
+
+    if not os.path.exists(file_path):
+        console.print(f"[red]文件不存在: {file_path}[/red]")
+        return None
+
+    from utils.multimodal_input import (
+        MultimodalInputProcessor,
+        build_multimodal_input,
+    )
+
+    inp = build_multimodal_input(file_path, text_hint)
+    if inp is None:
+        ext = os.path.splitext(file_path)[1].lower()
+        console.print(f"[yellow]不支持的文件类型: {ext}[/yellow]")
+        return None
+
+    console.print(f"[dim]正在处理附件: {os.path.basename(file_path)}...[/dim]")
+    processor = MultimodalInputProcessor()
+    processed = processor.process(inp)
+    if processed:
+        preview = processed[:120].replace("\n", " ")
+        console.print(f"[dim]已解析: {preview}{'...' if len(processed) > 120 else ''}[/dim]")
+    else:
+        console.print("[yellow]附件处理未产生有效文本[/yellow]")
+    return processed or None
+
+
 def print_banner():
     """打印启动横幅"""
     banner = r"""
@@ -183,7 +225,7 @@ def interactive_mode():
         memory = None
 
     console.print("[green]输入你的指令，按 Ctrl+C 或 Ctrl+D 退出[/green]")
-    console.print("[dim]提示：使用上下方向键浏览历史命令 | !<cmd> 直接执行 shell | /cd /ls /cwd /allow /shell[/dim]\n")
+    console.print("[dim]提示：使用上下方向键浏览历史命令 | !<cmd> 直接执行 shell | /cd /ls /cwd /allow /shell /attach[/dim]\n")
 
     # 对话上下文：保留最近 5 轮的交互记录
     conversation_history: List[Dict] = []
@@ -238,6 +280,14 @@ def interactive_mode():
                 enhanced_input.clear_history()
                 console.print("[green]历史记录已清除[/green]")
                 continue
+
+            # /attach <file_path> [可选文字描述]
+            if user_input.strip().startswith("/attach"):
+                processed = _handle_attach_command(user_input)
+                if processed:
+                    user_input = processed
+                else:
+                    continue
 
             if not user_input.strip():
                 continue

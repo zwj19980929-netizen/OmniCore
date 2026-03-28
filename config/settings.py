@@ -195,6 +195,7 @@ class Settings:
     VISION_COOLDOWN_SECONDS = float(os.getenv("VISION_COOLDOWN_SECONDS", "3.0"))
     VISION_MAX_TOKENS_PER_RUN = int(os.getenv("VISION_MAX_TOKENS_PER_RUN", "20000"))
     VISION_CALL_TIMEOUT = int(os.getenv("VISION_CALL_TIMEOUT", "30000"))  # ms, 短于全局超时
+    VISION_BLOCK_DIFF_THRESHOLD = float(os.getenv("VISION_BLOCK_DIFF_THRESHOLD", "0.08"))
 
     # === 页面感知配置 ===
     # 传给 LLM 的主文本字符上限（detail/list/serp 页面）
@@ -319,6 +320,14 @@ class Settings:
     DEFAULT_PREFERRED_TOOLS = _env_csv("DEFAULT_PREFERRED_TOOLS")
     DEFAULT_PREFERRED_SITES = _env_csv("DEFAULT_PREFERRED_SITES")
     DEFAULT_AUTO_QUEUE_CONFIRMATIONS = os.getenv("DEFAULT_AUTO_QUEUE_CONFIRMATIONS", "false").lower() == "true"
+
+    # === 多模态输入/输出 ===
+    MULTIMODAL_IMAGE_ENABLED = os.getenv("MULTIMODAL_IMAGE_ENABLED", "true").lower() == "true"
+    MULTIMODAL_AUDIO_ENABLED = os.getenv("MULTIMODAL_AUDIO_ENABLED", "false").lower() == "true"
+    MULTIMODAL_DOCUMENT_ENABLED = os.getenv("MULTIMODAL_DOCUMENT_ENABLED", "true").lower() == "true"
+    VOICE_OUTPUT_ENABLED = os.getenv("VOICE_OUTPUT_ENABLED", "false").lower() == "true"
+    VOICE_OUTPUT_MODEL = os.getenv("VOICE_OUTPUT_MODEL", "tts-1")
+    VOICE_OUTPUT_VOICE = os.getenv("VOICE_OUTPUT_VOICE", "alloy")
 
     # === 意图分类 ===
     INTENT_TYPES = [
