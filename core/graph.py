@@ -1935,15 +1935,19 @@ def build_graph_from_registry(registry: StageRegistry = None):
         """Filter target names to only those actually registered."""
         return {n: n for n in names if n in stage_names or n == END}
 
-    # Router -> human_confirm | finalize
+    # Router -> plan_validator | finalize  (should_continue_after_route returns these keys)
     if "router" in stage_names:
         targets = {}
-        if "human_confirm" in stage_names:
-            targets["human_confirm"] = "human_confirm"
+        if "plan_validator" in stage_names:
+            targets["plan_validator"] = "plan_validator"
         if "finalize" in stage_names:
             targets["finalize"] = "finalize"
         if targets:
             graph.add_conditional_edges("router", should_continue_after_route, targets)
+
+    # plan_validator -> human_confirm (direct edge)
+    if "plan_validator" in stage_names and "human_confirm" in stage_names:
+        graph.add_edge("plan_validator", "human_confirm")
 
     # human_confirm -> parallel_executor | validator | END
     if "human_confirm" in stage_names:

@@ -352,6 +352,8 @@ class VisionBudget:
     def can_call(self) -> bool:
         if self.calls_made >= self.max_calls_per_run:
             return False
+        if self.tokens_used >= self.max_total_tokens:
+            return False
         if time.time() - self.last_call_time < self.cooldown_seconds:
             return False
         return True
@@ -1472,12 +1474,16 @@ class BrowserAgent:
         )
 
         try:
-            response = await asyncio.to_thread(
-                vision_llm.chat_with_image,
-                prompt,
-                screenshot_r.data,
-                0.1,
-                1200,
+            vision_timeout = settings.VISION_CALL_TIMEOUT / 1000  # ms → seconds
+            response = await asyncio.wait_for(
+                asyncio.to_thread(
+                    vision_llm.chat_with_image,
+                    prompt,
+                    screenshot_r.data,
+                    0.1,
+                    1200,
+                ),
+                timeout=vision_timeout,
             )
             self._vision_budget.record_call(
                 tokens=(response.usage or {}).get("total_tokens", 0)
@@ -1495,6 +1501,10 @@ class BrowserAgent:
             if action.action_type in {ActionType.FAILED, ActionType.WAIT}:
                 return None
             return action
+        except asyncio.TimeoutError:
+            log_warning(f"vision fallback timed out after {settings.VISION_CALL_TIMEOUT}ms")
+            self._vision_budget.record_call()
+            return None
         except Exception as exc:
             log_warning(f"vision fallback failed: {exc}")
             return None
@@ -2521,7 +2531,8 @@ class BrowserAgent:
             }
 
         if action.action_type == ActionType.EXTRACT:
-            data = await self._extract_data_for_intent(task_intent)
+            # Reuse observed_data from step start instead of calling _extract_data_for_intent again
+            data = observed_data
             _merge_new_data(data)
             snapshot = self._last_semantic_snapshot or {}
             main_text = self._get_snapshot_main_text(snapshot)
@@ -2780,6 +2791,11 @@ class BrowserAgent:
             prefetched["snapshot"] = post_snapshot
             step_data = await self._extract_data_for_intent(task_intent)
             _merge_new_data(step_data)
+            # main_text fallback: if structured extraction found nothing, use snapshot text
+            if not accumulated_data and not step_data:
+                _snap_main = self._get_snapshot_main_text(post_snapshot)
+                if _snap_main and len(_snap_main) >= 50:
+                    _merge_new_data([{"text": _snap_main, "source": "page_main_text"}])
             candidate_data = accumulated_data or step_data
             requires_data = self._is_read_only_task(task, task_intent) or task_intent.intent_type == "search"
             has_sufficient_data = bool(candidate_data)

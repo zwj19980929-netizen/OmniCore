@@ -504,26 +504,38 @@ class BrowserExecutionLayer:
         if not is_search_engine_domain(current_url):
             return []
 
-        # Log selector health when a known profile is active
+        # Check selector health — skip CSS extraction entirely when score is 0
         profile = find_search_engine_profile(current_url)
+        _skip_css = False
         if profile:
             try:
                 health = await validate_selectors(self.toolkit, profile)
-                if health["health_score"] < 0.5:
+                if health["health_score"] == 0.0:
                     log_warning(
-                        "search selector health low",
-                        engine=profile.name,
-                        health_score=health["health_score"],
-                        failed=health["primary_failed"],
+                        f"search selectors all failed [{profile.name}], skipping CSS extraction"
+                        f" | failed={health['primary_failed']}"
+                        f" | fallback_matched={health['fallback_matched']}"
+                    )
+                    _skip_css = not health["fallback_matched"]
+                elif health["health_score"] < 0.5:
+                    log_warning(
+                        f"search selector health low [{profile.name}]"
+                        f" | score={health['health_score']:.2f}"
+                        f" | failed={health['primary_failed']}"
                     )
             except Exception as _exc:
                 pass  # health check is advisory only
 
         # Try cards from semantic snapshot first (handled by orchestrator via perception layer)
         # This method focuses on the JS-based extraction fallback
+        cards: list = []
         selectors = get_search_result_selectors(current_url)
-        r = await self.toolkit.evaluate_js(
-            r"""
+        if _skip_css:
+            # Health check determined all selectors miss — jump straight to vision fallback
+            pass
+        else:
+            r = await self.toolkit.evaluate_js(
+                r"""
             (payload) => {
               const normalize = (value) => (value || '').replace(/\s+/g, ' ').trim();
               const isVisible = (element) => {
@@ -637,8 +649,8 @@ class BrowserExecutionLayer:
             }
             """,
             {"selectors": selectors},
-        )
-        cards = r.data if r.success and isinstance(r.data, list) else []
+            )
+            cards = r.data if r.success and isinstance(r.data, list) else []
 
         # Vision fallback: when all CSS selectors fail, ask the vision model to extract results
         if not cards and self.perception is not None:

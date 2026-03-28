@@ -56,8 +56,8 @@ def compute_pixel_diff(img_a: bytes, img_b: bytes, downsample: int = 4) -> float
 def compute_pixel_diff_roi(
     img_a: bytes,
     img_b: bytes,
-    exclude_top: int = 60,
-    exclude_bottom: int = 60,
+    exclude_top_frac: float = 0.05,
+    exclude_bottom_frac: float = 0.05,
     downsample: int = 4,
 ) -> float:
     """
@@ -67,8 +67,8 @@ def compute_pixel_diff_roi(
     Args:
         img_a: First screenshot (JPEG/PNG bytes).
         img_b: Second screenshot (JPEG/PNG bytes).
-        exclude_top: Pixels to exclude from the top (before downsampling).
-        exclude_bottom: Pixels to exclude from the bottom (before downsampling).
+        exclude_top_frac: Fraction of image height to exclude from top (0.0-0.5).
+        exclude_bottom_frac: Fraction of image height to exclude from bottom (0.0-0.5).
         downsample: Resize factor to speed up comparison.
 
     Returns:
@@ -81,8 +81,6 @@ def compute_pixel_diff_roi(
     except Exception:
         return 1.0
 
-    orig_h = a.size[1]
-
     if downsample > 1:
         w, h = a.size
         small = (max(w // downsample, 1), max(h // downsample, 1))
@@ -93,12 +91,9 @@ def compute_pixel_diff_roi(
         b = b.resize(a.size, Image.NEAREST)
 
     w, h = a.size
-    # Scale exclusion zones to downsampled coordinates
-    scale = h / max(orig_h, 1)
-    top_px = max(0, int(exclude_top * scale))
-    bot_px = max(0, int(exclude_bottom * scale))
-    roi_top = top_px
-    roi_bottom = max(roi_top + 1, h - bot_px)
+    # Proportional exclusion zones — works across all viewport sizes
+    roi_top = max(0, int(h * exclude_top_frac))
+    roi_bottom = max(roi_top + 1, h - int(h * exclude_bottom_frac))
 
     pixels_a = list(a.getdata())
     pixels_b = list(b.getdata())
@@ -210,7 +205,7 @@ def screenshots_differ(
     if compute_pixel_diff_roi(img_a, img_b) > effective_threshold:
         return True
 
-    if use_block_diff and compute_block_diff(img_a, img_b) > 0.08:
+    if use_block_diff and compute_block_diff(img_a, img_b) > settings.VISION_BLOCK_DIFF_THRESHOLD:
         return True
 
     return False

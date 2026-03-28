@@ -250,6 +250,22 @@ class CriticAgent:
         """
         log_agent_action(self.name, "开始审查任务结果", task_description[:50])
 
+        # Quick check: success=True but data is empty/missing → reject
+        if (
+            isinstance(task_result, dict)
+            and task_result.get("success")
+            and self._looks_like_list_extraction_task(task_description)
+        ):
+            data = task_result.get("data")
+            if not data or (isinstance(data, list) and len(data) == 0):
+                return {
+                    "approved": False,
+                    "score": 0.3,
+                    "issues": ["success=True 但 data 为空，任务声称成功但未提取到任何数据"],
+                    "suggestions": ["检查提取逻辑是否正确识别了页面结构"],
+                    "summary": "任务标记成功但无数据返回",
+                }
+
         deterministic_result = self._deterministic_review_result(task_description, task_result)
         if deterministic_result is not None:
             log_agent_action(

@@ -365,7 +365,18 @@ async def validate_selectors(toolkit: Any, profile: SearchEngineProfile) -> Dict
         }
 
     result = await toolkit.evaluate_js(
-        "(selectors) => selectors.map(sel => ({ sel, count: document.querySelectorAll(sel).length }))",
+        """(selectors) => {
+            const querySelectorAllDeep = (selector, root, depth) => {
+                if ((depth = depth || 0) > 10) return [];
+                root = root || document;
+                const results = Array.from(root.querySelectorAll(selector));
+                for (const el of root.querySelectorAll('*')) {
+                    if (el.shadowRoot) results.push(...querySelectorAllDeep(selector, el.shadowRoot, depth + 1));
+                }
+                return results;
+            };
+            return selectors.map(sel => ({ sel, count: querySelectorAllDeep(sel).length }));
+        }""",
         all_selectors,
     )
     counts: List[Dict[str, Any]] = result.data if (result and result.success and isinstance(result.data, list)) else []

@@ -126,24 +126,26 @@ const currentHost = cleanHost(location.hostname || '');
 const searchEngineHosts = ['google.com','bing.com','duckduckgo.com','baidu.com','sogou.com'];
 const isSearchHost = searchEngineHosts.some(h => currentHost === h || currentHost.endsWith('.'+h));
 
-// Shadow DOM deep-traversal helpers
-const querySelectorAllDeep = (selector, root) => {
+// Shadow DOM deep-traversal helpers (depth-limited, optimised for custom elements)
+const querySelectorAllDeep = (selector, root, depth) => {
+  if ((depth = depth || 0) > 10) return [];
   root = root || document;
   const results = Array.from(root.querySelectorAll(selector));
-  for (const el of Array.from(root.querySelectorAll('*'))) {
+  for (const el of root.querySelectorAll('*')) {
     if (el.shadowRoot) {
-      results.push(...querySelectorAllDeep(selector, el.shadowRoot));
+      results.push(...querySelectorAllDeep(selector, el.shadowRoot, depth + 1));
     }
   }
   return results;
 };
-const querySelectorDeep = (selector, root) => {
+const querySelectorDeep = (selector, root, depth) => {
+  if ((depth = depth || 0) > 10) return null;
   root = root || document;
   const found = root.querySelector(selector);
   if (found) return found;
-  for (const el of Array.from(root.querySelectorAll('*'))) {
+  for (const el of root.querySelectorAll('*')) {
     if (el.shadowRoot) {
-      const inner = querySelectorDeep(selector, el.shadowRoot);
+      const inner = querySelectorDeep(selector, el.shadowRoot, depth + 1);
       if (inner) return inner;
     }
   }
@@ -656,11 +658,15 @@ SCRIPT_CONTENT_CARDS = r"""
       }
     }
 
-    // Phase 2: Generic fallback — for any search-like page (including non-search-engine sites)
-    if (!cards.length && looksLikeSearchPage) {
+    // Phase 2: Generic fallback — for any search-like or list page
+    // Also trigger on pages with list-like content (tables, repeated items) even if URL doesn't look like search
+    const contentRoot2 = document.querySelector('main, [role="main"]') || document.body;
+    const listCandidates2 = contentRoot2.querySelectorAll('li, article, table tbody tr, [role="listitem"], [class*="card"]:not(nav *), [class*="result"]:not(nav *), [class*="item"]:not(nav *):not(li), [class*="entry"]:not(nav *)');
+    const hasListContent = listCandidates2.length >= 4;
+    if (!cards.length && (looksLikeSearchPage || hasListContent)) {
       const contentRoot = document.querySelector('main, [role="main"]') || document.body;
       // Try list items, articles, sections, and divs with links inside the content area
-      const fallbackSels = 'li, article, section, [role="listitem"], [class*="result"], [class*="item"]:not(li), [class*="card"], [class*="repo"], [class*="entry"]';
+      const fallbackSels = 'li, article, section, [role="listitem"], [class*="result"], [class*="item"]:not(li), [class*="card"], [class*="repo"], [class*="entry"], table tbody tr';
       const fallback = Array.from(contentRoot.querySelectorAll(fallbackSels));
       for (const c of fallback) {
         if (!isVisible(c)) continue;
@@ -674,7 +680,22 @@ SCRIPT_CONTENT_CARDS = r"""
           const t = normalize(a.innerText || a.textContent || a.getAttribute('aria-label') || a.getAttribute('title') || '');
           return t.length >= 3 && !/^(sign|log|next|prev|more|load)/i.test(t);
         });
-        if (buildCard(c, anchor, true) && cards.length >= __MAX_CARDS__) break;
+        if (anchor) {
+          if (buildCard(c, anchor, true) && cards.length >= __MAX_CARDS__) break;
+        } else if (hasListContent && !looksLikeSearchPage) {
+          // On non-search list pages, capture anchor-less items as data cards
+          const titleNode = c.querySelector('h1, h2, h3, h4, th, td:first-child, strong, b');
+          const title = normalize(titleNode?.innerText || titleNode?.textContent || text.slice(0, 80));
+          if (title.length >= 3) {
+            const key = `${title}|${text.slice(0, 40)}`;
+            if (!seen.has(key)) {
+              seen.add(key);
+              rank++;
+              cards.push({ ref: `card_${rank}`, card_type: 'list_item', title: title.slice(0, __CARD_TITLE_CHARS__), source: currentHost, snippet: text.slice(0, __CARD_SNIPPET_CHARS__), date: '', host: currentHost, link: location.href, raw_link: location.href, target_url: '', rank, target_ref: '', target_selector: selectorOf(c) });
+              if (cards.length >= __MAX_CARDS__) break;
+            }
+          }
+        }
       }
     }
 
@@ -1090,12 +1111,13 @@ SCRIPT_FALLBACK_SEMANTIC_SNAPSHOT = r"""() => {
                     return el.tagName.toLowerCase();
                 };
 
-                // Shadow DOM deep-traversal helper (inline for standalone script)
-                const querySelectorAllDeep = (selector, root) => {
+                // Shadow DOM deep-traversal helper (inline, depth-limited)
+                const querySelectorAllDeep = (selector, root, depth) => {
+                    if ((depth = depth || 0) > 10) return [];
                     root = root || document;
                     const results = Array.from(root.querySelectorAll(selector));
-                    for (const el of Array.from(root.querySelectorAll('*'))) {
-                        if (el.shadowRoot) results.push(...querySelectorAllDeep(selector, el.shadowRoot));
+                    for (const el of root.querySelectorAll('*')) {
+                        if (el.shadowRoot) results.push(...querySelectorAllDeep(selector, el.shadowRoot, depth + 1));
                     }
                     return results;
                 };
@@ -1169,12 +1191,13 @@ SCRIPT_FALLBACK_SEMANTIC_SNAPSHOT = r"""() => {
 
 SCRIPT_EXTRACT_INTERACTIVE_ELEMENTS = r"""
             () => {
-              // Shadow DOM deep-traversal helper
-              const querySelectorAllDeep = (selector, root) => {
+              // Shadow DOM deep-traversal helper (depth-limited)
+              const querySelectorAllDeep = (selector, root, depth) => {
+                if ((depth = depth || 0) > 10) return [];
                 root = root || document;
                 const results = Array.from(root.querySelectorAll(selector));
-                for (const el of Array.from(root.querySelectorAll('*'))) {
-                  if (el.shadowRoot) results.push(...querySelectorAllDeep(selector, el.shadowRoot));
+                for (const el of root.querySelectorAll('*')) {
+                  if (el.shadowRoot) results.push(...querySelectorAllDeep(selector, el.shadowRoot, depth + 1));
                 }
                 return results;
               };
