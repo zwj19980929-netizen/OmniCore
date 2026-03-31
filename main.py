@@ -524,7 +524,10 @@ def interactive_mode():
     # 初始化增强输入
     enhanced_input = EnhancedInput()
 
-    if not enhanced_input.has_readline:
+    if not enhanced_input.has_readline and sys.platform == "win32":
+        console.print("[dim]Windows 下默认禁用 pyreadline3，避免交互式输入因控制台尺寸探测失败而崩溃。[/dim]")
+        console.print("[dim]如需强制启用，可设置环境变量 OMNICORE_ENABLE_PYREADLINE3=1。[/dim]\n")
+    elif not enhanced_input.has_readline:
         console.print("[dim]提示：安装 gnureadline 可获得更好的命令行体验[/dim]")
         console.print("[dim]  macOS: pip install gnureadline[/dim]\n")
 

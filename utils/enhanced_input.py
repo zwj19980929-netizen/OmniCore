@@ -4,7 +4,7 @@
 """
 import os
 import sys
-from typing import List, Optional, Callable
+from typing import List, Optional
 
 
 def _is_libedit(readline_module) -> bool:
@@ -13,17 +13,29 @@ def _is_libedit(readline_module) -> bool:
     return "libedit" in doc
 
 
+def _env_flag_enabled(name: str) -> bool:
+    value = (os.getenv(name) or "").strip().lower()
+    return value in {"1", "true", "yes", "on"}
+
+
 class EnhancedInput:
     """增强的命令行输入"""
 
     def __init__(self, history_file: str = "~/.omnicore_history"):
         self.history_file = os.path.expanduser(history_file)
         self.has_readline = False
+        self.readline = None
+        self.readline_disabled_reason: Optional[str] = None
         self._setup_readline()
 
     def _setup_readline(self):
         """设置 readline 支持"""
         try:
+            if sys.platform == "win32" and not _env_flag_enabled("OMNICORE_ENABLE_PYREADLINE3"):
+                self.has_readline = False
+                self.readline_disabled_reason = "windows_pyreadline3_disabled"
+                return
+
             import readline
 
             # pyreadline3 on Windows can raise TypeError/AttributeError during
@@ -34,10 +46,12 @@ class EnhancedInput:
                     readline.get_current_history_length()
                 except Exception:
                     self.has_readline = False
+                    self.readline_disabled_reason = "readline_probe_failed"
                     return
 
             self.readline = readline
             self.has_readline = True
+            self.readline_disabled_reason = None
 
             # 加载历史记录
             if os.path.exists(self.history_file):
@@ -60,6 +74,7 @@ class EnhancedInput:
 
         except (ImportError, Exception):
             self.has_readline = False
+            self.readline_disabled_reason = "readline_unavailable"
 
     def _completer(self, text: str, state: int) -> Optional[str]:
         """自动补全函数"""
@@ -79,17 +94,27 @@ class EnhancedInput:
         """增强的输入函数"""
         try:
             return input(prompt).strip()
-        except TypeError:
+        except (TypeError, AttributeError):
             # pyreadline3 on Windows can crash inside input() when the console
             # size cannot be determined (size() returns None). Disable readline
             # and fall back to plain input for the rest of the session.
             self.has_readline = False
+            self.readline_disabled_reason = "readline_runtime_failure"
             try:
                 import readline as _rl
                 _rl.set_completer(None)
             except Exception:
                 pass
-            return input(prompt).strip()
+            return self._plain_input(prompt)
+
+    @staticmethod
+    def _plain_input(prompt: str) -> str:
+        sys.stdout.write(prompt)
+        sys.stdout.flush()
+        line = sys.stdin.readline()
+        if line == "":
+            raise EOFError
+        return line.strip()
 
     def save_history(self):
         """保存历史记录"""
