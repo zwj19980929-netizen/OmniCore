@@ -42,6 +42,7 @@ error.txt
 outputs/
 reports/
 data/
+model/
 
 # Pytest
 .pytest_cache/

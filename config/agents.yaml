@@ -46,3 +46,47 @@ agents:
       - input_control
     max_parallelism: 1
     risk_level: "high"
+
+  terminal_worker:
+    adapter: "terminal_worker"
+    description: "Execute shell commands, read/write/edit files, and search file contents or paths"
+    description_zh: "执行 Shell 命令、文件读写编辑、文件搜索（glob/grep）"
+    capabilities:
+      - shell_execution
+      - file_read
+      - file_write
+      - file_search
+    max_parallelism: 1
+    risk_level: "medium"
+
+  enhanced_web_worker:
+    adapter: "enhanced_web_worker"
+    description: "Enhanced web extraction with three-layer perception for complex or dynamic pages"
+    description_zh: "三层感知架构的增强版网页提取，适合复杂或动态页面"
+    capabilities:
+      - web_scraping
+      - content_extraction
+      - enhanced_perception
+    max_parallelism: 2
+    risk_level: "low"
+
+  api_worker:
+    adapter: "api_worker"
+    description: "Call external HTTP APIs with structured request/response handling"
+    description_zh: "调用外部 HTTP API，支持 GET/POST/PUT/DELETE 等方法"
+    capabilities:
+      - http_request
+      - external_api
+      - rest_api
+    max_parallelism: 4
+    risk_level: "medium"
+
+  mcp_handler:
+    adapter: "mcp_adapter"
+    description: "Execute tools via MCP (Model Context Protocol) servers"
+    description_zh: "通过 MCP 协议调用外部工具服务（数据库、IM、API 等）"
+    capabilities:
+      - mcp_tools
+      - external_api
+    max_parallelism: 2
+    risk_level: "medium"

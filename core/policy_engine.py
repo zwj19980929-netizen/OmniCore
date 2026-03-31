@@ -210,6 +210,27 @@ def evaluate_task_policy(task: Dict[str, Any]) -> PolicyDecision:
             affected_resources=[target] if target else [],
         )
 
+    # MCP 工具策略：基于工具名和 Server 配置的 risk_level
+    if tool_name.startswith("mcp.") or task_type == "mcp_handler":
+        mcp_high_risk_tokens = (
+            "delete", "remove", "drop", "send_message", "post",
+            "create_issue", "merge", "close", "write", "push",
+        )
+        tool_lower = tool_name.lower()
+        desc_lower = lowered_description
+        if any(token in tool_lower or token in desc_lower for token in mcp_high_risk_tokens):
+            return PolicyDecision(
+                requires_confirmation=True,
+                reason=f"MCP tool '{tool_name}' involves a high-risk operation",
+                risk_level="high",
+            )
+        # read-only MCP 操作自动放行
+        return PolicyDecision(
+            requires_confirmation=False,
+            reason="MCP tool read-only operation",
+            risk_level=risk_level,
+        )
+
     if "delete" in lowered_description or "remove" in lowered_description:
         return PolicyDecision(
             requires_confirmation=True,

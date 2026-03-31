@@ -708,6 +708,8 @@ class RouterAgent:
         successful_paths: list = None,
         failure_patterns: list = None,
         current_os_context: dict = None,
+        *,
+        knowledge_context: str = "",
     ) -> Dict[str, Any]:
         """
         分析用户意图并拆解任务
@@ -970,6 +972,10 @@ class RouterAgent:
             user_message += "\n".join(deterministic_hints)
             user_message += "\n\n---\n"
 
+        if knowledge_context:
+            user_message += knowledge_context
+            user_message += "\n\n---\n"
+
         user_message += f"请分析以下用户指令并拆解任务：\n\n{user_input}"
 
         # 使用配置的 Router 专用 max_tokens
@@ -995,6 +1001,25 @@ class RouterAgent:
                 result,
                 current_time_context,
             )
+
+            # 成本感知：为任务打复杂度分并推荐合适的 cost_tier
+            if settings.COMPLEXITY_AWARE_ROUTING:
+                try:
+                    from core.complexity_scorer import (
+                        score_task_complexity,
+                        complexity_to_cost_preference,
+                    )
+                    complexity = score_task_complexity(
+                        result.get("tasks", []), user_input
+                    )
+                    result["task_complexity"] = complexity
+                    result["recommended_cost_tier"] = complexity_to_cost_preference(complexity)
+                    logger.debug(
+                        f"任务复杂度: {complexity:.3f} → 推荐 cost_tier={result['recommended_cost_tier']}"
+                    )
+                except Exception as _e:
+                    logger.warning(f"Complexity scoring failed: {_e}")
+
             log_agent_action(
                 self.name,
                 f"意图识别完成: {result.get('intent')}",
@@ -1101,6 +1126,53 @@ class RouterAgent:
         if self._is_terminal_fast_path(user_input):
             return self._build_terminal_fast_task(user_input, state)
 
+        # Skill Library 匹配（在 LLM 规划之前，命中则跳过完整规划）
+        try:
+            from memory.skill_store import SkillStore
+            skill_store = SkillStore()
+            matched_skill = skill_store.match(user_input)
+            if matched_skill:
+                task_queue = skill_store.instantiate(matched_skill, user_input)
+                if task_queue:
+                    log_agent_action(self.name, "Skill matched", f"{matched_skill.name} ({matched_skill.skill_id})")
+                    from core.state import build_task_item_from_plan
+                    state["current_intent"] = matched_skill.source_intent or "skill_replay"
+                    state["intent_confidence"] = 0.9
+                    state["task_queue"] = [build_task_item_from_plan(t) for t in task_queue]
+                    state["policy_decisions"] = [
+                        build_policy_decision_from_task(task)
+                        for task in state["task_queue"]
+                    ]
+                    state["needs_human_confirm"] = any(
+                        task.get("requires_confirmation", False) for task in state["task_queue"]
+                    )
+                    state["human_approved"] = not state["needs_human_confirm"]
+                    state["matched_skill_id"] = matched_skill.skill_id
+                    state["shared_memory"]["router_direct_answer"] = ""
+                    state["shared_memory"]["router_high_risk_reason"] = ""
+                    state["execution_status"] = "routing"
+                    from langchain_core.messages import SystemMessage
+                    state["messages"].append(
+                        SystemMessage(content=f"Router 分析完成: Skill matched — {matched_skill.name}")
+                    )
+                    return state
+        except Exception as exc:
+            log_warning(f"Skill matching failed (fallback to LLM): {exc}")
+
+        # Knowledge Base RAG: 检索相关知识注入上下文
+        knowledge_context = ""
+        try:
+            from config.settings import settings as _settings
+            if _settings.KNOWLEDGE_BASE_ENABLED:
+                from memory.knowledge_store import KnowledgeStore
+                kb = KnowledgeStore()
+                kb_results = kb.retrieve(user_input, top_k=3, max_total_chars=2000)
+                if kb_results:
+                    knowledge_context = kb.format_as_context(kb_results)
+                    log_agent_action(self.name, "RAG context injected", f"{len(kb_results)} items")
+        except Exception as exc:
+            log_warning(f"Knowledge retrieval failed (fallback to normal): {exc}")
+
         # 分析意图（传入对话历史）
         conversation_history = state.get("shared_memory", {}).get("conversation_history")
         related_history = state.get("shared_memory", {}).get("related_history")
@@ -1126,6 +1198,7 @@ class RouterAgent:
             successful_paths,
             failure_patterns,
             current_os_context,
+            knowledge_context=knowledge_context,
         )
 
         # 构建任务队列

@@ -39,7 +39,274 @@ def _get_terminal_worker():
     return _terminal_worker
 
 
-def _handle_builtin_command(user_input: str) -> Optional[Dict]:
+def _handle_skills_command(stripped: str) -> Dict:
+    """Handle /skills [--all | deprecate <id> | delete <id>] command."""
+    try:
+        from memory.skill_store import SkillStore
+        store = SkillStore()
+    except Exception as e:
+        return {"success": False, "output": f"Skill Library 初始化失败: {e}", "is_special_command": True}
+
+    args = stripped[7:].strip()
+
+    if args.startswith("deprecate "):
+        skill_id = args[10:].strip()
+        ok = store.deprecate_skill(skill_id)
+        msg = f"已废弃: {skill_id}" if ok else f"未找到: {skill_id}"
+        return {"success": ok, "output": msg, "is_special_command": True}
+
+    if args.startswith("delete "):
+        skill_id = args[7:].strip()
+        ok = store.delete_skill(skill_id)
+        msg = f"已删除: {skill_id}" if ok else f"未找到: {skill_id}"
+        return {"success": ok, "output": msg, "is_special_command": True}
+
+    include_deprecated = "--all" in args
+    skills = store.list_skills(include_deprecated=include_deprecated)
+    if not skills:
+        return {"success": True, "output": "Skill Library 为空，完成任务后会自动提炼技能。", "is_special_command": True}
+
+    lines = [f"Skill Library ({len(skills)} 个技能):", ""]
+    for s in skills:
+        status = "deprecated" if s.deprecated else "active"
+        rate = f"{s.success_rate:.0%}" if s.total_uses > 0 else "N/A"
+        lines.append(f"  [{status}] {s.name} (id={s.skill_id})")
+        lines.append(f"         成功率={rate}  使用={s.total_uses}次  意图={s.source_intent}")
+    lines.append("")
+    lines.append("命令: /skills --all | /skills deprecate <id> | /skills delete <id>")
+    return {"success": True, "output": "\n".join(lines), "is_special_command": True}
+
+
+def _handle_learn_command(stripped: str) -> Dict:
+    """Handle /learn <url_or_file_path> command."""
+    target = stripped[6:].strip()
+    if not target:
+        return {"success": False, "output": "用法: /learn <url_or_file_path>", "is_special_command": True}
+
+    try:
+        from memory.knowledge_store import KnowledgeStore
+        kb = KnowledgeStore()
+    except Exception as e:
+        return {"success": False, "output": f"知识库初始化失败: {e}", "is_special_command": True}
+
+    if target.startswith("http://") or target.startswith("https://"):
+        # URL — 通过 web_worker 抓取
+        try:
+            from agents.web_worker import WebWorker
+            import asyncio
+            worker = WebWorker()
+            loop = asyncio.new_event_loop()
+            result = loop.run_until_complete(
+                worker.execute_async({"task": f"提取网页内容: {target}", "url": target}, {})
+            )
+            loop.close()
+            content = str(result.get("extracted_text", "") or result.get("content", "") or "")
+            title = str(result.get("title", "") or target)
+            if not content:
+                return {"success": False, "output": f"未能从 URL 提取内容: {target}", "is_special_command": True}
+            count = kb.index_web_page(url=target, title=title, content=content)
+            return {"success": True, "output": f"已索引网页: {title} ({count} chunks)", "is_special_command": True}
+        except Exception as e:
+            return {"success": False, "output": f"网页抓取失败: {e}", "is_special_command": True}
+    else:
+        # 本地文件
+        file_path = os.path.expanduser(target)
+        if not os.path.exists(file_path):
+            return {"success": False, "output": f"文件不存在: {file_path}", "is_special_command": True}
+        from utils.document_parser import extract_text
+        content = extract_text(file_path)
+        if not content:
+            return {"success": False, "output": f"无法解析文件: {file_path}", "is_special_command": True}
+        count = kb.index_document(file_path=file_path, content=content)
+        return {"success": True, "output": f"已索引文件: {os.path.basename(file_path)} ({count} chunks)", "is_special_command": True}
+
+
+def _handle_knowledge_command(stripped: str) -> Dict:
+    """Handle /knowledge [search <query> | stats | delete <source>] command."""
+    try:
+        from memory.knowledge_store import KnowledgeStore
+        kb = KnowledgeStore()
+    except Exception as e:
+        return {"success": False, "output": f"知识库初始化失败: {e}", "is_special_command": True}
+
+    parts = stripped.split(None, 2)
+    sub_cmd = parts[1] if len(parts) > 1 else "stats"
+
+    if sub_cmd == "search" and len(parts) > 2:
+        results = kb.search(parts[2])
+        if not results:
+            return {"success": True, "output": "未找到相关知识。", "is_special_command": True}
+        lines = [f"搜索结果 ({len(results)} 条):", ""]
+        for r in results:
+            relevance = f"{1 - r.get('distance', 0):.0%}" if r.get("distance") is not None else "N/A"
+            lines.append(f"  [{r.get('type', '')}] {r.get('title', 'N/A')} (相关度={relevance})")
+            content_preview = r.get("content", "")[:200].replace("\n", " ")
+            lines.append(f"    {content_preview}...")
+        return {"success": True, "output": "\n".join(lines), "is_special_command": True}
+
+    if sub_cmd == "delete" and len(parts) > 2:
+        count = kb.delete_by_source(parts[2])
+        return {"success": True, "output": f"已删除 {count} 条知识。", "is_special_command": True}
+
+    # stats (default)
+    stats = kb.get_stats()
+    by_type = stats.get("by_type", {})
+    total = stats.get("total_memories", 0)
+    lines = [f"知识库统计 (共 {total} 条):", ""]
+    for k, v in sorted(by_type.items()):
+        lines.append(f"  {k}: {v} 条")
+    if not by_type:
+        lines.append("  (空)")
+    lines.append("")
+    lines.append("命令: /knowledge search <query> | /knowledge stats | /knowledge delete <source>")
+    return {"success": True, "output": "\n".join(lines), "is_special_command": True}
+
+
+def _handle_cost_command() -> Dict:
+    """Handle /cost command — show current month LLM cost statistics."""
+    from config.settings import settings
+    try:
+        from utils.cost_tracker import MonthlyCostGuard
+        guard = MonthlyCostGuard(
+            monthly_budget_usd=settings.MONTHLY_BUDGET_USD,
+            data_dir=settings.DATA_DIR,
+        )
+    except Exception as e:
+        return {"success": False, "output": f"成本追踪初始化失败: {e}", "is_special_command": True}
+
+    used, budget, warning = guard.check_budget()
+    models = guard.get_top_models_by_cost()
+
+    budget_str = f"/ ${budget:.2f}" if budget > 0 else "(未设置预算)"
+    warn_str = "  ⚠ 接近预算上限！" if warning else ""
+
+    lines = [f"本月 LLM 成本: ${used:.4f} {budget_str}{warn_str}", ""]
+    if models:
+        lines.append("按模型分布：")
+        for m in models[:8]:
+            lines.append(f"  {m['model']}: ${m['cost_usd']:.4f} ({m['calls']} 次)")
+    else:
+        lines.append("暂无本月调用记录。")
+    lines.append("")
+    lines.append("设置月度预算：在 .env 中添加 MONTHLY_BUDGET_USD=<金额>")
+    return {"success": True, "output": "\n".join(lines), "is_special_command": True}
+
+
+def _handle_watch_command(stripped: str, session_id: str = "") -> Dict:
+    """Handle /watch [url <url> | email | webhook | list | pause | resume | stop] command."""
+    from config.settings import settings
+
+    parts = stripped.split(maxsplit=3)
+    sub_cmd = parts[1].lower() if len(parts) > 1 else "list"
+
+    if sub_cmd == "url" and len(parts) >= 3:
+        url = parts[2]
+        note = parts[3] if len(parts) > 3 else ""
+        from utils.event_sources.web_page_watch import WebPageWatchSource
+        src = WebPageWatchSource(data_dir=str(settings.DATA_DIR))
+        watch_id = src.create_watch({
+            "url": url,
+            "session_id": session_id,
+            "note": note,
+            "check_interval_seconds": settings.WEB_WATCH_DEFAULT_INTERVAL,
+            "change_threshold": settings.WEB_WATCH_DEFAULT_THRESHOLD,
+            "user_input_template": "网页 {url} 内容发生了变化，请抓取并汇报变化内容。",
+        })
+        lines = [
+            f"已创建网页监控: {watch_id}",
+            f"  URL: {url}",
+            f"  检查间隔: {settings.WEB_WATCH_DEFAULT_INTERVAL}s",
+            f"  变化阈值: {settings.WEB_WATCH_DEFAULT_THRESHOLD * 100:.0f}%",
+        ]
+        if note:
+            lines.append(f"  备注: {note}")
+        return {"success": True, "output": "\n".join(lines), "is_special_command": True}
+
+    if sub_cmd == "list":
+        lines = []
+        # 网页监控
+        try:
+            from utils.event_sources.web_page_watch import WebPageWatchSource
+            src = WebPageWatchSource(data_dir=str(settings.DATA_DIR))
+            for w in src.list_watches():
+                status_icon = {"active": "🟢", "paused": "⏸"}.get(w.get("status", ""), "⬜")
+                lines.append(f"  {status_icon} [{w['watch_id']}] {w.get('url', 'N/A')} (间隔: {w.get('check_interval_seconds', '?')}s)")
+        except Exception:
+            pass
+        # 邮件监控
+        try:
+            from utils.event_sources.email_watch import EmailWatchSource
+            src = EmailWatchSource(data_dir=str(settings.DATA_DIR))
+            for w in src.list_watches():
+                status_icon = {"active": "🟢", "paused": "⏸"}.get(w.get("status", ""), "⬜")
+                lines.append(f"  {status_icon} [{w['watch_id']}] {w.get('username', '')}@{w.get('imap_host', 'N/A')}")
+        except Exception:
+            pass
+        # Webhook 监控
+        try:
+            from utils.event_sources.webhook_source import WebhookSource
+            src = WebhookSource(data_dir=str(settings.DATA_DIR))
+            for w in src.list_watches():
+                status_icon = {"active": "🟢", "paused": "⏸"}.get(w.get("status", ""), "⬜")
+                lines.append(f"  {status_icon} [{w['watch_id']}] webhook")
+        except Exception:
+            pass
+
+        if not lines:
+            lines.append("  暂无监控项。")
+        lines.append("")
+        lines.append("命令: /watch url <url> [备注] | /watch list | /watch pause <id> | /watch resume <id> | /watch stop <id>")
+        return {"success": True, "output": "\n".join(lines), "is_special_command": True}
+
+    if sub_cmd == "pause" and len(parts) >= 3:
+        watch_id = parts[2]
+        _watch_action(watch_id, "pause", settings)
+        return {"success": True, "output": f"已暂停监控: {watch_id}", "is_special_command": True}
+
+    if sub_cmd == "resume" and len(parts) >= 3:
+        watch_id = parts[2]
+        _watch_action(watch_id, "resume", settings)
+        return {"success": True, "output": f"已恢复监控: {watch_id}", "is_special_command": True}
+
+    if sub_cmd in ("stop", "delete") and len(parts) >= 3:
+        watch_id = parts[2]
+        _watch_action(watch_id, "delete", settings)
+        return {"success": True, "output": f"已删除监控: {watch_id}", "is_special_command": True}
+
+    return {
+        "success": False,
+        "output": "用法: /watch url <url> [备注] | /watch list | /watch pause <id> | /watch resume <id> | /watch stop <id>",
+        "is_special_command": True,
+    }
+
+
+def _watch_action(watch_id: str, action: str, settings) -> None:
+    """对指定 watch_id 执行 pause/resume/delete 操作。"""
+    sources = []
+    try:
+        from utils.event_sources.web_page_watch import WebPageWatchSource
+        sources.append(WebPageWatchSource(data_dir=str(settings.DATA_DIR)))
+    except Exception:
+        pass
+    try:
+        from utils.event_sources.email_watch import EmailWatchSource
+        sources.append(EmailWatchSource(data_dir=str(settings.DATA_DIR)))
+    except Exception:
+        pass
+    try:
+        from utils.event_sources.webhook_source import WebhookSource
+        sources.append(WebhookSource(data_dir=str(settings.DATA_DIR)))
+    except Exception:
+        pass
+
+    for src in sources:
+        try:
+            getattr(src, f"{action}_watch")(watch_id)
+        except Exception:
+            pass
+
+
+def _handle_builtin_command(user_input: str, session_id: str = "") -> Optional[Dict]:
     """
     处理终端内置快捷命令，返回 result dict 或 None（不是内置命令）。
 
@@ -50,6 +317,8 @@ def _handle_builtin_command(user_input: str) -> Optional[Dict]:
       /cwd           显示当前工作目录
       /allow <prefix> 会话内批准某类命令前缀
       /shell         显示当前 shell 和工作目录信息
+      /cost          查看本月 LLM 成本统计
+      /watch         事件驱动监控管理
     """
     stripped = user_input.strip()
 
@@ -128,6 +397,26 @@ def _handle_builtin_command(user_input: str) -> Optional[Dict]:
             return {"success": False, "output": "终端功能未启用", "is_special_command": True}
         worker.approve_command_prefix(prefix)
         return {"success": True, "output": f"已批准命令前缀: '{prefix}'（本会话内有效）", "is_special_command": True}
+
+    # /watch [url|list|pause|resume|stop]
+    if stripped.lower().startswith("/watch"):
+        return _handle_watch_command(stripped, session_id=session_id)
+
+    # /skills [--all]
+    if stripped.lower().startswith("/skills"):
+        return _handle_skills_command(stripped)
+
+    # /learn <url_or_file>
+    if stripped.lower().startswith("/learn"):
+        return _handle_learn_command(stripped)
+
+    # /knowledge [search|stats|delete]
+    if stripped.lower().startswith("/knowledge"):
+        return _handle_knowledge_command(stripped)
+
+    # /cost — 本月 LLM 成本统计
+    if stripped.lower() == "/cost":
+        return _handle_cost_command()
 
     # /shell
     if stripped.lower() == "/shell":
@@ -225,7 +514,7 @@ def interactive_mode():
         memory = None
 
     console.print("[green]输入你的指令，按 Ctrl+C 或 Ctrl+D 退出[/green]")
-    console.print("[dim]提示：使用上下方向键浏览历史命令 | !<cmd> 直接执行 shell | /cd /ls /cwd /allow /shell /attach[/dim]\n")
+    console.print("[dim]提示：使用上下方向键浏览历史命令 | !<cmd> 直接执行 shell | /cd /ls /cwd /allow /shell /attach /skills /learn /knowledge /watch[/dim]\n")
 
     # 对话上下文：保留最近 5 轮的交互记录
     conversation_history: List[Dict] = []
@@ -250,7 +539,7 @@ def interactive_mode():
                 break
 
             # 终端内置快捷命令（!cmd, /cd, /ls, /cwd, /allow, /shell）
-            builtin_result = _handle_builtin_command(user_input)
+            builtin_result = _handle_builtin_command(user_input, session_id=session_id or "")
             if builtin_result is not None:
                 if not builtin_result.get("is_special_command") or user_input.strip().startswith("!"):
                     # 对于 !cmd，流式输出已打印，只显示状态

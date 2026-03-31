@@ -141,6 +141,9 @@ class OmniCoreState(TypedDict):
     # Validator 硬规则校验是否通过
     validator_passed: bool
 
+    # Skill Library: 匹配到的 Skill ID（用于 finalize 阶段反馈更新）
+    matched_skill_id: str
+
 
 def create_initial_state(
     user_input: str,
@@ -171,4 +174,5 @@ def create_initial_state(
         execution_status="idle",
         replan_count=0,
         validator_passed=True,
+        matched_skill_id="",
     )

@@ -1,0 +1,53 @@
+# MCP (Model Context Protocol) Server 声明式配置
+# 每个 Server 提供一组工具，OmniCore 启动时自动发现并注册到 ToolRegistry。
+#
+# 传输方式：
+#   - stdio: 启动子进程，通过 stdin/stdout JSON-RPC 通信（最常用）
+#   - sse: 连接远程 Server 的 SSE 端点
+#   - streamable_http: 标准 HTTP POST JSON-RPC
+#
+# 环境变量引用：使用 ${ENV_VAR} 语法，运行时从 os.environ 解析。
+
+servers:
+  # ── stdio 模式示例 ──────────────────────────────
+  filesystem:
+    transport: stdio
+    command: "npx"
+    args: ["-y", "@modelcontextprotocol/server-filesystem", "/Users/zhangwenjun/Documents"]
+    enabled: false
+    description: "Local filesystem access (read, write, search)"
+    description_zh: "本地文件系统读写与搜索"
+    risk_level: "medium"
+    max_parallelism: 3
+
+  github:
+    transport: stdio
+    command: "npx"
+    args: ["-y", "@modelcontextprotocol/server-github"]
+    env:
+      GITHUB_PERSONAL_ACCESS_TOKEN: "${GITHUB_TOKEN}"
+    enabled: false
+    description: "GitHub API operations (repos, issues, PRs)"
+    description_zh: "GitHub 仓库、Issue、PR 操作"
+    risk_level: "medium"
+    max_parallelism: 2
+
+  # ── SSE 模式示例 ────────────────────────────────
+  slack:
+    transport: sse
+    url: "http://localhost:3001/sse"
+    enabled: false
+    description: "Slack messaging and channel management"
+    description_zh: "Slack 消息发送与频道管理"
+    risk_level: "high"
+    max_parallelism: 1
+
+  # ── Streamable HTTP 模式示例 ────────────────────
+  database:
+    transport: streamable_http
+    url: "http://localhost:3002/mcp"
+    enabled: false
+    description: "Database query interface"
+    description_zh: "数据库查询接口"
+    risk_level: "high"
+    max_parallelism: 1

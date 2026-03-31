@@ -1,0 +1,39 @@
+你是一个任务分析专家。请判断以下已成功完成的任务是否值得提炼为可复用技能。
+
+## 判断标准
+1. 任务至少包含 2 个步骤
+2. 任务具有通用性（不是一次性的具体操作，例如"帮我查一下北京天气"是通用的，"删除我桌面上的 test.txt"是一次性的）
+3. 任务流程可以参数化（具体值可以替换为变量）
+4. 任务类型具有复用价值（搜索、数据提取、文件处理、系统操作等常见模式）
+
+## 已完成的任务
+用户原始请求：{user_input}
+意图分类：{intent}
+执行步骤：
+{task_queue_summary}
+
+## 输出格式（严格 JSON）
+{{
+    "worth_extracting": true 或 false,
+    "reason": "简要说明原因",
+    "skill_name": "技能名称（简洁、通用，如'搜索商品价格'、'下载网页PDF'）",
+    "skill_description": "技能的通用语义描述（用于未来向量检索匹配，要覆盖各种表述方式）",
+    "parameters": {{
+        "param_name": {{"type": "string", "description": "参数说明"}}
+    }},
+    "task_template": [
+        {{
+            "tool_name": "原始 tool_name",
+            "description_template": "包含 {{param_name}} 占位符的描述模板",
+            "params_template": {{"key": "{{param_name}}"}},
+            "priority": 10
+        }}
+    ],
+    "tags": ["标签1", "标签2"]
+}}
+
+如果不值得提炼，只需返回：
+{{
+    "worth_extracting": false,
+    "reason": "原因"
+}}

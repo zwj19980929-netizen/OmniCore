@@ -2114,6 +2114,11 @@ def run_next_queued_task(
     _release_due_schedules()
     _release_directory_watch_events()
     try:
+        from utils.event_dispatcher import get_event_dispatcher
+        get_event_dispatcher().dispatch_pending_events()
+    except Exception as e:
+        log_warning(f"Event dispatcher failed: {e}")
+    try:
         from utils.runtime_state_store import get_runtime_state_store
 
         claimed = get_runtime_state_store().claim_next_queued_job()

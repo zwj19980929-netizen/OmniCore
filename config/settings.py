@@ -329,6 +329,37 @@ class Settings:
     VOICE_OUTPUT_MODEL = os.getenv("VOICE_OUTPUT_MODEL", "tts-1")
     VOICE_OUTPUT_VOICE = os.getenv("VOICE_OUTPUT_VOICE", "alloy")
 
+    # === MCP (Model Context Protocol) ===
+    MCP_ENABLED = os.getenv("MCP_ENABLED", "true").lower() == "true"
+    MCP_TOOL_CALL_TIMEOUT = _env_int("MCP_TOOL_CALL_TIMEOUT", 30)
+
+    # === Knowledge Base (RAG) ===
+    KNOWLEDGE_BASE_ENABLED = os.getenv("KNOWLEDGE_BASE_ENABLED", "true").lower() == "true"
+    KNOWLEDGE_RETRIEVAL_TOP_K = _env_int("KNOWLEDGE_RETRIEVAL_TOP_K", 5)
+    KNOWLEDGE_MAX_CONTEXT_CHARS = _env_int("KNOWLEDGE_MAX_CONTEXT_CHARS", 4000)
+    KNOWLEDGE_DISTANCE_THRESHOLD = float(os.getenv("KNOWLEDGE_DISTANCE_THRESHOLD", "0.5"))
+    KNOWLEDGE_MIN_CONTENT_LENGTH = _env_int("KNOWLEDGE_MIN_CONTENT_LENGTH", 50)
+
+    # === 成本感知智能路由 ===
+    COST_TRACKING_ENABLED = os.getenv("COST_TRACKING_ENABLED", "true").lower() == "true"
+    MONTHLY_BUDGET_USD = float(os.getenv("MONTHLY_BUDGET_USD", "0"))  # 0 表示不限制
+    COMPLEXITY_AWARE_ROUTING = os.getenv("COMPLEXITY_AWARE_ROUTING", "true").lower() == "true"
+
+    # === 事件驱动信息流 ===
+    EVENT_DRIVEN_ENABLED = os.getenv("EVENT_DRIVEN_ENABLED", "true").lower() == "true"
+    WEB_WATCH_MIN_INTERVAL = _env_int("WEB_WATCH_MIN_INTERVAL", 300)  # 最小检查间隔（秒）
+    WEB_WATCH_DEFAULT_INTERVAL = _env_int("WEB_WATCH_DEFAULT_INTERVAL", 3600)  # 默认检查间隔
+    WEB_WATCH_DEFAULT_THRESHOLD = float(os.getenv("WEB_WATCH_DEFAULT_THRESHOLD", "0.1"))
+    WEBHOOK_ENABLED = os.getenv("WEBHOOK_ENABLED", "false").lower() == "true"
+    WEBHOOK_PORT = _env_int("WEBHOOK_PORT", 9988)
+
+    # === Skill Library ===
+    SKILL_LIBRARY_ENABLED = os.getenv("SKILL_LIBRARY_ENABLED", "true").lower() == "true"
+    SKILL_MATCH_THRESHOLD = float(os.getenv("SKILL_MATCH_THRESHOLD", "0.3"))
+    SKILL_MIN_STEPS_TO_EXTRACT = _env_int("SKILL_MIN_STEPS_TO_EXTRACT", 2)
+    SKILL_AUTO_DEPRECATE_THRESHOLD = float(os.getenv("SKILL_AUTO_DEPRECATE_THRESHOLD", "0.3"))
+    SKILL_AUTO_DEPRECATE_MIN_USES = _env_int("SKILL_AUTO_DEPRECATE_MIN_USES", 3)
+
     # === 意图分类 ===
     INTENT_TYPES = [
         "web_scraping",      # 网页抓取

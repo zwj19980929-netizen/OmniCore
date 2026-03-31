@@ -4,6 +4,7 @@ tool-centric runtime.
 """
 from __future__ import annotations
 
+import asyncio
 import re
 import threading
 from dataclasses import dataclass, field
@@ -499,9 +500,73 @@ def build_dynamic_tool_prompt_lines() -> List[str]:
     return lines
 
 
+def _register_mcp_tools(registry: ToolRegistry) -> None:
+    """从 MCPClientManager 动态注册所有已发现的 MCP 工具。
+
+    在同步上下文中调用：如果有可用的 async 事件循环则复用，否则创建临时循环。
+    MCP Server 连接失败不影响启动——跳过并记录警告。
+    """
+    from config.settings import settings
+
+    if not getattr(settings, "MCP_ENABLED", True):
+        return
+
+    try:
+        from core.mcp_client import MCPClientManager
+    except ImportError:
+        return
+
+    async def _init_and_collect():
+        manager = await MCPClientManager.get_instance()
+        return manager
+
+    # 获取或创建事件循环
+    try:
+        loop = asyncio.get_running_loop()
+        # 已有运行中的循环（如 Streamlit），跳过同步初始化
+        # MCP 工具将在首次 adapter.execute 调用时懒加载
+        return
+    except RuntimeError:
+        pass
+
+    try:
+        loop = asyncio.new_event_loop()
+        try:
+            manager = loop.run_until_complete(_init_and_collect())
+        finally:
+            # 不关闭循环中的 MCP 子进程连接，只停止循环
+            loop.close()
+    except Exception as exc:
+        from utils.logger import log_warning
+        log_warning(f"MCP tool registration skipped: {exc}")
+        return
+
+    for tool in manager.get_all_tools():
+        full_name = f"mcp.{tool.server_name}.{tool.name}"
+        client = manager.get_client(tool.server_name)
+        if not client:
+            continue
+
+        registry.register(
+            RegisteredTool(
+                spec=ToolSpec(
+                    name=full_name,
+                    task_type="mcp_handler",
+                    description=tool.description or f"MCP tool: {tool.name}",
+                    risk_level=client.config.risk_level,
+                    tags=["mcp", tool.server_name],
+                    input_schema=tool.input_schema,
+                ),
+                adapter_name="mcp_adapter",
+                max_parallelism=client.config.max_parallelism,
+            )
+        )
+
+
 def build_builtin_tool_registry() -> ToolRegistry:
     registry = ToolRegistry()
     _register_builtin_tools(registry)
+    _register_mcp_tools(registry)
     return _sync_plugin_tools(registry)
 
 

@@ -62,6 +62,7 @@ class LLMClient:
         model: Optional[str] = None,
         capability: Optional[str] = None,
         provider: Optional[str] = None,
+        complexity: Optional[float] = None,
     ):
         """
         初始化 LLM 客户端
@@ -70,6 +71,7 @@ class LLMClient:
             model: 模型名称，如 "gemini/gemini-2.5-pro" 或 "gpt-4o"
             capability: 按能力自动选择模型，如 "vision", "image_gen", "stt"
             provider: 限定厂家，如 "gemini", "kimi", "minimax"
+            complexity: 任务复杂度分（0~1.0），用于动态选择 cost_tier
         """
         if model:
             self.model = model
@@ -79,7 +81,13 @@ class LLMClient:
             if provider:
                 registry.set_provider(provider)
             cap_enum = ModelCapability(capability)
-            resolved = registry.get_model_for_capability(cap_enum)
+
+            prefer_cost: Optional[str] = None
+            if complexity is not None and settings.COMPLEXITY_AWARE_ROUTING:
+                from core.complexity_scorer import complexity_to_cost_preference
+                prefer_cost = complexity_to_cost_preference(complexity)
+
+            resolved = registry.get_model_for_capability(cap_enum, prefer_cost=prefer_cost)
             if not resolved:
                 raise ValueError(f"没有找到支持 {capability} 的模型")
             self.model = resolved
@@ -479,12 +487,42 @@ class LLMClient:
                 )
 
         call_duration_ms = (_time.time() - call_start) * 1000
+        model_name = response.model or kwargs.get("model", "unknown")
+        tokens_in = response.usage.prompt_tokens
+        tokens_out = response.usage.completion_tokens
         get_structured_logger().log_llm_call(
-            model=response.model or kwargs.get("model", "unknown"),
-            tokens_in=response.usage.prompt_tokens,
-            tokens_out=response.usage.completion_tokens,
+            model=model_name,
+            tokens_in=tokens_in,
+            tokens_out=tokens_out,
             duration_ms=call_duration_ms,
         )
+
+        # 成本追踪
+        if settings.COST_TRACKING_ENABLED:
+            try:
+                from utils.cost_tracker import CostTracker, MonthlyCostGuard
+                cost = CostTracker.calculate_cost(
+                    model_full_name=model_name,
+                    tokens_in=tokens_in,
+                    tokens_out=tokens_out,
+                )
+                if cost > 0:
+                    guard = MonthlyCostGuard(
+                        monthly_budget_usd=settings.MONTHLY_BUDGET_USD,
+                        data_dir=settings.DATA_DIR,
+                    )
+                    guard.record_cost(cost, model=model_name)
+                    used, budget, warning = guard.check_budget()
+                    if warning:
+                        log_agent_action(
+                            "CostGuard",
+                            f"月度预算警告：已消耗 ${used:.4f} / ${budget:.2f}"
+                            f" ({used/budget:.0%})",
+                            "",
+                        )
+            except Exception:
+                pass
+
         return LLMResponse(
             content=content,
             model=response.model,

@@ -992,6 +992,90 @@ async def execute_tool_via_adapter(
     return await adapter.execute(task, shared_memory_snapshot, registered_tool)
 
 
+# MCP 工具适配器 — 将 TaskItem 转发到 MCP Server
+@tool_adapter("mcp_adapter")
+class MCPToolAdapter(BaseToolAdapter):
+    """MCP 协议工具适配器。
+
+    通过 MCPClientManager 将任务分发到对应的 MCP Server 执行。
+    工具名称格式: mcp.{server_name}.{tool_name}
+    """
+
+    async def execute(
+        self,
+        task: Dict[str, Any],
+        shared_memory_snapshot: Dict[str, Any],
+        registered_tool: RegisteredTool,
+    ) -> Dict[str, Any]:
+        full_tool_name = registered_tool.spec.name
+        params = task.get("params", {}) or task.get("tool_args", {}) or {}
+
+        try:
+            from core.mcp_client import MCPClientManager
+
+            manager = await MCPClientManager.get_instance()
+            result = await manager.call_tool(full_tool_name, params)
+
+            # MCP 返回的 content 数组 -> 提取文本
+            output_text = _extract_mcp_text(result)
+
+            log_agent_action(
+                "MCP",
+                f"Tool '{full_tool_name}' completed, output length={len(output_text)}",
+            )
+
+            return _base_outcome(
+                task,
+                registered_tool,
+                status=str(TaskStatus.COMPLETED),
+                result={"success": True, "output": output_text, "raw": result},
+                shared_memory=output_text,
+                error_trace="",
+                failure_type=None,
+            )
+
+        except ConnectionError as e:
+            log_error(f"MCP connection error: {e}")
+            return _base_outcome(
+                task,
+                registered_tool,
+                status=str(TaskStatus.FAILED),
+                result={"success": False, "error": str(e)},
+                shared_memory=None,
+                error_trace=str(e),
+                failure_type=str(FailureType.EXECUTION_ERROR),
+            )
+        except Exception as e:
+            log_error(f"MCP tool execution failed [{full_tool_name}]: {e}")
+            return _base_outcome(
+                task,
+                registered_tool,
+                status=str(TaskStatus.FAILED),
+                result={"success": False, "error": str(e)},
+                shared_memory=None,
+                error_trace=str(e),
+                failure_type=str(FailureType.UNKNOWN),
+            )
+
+
+def _extract_mcp_text(result: Any) -> str:
+    """从 MCP tools/call 返回值提取文本内容。
+
+    MCP 规范返回格式: {"content": [{"type": "text", "text": "..."}, ...]}
+    """
+    if result is None:
+        return ""
+    if isinstance(result, dict) and "content" in result:
+        parts = []
+        for item in result["content"]:
+            if isinstance(item, dict) and item.get("type") == "text":
+                parts.append(item.get("text", ""))
+        return "\n".join(parts) if parts else str(result)
+    if isinstance(result, str):
+        return result
+    return str(result)
+
+
 # 🔥 注册内置 adapters
 register_tool_adapter_class("web_worker", WebWorkerAdapter)
 register_tool_adapter_class("enhanced_web_worker", EnhancedWebWorkerAdapter)
@@ -1000,3 +1084,4 @@ register_tool_adapter_class("api_worker", ApiWorkerAdapter)
 register_tool_adapter_class("system_worker", SystemWorkerAdapter)
 register_tool_adapter_class("terminal_worker", TerminalWorkerAdapter)
 register_tool_adapter_class("browser_agent", BrowserAgentAdapter)
+register_tool_adapter_class("mcp_adapter", MCPToolAdapter)

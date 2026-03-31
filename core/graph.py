@@ -1725,6 +1725,68 @@ def finalize_node(state: OmniCoreState) -> OmniCoreState:
         state["execution_status"] = "completed_with_issues"
         log_error(f"任务未通过审查: {state['critic_feedback']}")
 
+    # Skill Library: 反馈更新（如果本次任务源自 Skill 匹配）
+    matched_skill_id = str(state.get("matched_skill_id", "") or "").strip()
+    if matched_skill_id:
+        try:
+            from memory.skill_store import SkillStore
+            skill_store = SkillStore()
+            skill_store.update_feedback(matched_skill_id, success=state.get("critic_approved", False))
+        except Exception as exc:
+            log_warning(f"Skill feedback update failed (non-blocking): {exc}")
+
+    # Skill Library: 提炼（成功完成的多步任务自动沉淀为 Skill）
+    if state.get("critic_approved", False) and not matched_skill_id:
+        try:
+            from memory.skill_store import SkillStore
+            skill_store = SkillStore()
+            skill_id = skill_store.extract_and_save(state)
+            if skill_id:
+                log_agent_action("SkillLibrary", "Extracted skill", skill_id)
+        except Exception as exc:
+            log_warning(f"Skill extraction failed (non-blocking): {exc}")
+
+    # Knowledge Base: 自动索引任务结果和浏览器产出
+    try:
+        from config.settings import settings as _kb_settings
+        if _kb_settings.KNOWLEDGE_BASE_ENABLED:
+            from memory.knowledge_store import KnowledgeStore
+            kb = KnowledgeStore()
+
+            # 索引任务结果摘要
+            final_output = str(state.get("final_output", "") or "")
+            if final_output:
+                kb.index_task_result(
+                    summary=final_output,
+                    user_input=str(state.get("user_input", "") or ""),
+                    job_id=str(state.get("job_id", "") or ""),
+                    session_id=str(state.get("session_id", "") or ""),
+                )
+
+            # 索引浏览器抓取的网页内容
+            for task in state.get("task_queue", []):
+                result = task.get("result")
+                if not isinstance(result, dict):
+                    continue
+                page_url = str(result.get("page_url", "") or result.get("url", "") or "")
+                page_content = str(
+                    result.get("page_content", "")
+                    or result.get("extracted_text", "")
+                    or result.get("content", "")
+                    or ""
+                )
+                if page_url and len(page_content) >= _kb_settings.KNOWLEDGE_MIN_CONTENT_LENGTH:
+                    page_title = str(result.get("page_title", "") or result.get("title", "") or "")
+                    kb.index_web_page(
+                        url=page_url,
+                        title=page_title,
+                        content=page_content,
+                        session_id=str(state.get("session_id", "") or ""),
+                        job_id=str(state.get("job_id", "") or ""),
+                    )
+    except Exception as exc:
+        log_warning(f"Knowledge indexing failed (non-blocking): {exc}")
+
     get_structured_logger().log_event("stage_end", detail="finalize")
     _save_runtime_checkpoint(state, "finalize", "Finalize completed")
     return state

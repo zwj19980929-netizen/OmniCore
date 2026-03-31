@@ -53,13 +53,13 @@ All 7 directions of the architecture upgrade are now integrated into the runtime
 
 | 优先级 | 方向 | 状态 |
 |--------|------|------|
-| P0 | MCP 工具生态接入 | ⬜ 未开始 |
-| P0 | Skill Library 经验复用 | ⬜ 未开始 |
+| P0 | MCP 工具生态接入 | ✅ 已完成 (2026-03-28) |
+| P0 | Skill Library 经验复用 | ✅ 已完成 (2026-03-29) |
 | P1 | IM Bot 远程访问 | ⬜ 未开始 |
-| P1 | 知识库 RAG 深度集成 | ⬜ 未开始 |
+| P1 | 知识库 RAG 深度集成 | ✅ 已完成 (2026-03-29) |
 | P2 | 多模态输入/输出 | ✅ 已完成 (2026-03-28) |
-| P2 | 成本感知智能路由 | ⬜ 未开始 |
-| P3 | 事件驱动信息流 | ⬜ 未开始 |
+| P2 | 成本感知智能路由 | ✅ 已完成 (2026-03-31) |
+| P3 | 事件驱动信息流 | ✅ 已完成 (2026-03-31) |
 | P3 | 多 Agent 协作 | ⬜ 未开始 |
 
 ## Current Work In Progress
