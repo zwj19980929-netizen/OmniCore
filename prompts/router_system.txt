@@ -46,7 +46,8 @@
             "required_capabilities": ["text_chat"],
             "success_criteria": ["描述成功的可验证条件"],
             "fallbacks": [{{"type": "retry", "param_patch": {{}}}}],
-            "abort_conditions": ["什么情况下应该放弃"]
+            "abort_conditions": ["什么情况下应该放弃"],
+            "conditional": null
         }}
     ],
     "is_high_risk": false,
@@ -67,6 +68,32 @@ fallbacks 是一个有序列表，Worker 失败时按顺序尝试：
 - `{{"type": "switch_worker", "target": "browser_agent", "param_patch": {{"task": "..."}}}}` — 切换到另一个 Worker 类型执行
 - 如果你不确定需要什么 fallback，可以留空列表 []
 
+## 条件任务与跨任务数据引用（多 Agent 协作）
+
+当多个任务有数据依赖时，下游任务的 params 可以用 `$task_id.field` 引用上游任务的输出：
+- `"$task_1.file_path"` → 引用 task_1 输出中的 file_path
+- `"$task_1.content"` → 引用 task_1 输出中的 content
+- `"$task_1.stdout"` → 引用 task_1 输出中的 stdout
+
+当某个任务只在特定条件下才需要执行时，使用 conditional 字段：
+- `"conditional": {{"when": "$task_1.file_path ends_with .zip", "else_skip": true}}`
+- 支持的操作符：`ends_with`、`starts_with`、`contains`、`==`、`!=`、`exists`
+- `else_skip: true` 表示条件不满足时自动跳过该任务，`false` 表示阻塞等待
+
+示例：Browser 下载 → Terminal 解压 → File 整理
+```
+{{"task_id": "task_1", "task_type": "browser_agent", "description": "下载文件", ...}},
+{{"task_id": "task_2", "task_type": "system_worker", "description": "解压文件",
+  "params": {{"command": "unzip $task_1.file_path -d /tmp/extracted/"}},
+  "depends_on": ["task_1"],
+  "conditional": {{"when": "$task_1.file_path ends_with .zip", "else_skip": true}}
+}},
+{{"task_id": "task_3", "task_type": "file_worker", "description": "整理结果",
+  "params": {{"action": "read", "data_source": "task_2"}},
+  "depends_on": ["task_2"]
+}}
+```
+
 ## params 参考（不是死规则，根据实际需要灵活填写）
 
 web_worker params:
@@ -79,11 +106,29 @@ browser_agent params:
 - headless: 是否无头模式
 
 file_worker params:
-- action: "write" 或 "read"
-- file_path: 文件路径
+- action: "write"（覆盖写入）| "read"（读取）| "append"（追加）| "generate"（LLM生成文档）| "convert"（格式转换）| "archive"（压缩打包）
+- file_path: 文件路径（write/read/append/generate 通用）
 - data_source: 数据来源的 task_id（用于写入从其他任务获取的数据）
 - data_sources: 多个数据来源的 task_id 列表（多源对比场景）
-- format: 输出格式（txt/xlsx/csv/markdown/html，根据场景智能选择）
+- format: 输出格式（txt/xlsx/csv/markdown/html/python/json/yaml，根据场景智能选择）
+- content: 直接写入的文本内容（write/append）
+- template: templates/ 目录下的 Jinja2 模板文件名（如 "report_table.html.j2"），用于自定义样式
+- topic: 文档主题（generate 模式必填）
+- outline: 章节大纲列表（generate 模式可选，如 ["背景","目标","方案","风险"]）
+- style: 文档风格（generate 模式可选）：技术文档 / 邮件 / 周报 / README / 方案
+- columns: 输出字段白名单（过滤敏感字段时使用）
+- exclude_columns: 输出字段黑名单（如 ["api_key","internal_id"]）
+- source_path: 源文件路径（convert 模式）
+- target_path: 目标文件路径（convert/archive 模式）
+- sources: 源文件路径列表（archive 模式，如 ["~/Desktop/a.xlsx","~/Desktop/b.txt"]）
+
+场景选择指南：
+- 帮我写一份报告/方案/邮件/周报 → action=generate，填 topic/style/outline
+- 追加日志/追加记录 → action=append
+- 把 csv 转成 xlsx → action=convert，填 source_path/target_path
+- 把多个文件打包 → action=archive，填 sources/target_path
+- 生成代码/配置文件（.py/.json/.yaml） → action=generate，填 format=python/json/yaml
+- 数据有敏感字段 → 加 exclude_columns 过滤
 
 ## 关键原则
 1. 灵活思考，不要死板套用规则

@@ -144,6 +144,14 @@ class OmniCoreState(TypedDict):
     # Skill Library: 匹配到的 Skill ID（用于 finalize 阶段反馈更新）
     matched_skill_id: str
 
+    # ── 多 Agent 协作 (P3-2) ──────────────────────────────
+    # 类型化的任务间数据传递：task_id → 结构化输出
+    task_outputs: Dict[str, Any]
+    # 动态规划：Planner 可在执行中插入新任务
+    dynamic_task_additions: List[Dict[str, Any]]
+    # Agent 间点对点消息队列
+    agent_messages: List[Dict[str, Any]]
+
 
 def create_initial_state(
     user_input: str,
@@ -175,4 +183,7 @@ def create_initial_state(
         replan_count=0,
         validator_passed=True,
         matched_skill_id="",
+        task_outputs={},
+        dynamic_task_additions=[],
+        agent_messages=[],
     )

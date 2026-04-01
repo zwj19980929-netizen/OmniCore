@@ -825,6 +825,67 @@ def parallel_executor_node(state: OmniCoreState) -> OmniCoreState:
 
 
 @register_stage(
+    name="dynamic_replan", order=32, required=False,
+    depends_on=("parallel_executor",),
+)
+def dynamic_replan_node(state: OmniCoreState) -> OmniCoreState:
+    """
+    动态规划节点：检查已完成的任务输出，将待插入的新任务合并到 task_queue。
+
+    由 Planner 或执行结果中的 dynamic_task_additions 驱动，限制最多插入
+    MAX_DYNAMIC_TASK_ADDITIONS 个任务，并检测循环依赖。
+    """
+    from core.constants import MAX_DYNAMIC_TASK_ADDITIONS
+    from core.state import ensure_task_defaults
+
+    sl = get_structured_logger()
+    job_id = state.get("job_id", "")
+
+    additions = state.get("dynamic_task_additions") or []
+    if not additions:
+        return state
+
+    with LogContext(job_id=job_id, stage="dynamic_replan"):
+        sl.log_event("stage_start", detail=f"pending_additions={len(additions)}")
+
+        existing_ids = {t["task_id"] for t in state["task_queue"] if t.get("task_id")}
+        inserted = 0
+
+        for new_task in additions:
+            if inserted >= MAX_DYNAMIC_TASK_ADDITIONS:
+                log_agent_action(
+                    "DynamicReplan",
+                    "达到动态任务插入上限",
+                    f"max={MAX_DYNAMIC_TASK_ADDITIONS}, dropped={len(additions) - inserted}",
+                )
+                break
+
+            task_id = new_task.get("task_id", "")
+            if not task_id or task_id in existing_ids:
+                continue
+
+            # 循环依赖检测
+            deps = set(new_task.get("depends_on") or [])
+            if task_id in deps:
+                continue  # 自引用
+
+            ensure_task_defaults(new_task)
+            if not new_task.get("status"):
+                new_task["status"] = "pending"
+            state["task_queue"].append(new_task)
+            existing_ids.add(task_id)
+            inserted += 1
+
+        state["dynamic_task_additions"] = []
+
+        if inserted > 0:
+            log_agent_action("DynamicReplan", f"动态插入 {inserted} 个新任务", "")
+        sl.log_event("stage_end", detail=f"inserted={inserted}")
+
+    return state
+
+
+@register_stage(
     name="critic", order=50, required=False,
     depends_on=("validator",),
     skip_condition="state.get('validator_passed') == False",
@@ -1333,7 +1394,17 @@ def should_retry_or_finish(state: OmniCoreState) -> Literal["finalize", "replann
     return "finalize"
 
 
-def after_parallel_executor(state: OmniCoreState) -> Literal["parallel_executor", "validator"]:
+def after_parallel_executor(state: OmniCoreState) -> Literal["parallel_executor", "dynamic_replan", "validator"]:
+    # 有待插入的动态任务 → 先经过 dynamic_replan
+    if state.get("dynamic_task_additions"):
+        return "dynamic_replan"
+    if collect_ready_task_indexes(state):
+        return "parallel_executor"
+    return "validator"
+
+
+def _after_dynamic_replan(state: OmniCoreState) -> Literal["parallel_executor", "validator"]:
+    """dynamic_replan 之后：有 ready 任务则继续执行，否则进入 validator。"""
     if collect_ready_task_indexes(state):
         return "parallel_executor"
     return "validator"
@@ -1831,8 +1902,15 @@ def build_graph() -> StateGraph:
         "end": END,
     })
 
-    # 批次执行后：还有 ready 任务就继续下一批，否则进入 validator
+    # 批次执行后：有动态任务插入 → dynamic_replan，有 ready → 继续执行，否则 validator
     graph.add_conditional_edges("parallel_executor", after_parallel_executor, {
+        "parallel_executor": "parallel_executor",
+        "dynamic_replan": "dynamic_replan",
+        "validator": "validator",
+    })
+
+    # dynamic_replan 后：有 ready 任务 → 继续执行，否则 validator
+    graph.add_conditional_edges("dynamic_replan", _after_dynamic_replan, {
         "parallel_executor": "parallel_executor",
         "validator": "validator",
     })
@@ -2021,10 +2099,12 @@ def build_graph_from_registry(registry: StageRegistry = None):
         targets["end"] = END
         graph.add_conditional_edges("human_confirm", get_first_executor, targets)
 
-    # parallel_executor -> parallel_executor (self-loop) | validator
+    # parallel_executor -> parallel_executor (self-loop) | dynamic_replan | validator
     if "parallel_executor" in stage_names:
         targets = {}
         targets["parallel_executor"] = "parallel_executor"
+        if "dynamic_replan" in stage_names:
+            targets["dynamic_replan"] = "dynamic_replan"
         if "validator" in stage_names:
             targets["validator"] = "validator"
         graph.add_conditional_edges(
@@ -2032,6 +2112,16 @@ def build_graph_from_registry(registry: StageRegistry = None):
             _after_parallel_executor_adaptive,
             targets,
         )
+
+    # dynamic_replan -> parallel_executor | validator
+    if "dynamic_replan" in stage_names:
+        targets = {}
+        if "parallel_executor" in stage_names:
+            targets["parallel_executor"] = "parallel_executor"
+        if "validator" in stage_names:
+            targets["validator"] = "validator"
+        if targets:
+            graph.add_conditional_edges("dynamic_replan", _after_dynamic_replan, targets)
 
     # validator -> critic | replanner | finalize
     if "validator" in stage_names:
@@ -2074,7 +2164,7 @@ def build_graph_from_registry(registry: StageRegistry = None):
 
 def _after_parallel_executor_adaptive(
     state: OmniCoreState,
-) -> Literal["parallel_executor", "validator"]:
+) -> Literal["parallel_executor", "dynamic_replan", "validator"]:
     """Post-executor routing with adaptive re-routing check (Direction 7).
 
     Before checking for more ready tasks, evaluate whether the execution

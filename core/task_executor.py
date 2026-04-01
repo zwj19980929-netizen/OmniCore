@@ -14,6 +14,7 @@ from agents.paod import classify_failure
 from config.settings import settings
 from core.constants import (
     TaskStatus,
+    TaskOutputType,
     FailureType,
 )
 from core.state import OmniCoreState
@@ -144,18 +145,34 @@ def _infer_task_dependencies(task: Dict[str, Any], task_queue: List[Dict[str, An
     return list(dict.fromkeys(inferred))
 
 
-def is_task_ready(task: Dict[str, Any], task_queue: List[Dict[str, Any]]) -> bool:
-    """Check whether a task's dependencies are satisfied."""
+def is_task_ready(
+    task: Dict[str, Any],
+    task_queue: List[Dict[str, Any]],
+    task_outputs: Optional[Dict[str, Any]] = None,
+) -> bool:
+    """Check whether a task's dependencies are satisfied and conditions are met."""
     depends = list(task.get("depends_on") or [])
     depends.extend(_infer_task_dependencies(task, task_queue))
-    if not depends:
-        return True
-    completed_ids = {
-        queued_task["task_id"]
-        for queued_task in task_queue
-        if queued_task["status"] == str(TaskStatus.COMPLETED)
-    }
-    return all(dep in completed_ids for dep in depends)
+    if depends:
+        completed_ids = {
+            queued_task["task_id"]
+            for queued_task in task_queue
+            if queued_task["status"] == str(TaskStatus.COMPLETED)
+        }
+        if not all(dep in completed_ids for dep in depends):
+            return False
+
+    # 条件检查：支持 conditional.when 表达式
+    conditional = task.get("conditional")
+    if conditional and task_outputs is not None:
+        when_expr = conditional.get("when", "")
+        if when_expr and not _evaluate_condition(when_expr, task_outputs):
+            if conditional.get("else_skip", False):
+                task["status"] = str(TaskStatus.COMPLETED)
+                task["result"] = {"skipped": True, "reason": f"Condition not met: {when_expr}"}
+            return False
+
+    return True
 
 
 _COST_ORDER = {"low": 0, "medium": 1, "high": 2}
@@ -165,8 +182,9 @@ def collect_ready_task_indexes(state: OmniCoreState) -> List[int]:
     """Collect indexes of pending tasks that are ready to run, sorted by estimated_cost (low first)."""
     ready_indexes: List[int] = []
     registry = get_builtin_tool_registry()
+    task_outputs = state.get("task_outputs") or {}
     for idx, task in enumerate(state["task_queue"]):
-        if task["status"] == str(TaskStatus.PENDING) and is_task_ready(task, state["task_queue"]):
+        if task["status"] == str(TaskStatus.PENDING) and is_task_ready(task, state["task_queue"], task_outputs):
             if registry.resolve_task(task) is not None:
                 ready_indexes.append(idx)
     # 按成本排序：低成本任务优先执行
@@ -291,6 +309,144 @@ async def _execute_single_task_async(
         }
 
 
+def _extract_typed_output(task: Dict[str, Any], outcome: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    """从任务执行结果中提取类型化输出，用于下游任务引用。"""
+    result = outcome.get("result") or {}
+    if isinstance(result, str):
+        return {
+            "type": str(TaskOutputType.TEXT_EXTRACTION),
+            "content": result,
+            "source_url": "",
+        }
+    if not isinstance(result, dict):
+        return None
+
+    tool_name = str(task.get("tool_name") or task.get("task_type") or "")
+    lower_tool = tool_name.lower()
+
+    if "browser" in lower_tool or "web" in lower_tool:
+        return {
+            "type": str(TaskOutputType.TEXT_EXTRACTION),
+            "content": result.get("extracted_text") or result.get("output") or result.get("text", ""),
+            "source_url": result.get("url", ""),
+        }
+    if "file" in lower_tool:
+        file_path = result.get("file_path") or result.get("path", "")
+        if file_path:
+            return {
+                "type": str(TaskOutputType.FILE_DOWNLOAD),
+                "file_path": file_path,
+                "file_size": result.get("file_size", 0),
+            }
+        return {
+            "type": str(TaskOutputType.TEXT_EXTRACTION),
+            "content": result.get("content") or result.get("output", ""),
+            "source_url": "",
+        }
+    if "terminal" in lower_tool or "system" in lower_tool:
+        return {
+            "type": str(TaskOutputType.COMMAND_OUTPUT),
+            "stdout": result.get("output") or result.get("stdout", ""),
+            "returncode": result.get("returncode", 0),
+        }
+
+    # 通用兜底：如有 content / output 字段则提取
+    content = result.get("content") or result.get("output") or result.get("text")
+    if content:
+        return {
+            "type": str(TaskOutputType.TEXT_EXTRACTION),
+            "content": str(content),
+            "source_url": result.get("url", ""),
+        }
+    return None
+
+
+def _resolve_task_params(
+    params: Dict[str, Any],
+    task_outputs: Dict[str, Any],
+) -> Dict[str, Any]:
+    """
+    解析任务参数中的 $ref 引用，支持跨任务数据传递。
+
+    引用格式：
+    - "$task_1.file_path"  → task_outputs["task_1"]["file_path"]
+    - "$task_1.content"    → task_outputs["task_1"]["content"]
+    - "$task_1"            → task_outputs["task_1"] (整个输出 dict)
+    """
+    if not task_outputs:
+        return params
+
+    resolved: Dict[str, Any] = {}
+    for k, v in params.items():
+        if isinstance(v, str) and v.startswith("$"):
+            ref = v[1:]  # 去掉 $
+            parts = ref.split(".", 1)
+            ref_task_id = parts[0]
+            task_out = task_outputs.get(ref_task_id)
+            if task_out is None:
+                resolved[k] = v  # 找不到时保留原值
+            elif len(parts) == 1:
+                resolved[k] = task_out  # 整个输出
+            else:
+                ref_field = parts[1]
+                resolved[k] = task_out.get(ref_field, v)
+        else:
+            resolved[k] = v
+    return resolved
+
+
+def _evaluate_condition(when_expr: str, task_outputs: Dict[str, Any]) -> bool:
+    """
+    求值简单条件表达式（不使用 eval）。
+
+    支持的操作符：
+    - "$task_id.field ends_with .ext"
+    - "$task_id.field starts_with prefix"
+    - "$task_id.field contains substr"
+    - "$task_id.field == value"
+    - "$task_id.field != value"
+    - "$task_id.field exists"
+    """
+    if not when_expr or not when_expr.strip():
+        return True
+
+    parts = when_expr.strip().split(None, 2)
+    if len(parts) < 2:
+        return True
+
+    # 解析左值
+    lhs_raw = parts[0]
+    if lhs_raw.startswith("$"):
+        ref = lhs_raw[1:]
+        ref_parts = ref.split(".", 1)
+        ref_task_id = ref_parts[0]
+        task_out = task_outputs.get(ref_task_id, {})
+        if len(ref_parts) > 1:
+            lhs = str(task_out.get(ref_parts[1], ""))
+        else:
+            lhs = str(task_out)
+    else:
+        lhs = lhs_raw
+
+    op = parts[1].lower()
+    rhs = parts[2] if len(parts) > 2 else ""
+
+    if op == "ends_with":
+        return lhs.endswith(rhs)
+    elif op == "starts_with":
+        return lhs.startswith(rhs)
+    elif op == "contains":
+        return rhs in lhs
+    elif op == "==":
+        return lhs == rhs
+    elif op == "!=":
+        return lhs != rhs
+    elif op == "exists":
+        return bool(lhs)
+    else:
+        return True  # 不认识的操作符视为满足
+
+
 def _apply_task_outcome(state: OmniCoreState, idx: int, outcome: Dict[str, Any]) -> None:
     """Apply a task execution outcome back into runtime state."""
     state["task_queue"][idx]["task_type"] = outcome.get("task_type", state["task_queue"][idx]["task_type"])
@@ -315,6 +471,22 @@ def _apply_task_outcome(state: OmniCoreState, idx: int, outcome: Dict[str, Any])
     if outcome.get("error_trace"):
         state["error_trace"] = outcome["error_trace"]
 
+    # 多 Agent 协作：写入类型化输出到 task_outputs
+    if outcome.get("status") == str(TaskStatus.COMPLETED):
+        task = state["task_queue"][idx]
+        typed_output = _extract_typed_output(task, outcome)
+        if typed_output:
+            if "task_outputs" not in state:
+                state["task_outputs"] = {}
+            task_id = task.get("task_id", "")
+            if task_id:
+                # 截断过大的文本输出（50KB）
+                for field in ("content", "stdout", "text"):
+                    if field in typed_output and isinstance(typed_output[field], str):
+                        if len(typed_output[field]) > 50_000:
+                            typed_output[field] = typed_output[field][:50_000] + "...(truncated)"
+                state["task_outputs"][task_id] = typed_output
+
 
 async def run_ready_batch_async(state: OmniCoreState) -> OmniCoreState:
     """
@@ -336,6 +508,20 @@ async def run_ready_batch_async(state: OmniCoreState) -> OmniCoreState:
     log_agent_action("TaskExecutor", f"执行批次任务 ({len(batch_indexes)})", ", ".join(task_labels))
 
     shared_memory_snapshot = dict(state["shared_memory"])
+
+    # 多 Agent 协作：解析 $ref 参数引用
+    task_outputs = state.get("task_outputs") or {}
+    if task_outputs:
+        for idx in batch_indexes:
+            original_params = state["task_queue"][idx].get("params") or {}
+            resolved = _resolve_task_params(original_params, task_outputs)
+            if resolved != original_params:
+                state["task_queue"][idx]["params"] = resolved
+                log_agent_action(
+                    "TaskExecutor",
+                    f"解析 $ref 参数 ({state['task_queue'][idx]['task_id']})",
+                    str({k: v for k, v in resolved.items() if v != original_params.get(k)}),
+                )
 
     if len(batch_indexes) == 1:
         # 串行执行

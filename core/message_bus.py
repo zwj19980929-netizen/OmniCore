@@ -30,6 +30,11 @@ MSG_USER_PREFERENCES = "user_preferences"
 MSG_WORK_CONTEXT = "work_context"
 MSG_MEMORY = "memory"
 
+# Agent-to-Agent 协作消息类型 (P3-2)
+MSG_AGENT_REQUEST = "agent_request"     # Agent A 请求 Agent B 执行子任务
+MSG_AGENT_RESPONSE = "agent_response"   # Agent B 返回结果给 Agent A
+MSG_AGENT_STATUS = "agent_status"       # Agent 状态广播（开始/完成/失败）
+
 
 # ---------------------------------------------------------------------------
 # Mapping from legacy shared_memory keys to (message_type, source, target)
@@ -53,6 +58,60 @@ _LEGACY_KEY_MAP: Dict[str, tuple] = {
     "successful_paths":           (MSG_MEMORY,               "system",  "*"),
     "failure_patterns":           (MSG_MEMORY,               "system",  "*"),
 }
+
+
+# ---------------------------------------------------------------------------
+# Agent-to-Agent 协作消息 (P3-2)
+# ---------------------------------------------------------------------------
+
+@dataclass
+class AgentRequest:
+    """Agent A → Agent B 的任务请求。
+
+    Attributes:
+        from_agent: 发起请求的 Agent 标识。
+        to_agent: 目标 Agent 标识。
+        task: 需要执行的任务描述（与 TaskItem 兼容的 dict）。
+        callback_task_id: 完成后更新哪个任务的结果（可选）。
+    """
+    from_agent: str
+    to_agent: str
+    task: Dict[str, Any]
+    callback_task_id: str = ""
+
+    def to_payload(self) -> Dict[str, Any]:
+        return asdict(self)
+
+    @classmethod
+    def from_payload(cls, data: Dict[str, Any]) -> "AgentRequest":
+        known = {"from_agent", "to_agent", "task", "callback_task_id"}
+        return cls(**{k: v for k, v in data.items() if k in known})
+
+
+@dataclass
+class AgentResponse:
+    """Agent B 的执行响应。
+
+    Attributes:
+        from_agent: 响应方 Agent 标识。
+        to_agent: 请求方 Agent 标识。
+        request_task_id: 对应的请求任务 ID。
+        result: 执行结果。
+        success: 是否成功。
+    """
+    from_agent: str
+    to_agent: str
+    request_task_id: str
+    result: Dict[str, Any]
+    success: bool
+
+    def to_payload(self) -> Dict[str, Any]:
+        return asdict(self)
+
+    @classmethod
+    def from_payload(cls, data: Dict[str, Any]) -> "AgentResponse":
+        known = {"from_agent", "to_agent", "request_task_id", "result", "success"}
+        return cls(**{k: v for k, v in data.items() if k in known})
 
 
 # ---------------------------------------------------------------------------

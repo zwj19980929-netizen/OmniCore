@@ -60,7 +60,32 @@ All 7 directions of the architecture upgrade are now integrated into the runtime
 | P2 | 多模态输入/输出 | ✅ 已完成 (2026-03-28) |
 | P2 | 成本感知智能路由 | ✅ 已完成 (2026-03-31) |
 | P3 | 事件驱动信息流 | ✅ 已完成 (2026-03-31) |
-| P3 | 多 Agent 协作 | ⬜ 未开始 |
+| P3 | 多 Agent 协作 | ✅ 已完成 (2026-03-31) |
+
+## 已完成: 文件生成能力优化 (2026-03-31)
+
+详细方案见 [`docs/2026-03-31-文件生成能力优化方案.md`](docs/2026-03-31-文件生成能力优化方案.md)，共 9 个优化项全部完成：
+
+| 优先级 | 优化项 | 状态 | 说明 |
+|--------|--------|------|------|
+| P0-1 | LLM 驱动的文档内容生成 | ✅ 已完成 | `action=generate`，新增 `_generate_content()`；`prompts/file_generate.txt` 模板 |
+| P0-2 | Jinja2 模板引擎支持 | ✅ 已完成 | `_render_template()`；`templates/report_table.html.j2` + `report_table.md.j2`；`requirements.txt` 增加 jinja2 |
+| P1-1 | 追加模式（append） | ✅ 已完成 | `action=append`，`_append_file()` 支持 txt/csv/xlsx/markdown |
+| P1-2 | 代码/配置文件格式验证 | ✅ 已完成 | `_validate_code_content()` 对 python/json/yaml/toml 做语法验证+格式化 |
+| P1-3 | Artifact 元数据增强 | ✅ 已完成 | `_build_artifact_preview()` 写入 `result["artifact_preview"]`（行数、列名、大小、格式） |
+| P2-1 | 流式写入大文件 | ✅ 已完成 | `_write_csv_streaming()` 分批写入；`len(data) > 50_000` 时自动触发 |
+| P2-2 | 列过滤与字段保护 | ✅ 已完成 | `_apply_column_filter()`，支持 `columns`（白名单）和 `exclude_columns`（黑名单）参数 |
+| P2-3 | 格式转换工具 | ✅ 已完成 | `action=convert`，`_convert_file()` 支持 csv/xlsx/json/markdown 互转 |
+| P2-4 | 压缩打包 | ✅ 已完成 | `action=archive`，`_archive_files()` 用标准库 zipfile |
+
+**涉及改动文件：**
+- `agents/file_worker.py` — 主要实现，新增全部 action 和辅助方法
+- `core/tool_registry.py` — 扩展 `file.read_write` schema，新增 10 个参数字段
+- `prompts/router_system.txt` — 补充 generate/append/convert/archive 场景引导和选择指南
+- `prompts/file_generate.txt` — 新建：LLM 文档生成系统提示词
+- `templates/report_table.html.j2` — 新建：HTML 报告 Jinja2 模板
+- `templates/report_table.md.j2` — 新建：Markdown 报告 Jinja2 模板
+- `requirements.txt` — 新增 `jinja2>=3.1.0`
 
 ## Current Work In Progress
 

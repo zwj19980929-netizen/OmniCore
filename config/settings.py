@@ -404,5 +404,13 @@ class Settings:
     # 用户自定义强制确认的命令前缀（逗号分隔）
     TERMINAL_ALWAYS_CONFIRM_PATTERNS = _env_csv("TERMINAL_ALWAYS_CONFIRM_PATTERNS")
 
+    # === FileWorker 配置 ===
+    # CSV 流式写入触发阈值（行数超过此值自动切换分批写入，避免 OOM）
+    FILE_STREAM_THRESHOLD = _env_int("FILE_STREAM_THRESHOLD", 50_000)
+    # CSV 流式写入每批行数
+    FILE_STREAM_CHUNK_SIZE = _env_int("FILE_STREAM_CHUNK_SIZE", 10_000)
+    # LLM 文档生成最大 tokens（generate 模式）
+    FILE_GENERATE_MAX_TOKENS = _env_int("FILE_GENERATE_MAX_TOKENS", 4096)
+
 
 settings = Settings()

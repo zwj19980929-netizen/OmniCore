@@ -115,6 +115,23 @@ class SystemAction(str, Enum):
         return self.value
 
 
+class TaskOutputType(str, Enum):
+    """任务输出的结构化类型（多 Agent 协作间数据传递）。"""
+    FILE_DOWNLOAD = "file_download"       # {"file_path": str, "file_size": int}
+    TEXT_EXTRACTION = "text_extraction"   # {"content": str, "source_url": str}
+    STRUCTURED_DATA = "structured_data"   # {"data": list/dict, "schema": str}
+    SCREENSHOT = "screenshot"             # {"file_path": str, "url": str}
+    COMMAND_OUTPUT = "command_output"     # {"stdout": str, "returncode": int}
+    ARTIFACT_REF = "artifact_ref"         # {"artifact_id": str, "artifact_type": str}
+
+    def __str__(self) -> str:
+        return self.value
+
+
+# 动态任务插入限制（防止无限循环）
+MAX_DYNAMIC_TASK_ADDITIONS = 10
+
+
 class TerminalAction(str, Enum):
     """终端操作类型枚举"""
     SHELL = "shell"           # 执行 shell 命令（完整 shell 语法）
