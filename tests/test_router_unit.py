@@ -249,13 +249,16 @@ def test_router_includes_current_time_context_from_state():
     fake_llm = _FakeLLM()
     router = RouterAgent(llm_client=fake_llm)
     state = create_initial_state("plan today's work")
-    state["shared_memory"]["current_time_context"] = {
+    from core.message_bus import MessageBus, MSG_TIME_CONTEXT
+    bus = MessageBus.from_dict(state.get("message_bus", []))
+    bus.publish("system", "*", MSG_TIME_CONTEXT, {"value": {
         "iso_datetime": "2026-03-04T18:30:00+08:00",
         "local_date": "2026-03-04",
         "local_time": "18:30:00",
         "weekday": "Wednesday",
         "timezone": "CST",
-    }
+    }})
+    state["message_bus"] = bus.to_dict()
 
     router.route(state)
 
@@ -268,11 +271,14 @@ def test_router_skips_current_location_context_for_non_geographic_task():
     fake_llm = _FakeLLM()
     router = RouterAgent(llm_client=fake_llm)
     state = create_initial_state("save the report to disk")
-    state["shared_memory"]["current_location_context"] = {
+    from core.message_bus import MessageBus, MSG_LOCATION_CONTEXT
+    bus = MessageBus.from_dict(state.get("message_bus", []))
+    bus.publish("system", "*", MSG_LOCATION_CONTEXT, {"value": {
         "location": "Shanghai, China",
         "timezone": "CST",
         "source": "user_preference",
-    }
+    }})
+    state["message_bus"] = bus.to_dict()
 
     router.route(state)
 
@@ -299,7 +305,11 @@ def test_router_persists_direct_answer_for_taskless_queries():
     router.route(state)
 
     assert state["task_queue"] == []
-    assert state["shared_memory"]["router_direct_answer"] == "当前时间是 2026-03-05 10:17:54。"
+    from core.message_bus import MessageBus, MSG_DIRECT_ANSWER
+    bus = MessageBus.from_dict(state.get("message_bus", []))
+    msg = bus.get_latest(MSG_DIRECT_ANSWER)
+    assert msg is not None
+    assert msg.payload["value"] == "当前时间是 2026-03-05 10:17:54。"
 
 
 def test_router_fact_freshness_guard_replaces_direct_answer_with_verification_tasks():

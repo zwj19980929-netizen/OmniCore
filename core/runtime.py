@@ -1699,11 +1699,14 @@ def resume_job_from_checkpoint(
 
     resumed_state = sanitize_value(checkpoint_state)
     resumed_state.setdefault("messages", [])
-    resumed_state.setdefault("shared_memory", {})
-    if isinstance(resumed_state["shared_memory"], dict):
-        resumed_state["shared_memory"]["_resume_after_stage"] = sanitize_text(checkpoint.get("stage") or "")
-        resumed_state["shared_memory"]["_resume_checkpoint_id"] = sanitize_text(checkpoint.get("checkpoint_id") or "")
-        resumed_state["shared_memory"]["_resume_requested_at"] = str(int(time.time()))
+    from core.message_bus import (
+        MessageBus, MSG_RESUME_STAGE, MSG_RESUME_CHECKPOINT_ID, MSG_RESUME_REQUESTED_AT,
+    )
+    _resume_bus = MessageBus.from_dict(resumed_state.get("message_bus", []))
+    _resume_bus.publish("runtime", "*", MSG_RESUME_STAGE, {"value": sanitize_text(checkpoint.get("stage") or "")})
+    _resume_bus.publish("runtime", "*", MSG_RESUME_CHECKPOINT_ID, {"value": sanitize_text(checkpoint.get("checkpoint_id") or "")})
+    _resume_bus.publish("runtime", "*", MSG_RESUME_REQUESTED_AT, {"value": str(int(time.time()))})
+    resumed_state["message_bus"] = _resume_bus.to_dict()
 
     result = _execute_submitted_job(
         sanitize_text(job_record.get("user_input") or ""),
@@ -1753,7 +1756,6 @@ def approve_waiting_job(job_id: str) -> Optional[Dict[str, Any]]:
         return None
 
     resumed_state = sanitize_value(selected_checkpoint.get("state") or {})
-    resumed_state.setdefault("shared_memory", {})
     approved_actions = []
     for task in resumed_state.get("task_queue", []) or []:
         if not isinstance(task, dict):
@@ -1765,12 +1767,16 @@ def approve_waiting_job(job_id: str) -> Optional[Dict[str, Any]]:
     if not approved_actions:
         return None
 
-    resumed_state["shared_memory"]["_approved_actions"] = approved_actions
-    resumed_state["shared_memory"]["_resume_after_stage"] = "human_confirm"
-    resumed_state["shared_memory"]["_resume_checkpoint_id"] = sanitize_text(
-        selected_checkpoint.get("checkpoint_id") or ""
+    from core.message_bus import (
+        MessageBus, MSG_APPROVED_ACTIONS, MSG_RESUME_STAGE,
+        MSG_RESUME_CHECKPOINT_ID, MSG_APPROVAL_RESUMED_AT,
     )
-    resumed_state["shared_memory"]["_approval_resumed_at"] = str(int(time.time()))
+    _approval_bus = MessageBus.from_dict(resumed_state.get("message_bus", []))
+    _approval_bus.publish("policy", "executor", MSG_APPROVED_ACTIONS, {"value": approved_actions})
+    _approval_bus.publish("runtime", "*", MSG_RESUME_STAGE, {"value": "human_confirm"})
+    _approval_bus.publish("runtime", "*", MSG_RESUME_CHECKPOINT_ID, {"value": sanitize_text(selected_checkpoint.get("checkpoint_id") or "")})
+    _approval_bus.publish("runtime", "*", MSG_APPROVAL_RESUMED_AT, {"value": str(int(time.time()))})
+    resumed_state["message_bus"] = _approval_bus.to_dict()
 
     result = _execute_submitted_job(
         sanitize_text(job_record.get("user_input") or ""),
@@ -1875,19 +1881,6 @@ def _execute_submitted_job(
         initial_state["user_input"] = clean_user_input
         initial_state["session_id"] = runtime_session_id
         initial_state["job_id"] = runtime_job_id
-        initial_state.setdefault("shared_memory", {})
-        initial_state["shared_memory"]["current_time_context"] = current_time_context
-        initial_state["shared_memory"]["current_os_context"] = current_os_context
-        initial_state["shared_memory"]["current_location_context"] = current_location_context
-        initial_state["shared_memory"]["user_preferences"] = user_preferences
-        initial_state["shared_memory"]["work_context"] = work_runtime_context.get("work_context", {})
-        initial_state["shared_memory"]["resource_memory"] = work_runtime_context.get("resource_memory", [])
-        initial_state["shared_memory"]["successful_paths"] = work_runtime_context.get("successful_paths", [])
-        initial_state["shared_memory"]["failure_patterns"] = work_runtime_context.get("failure_patterns", [])
-        initial_state["shared_memory"]["work_scope"] = work_runtime_context.get("scope", {})
-        initial_state["shared_memory"]["memory_scope"] = memory_scope
-        if clean_history:
-            initial_state["shared_memory"]["conversation_history"] = clean_history
     else:
         initial_state = create_initial_state(
             clean_user_input,
@@ -1895,46 +1888,37 @@ def _execute_submitted_job(
             job_id=runtime_job_id,
         )
 
-        if clean_history:
-            initial_state["shared_memory"]["conversation_history"] = clean_history
-        initial_state["shared_memory"]["current_time_context"] = current_time_context
-        initial_state["shared_memory"]["current_os_context"] = current_os_context
-        initial_state["shared_memory"]["current_location_context"] = current_location_context
-        initial_state["shared_memory"]["user_preferences"] = user_preferences
-        initial_state["shared_memory"]["work_context"] = work_runtime_context.get("work_context", {})
-        initial_state["shared_memory"]["resource_memory"] = work_runtime_context.get("resource_memory", [])
-        initial_state["shared_memory"]["successful_paths"] = work_runtime_context.get("successful_paths", [])
-        initial_state["shared_memory"]["failure_patterns"] = work_runtime_context.get("failure_patterns", [])
-        initial_state["shared_memory"]["work_scope"] = work_runtime_context.get("scope", {})
-        initial_state["shared_memory"]["memory_scope"] = memory_scope
+    # Publish all context data to MessageBus (R2: replaces shared_memory)
+    from core.message_bus import (
+        MessageBus,
+        MSG_TIME_CONTEXT, MSG_OS_CONTEXT, MSG_LOCATION_CONTEXT,
+        MSG_USER_PREFERENCES, MSG_WORK_CONTEXT, MSG_RESOURCE_MEMORY,
+        MSG_SUCCESSFUL_PATHS, MSG_FAILURE_PATTERNS, MSG_WORK_SCOPE,
+        MSG_MEMORY_SCOPE, MSG_CONVERSATION_HISTORY, MSG_SESSION_ARTIFACTS,
+        MSG_RELATED_HISTORY,
+    )
+    bus = MessageBus.from_dict(initial_state.get("message_bus", []))
+    job_id = runtime_job_id
 
-        try:
-            from utils.runtime_state_store import get_runtime_state_store
+    def _pub(msg_type: str, value: Any) -> None:
+        if value is not None:
+            bus.publish("system", "*", msg_type, {"value": value}, job_id=job_id)
 
-            if runtime_session_id:
-                session_artifacts = get_runtime_state_store().load_artifacts(
-                    session_id=runtime_session_id,
-                    limit=10,
-                )
-                if session_artifacts:
-                    initial_state["shared_memory"]["session_artifacts"] = sanitize_value(session_artifacts)
-        except Exception as e:
-            log_warning(f"Failed to load session artifacts: {e}")
+    _pub(MSG_TIME_CONTEXT, current_time_context)
+    _pub(MSG_OS_CONTEXT, current_os_context)
+    _pub(MSG_LOCATION_CONTEXT, current_location_context)
+    _pub(MSG_USER_PREFERENCES, user_preferences)
+    _pub(MSG_WORK_CONTEXT, work_runtime_context.get("work_context", {}))
+    _pub(MSG_RESOURCE_MEMORY, work_runtime_context.get("resource_memory", []))
+    _pub(MSG_SUCCESSFUL_PATHS, work_runtime_context.get("successful_paths", []))
+    _pub(MSG_FAILURE_PATTERNS, work_runtime_context.get("failure_patterns", []))
+    _pub(MSG_WORK_SCOPE, work_runtime_context.get("scope", {}))
+    _pub(MSG_MEMORY_SCOPE, memory_scope)
 
-        if memory:
-            try:
-                related_memories = memory_manager.search_related_history(
-                    clean_user_input,
-                    scope=memory_scope,
-                    n_results=3,
-                )
-                if related_memories:
-                    related_memories = sanitize_value(related_memories)
-                    log_agent_action("Memory", "Found related memories", f"{len(related_memories)} item(s)")
-                    initial_state["shared_memory"]["related_history"] = related_memories
-            except Exception as e:
-                log_warning(f"Failed to query related memories: {e}")
+    if clean_history:
+        _pub(MSG_CONVERSATION_HISTORY, clean_history)
 
+    # Load session artifacts
     try:
         from utils.runtime_state_store import get_runtime_state_store
 
@@ -1944,22 +1928,12 @@ def _execute_submitted_job(
                 limit=10,
             )
             if session_artifacts:
-                initial_state["shared_memory"]["session_artifacts"] = sanitize_value(session_artifacts)
+                _pub(MSG_SESSION_ARTIFACTS, sanitize_value(session_artifacts))
     except Exception as e:
-        log_warning(f"Failed to refresh session artifacts: {e}")
+        log_warning(f"Failed to load session artifacts: {e}")
 
-    initial_state["shared_memory"]["current_time_context"] = current_time_context
-    initial_state["shared_memory"]["current_os_context"] = current_os_context
-    initial_state["shared_memory"]["current_location_context"] = current_location_context
-    initial_state["shared_memory"]["user_preferences"] = user_preferences
-    initial_state["shared_memory"]["work_context"] = work_runtime_context.get("work_context", {})
-    initial_state["shared_memory"]["resource_memory"] = work_runtime_context.get("resource_memory", [])
-    initial_state["shared_memory"]["successful_paths"] = work_runtime_context.get("successful_paths", [])
-    initial_state["shared_memory"]["failure_patterns"] = work_runtime_context.get("failure_patterns", [])
-    initial_state["shared_memory"]["work_scope"] = work_runtime_context.get("scope", {})
-    initial_state["shared_memory"]["memory_scope"] = memory_scope
-
-    if memory and initial_state_override:
+    # Load related memories
+    if memory:
         try:
             related_memories = memory_manager.search_related_history(
                 clean_user_input,
@@ -1967,9 +1941,13 @@ def _execute_submitted_job(
                 n_results=3,
             )
             if related_memories:
-                initial_state["shared_memory"]["related_history"] = sanitize_value(related_memories)
+                related_memories = sanitize_value(related_memories)
+                log_agent_action("Memory", "Found related memories", f"{len(related_memories)} item(s)")
+                _pub(MSG_RELATED_HISTORY, related_memories)
         except Exception as e:
-            log_warning(f"Failed to refresh related memories: {e}")
+            log_warning(f"Failed to query related memories: {e}")
+
+    initial_state["message_bus"] = bus.to_dict()
 
     _persist_runtime_checkpoint(
         session_id=runtime_session_id,

@@ -89,7 +89,7 @@ class TestExtractTypedOutput:
         assert output["returncode"] == 0
 
     def test_terminal_worker_extraction(self):
-        task = {"tool_name": "terminal.shell", "task_type": "terminal_worker"}
+        task = {"tool_name": "terminal.execute", "task_type": "terminal_worker"}
         outcome = {"result": {"stdout": "ls output", "returncode": 0}}
         output = _extract_typed_output(task, outcome)
         assert output["type"] == "command_output"

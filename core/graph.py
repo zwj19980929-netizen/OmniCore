@@ -25,6 +25,8 @@ from utils.structured_logger import get_structured_logger, LogContext
 from core.message_bus import (
     MessageBus, MSG_DIRECT_ANSWER, MSG_HIGH_RISK_REASON, MSG_REPLAN_HISTORY,
     MSG_FINAL_INSTRUCTIONS, MSG_APPROVED_ACTIONS, MSG_RESUME_STAGE, MSG_CONTEXT,
+    MSG_USER_PREFERENCES, MSG_WORK_CONTEXT, MSG_TIME_CONTEXT,
+    MSG_LOCATION_CONTEXT, MSG_SUCCESSFUL_PATHS,
 )
 from utils.human_confirm import HumanConfirm
 from utils.prompt_manager import get_prompt
@@ -42,7 +44,7 @@ MAX_REPLAN = 3  # 最多重规划 3 次（给 Replanner 足够空间做策略转
 
 
 # ---------------------------------------------------------------------------
-# MessageBus helpers (dual-write with shared_memory for backward compat)
+# MessageBus helpers
 # ---------------------------------------------------------------------------
 
 def _get_bus(state: OmniCoreState) -> MessageBus:
@@ -56,22 +58,22 @@ def _save_bus(state: OmniCoreState, bus: MessageBus):
     state["message_bus"] = bus.to_dict()
 
 
-def _bus_get_str(state: OmniCoreState, message_type: str, legacy_key: str, target: str = None) -> str:
-    """Read a string value from bus (preferred) or shared_memory (fallback)."""
+def _bus_get_str(state: OmniCoreState, message_type: str, target: str = None) -> str:
+    """Read a string value from the bus."""
     bus = _get_bus(state)
     msg = bus.get_latest(message_type, target=target)
     if msg is not None:
         return str(msg.payload.get("value", "") or "").strip()
-    return str(state.get("shared_memory", {}).get(legacy_key, "") or "").strip()
+    return ""
 
 
-def _bus_get(state: OmniCoreState, message_type: str, legacy_key: str, default=None):
-    """Read any value from bus (preferred) or shared_memory (fallback)."""
+def _bus_get(state: OmniCoreState, message_type: str, default=None):
+    """Read any value from the bus."""
     bus = _get_bus(state)
     msg = bus.get_latest(message_type)
     if msg is not None:
         return msg.payload.get("value", default)
-    return state.get("shared_memory", {}).get(legacy_key, default)
+    return default
 
 _CHECKPOINT_STAGE_ORDER = {
     "route": 1,
@@ -698,24 +700,18 @@ def _build_replan_failure_record(task: Dict[str, Any]) -> Dict[str, Any]:
 
 
 def _should_skip_for_resume(state: OmniCoreState, stage: str) -> bool:
-    shared_memory = state.get("shared_memory", {})
-    if not isinstance(shared_memory, dict):
-        return False
-
-    resume_after = _bus_get_str(state, MSG_RESUME_STAGE, "_resume_after_stage")
+    resume_after = _bus_get_str(state, MSG_RESUME_STAGE)
     if not resume_after:
         return False
 
     target_index = _CHECKPOINT_STAGE_ORDER.get(resume_after)
     current_index = _CHECKPOINT_STAGE_ORDER.get(stage)
     if target_index is None or current_index is None:
-        shared_memory.pop("_resume_after_stage", None)
         return False
 
     if current_index <= target_index:
         return True
 
-    shared_memory.pop("_resume_after_stage", None)
     return False
 
 
@@ -733,12 +729,7 @@ def _has_waiting_tasks(state: OmniCoreState) -> bool:
 
 
 def _mark_confirmation_required_tasks_waiting(state: OmniCoreState) -> None:
-    shared_memory = state.get("shared_memory", {})
-    if not isinstance(shared_memory, dict):
-        shared_memory = {}
-        state["shared_memory"] = shared_memory
-
-    approved_actions_raw = _bus_get(state, MSG_APPROVED_ACTIONS, "_approved_actions", default=[])
+    approved_actions_raw = _bus_get(state, MSG_APPROVED_ACTIONS, default=[])
     approved_actions = {
         str(item).strip()
         for item in (approved_actions_raw or [])
@@ -772,6 +763,8 @@ def route_node(state: OmniCoreState) -> OmniCoreState:
     """Route user request: analyze intent and decompose into sub-tasks."""
     if _should_skip_for_resume(state, "route"):
         return state
+    from utils.context_budget import snip_history
+    state["messages"] = snip_history(state["messages"])
     sl = get_structured_logger()
     job_id = state.get("job_id", "")
     with LogContext(job_id=job_id, stage="router"):
@@ -975,7 +968,7 @@ def human_confirm_node_v2(state: OmniCoreState) -> OmniCoreState:
         return state
     sl = get_structured_logger()
     sl.log_event("stage_start", detail="human_confirm")
-    user_preferences = state.get("shared_memory", {}).get("user_preferences", {})
+    user_preferences = _bus_get(state, MSG_USER_PREFERENCES, default={})
     auto_queue_confirmations = bool(
         isinstance(user_preferences, dict) and user_preferences.get("auto_queue_confirmations", False)
     )
@@ -1001,7 +994,7 @@ def human_confirm_node_v2(state: OmniCoreState) -> OmniCoreState:
         if flagged_tasks:
             details += f" {len(flagged_tasks)} task(s) were flagged by deterministic policy."
 
-        router_risk_reason = _bus_get_str(state, MSG_HIGH_RISK_REASON, "router_high_risk_reason")
+        router_risk_reason = _bus_get_str(state, MSG_HIGH_RISK_REASON)
         if router_risk_reason:
             details += f" Router risk signal: {router_risk_reason}"
 
@@ -1168,7 +1161,7 @@ def _build_delivery_package(state: OmniCoreState) -> dict:
         )
 
     review_status = "approved" if state.get("critic_approved") else "needs_attention"
-    work_context = state.get("shared_memory", {}).get("work_context", {})
+    work_context = _bus_get(state, MSG_WORK_CONTEXT, default={})
     goal = work_context.get("goal", {}) if isinstance(work_context, dict) else {}
     project = work_context.get("project", {}) if isinstance(work_context, dict) else {}
     todo = work_context.get("todo", {}) if isinstance(work_context, dict) else {}
@@ -1428,13 +1421,9 @@ def _synthesize_user_facing_answer(
     if not evidence:
         return delivery_summary
 
-    shared_memory = state.get("shared_memory", {})
-    if not isinstance(shared_memory, dict):
-        shared_memory = {}
-
-    current_time_context = shared_memory.get("current_time_context")
-    current_location_context = shared_memory.get("current_location_context")
-    final_answer_instructions = _bus_get(state, MSG_FINAL_INSTRUCTIONS, "_final_answer_instructions", default=[])
+    current_time_context = _bus_get_str(state, MSG_TIME_CONTEXT)
+    current_location_context = _bus_get_str(state, MSG_LOCATION_CONTEXT)
+    final_answer_instructions = _bus_get(state, MSG_FINAL_INSTRUCTIONS, default=[])
     if not isinstance(final_answer_instructions, list):
         final_answer_instructions = [final_answer_instructions]
     instruction_lines = [
@@ -1515,23 +1504,20 @@ def replanner_node(state: OmniCoreState) -> OmniCoreState:
     """Reflect on failed execution and produce a better next plan."""
     if _should_skip_for_resume(state, "replanner"):
         return state
+    from utils.context_budget import snip_history
+    state["messages"] = snip_history(state["messages"])
     sl = get_structured_logger()
     job_id = state.get("job_id", "")
     with LogContext(job_id=job_id, stage="replanner"):
         sl.log_event("stage_start", detail=f"replan_count={state.get('replan_count', 0)}")
         sl.log_replan(reason=f"attempt {state.get('replan_count', 0) + 1}")
 
-    shared_memory = state.get("shared_memory", {})
-    if not isinstance(shared_memory, dict):
-        shared_memory = {}
-        state["shared_memory"] = shared_memory
-
     state["replan_count"] = state.get("replan_count", 0) + 1
     log_agent_action("Replanner", f"开始反思重规划（第 {state['replan_count']} 次）")
 
     is_final_attempt = state["replan_count"] >= MAX_REPLAN
     authoritative_target_url = _derive_authoritative_target_url(state)
-    replan_history = _bus_get(state, MSG_REPLAN_HISTORY, "_replan_history", default=[])
+    replan_history = _bus_get(state, MSG_REPLAN_HISTORY, default=[])
 
     tried_urls: List[str] = []
     current_strategies: List[str] = []
@@ -1601,7 +1587,8 @@ def replanner_node(state: OmniCoreState) -> OmniCoreState:
             "error_summaries": error_summaries,
         }
     )
-    shared_memory["_replan_history"] = replan_history
+    bus = _get_bus(state)
+    bus.publish("system", "*", MSG_REPLAN_HISTORY, {"value": replan_history}, job_id=state.get("job_id", ""))
 
     # 构建结构化重规划上下文
     structured_context = {
@@ -1611,7 +1598,7 @@ def replanner_node(state: OmniCoreState) -> OmniCoreState:
         "failed_tasks": failed_tasks_structured,
         "history": replan_history[:-1],  # 之前的轮次
         "authoritative_url": authoritative_target_url,
-        "successful_paths": shared_memory.get("successful_paths", []),
+        "successful_paths": _bus_get(state, MSG_SUCCESSFUL_PATHS, default=[]),
     }
 
     llm = LLMClient()
@@ -1636,12 +1623,7 @@ def replanner_node(state: OmniCoreState) -> OmniCoreState:
             repaired_tasks
         )
         if finalize_instructions:
-            shared_memory["_final_answer_instructions"] = finalize_instructions
-            bus = _get_bus(state)
             bus.publish("critic", "finalize", MSG_FINAL_INSTRUCTIONS, {"value": finalize_instructions}, job_id=state.get("job_id", ""))
-            _save_bus(state, bus)
-        else:
-            shared_memory.pop("_final_answer_instructions", None)
         log_agent_action("Replanner", f"分析: {str(result.get('analysis', '') or '')[:80]}")
 
         if result.get("should_give_up", False):
@@ -1692,6 +1674,8 @@ def replanner_node(state: OmniCoreState) -> OmniCoreState:
     except Exception as exc:
         log_error(f"重规划失败: {exc}")
 
+    _save_bus(state, bus)
+
     from langchain_core.messages import SystemMessage
 
     state["messages"].append(
@@ -1714,11 +1698,7 @@ def finalize_node(state: OmniCoreState) -> OmniCoreState:
         sl.log_event("stage_start")
 
     if not state["task_queue"]:
-        shared_memory = state.get("shared_memory", {})
-        if not isinstance(shared_memory, dict):
-            shared_memory = {}
-
-        direct_answer = _bus_get_str(state, MSG_DIRECT_ANSWER, "router_direct_answer")
+        direct_answer = _bus_get_str(state, MSG_DIRECT_ANSWER)
         if direct_answer:
             state["final_output"] = direct_answer
             state["execution_status"] = "completed"

@@ -30,7 +30,7 @@ def test_human_confirm_node_updates_policy_decisions_on_approval(monkeypatch):
         ],
         "needs_human_confirm": True,
         "human_approved": False,
-        "shared_memory": {},
+        "message_bus": [],
         "execution_status": "routing",
         "error_trace": "",
     }
@@ -74,7 +74,7 @@ def test_human_confirm_node_cancellation_sets_final_output_and_stops_execution(m
         "policy_decisions": [],
         "needs_human_confirm": True,
         "human_approved": False,
-        "shared_memory": {},
+        "message_bus": [],
         "execution_status": "routing",
         "error_trace": "",
         "final_output": "",

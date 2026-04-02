@@ -1,9 +1,22 @@
 import ast
+import time
 from collections import Counter
 from pathlib import Path
 
 from core.graph import _repair_mojibake_text, finalize_node
 import core.graph as graph_module
+
+
+def _build_bus_data(entries=None):
+    """Build a serialized MessageBus list for test state dicts."""
+    if not entries:
+        return []
+    now = time.time()
+    return [
+        {"source": src, "target": tgt, "message_type": mtype,
+         "payload": payload, "timestamp": now, "job_id": ""}
+        for src, tgt, mtype, payload in entries
+    ]
 
 
 def test_finalize_node_builds_delivery_summary_with_artifacts(monkeypatch):
@@ -43,7 +56,7 @@ def test_finalize_node_builds_delivery_summary_with_artifacts(monkeypatch):
             },
         ],
         "current_task_index": 0,
-        "shared_memory": {},
+        "message_bus": [],
         "artifacts": [],
         "critic_feedback": "One source could not be fetched.",
         "critic_approved": False,
@@ -113,7 +126,7 @@ def test_finalize_node_includes_parsed_findings_from_structured_data(monkeypatch
             }
         ],
         "current_task_index": 0,
-        "shared_memory": {},
+        "message_bus": [],
         "artifacts": [],
         "critic_feedback": "All tasks approved",
         "critic_approved": True,
@@ -179,7 +192,7 @@ def test_finalize_node_prefers_user_facing_answer_for_completed_tasks(monkeypatc
             }
         ],
         "current_task_index": 0,
-        "shared_memory": {},
+        "message_bus": [],
         "artifacts": [],
         "critic_feedback": "All tasks approved",
         "critic_approved": True,
@@ -234,7 +247,7 @@ def test_finalize_node_uses_deterministic_table_for_explicit_list_requests(monke
             }
         ],
         "current_task_index": 0,
-        "shared_memory": {},
+        "message_bus": [],
         "artifacts": [],
         "critic_feedback": "",
         "critic_approved": True,
@@ -302,7 +315,7 @@ def test_finalize_node_marks_waiting_for_approval_state(monkeypatch):
             }
         ],
         "current_task_index": 0,
-        "shared_memory": {},
+        "message_bus": [],
         "artifacts": [],
         "critic_feedback": "",
         "critic_approved": True,
@@ -339,7 +352,7 @@ def test_finalize_node_refuses_fact_answer_without_direct_answer_or_evidence(mon
         "intent_confidence": 0.0,
         "task_queue": [],
         "current_task_index": 0,
-        "shared_memory": {},
+        "message_bus": [],
         "artifacts": [],
         "critic_feedback": "",
         "critic_approved": False,
@@ -377,16 +390,10 @@ def test_finalize_node_prefers_router_direct_answer_without_llm(monkeypatch):
         "intent_confidence": 1.0,
         "task_queue": [],
         "current_task_index": 0,
-        "shared_memory": {
-            "router_direct_answer": "当前时间是 2026-03-05 星期四 10:17:54（CST）。",
-            "current_time_context": {
-                "iso_datetime": "2026-03-05T10:17:54+08:00",
-                "local_date": "2026-03-05",
-                "local_time": "10:17:54",
-                "weekday": "Thursday",
-                "timezone": "CST",
-            },
-        },
+        "message_bus": _build_bus_data([
+            ("router", "finalize", "direct_answer", {"value": "当前时间是 2026-03-05 星期四 10:17:54（CST）。"}),
+            ("system", "*", "time_context", {"value": {"iso_datetime": "2026-03-05T10:17:54+08:00", "local_date": "2026-03-05", "local_time": "10:17:54", "weekday": "Thursday", "timezone": "CST"}}),
+        ]),
         "artifacts": [],
         "critic_feedback": "",
         "critic_approved": False,
@@ -449,11 +456,11 @@ def test_finalize_node_passes_replan_answer_guidance_to_synthesizer(monkeypatch)
             }
         ],
         "current_task_index": 0,
-        "shared_memory": {
-            "_final_answer_instructions": [
+        "message_bus": _build_bus_data([
+            ("critic", "finalize", "final_instructions", {"value": [
                 "Based on the extracted dates, calculate duration and answer the user directly."
-            ]
-        },
+            ]}),
+        ]),
         "artifacts": [],
         "critic_feedback": "",
         "critic_approved": True,

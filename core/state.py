@@ -104,10 +104,8 @@ class OmniCoreState(TypedDict):
     # 当前正在执行的任务索引
     current_task_index: int
 
-    # Legacy inter-agent data store (kept for backward compatibility)
-    shared_memory: Dict[str, Any]
-
-    # Typed message bus (serialized form, see core.message_bus.MessageBus)
+    # Typed message bus — sole inter-node communication channel (R2)
+    # Serialized form, see core.message_bus.MessageBus
     message_bus: List[Dict[str, Any]]
 
     artifacts: List[ArtifactItem]
@@ -168,7 +166,6 @@ def create_initial_state(
         intent_confidence=0.0,
         task_queue=[],
         current_task_index=0,
-        shared_memory={},
         message_bus=[],
         artifacts=[],
         policy_decisions=[],

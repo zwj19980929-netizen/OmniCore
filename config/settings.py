@@ -340,6 +340,20 @@ class Settings:
     KNOWLEDGE_DISTANCE_THRESHOLD = float(os.getenv("KNOWLEDGE_DISTANCE_THRESHOLD", "0.5"))
     KNOWLEDGE_MIN_CONTENT_LENGTH = _env_int("KNOWLEDGE_MIN_CONTENT_LENGTH", 50)
 
+    # === 上下文成本控制（R1）===
+    # 工具返回结果最大字符数（超出则截断，保留头 60% + 尾 30%）
+    TOOL_RESULT_MAX_CHARS = max(_env_int("TOOL_RESULT_MAX_CHARS", 8000), 500)
+    # 历史消息最大条数（超出则触发 snip）
+    HISTORY_MAX_MESSAGES = max(_env_int("HISTORY_MAX_MESSAGES", 20), 5)
+    # 保留最近完整消息数（其余消息内容截断到 200 字符）
+    HISTORY_KEEP_RECENT = max(_env_int("HISTORY_KEEP_RECENT", 10), 1)
+
+    # === MessageBus 配置（R2）===
+    # 消息 TTL 秒数（0=不过期，默认 30 分钟）
+    MESSAGE_BUS_TTL = _env_int("MESSAGE_BUS_TTL", 1800)
+    # 消息最大容量（超出时删除最旧消息）
+    MESSAGE_BUS_MAX_CAPACITY = max(_env_int("MESSAGE_BUS_MAX_CAPACITY", 500), 50)
+
     # === 成本感知智能路由 ===
     COST_TRACKING_ENABLED = os.getenv("COST_TRACKING_ENABLED", "true").lower() == "true"
     MONTHLY_BUDGET_USD = float(os.getenv("MONTHLY_BUDGET_USD", "0"))  # 0 表示不限制

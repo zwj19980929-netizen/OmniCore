@@ -62,7 +62,7 @@ def _make_failed_state():
             }
         ],
         "current_task_index": 0,
-        "shared_memory": {},
+        "message_bus": [],
         "artifacts": [],
         "policy_decisions": [],
         "critic_feedback": "",

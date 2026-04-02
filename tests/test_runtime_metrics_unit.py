@@ -181,7 +181,7 @@ class FakeRuntimeStateStore:
                 "state": {
                     "session_id": "session_checkpoint",
                     "job_id": "job_checkpoint",
-                    "shared_memory": {},
+                    "message_bus": [],
                     "task_queue": [
                         {
                             "task_id": "task_resume",
@@ -204,7 +204,7 @@ class FakeRuntimeStateStore:
                     "state": {
                         "session_id": "session_checkpoint",
                         "job_id": "job_checkpoint",
-                        "shared_memory": {},
+                        "message_bus": [],
                         "task_queue": [
                             {
                                 "task_id": "task_resume",
@@ -222,7 +222,7 @@ class FakeRuntimeStateStore:
                     "state": {
                         "session_id": "session_checkpoint",
                         "job_id": "job_checkpoint",
-                        "shared_memory": {},
+                        "message_bus": [],
                         "task_queue": [],
                     },
                 },
@@ -238,7 +238,7 @@ class FakeRuntimeStateStore:
                     "state": {
                         "session_id": "session_waiting",
                         "job_id": "job_waiting",
-                        "shared_memory": {},
+                        "message_bus": [],
                         "task_queue": [
                             {
                                 "task_id": "task_api",
@@ -443,7 +443,10 @@ def test_resume_job_from_checkpoint_reuses_saved_state(monkeypatch):
     assert resumed["resume_checkpoint_stage"] == "parallel_executor"
     assert calls[0]["runtime_session_id"] == "session_checkpoint"
     assert calls[0]["runtime_job_id"] == "job_checkpoint"
-    assert calls[0]["initial_state_override"]["shared_memory"]["_resume_after_stage"] == "parallel_executor"
+    from core.message_bus import MessageBus, MSG_RESUME_STAGE
+    bus = MessageBus.from_dict(calls[0]["initial_state_override"].get("message_bus", []))
+    msg = bus.get_latest(MSG_RESUME_STAGE)
+    assert msg is not None and msg.payload["value"] == "parallel_executor"
 
 
 def test_resume_job_from_specific_checkpoint(monkeypatch):
@@ -460,7 +463,10 @@ def test_resume_job_from_specific_checkpoint(monkeypatch):
 
     assert resumed["resume_checkpoint_id"] == "checkpoint_resume"
     assert resumed["resume_strategy"] == "checkpoint_replay"
-    assert calls[0]["initial_state_override"]["shared_memory"]["_resume_checkpoint_id"] == "checkpoint_resume"
+    from core.message_bus import MessageBus, MSG_RESUME_CHECKPOINT_ID
+    bus = MessageBus.from_dict(calls[0]["initial_state_override"].get("message_bus", []))
+    msg = bus.get_latest(MSG_RESUME_CHECKPOINT_ID)
+    assert msg is not None and msg.payload["value"] == "checkpoint_resume"
 
 
 def test_approve_waiting_job_resumes_from_waiting_checkpoint(monkeypatch):
@@ -479,7 +485,10 @@ def test_approve_waiting_job_resumes_from_waiting_checkpoint(monkeypatch):
     assert resumed["resume_strategy"] == "approval_resume"
     task = calls[0]["initial_state_override"]["task_queue"][0]
     assert task["status"] == "pending"
-    assert calls[0]["initial_state_override"]["shared_memory"]["_approved_actions"] == ["task_api"]
+    from core.message_bus import MessageBus, MSG_APPROVED_ACTIONS
+    bus = MessageBus.from_dict(calls[0]["initial_state_override"].get("message_bus", []))
+    msg = bus.get_latest(MSG_APPROVED_ACTIONS)
+    assert msg is not None and msg.payload["value"] == ["task_api"]
 
 
 def test_release_directory_watch_events_falls_back_when_template_is_missing(monkeypatch):

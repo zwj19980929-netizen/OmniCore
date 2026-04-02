@@ -89,7 +89,7 @@ def _make_state(user_input: str, failed_params: dict, failed_result: dict):
             }
         ],
         "current_task_index": 0,
-        "shared_memory": {},
+        "message_bus": [],
         "artifacts": [],
         "policy_decisions": [],
         "critic_feedback": "",
@@ -247,6 +247,10 @@ def test_replanner_strips_non_executable_system_summary_task(monkeypatch):
     assert task_ids == ["replan_task_fetch"]
     assert result["needs_human_confirm"] is False
     assert result["human_approved"] is True
-    assert result["shared_memory"]["_final_answer_instructions"] == [
+    from core.message_bus import MessageBus, MSG_FINAL_INSTRUCTIONS
+    bus = MessageBus.from_dict(result.get("message_bus", []))
+    msg = bus.get_latest(MSG_FINAL_INSTRUCTIONS)
+    assert msg is not None
+    assert msg.payload["value"] == [
         "Based on the extracted dates, calculate duration and answer the user directly."
     ]

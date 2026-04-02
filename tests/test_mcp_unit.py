@@ -373,7 +373,7 @@ class TestMCPToolAdapter:
             assert outcome["status"] == "completed"
             assert outcome["result"]["success"] is True
             assert outcome["result"]["output"] == "file contents here"
-            assert outcome["shared_memory"] == "file contents here"
+            assert "shared_memory" not in outcome  # R2: shared_memory removed from outcomes
 
         asyncio.run(_impl())
 

@@ -143,7 +143,6 @@ def _base_outcome(
     *,
     status: str,
     result: Any,
-    shared_memory: Any,
     error_trace: str,
     failure_type: Optional[str],
     params: Optional[Dict[str, Any]] = None,
@@ -156,7 +155,6 @@ def _base_outcome(
         "result": result,
         "execution_trace": task.get("execution_trace", []),
         "failure_type": failure_type,
-        "shared_memory": shared_memory,
         "error_trace": error_trace,
         "risk_level": task.get("risk_level", registered_tool.spec.risk_level),
     }
@@ -474,21 +472,17 @@ class WebWorkerAdapter(BaseToolAdapter):
                 "result": None,
                 "execution_trace": task.get("execution_trace", []),
                 "failure_type": None,
-                "shared_memory": None,
                 "error_trace": "",
                 "risk_level": target_tool.spec.risk_level if target_tool else task.get("risk_level", "medium"),
             }
 
-        shared_memory_value = None
-        if isinstance(result, dict) and result.get("success") and result.get("data"):
-            shared_memory_value = result.get("data")
         status = str(TaskStatus.COMPLETED) if result.get("success") else str(TaskStatus.FAILED)
         return _base_outcome(
             task,
             registered_tool,
             status=status,
             result=result,
-            shared_memory=shared_memory_value,
+
             error_trace="" if result.get("success") else result.get("error", "Unknown error"),
             failure_type=task.get("failure_type"),
             params=clean_params,
@@ -518,7 +512,7 @@ class EnhancedWebWorkerAdapter(BaseToolAdapter):
                 registered_tool,
                 status=str(TaskStatus.FAILED),
                 result={"success": False, "error": "Missing task description"},
-                shared_memory=None,
+
                 error_trace="Missing task description",
                 failure_type=str(FailureType.INVALID_INPUT),
             )
@@ -539,10 +533,6 @@ class EnhancedWebWorkerAdapter(BaseToolAdapter):
                 # 执行智能提取
                 result = await worker.smart_extract(toolkit, task_description, limit)
 
-                shared_memory_value = None
-                if result.get("success") and result.get("data"):
-                    shared_memory_value = result.get("data")
-
                 status = str(TaskStatus.COMPLETED) if result.get("success") else str(TaskStatus.FAILED)
 
                 return _base_outcome(
@@ -550,7 +540,7 @@ class EnhancedWebWorkerAdapter(BaseToolAdapter):
                     registered_tool,
                     status=status,
                     result=result,
-                    shared_memory=shared_memory_value,
+        
                     error_trace="" if result.get("success") else result.get("error", "Unknown error"),
                     failure_type=None if result.get("success") else str(FailureType.EXECUTION_ERROR),
                 )
@@ -561,7 +551,7 @@ class EnhancedWebWorkerAdapter(BaseToolAdapter):
                 registered_tool,
                 status=str(TaskStatus.FAILED),
                 result={"success": False, "error": str(e)},
-                shared_memory=None,
+
                 error_trace=str(e),
                 failure_type=str(FailureType.EXECUTION_ERROR),
             )
@@ -599,7 +589,7 @@ class ExecutorBackedAdapter(BaseToolAdapter):
             registered_tool,
             status=status,
             result=result,
-            shared_memory=result,
+
             error_trace="" if result.get("success") else result.get("error", "Unknown error"),
             failure_type=task.get("failure_type"),
         )
@@ -629,7 +619,7 @@ class ApiWorkerAdapter(BaseToolAdapter):
                 registered_tool,
                 status=str(TaskStatus.FAILED),
                 result={"success": False, "error": error_message},
-                shared_memory=None,
+
                 error_trace=error_message,
                 failure_type=str(FailureType.INVALID_INPUT),
                 params=params,
@@ -661,7 +651,7 @@ class ApiWorkerAdapter(BaseToolAdapter):
                 registered_tool,
                 status="waiting_for_approval",
                 result=approval_result,
-                shared_memory=approval_result,
+
                 error_trace="",
                 failure_type=None,
                 params=params,
@@ -732,7 +722,7 @@ class ApiWorkerAdapter(BaseToolAdapter):
             registered_tool,
             status=status,
             result=result,
-            shared_memory=result if result.get("success") else None,
+
             error_trace="" if result.get("success") else str(result.get("error", "Unknown error")),
             failure_type=None if result.get("success") else classify_failure(str(result.get("error", ""))),
             params=params,
@@ -759,7 +749,7 @@ class TerminalWorkerAdapter(ExecutorBackedAdapter):
         worker = pool.get_worker("terminal_worker")
         loop = asyncio.get_running_loop()
 
-        # 流式输出回调（通过 shared_memory 传递给调用方）
+        # 流式输出回调
         streamed_stdout: list = []
         streamed_stderr: list = []
 
@@ -793,7 +783,7 @@ class TerminalWorkerAdapter(ExecutorBackedAdapter):
             registered_tool,
             status=status,
             result=result,
-            shared_memory=result,
+
             error_trace="" if result.get("success") else result.get("error", "Unknown error"),
             failure_type=task.get("failure_type"),
         )
@@ -907,7 +897,7 @@ class BrowserAgentAdapter(BaseToolAdapter):
                 registered_tool,
                 status=str(TaskStatus.COMPLETED) if result.get("success") else str(TaskStatus.FAILED),
                 result=result,
-                shared_memory=result,
+    
                 error_trace="" if result.get("success") else result.get("message", "Browser task failed"),
                 failure_type=task.get("failure_type"),
             )
@@ -922,7 +912,7 @@ class BrowserAgentAdapter(BaseToolAdapter):
             registered_tool,
             status=str(TaskStatus.FAILED),
             result={"success": False, "error": error_message},
-            shared_memory={"success": False, "error": error_message},
+
             error_trace=error_message,
             failure_type=task.get("failure_type"),
         )
@@ -985,7 +975,6 @@ async def execute_tool_via_adapter(
                 "success": False,
                 "error": f"Unknown tool adapter: {registered_tool.adapter_name}",
             },
-            shared_memory=None,
             error_trace=f"Unknown tool adapter: {registered_tool.adapter_name}",
             failure_type=str(FailureType.INVALID_INPUT),
         )
@@ -1029,7 +1018,6 @@ class MCPToolAdapter(BaseToolAdapter):
                 registered_tool,
                 status=str(TaskStatus.COMPLETED),
                 result={"success": True, "output": output_text, "raw": result},
-                shared_memory=output_text,
                 error_trace="",
                 failure_type=None,
             )
@@ -1041,7 +1029,7 @@ class MCPToolAdapter(BaseToolAdapter):
                 registered_tool,
                 status=str(TaskStatus.FAILED),
                 result={"success": False, "error": str(e)},
-                shared_memory=None,
+
                 error_trace=str(e),
                 failure_type=str(FailureType.EXECUTION_ERROR),
             )
@@ -1052,7 +1040,7 @@ class MCPToolAdapter(BaseToolAdapter):
                 registered_tool,
                 status=str(TaskStatus.FAILED),
                 result={"success": False, "error": str(e)},
-                shared_memory=None,
+
                 error_trace=str(e),
                 failure_type=str(FailureType.UNKNOWN),
             )

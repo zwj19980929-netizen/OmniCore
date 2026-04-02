@@ -13,7 +13,7 @@ def test_run_ready_batch_reuses_background_loop(monkeypatch):
 
     monkeypatch.setattr(task_executor, "run_ready_batch_async", _fake_run_ready_batch_async)
 
-    state = {"task_queue": [], "shared_memory": {}}
+    state = {"task_queue": [], "message_bus": []}
     task_executor.run_ready_batch(state)
     task_executor.run_ready_batch(state)
 
@@ -39,7 +39,7 @@ def test_shutdown_executor_runtime_closes_browser_pools(monkeypatch):
     )
     monkeypatch.setattr(task_executor, "run_ready_batch_async", _fake_run_ready_batch_async)
 
-    state = {"task_queue": [], "shared_memory": {}}
+    state = {"task_queue": [], "message_bus": []}
     task_executor.run_ready_batch(state)
     task_executor.shutdown_executor_runtime(timeout_seconds=2.0)
 

@@ -12,6 +12,7 @@ from typing import Dict, Any, List, Optional, Tuple
 
 from agents.paod import classify_failure
 from config.settings import settings
+from utils.context_budget import truncate_tool_result, truncate_result_dict
 from core.constants import (
     TaskStatus,
     TaskOutputType,
@@ -214,6 +215,8 @@ def _select_batch_indexes(state: OmniCoreState, ready_indexes: List[int]) -> Lis
     selected: List[int] = []
     per_tool_counts: Dict[str, int] = {}
     serialized_selected = False
+    # 批次中已出现的非 concurrent_safe 工具类型（同类可并行，异类互斥）
+    non_concurrent_safe_type: Optional[str] = None
 
     for idx in ready_indexes:
         if len(selected) >= max_total:
@@ -225,15 +228,25 @@ def _select_batch_indexes(state: OmniCoreState, ready_indexes: List[int]) -> Lis
             tool_key = str(task.get("tool_name") or task.get("task_type") or f"task_{idx}")
             max_for_tool = 1
             serialized = False
+            concurrent_safe = True
         else:
             tool_key = registered_tool.spec.name
             max_for_tool = max(registered_tool.max_parallelism, 1)
             serialized = registered_tool.serialized
+            concurrent_safe = registered_tool.spec.concurrent_safe
 
         if serialized_selected:
             continue
         if serialized and selected:
             continue
+        # concurrent_safe=False 的工具：同类可并行，但不与其他工具混批
+        if not concurrent_safe:
+            if selected and non_concurrent_safe_type != tool_key:
+                continue
+        else:
+            # concurrent_safe=True 的工具：不能加入已有非 concurrent_safe 异类的批次
+            if non_concurrent_safe_type is not None:
+                continue
         if per_tool_counts.get(tool_key, 0) >= max_for_tool:
             continue
 
@@ -241,6 +254,8 @@ def _select_batch_indexes(state: OmniCoreState, ready_indexes: List[int]) -> Lis
         per_tool_counts[tool_key] = per_tool_counts.get(tool_key, 0) + 1
         if serialized:
             serialized_selected = True
+        if not concurrent_safe and non_concurrent_safe_type is None:
+            non_concurrent_safe_type = tool_key
 
     return selected or [ready_indexes[0]]
 
@@ -264,7 +279,6 @@ async def _execute_registered_tool_async(
             "result": {"success": False, "error": f"Unknown tool or compatibility task type: {unknown_identifier}"},
             "execution_trace": local_task.get("execution_trace", []),
             "failure_type": str(FailureType.INVALID_INPUT),
-            "shared_memory": None,
             "error_trace": f"Unknown tool or compatibility task type: {unknown_identifier}",
             "risk_level": local_task.get("risk_level", "medium"),
         }
@@ -303,7 +317,6 @@ async def _execute_single_task_async(
             "result": {"success": False, "error": error_message},
             "execution_trace": local_task.get("execution_trace", []),
             "failure_type": classify_failure(error_message),
-            "shared_memory": None,
             "error_trace": error_message,
             "risk_level": local_task.get("risk_level", "medium"),
         }
@@ -321,16 +334,22 @@ def _extract_typed_output(task: Dict[str, Any], outcome: Dict[str, Any]) -> Opti
     if not isinstance(result, dict):
         return None
 
-    tool_name = str(task.get("tool_name") or task.get("task_type") or "")
-    lower_tool = tool_name.lower()
+    # 优先从注册工具的 ToolSpec.output_type 获取输出类型，避免字符串 heuristic
+    registered = _resolve_registered_tool(task)
+    output_type = registered.spec.output_type if registered else ""
 
-    if "browser" in lower_tool or "web" in lower_tool:
+    if output_type == str(TaskOutputType.TEXT_EXTRACTION):
         return {
             "type": str(TaskOutputType.TEXT_EXTRACTION),
-            "content": result.get("extracted_text") or result.get("output") or result.get("text", ""),
+            "content": (
+                result.get("extracted_text")
+                or result.get("output")
+                or result.get("text")
+                or result.get("content", "")
+            ),
             "source_url": result.get("url", ""),
         }
-    if "file" in lower_tool:
+    if output_type == str(TaskOutputType.FILE_DOWNLOAD):
         file_path = result.get("file_path") or result.get("path", "")
         if file_path:
             return {
@@ -338,19 +357,20 @@ def _extract_typed_output(task: Dict[str, Any], outcome: Dict[str, Any]) -> Opti
                 "file_path": file_path,
                 "file_size": result.get("file_size", 0),
             }
+        # 文件工具读操作返回文本而非文件路径时降级为 text_extraction
         return {
             "type": str(TaskOutputType.TEXT_EXTRACTION),
             "content": result.get("content") or result.get("output", ""),
             "source_url": "",
         }
-    if "terminal" in lower_tool or "system" in lower_tool:
+    if output_type == str(TaskOutputType.COMMAND_OUTPUT):
         return {
             "type": str(TaskOutputType.COMMAND_OUTPUT),
             "stdout": result.get("output") or result.get("stdout", ""),
             "returncode": result.get("returncode", 0),
         }
 
-    # 通用兜底：如有 content / output 字段则提取
+    # 通用兜底：output_type 未设置时按结果字段推断
     content = result.get("content") or result.get("output") or result.get("text")
     if content:
         return {
@@ -455,7 +475,8 @@ def _apply_task_outcome(state: OmniCoreState, idx: int, outcome: Dict[str, Any])
     )
     state["task_queue"][idx]["params"] = outcome.get("params", state["task_queue"][idx]["params"])
     state["task_queue"][idx]["status"] = outcome["status"]
-    state["task_queue"][idx]["result"] = outcome.get("result")
+    raw_result = outcome.get("result")
+    state["task_queue"][idx]["result"] = truncate_result_dict(raw_result) if isinstance(raw_result, dict) else raw_result
     state["task_queue"][idx]["risk_level"] = outcome.get(
         "risk_level", state["task_queue"][idx].get("risk_level", "medium")
     )
@@ -463,10 +484,6 @@ def _apply_task_outcome(state: OmniCoreState, idx: int, outcome: Dict[str, Any])
         "execution_trace", state["task_queue"][idx].get("execution_trace", [])
     )
     state["task_queue"][idx]["failure_type"] = outcome.get("failure_type")
-
-    if outcome.get("shared_memory") is not None:
-        task_id = state["task_queue"][idx]["task_id"]
-        state["shared_memory"][task_id] = outcome["shared_memory"]
 
     if outcome.get("error_trace"):
         state["error_trace"] = outcome["error_trace"]
@@ -480,11 +497,9 @@ def _apply_task_outcome(state: OmniCoreState, idx: int, outcome: Dict[str, Any])
                 state["task_outputs"] = {}
             task_id = task.get("task_id", "")
             if task_id:
-                # 截断过大的文本输出（50KB）
                 for field in ("content", "stdout", "text"):
                     if field in typed_output and isinstance(typed_output[field], str):
-                        if len(typed_output[field]) > 50_000:
-                            typed_output[field] = typed_output[field][:50_000] + "...(truncated)"
+                        typed_output[field] = truncate_tool_result(typed_output[field])
                 state["task_outputs"][task_id] = typed_output
 
 
@@ -507,7 +522,9 @@ async def run_ready_batch_async(state: OmniCoreState) -> OmniCoreState:
     ]
     log_agent_action("TaskExecutor", f"执行批次任务 ({len(batch_indexes)})", ", ".join(task_labels))
 
-    shared_memory_snapshot = dict(state["shared_memory"])
+    from core.message_bus import MessageBus
+    bus = MessageBus.from_dict(state.get("message_bus", []))
+    shared_memory_snapshot = bus.to_snapshot()
 
     # 多 Agent 协作：解析 $ref 参数引用
     task_outputs = state.get("task_outputs") or {}
@@ -551,8 +568,7 @@ async def run_ready_batch_async(state: OmniCoreState) -> OmniCoreState:
                     "result": {"success": False, "error": error_message},
                     "execution_trace": state["task_queue"][idx].get("execution_trace", []),
                     "failure_type": classify_failure(error_message),
-                    "shared_memory": None,
-                    "error_trace": error_message,
+                            "error_trace": error_message,
                     "risk_level": state["task_queue"][idx].get("risk_level", "medium"),
                 }))
             else:

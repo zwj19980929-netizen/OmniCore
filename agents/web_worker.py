@@ -4072,7 +4072,9 @@ class WebWorker:
                 if task["task_type"] == "web_worker" and task["status"] == "pending":
                     state["task_queue"][idx]["status"] = "running"
 
-                    result = await self.execute_async(task, state["shared_memory"])
+                    from core.message_bus import MessageBus
+                    _bus = MessageBus.from_dict(state.get("message_bus", []))
+                    result = await self.execute_async(task, _bus.to_snapshot())
 
                     # 检测 switch_worker 信号
                     if isinstance(result, dict) and result.get("_switch_worker"):
@@ -4088,9 +4090,6 @@ class WebWorker:
                         "completed" if result.get("success") else "failed"
                     )
                     state["task_queue"][idx]["result"] = result
-
-                    if result.get("success") and result.get("data"):
-                        state["shared_memory"][task["task_id"]] = result["data"]
 
                     if not result.get("success"):
                         state["task_queue"][idx]["failure_type"] = classify_failure(

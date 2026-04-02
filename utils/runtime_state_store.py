@@ -128,7 +128,7 @@ def _checkpoint_snapshot(state: Dict[str, Any]) -> Dict[str, Any]:
         "critic_feedback",
         "validator_passed",
         "task_queue",
-        "shared_memory",
+        "message_bus",
         "policy_decisions",
         "artifacts",
         "delivery_package",

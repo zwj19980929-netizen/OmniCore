@@ -877,13 +877,14 @@ class FileWorker:
             if task["task_type"] == "file_worker" and task["status"] == "pending":
                 state["task_queue"][idx]["status"] = "running"
 
-                result = self.execute(task, state["shared_memory"])
+                from core.message_bus import MessageBus
+                bus = MessageBus.from_dict(state.get("message_bus", []))
+                result = self.execute(task, bus.to_snapshot())
 
                 state["task_queue"][idx]["status"] = (
                     "completed" if result.get("success") else "failed"
                 )
                 state["task_queue"][idx]["result"] = result
-                state["shared_memory"][task["task_id"]] = result
 
                 if not result.get("success"):
                     state["error_trace"] = result.get("error", "未知错误")

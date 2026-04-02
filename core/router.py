@@ -1101,11 +1101,13 @@ class RouterAgent:
         state["task_queue"] = [task]
         state["policy_decisions"] = [build_policy_decision_from_task(task)]
         state["needs_human_confirm"] = policy.requires_confirmation
-        state["shared_memory"]["router_direct_answer"] = ""
-        state["shared_memory"]["router_high_risk_reason"] = (
-            policy.reason if policy.requires_confirmation else ""
-        )
         state["execution_status"] = "routing"
+        # Publish risk reason to MessageBus
+        from core.message_bus import MessageBus, MSG_HIGH_RISK_REASON
+        bus = MessageBus.from_dict(state.get("message_bus", []))
+        if policy.requires_confirmation:
+            bus.publish("router", "executor", MSG_HIGH_RISK_REASON, {"value": policy.reason}, job_id=state.get("job_id", ""))
+        state["message_bus"] = bus.to_dict()
 
         log_agent_action("Router", "终端快速通道", f"$ {user_input[:60]}")
         return state
@@ -1148,8 +1150,6 @@ class RouterAgent:
                     )
                     state["human_approved"] = not state["needs_human_confirm"]
                     state["matched_skill_id"] = matched_skill.skill_id
-                    state["shared_memory"]["router_direct_answer"] = ""
-                    state["shared_memory"]["router_high_risk_reason"] = ""
                     state["execution_status"] = "routing"
                     from langchain_core.messages import SystemMessage
                     state["messages"].append(
@@ -1173,18 +1173,32 @@ class RouterAgent:
         except Exception as exc:
             log_warning(f"Knowledge retrieval failed (fallback to normal): {exc}")
 
-        # 分析意图（传入对话历史）
-        conversation_history = state.get("shared_memory", {}).get("conversation_history")
-        related_history = state.get("shared_memory", {}).get("related_history")
-        session_artifacts = state.get("shared_memory", {}).get("session_artifacts")
-        user_preferences = state.get("shared_memory", {}).get("user_preferences")
-        current_time_context = state.get("shared_memory", {}).get("current_time_context")
-        current_location_context = state.get("shared_memory", {}).get("current_location_context")
-        current_os_context = state.get("shared_memory", {}).get("current_os_context")
-        work_context = state.get("shared_memory", {}).get("work_context")
-        resource_memory = state.get("shared_memory", {}).get("resource_memory")
-        successful_paths = state.get("shared_memory", {}).get("successful_paths")
-        failure_patterns = state.get("shared_memory", {}).get("failure_patterns")
+        # 分析意图（从 MessageBus 读取上下文）
+        from core.message_bus import (
+            MessageBus, MSG_CONVERSATION_HISTORY, MSG_RELATED_HISTORY,
+            MSG_SESSION_ARTIFACTS, MSG_USER_PREFERENCES, MSG_TIME_CONTEXT,
+            MSG_LOCATION_CONTEXT, MSG_OS_CONTEXT, MSG_WORK_CONTEXT,
+            MSG_RESOURCE_MEMORY, MSG_SUCCESSFUL_PATHS, MSG_FAILURE_PATTERNS,
+            MSG_DIRECT_ANSWER as _MSG_DIRECT_ANSWER,
+            MSG_HIGH_RISK_REASON as _MSG_HIGH_RISK_REASON,
+        )
+        bus = MessageBus.from_dict(state.get("message_bus", []))
+
+        def _bus_val(msg_type: str, default=None):
+            msg = bus.get_latest(msg_type)
+            return msg.payload.get("value", default) if msg else default
+
+        conversation_history = _bus_val(MSG_CONVERSATION_HISTORY)
+        related_history = _bus_val(MSG_RELATED_HISTORY)
+        session_artifacts = _bus_val(MSG_SESSION_ARTIFACTS)
+        user_preferences = _bus_val(MSG_USER_PREFERENCES)
+        current_time_context = _bus_val(MSG_TIME_CONTEXT)
+        current_location_context = _bus_val(MSG_LOCATION_CONTEXT)
+        current_os_context = _bus_val(MSG_OS_CONTEXT)
+        work_context = _bus_val(MSG_WORK_CONTEXT)
+        resource_memory = _bus_val(MSG_RESOURCE_MEMORY)
+        successful_paths = _bus_val(MSG_SUCCESSFUL_PATHS)
+        failure_patterns = _bus_val(MSG_FAILURE_PATTERNS)
         analysis = self.analyze_intent(
             user_input,
             conversation_history,
@@ -1220,18 +1234,13 @@ class RouterAgent:
         state["needs_human_confirm"] = analysis.get("is_high_risk", False) or any(
             task.get("requires_confirmation", False) for task in task_queue
         )
-        state["shared_memory"]["router_high_risk_reason"] = analysis.get("high_risk_reason", "")
-        state["shared_memory"]["router_direct_answer"] = str(analysis.get("direct_answer", "") or "").strip()
-        # Dual-write to MessageBus
-        from core.message_bus import MessageBus, MSG_DIRECT_ANSWER, MSG_HIGH_RISK_REASON
-        bus_data = state.get("message_bus", [])
-        bus = MessageBus.from_dict(bus_data) if bus_data else MessageBus()
-        direct_answer = state["shared_memory"]["router_direct_answer"]
+        # Publish router results to MessageBus
+        direct_answer = str(analysis.get("direct_answer", "") or "").strip()
         if direct_answer:
-            bus.publish("router", "finalize", MSG_DIRECT_ANSWER, {"value": direct_answer}, job_id=state.get("job_id", ""))
-        high_risk_reason = state["shared_memory"]["router_high_risk_reason"]
+            bus.publish("router", "finalize", _MSG_DIRECT_ANSWER, {"value": direct_answer}, job_id=state.get("job_id", ""))
+        high_risk_reason = analysis.get("high_risk_reason", "")
         if high_risk_reason:
-            bus.publish("router", "executor", MSG_HIGH_RISK_REASON, {"value": high_risk_reason}, job_id=state.get("job_id", ""))
+            bus.publish("router", "executor", _MSG_HIGH_RISK_REASON, {"value": high_risk_reason}, job_id=state.get("job_id", ""))
         state["message_bus"] = bus.to_dict()
         state["execution_status"] = "routing"
 
