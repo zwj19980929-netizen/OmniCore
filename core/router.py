@@ -1137,7 +1137,6 @@ class RouterAgent:
                 task_queue = skill_store.instantiate(matched_skill, user_input)
                 if task_queue:
                     log_agent_action(self.name, "Skill matched", f"{matched_skill.name} ({matched_skill.skill_id})")
-                    from core.state import build_task_item_from_plan
                     state["current_intent"] = matched_skill.source_intent or "skill_replay"
                     state["intent_confidence"] = 0.9
                     state["task_queue"] = [build_task_item_from_plan(t) for t in task_queue]
