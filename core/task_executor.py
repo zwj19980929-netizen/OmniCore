@@ -469,6 +469,7 @@ def _evaluate_condition(when_expr: str, task_outputs: Dict[str, Any]) -> bool:
 
 def _apply_task_outcome(state: OmniCoreState, idx: int, outcome: Dict[str, Any]) -> None:
     """Apply a task execution outcome back into runtime state."""
+    old_status = state["task_queue"][idx].get("status")
     state["task_queue"][idx]["task_type"] = outcome.get("task_type", state["task_queue"][idx]["task_type"])
     state["task_queue"][idx]["tool_name"] = outcome.get(
         "tool_name", state["task_queue"][idx].get("tool_name", "")
@@ -487,6 +488,12 @@ def _apply_task_outcome(state: OmniCoreState, idx: int, outcome: Dict[str, Any])
 
     if outcome.get("error_trace"):
         state["error_trace"] = outcome["error_trace"]
+
+    # R5: track when task status last changed (for plan reminder)
+    new_status = state["task_queue"][idx].get("status")
+    if old_status != new_status:
+        from core.plan_reminder import update_status_change_turn
+        update_status_change_turn(state)
 
     # 多 Agent 协作：写入类型化输出到 task_outputs
     if outcome.get("status") == str(TaskStatus.COMPLETED):

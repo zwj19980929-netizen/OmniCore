@@ -564,17 +564,17 @@ PLAN_REMINDER_INTERVAL = int(os.getenv("PLAN_REMINDER_INTERVAL", "5"))
 
 | 步骤 | 任务 | 交付物 | 状态 |
 |------|------|--------|------|
-| 1 | 新建 `core/plan_manager.py`（save_plan / load_plan / complete_plan / _append_replan_record） | `core/plan_manager.py` | 🔲 |
-| 2 | 新建 `core/plan_reminder.py`（generate_reminder / update_status_change_turn） | `core/plan_reminder.py` | 🔲 |
-| 3 | `config/settings.py` 新增 `PLAN_PERSISTENCE_ENABLED` / `PLAN_REMINDER_INTERVAL` | `config/settings.py` | 🔲 |
-| 4 | `core/state.py` `loop_state` 增加 `last_status_change_turn` 字段（如果 R3 已实现 LoopState，直接加字段） | `core/state.py` 或 `core/loop_state.py` | 🔲 |
-| 5 | route_node 集成 `save_plan()` | `core/graph.py` 或 `core/graph_nodes.py` | 🔲 |
-| 6 | replanner_node 集成 `save_plan()` 重规划记录 | `core/graph.py` 或 `core/replanner.py` | 🔲 |
-| 7 | parallel_executor_node 前插入 `generate_reminder()` | `core/graph.py` 或 `core/graph_nodes.py` | 🔲 |
-| 8 | `_apply_task_outcome()` 中调用 `update_status_change_turn()` | `core/task_executor.py` | 🔲 |
-| 9 | finalize_node 调用 `complete_plan()` | `core/graph.py` 或 `core/finalizer.py` | 🔲 |
-| 10 | resume_job_from_checkpoint 恢复计划上下文 | `core/runtime.py` | 🔲 |
-| 11 | 单元测试：计划保存/加载/更新、reminder 触发逻辑 | `tests/test_plan_manager_unit.py` | 🔲 |
+| 1 | 新建 `core/plan_manager.py`（save_plan / load_plan / complete_plan / _append_replan_record） | `core/plan_manager.py` | ✅ |
+| 2 | 新建 `core/plan_reminder.py`（generate_reminder / update_status_change_turn） | `core/plan_reminder.py` | ✅ |
+| 3 | `config/settings.py` 新增 `PLAN_PERSISTENCE_ENABLED` / `PLAN_REMINDER_INTERVAL` | `config/settings.py` | ✅ |
+| 4 | `core/loop_state.py` `LoopState` 增加 `last_status_change_turn` 字段 + 序列化 | `core/loop_state.py` | ✅ |
+| 5 | route_node 集成 `save_plan()` | `core/graph_nodes.py` | ✅ |
+| 6 | replanner_node 集成 `save_plan()` 重规划记录 | `core/replanner.py` | ✅ |
+| 7 | parallel_executor_node 前插入 `generate_reminder()` | `core/graph_nodes.py` | ✅ |
+| 8 | `_apply_task_outcome()` 中调用 `update_status_change_turn()` | `core/task_executor.py` | ✅ |
+| 9 | finalize_node 调用 `complete_plan()` | `core/finalizer.py` | ✅ |
+| 10 | resume_job_from_checkpoint 恢复计划上下文 | `core/runtime.py` | ✅ |
+| 11 | 单元测试：计划保存/加载/更新、reminder 触发逻辑 | `tests/test_plan_manager_unit.py` | ✅ |
 
 ---
 

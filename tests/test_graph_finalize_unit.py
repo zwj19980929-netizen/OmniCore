@@ -4,7 +4,7 @@ from collections import Counter
 from pathlib import Path
 
 from core.graph import _repair_mojibake_text, finalize_node
-import core.graph as graph_module
+import core.finalizer as finalizer_module
 
 
 def _build_bus_data(entries=None):
@@ -24,7 +24,7 @@ def test_finalize_node_builds_delivery_summary_with_artifacts(monkeypatch):
         def __init__(self, *args, **kwargs):
             raise RuntimeError("LLM unavailable")
 
-    monkeypatch.setattr(graph_module, "LLMClient", _FailingLLM)
+    monkeypatch.setattr(finalizer_module, "LLMClient", _FailingLLM)
 
     state = {
         "messages": [],
@@ -89,7 +89,7 @@ def test_finalize_node_includes_parsed_findings_from_structured_data(monkeypatch
         def __init__(self, *args, **kwargs):
             raise RuntimeError("LLM unavailable")
 
-    monkeypatch.setattr(graph_module, "LLMClient", _FailingLLM)
+    monkeypatch.setattr(finalizer_module, "LLMClient", _FailingLLM)
 
     state = {
         "messages": [],
@@ -161,7 +161,7 @@ def test_finalize_node_prefers_user_facing_answer_for_completed_tasks(monkeypatc
                 "根据当前抓取到的最新信息，美伊相关局势仍在升级，既有军事施压，也出现了重新接触和降温信号。"
             )
 
-    monkeypatch.setattr(graph_module, "LLMClient", _FakeLLM)
+    monkeypatch.setattr(finalizer_module, "LLMClient", _FakeLLM)
 
     state = {
         "messages": [],
@@ -218,7 +218,7 @@ def test_finalize_node_uses_deterministic_table_for_explicit_list_requests(monke
         def __init__(self, *args, **kwargs):
             raise AssertionError("LLMClient should not be called for explicit structured list output")
 
-    monkeypatch.setattr(graph_module, "LLMClient", _ShouldNotCallLLM)
+    monkeypatch.setattr(finalizer_module, "LLMClient", _ShouldNotCallLLM)
 
     state = {
         "messages": [],
@@ -293,7 +293,7 @@ def test_finalize_node_marks_waiting_for_approval_state(monkeypatch):
         def __init__(self, *args, **kwargs):
             raise AssertionError("LLMClient should not be called for waiting states")
 
-    monkeypatch.setattr(graph_module, "LLMClient", _ShouldNotCallLLM)
+    monkeypatch.setattr(finalizer_module, "LLMClient", _ShouldNotCallLLM)
 
     state = {
         "messages": [],
@@ -341,7 +341,7 @@ def test_finalize_node_refuses_fact_answer_without_direct_answer_or_evidence(mon
         def __init__(self, *args, **kwargs):
             raise AssertionError("LLMClient should not be called for unsupported no-task fallback")
 
-    monkeypatch.setattr(graph_module, "LLMClient", _ShouldNotCallLLM)
+    monkeypatch.setattr(finalizer_module, "LLMClient", _ShouldNotCallLLM)
 
     state = {
         "messages": [type("Msg", (), {"content": "Router 分析完成: 解析失败: malformed json"})()],
@@ -379,7 +379,7 @@ def test_finalize_node_prefers_router_direct_answer_without_llm(monkeypatch):
         def __init__(self, *args, **kwargs):
             raise AssertionError("LLMClient should not be called when router_direct_answer exists")
 
-    monkeypatch.setattr(graph_module, "LLMClient", _ShouldNotCallLLM)
+    monkeypatch.setattr(finalizer_module, "LLMClient", _ShouldNotCallLLM)
 
     state = {
         "messages": [],
@@ -425,7 +425,7 @@ def test_finalize_node_passes_replan_answer_guidance_to_synthesizer(monkeypatch)
             type(self).last_user_message = user_message
             return type("Resp", (), {"content": "Based on the verified timeline, it lasted 6 days."})()
 
-    monkeypatch.setattr(graph_module, "LLMClient", _CapturingLLM)
+    monkeypatch.setattr(finalizer_module, "LLMClient", _CapturingLLM)
 
     state = {
         "messages": [],

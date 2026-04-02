@@ -3,7 +3,7 @@ from core.graph import get_first_executor, human_confirm_node_v2
 
 def test_human_confirm_node_updates_policy_decisions_on_approval(monkeypatch):
     monkeypatch.setattr(
-        "core.graph.HumanConfirm.request_confirmation",
+        "core.graph_nodes.HumanConfirm.request_confirmation",
         lambda **kwargs: True,
     )
 
@@ -44,7 +44,7 @@ def test_human_confirm_node_updates_policy_decisions_on_approval(monkeypatch):
 
 def test_human_confirm_node_cancellation_sets_final_output_and_stops_execution(monkeypatch):
     monkeypatch.setattr(
-        "core.graph.HumanConfirm.request_confirmation",
+        "core.graph_nodes.HumanConfirm.request_confirmation",
         lambda **kwargs: False,
     )
 

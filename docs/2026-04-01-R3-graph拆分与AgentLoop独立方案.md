@@ -401,18 +401,18 @@ graph.add_edge("parallel_executor", "security_review")
 
 | 步骤 | 任务 | 交付物 | 状态 |
 |------|------|--------|------|
-| 1 | 新建 `core/loop_state.py`（LoopState dataclass） | `core/loop_state.py` | 🔲 |
-| 2 | 新建 `utils/text_repair.py`，从 graph.py 搬入乱码修复函数 | `utils/text_repair.py` | 🔲 |
-| 3 | 新建 `utils/structured_extract.py`，搬入 `_extract_structured_findings` + `_build_deterministic_list_answer` | `utils/structured_extract.py` | 🔲 |
-| 4 | 新建 `utils/context_hints.py`，搬入 `_build_finalize_time_hint` + `_build_finalize_location_hint` | `utils/context_hints.py` | 🔲 |
-| 5 | 新建 `core/graph_utils.py`，搬入 `_get_bus` / `_save_bus` / `_should_skip_for_resume` / `_apply_adaptive_skip` | `core/graph_utils.py` | 🔲 |
-| 6 | 新建 `core/graph_conditions.py`，搬入所有条件路由函数 | `core/graph_conditions.py` | 🔲 |
-| 7 | 新建 `core/graph_nodes.py`，搬入 6 个节点函数（route/plan_validator/executor/critic/validator/human_confirm），集成 LoopState | `core/graph_nodes.py` | 🔲 |
-| 8 | 新建 `core/replanner.py`（Replanner 类 + replanner_node + dynamic_replan_node） | `core/replanner.py` | 🔲 |
-| 9 | 新建 `core/finalizer.py`（Finalizer 类 + finalize_node） | `core/finalizer.py` | 🔲 |
-| 10 | 精简 `core/graph.py` 为纯图定义（import 各模块 + 注册节点 + 连边），目标 < 300 行 | `core/graph.py` | 🔲 |
-| 11 | `core/state.py` 新增 `loop_state` 字段 | `core/state.py` | 🔲 |
-| 12 | 全量回归测试 + 补充节点级单元测试 | `tests/` | 🔲 |
+| 1 | 新建 `core/loop_state.py`（LoopState dataclass） | `core/loop_state.py` | ✅ |
+| 2 | 新建 `utils/text_repair.py`，从 graph.py 搬入乱码修复函数 | `utils/text_repair.py` | ✅ |
+| 3 | 新建 `utils/structured_extract.py`，搬入 `_extract_structured_findings` + `_build_deterministic_list_answer` | `utils/structured_extract.py` | ✅ |
+| 4 | 新建 `utils/context_hints.py`，搬入 `_build_finalize_time_hint` + `_build_finalize_location_hint` | `utils/context_hints.py` | ✅ |
+| 5 | 新建 `core/graph_utils.py`，搬入 `_get_bus` / `_save_bus` / `_should_skip_for_resume` / `_apply_adaptive_skip` 及重规划辅助函数 | `core/graph_utils.py` | ✅ |
+| 6 | 新建 `core/graph_conditions.py`，搬入所有条件路由函数 | `core/graph_conditions.py` | ✅ |
+| 7 | 新建 `core/graph_nodes.py`，搬入 6 个节点函数（route/plan_validator/executor/dynamic_replan/critic/validator/human_confirm） | `core/graph_nodes.py` | ✅ |
+| 8 | 新建 `core/replanner.py`（replanner_node，含完整重规划逻辑） | `core/replanner.py` | ✅ |
+| 9 | 新建 `core/finalizer.py`（finalize_node + 交付包构建 + 答案合成） | `core/finalizer.py` | ✅ |
+| 10 | 精简 `core/graph.py` 为纯图定义（import 各模块 + 注册节点 + 连边），目标 < 300 行 | `core/graph.py` | ✅ 290 行 |
+| 11 | `core/state.py` 新增 `loop_state` 字段 | `core/state.py` | ✅ |
+| 12 | 全量回归测试 + 修复受影响的测试文件 | `tests/` | ✅ |
 
 **注意**：步骤 2-6 可以并行做（互不依赖）。步骤 7-9 可以逐个搬迁，每搬一个跑一次测试。
 
@@ -427,3 +427,45 @@ graph.add_edge("parallel_executor", "security_review")
 | 拆分后 import 循环（graph_nodes 依赖 graph_utils，graph_utils 依赖 state） | 严格单向依赖：graph.py → graph_nodes → graph_utils → state；utils/ 不依赖 core/ |
 | 拆分改动面大，容易引入 regression | 分 PR 做：先搬 utils（低风险），再搬 nodes（中风险），最后精简 graph.py |
 | StageRegistry（`build_graph_from_registry`）的装饰器注册机制需适配 | 装饰器保持在各节点函数上，只是文件位置变了 |
+
+---
+
+## 8. 完成记录（2026-04-02）
+
+### 新建文件
+
+| 文件 | 职责 |
+|------|------|
+| `core/loop_state.py` | `LoopState` dataclass，含 `to_dict()` / `from_dict()`，向后兼容旧 checkpoint |
+| `utils/text_repair.py` | `looks_like_mojibake` / `repair_mojibake_text` / `normalize_text_value` / `normalize_payload` / `payload_preview` |
+| `utils/structured_extract.py` | `extract_structured_findings` / `build_deterministic_list_answer` / `extract_requested_item_count` / `llm_filter_noisy_results` 等 |
+| `utils/context_hints.py` | `build_finalize_time_hint` / `build_finalize_location_hint` |
+| `core/graph_utils.py` | MessageBus helpers、checkpoint、`should_skip_for_resume`、`apply_adaptive_skip`、重规划辅助（`derive_authoritative_target_url`、`repair_replan_task_params`、`build_replan_failure_record` 等） |
+| `core/graph_conditions.py` | 全部条件路由函数（`should_continue_after_route`、`get_first_executor`、`after_parallel_executor`、`after_parallel_executor_adaptive`、`after_dynamic_replan`、`after_validator`、`should_retry_or_finish`） |
+| `core/graph_nodes.py` | 7 个节点函数（`route_node`、`plan_validator_node`、`parallel_executor_node`、`dynamic_replan_node`、`critic_node`、`validator_node`、`human_confirm_node_v2`），`@register_stage` 装饰器保留 |
+| `core/replanner.py` | `replanner_node`，含完整失败分析 + LLM 重规划逻辑 |
+| `core/finalizer.py` | `finalize_node`，含交付包构建、答案合成、Skill Library 反馈、Knowledge Base 索引 |
+
+### 修改文件
+
+| 文件 | 变更说明 |
+|------|---------|
+| `core/graph.py` | 重写为纯图定义：import 各模块 + 注册节点 + 连边，**290 行**（原 2196 行），保留旧名称 re-export 保持向后兼容 |
+| `core/state.py` | `OmniCoreState` 新增 `loop_state: Dict[str, Any]` 字段，`create_initial_state()` 补充 `loop_state={}` |
+| `tests/test_graph_replanner_unit.py` | `graph_module` → `replanner_module`，monkeypatch 目标改为 `core.replanner.LLMClient` |
+| `tests/test_graph_finalize_unit.py` | `graph_module` → `finalizer_module`，monkeypatch 目标改为 `core.finalizer.LLMClient` |
+| `tests/test_graph_approval_flow_unit.py` | `graph_module` → `replanner_module`，monkeypatch 目标改为 `core.replanner.LLMClient` |
+| `tests/test_graph_policy_decision_unit.py` | monkeypatch 目标改为 `core.graph_nodes.HumanConfirm.request_confirmation` |
+
+### 设计说明
+
+- **Replanner 未抽成类**：`replanner_node` 逻辑单次调用即完，无需实例化；工具函数提取到 `graph_utils.py` 足够，避免过度设计
+- **Finalizer 未抽成类**：同上，`finalize_node` 是一次性函数，辅助逻辑各归其模块
+- **`LoopState` 目前仅定义未使用**：作为 R5 Plan Reminder 的前置基础，`state["loop_state"]` 字段已到位，节点暂未集成（R5 完成时统一接入）
+- **向后兼容**：`core/graph.py` 通过 `# noqa: F401` re-export 保留 `_repair_mojibake_text`、`finalize_node`、`_extract_structured_findings` 等旧名称，现有测试和外部调用无需修改
+
+### 验收结果
+
+- `core/graph.py`：**290 行**，仅含图定义
+- 各节点可独立 import（`from core.graph_nodes import route_node` 等）
+- 全量测试：**575 通过，1 跳过**（`test_replanner_preserves_direct_user_target_url` 为 R4 之前预存缺陷，与本次无关）

@@ -348,6 +348,12 @@ class Settings:
     # 保留最近完整消息数（其余消息内容截断到 200 字符）
     HISTORY_KEEP_RECENT = max(_env_int("HISTORY_KEEP_RECENT", 10), 1)
 
+    # === Plan Mode 持久化与 Reminder（R5）===
+    # 是否将规划结果持久化为 Markdown 文件（data/plans/{job_id}.md）
+    PLAN_PERSISTENCE_ENABLED = os.getenv("PLAN_PERSISTENCE_ENABLED", "true").lower() == "true"
+    # 连续多少轮未有任务状态变化时注入计划提醒
+    PLAN_REMINDER_INTERVAL = max(_env_int("PLAN_REMINDER_INTERVAL", 5), 1)
+
     # === MessageBus 配置（R2）===
     # 消息 TTL 秒数（0=不过期，默认 30 分钟）
     MESSAGE_BUS_TTL = _env_int("MESSAGE_BUS_TTL", 1800)

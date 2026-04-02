@@ -1,5 +1,5 @@
 from core.graph import replanner_node
-import core.graph as graph_module
+import core.replanner as replanner_module
 
 
 class _FakeResponse:
@@ -107,7 +107,7 @@ def _make_state(user_input: str, failed_params: dict, failed_result: dict):
 
 def test_replanner_preserves_direct_user_target_url(monkeypatch):
     fake_llm = _FakeLLM()
-    monkeypatch.setattr(graph_module, "LLMClient", lambda: fake_llm)
+    monkeypatch.setattr(replanner_module, "LLMClient", lambda: fake_llm)
 
     target_url = "https://www.weather.com.cn/weather/101220101.shtml"
     state = _make_state(
@@ -131,7 +131,7 @@ def test_replanner_preserves_direct_user_target_url(monkeypatch):
 
 def test_replanner_can_reuse_target_url_from_failed_task_when_user_input_has_no_url(monkeypatch):
     fake_llm = _FakeLLM()
-    monkeypatch.setattr(graph_module, "LLMClient", lambda: fake_llm)
+    monkeypatch.setattr(replanner_module, "LLMClient", lambda: fake_llm)
 
     target_url = "https://www.weather.com.cn/weather/101220101.shtml"
     state = _make_state(
@@ -153,7 +153,7 @@ def test_replanner_can_reuse_target_url_from_failed_task_when_user_input_has_no_
 
 def test_replanner_sanitizes_polluted_target_url_before_reuse(monkeypatch):
     fake_llm = _FakeLLM()
-    monkeypatch.setattr(graph_module, "LLMClient", lambda: fake_llm)
+    monkeypatch.setattr(replanner_module, "LLMClient", lambda: fake_llm)
 
     polluted_url = "https://news.ycombinator.com），抓取前 3 条新闻"
     state = _make_state(
@@ -175,7 +175,7 @@ def test_replanner_sanitizes_polluted_target_url_before_reuse(monkeypatch):
 
 def test_replanner_preserves_critic_approved_completed_tasks(monkeypatch):
     fake_llm = _FakeLLM()
-    monkeypatch.setattr(graph_module, "LLMClient", lambda: fake_llm)
+    monkeypatch.setattr(replanner_module, "LLMClient", lambda: fake_llm)
 
     target_url = "https://www.weather.com.cn/weather/101220101.shtml"
     state = _make_state(
@@ -213,7 +213,7 @@ def test_replanner_preserves_critic_approved_completed_tasks(monkeypatch):
 
 def test_replanner_does_not_treat_generic_weather_homepage_as_authoritative(monkeypatch):
     fake_llm = _FakeLLM()
-    monkeypatch.setattr(graph_module, "LLMClient", lambda: fake_llm)
+    monkeypatch.setattr(replanner_module, "LLMClient", lambda: fake_llm)
 
     state = _make_state(
         user_input="给我查查合肥的天气，我想看看你是怎么操作浏览器的",
@@ -233,7 +233,7 @@ def test_replanner_does_not_treat_generic_weather_homepage_as_authoritative(monk
 
 def test_replanner_strips_non_executable_system_summary_task(monkeypatch):
     fake_llm = _SynthesisTaskLLM()
-    monkeypatch.setattr(graph_module, "LLMClient", lambda: fake_llm)
+    monkeypatch.setattr(replanner_module, "LLMClient", lambda: fake_llm)
 
     state = _make_state(
         user_input="最近美伊冲突持续了几天？",

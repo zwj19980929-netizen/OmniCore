@@ -1708,6 +1708,15 @@ def resume_job_from_checkpoint(
     _resume_bus.publish("runtime", "*", MSG_RESUME_REQUESTED_AT, {"value": str(int(time.time()))})
     resumed_state["message_bus"] = _resume_bus.to_dict()
 
+    # R5: inject persisted plan context into resumed state
+    from core.plan_manager import load_plan
+    plan_content = load_plan(job_id)
+    if plan_content:
+        from langchain_core.messages import SystemMessage
+        resumed_state.setdefault("messages", []).insert(
+            0, SystemMessage(content=f"[恢复的执行计划]\n{plan_content}")
+        )
+
     result = _execute_submitted_job(
         sanitize_text(job_record.get("user_input") or ""),
         runtime_session_id=sanitize_text(job_record.get("session_id") or ""),

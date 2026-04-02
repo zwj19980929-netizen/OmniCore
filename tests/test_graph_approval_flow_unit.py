@@ -1,6 +1,6 @@
 from core.graph import after_validator, get_first_executor, replanner_node, should_retry_or_finish
 from core.task_executor import collect_ready_task_indexes
-import core.graph as graph_module
+import core.replanner as replanner_module
 
 
 class _FakeResponse:
@@ -79,7 +79,7 @@ def _make_failed_state():
 
 
 def test_replanner_only_blocks_confirmation_required_tasks(monkeypatch):
-    monkeypatch.setattr(graph_module, "LLMClient", lambda: _MixedRiskLLM())
+    monkeypatch.setattr(replanner_module, "LLMClient", lambda: _MixedRiskLLM())
 
     result = replanner_node(_make_failed_state())
 

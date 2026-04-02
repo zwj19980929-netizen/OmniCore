@@ -150,6 +150,10 @@ class OmniCoreState(TypedDict):
     # Agent 间点对点消息队列
     agent_messages: List[Dict[str, Any]]
 
+    # ── 跨轮执行状态追踪 (R3) ─────────────────────────────
+    # LoopState 的序列化形态，见 core.loop_state.LoopState
+    loop_state: Dict[str, Any]
+
 
 def create_initial_state(
     user_input: str,
@@ -183,4 +187,5 @@ def create_initial_state(
         task_outputs={},
         dynamic_task_additions=[],
         agent_messages=[],
+        loop_state={},
     )
