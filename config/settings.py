@@ -354,6 +354,12 @@ class Settings:
     # 连续多少轮未有任务状态变化时注入计划提醒
     PLAN_REMINDER_INTERVAL = max(_env_int("PLAN_REMINDER_INTERVAL", 5), 1)
 
+    # === Session Memory 后台提炼（R7）===
+    # 是否启用 session memory 定期提炼（默认关闭，需手动开启）
+    SESSION_MEMORY_ENABLED = os.getenv("SESSION_MEMORY_ENABLED", "false").lower() == "true"
+    # 每隔多少轮触发一次 session memory 提炼
+    SESSION_MEMORY_INTERVAL = max(_env_int("SESSION_MEMORY_INTERVAL", 8), 2)
+
     # === MessageBus 配置（R2）===
     # 消息 TTL 秒数（0=不过期，默认 30 分钟）
     MESSAGE_BUS_TTL = _env_int("MESSAGE_BUS_TTL", 1800)

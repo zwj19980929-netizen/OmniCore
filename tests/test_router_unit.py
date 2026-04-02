@@ -421,6 +421,8 @@ def test_router_includes_failure_avoidance_hints():
 
 
 def test_router_system_prompt_uses_dynamic_tool_catalog(monkeypatch):
+    # R6: dynamic tool catalog is now in _build_dynamic_context() (user message prefix),
+    # not in the static system prompt. Verify the right function contains catalog entries.
     module_root = Path(__file__).parent / "plugin_fixtures"
     monkeypatch.syspath_prepend(str(module_root))
     monkeypatch.setattr(settings, "TOOL_ADAPTER_PLUGIN_MODULES", ("dynamic_tool_adapter_plugin_fixture",))
@@ -428,11 +430,17 @@ def test_router_system_prompt_uses_dynamic_tool_catalog(monkeypatch):
     monkeypatch.setattr(settings, "ENABLED_TOOL_PLUGIN_IDS", ())
     monkeypatch.setattr(settings, "DISABLED_TOOL_PLUGIN_IDS", ())
     monkeypatch.setattr("core.tool_registry._builtin_registry", None)
+    import core.router as _router_mod
+    monkeypatch.setattr(_router_mod, "_STATIC_PROMPT", None)
+    monkeypatch.setattr(_router_mod, "_DYNAMIC_TEMPLATE", None)
 
-    prompt = RouterAgent._build_router_system_prompt()
+    dynamic_ctx = RouterAgent._build_dynamic_context()
 
-    assert "Registered Tool Catalog" in prompt
-    assert "plugin.dynamic_tool" in prompt
+    assert "Registered Tool Catalog" in dynamic_ctx
+    assert "plugin.dynamic_tool" in dynamic_ctx
+    # Static system prompt must NOT contain the dynamic catalog
+    static_prompt = RouterAgent._build_system_prompt()
+    assert "plugin.dynamic_tool" not in static_prompt
 
 
 def test_router_system_prompt_excludes_disabled_plugins(monkeypatch):
@@ -443,7 +451,10 @@ def test_router_system_prompt_excludes_disabled_plugins(monkeypatch):
     monkeypatch.setattr(settings, "ENABLED_TOOL_PLUGIN_IDS", ())
     monkeypatch.setattr(settings, "DISABLED_TOOL_PLUGIN_IDS", ("test.dynamic_fixture",))
     monkeypatch.setattr("core.tool_registry._builtin_registry", None)
+    import core.router as _router_mod
+    monkeypatch.setattr(_router_mod, "_STATIC_PROMPT", None)
+    monkeypatch.setattr(_router_mod, "_DYNAMIC_TEMPLATE", None)
 
-    prompt = RouterAgent._build_router_system_prompt()
+    dynamic_ctx = RouterAgent._build_dynamic_context()
 
-    assert "plugin.dynamic_tool" not in prompt
+    assert "plugin.dynamic_tool" not in dynamic_ctx

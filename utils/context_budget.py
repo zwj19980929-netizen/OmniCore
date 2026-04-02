@@ -81,6 +81,7 @@ def snip_history(
     messages: list,
     max_messages: Optional[int] = None,
     keep_recent: Optional[int] = None,
+    session_memory: str = "",
 ) -> list:
     """
     对消息历史进行裁剪：保留最近 keep_recent 条完整消息，更早的消息内容截断到 200 字符。
@@ -88,15 +89,22 @@ def snip_history(
     只在消息总数超过 max_messages 时触发裁剪。
     裁剪后的消息保留原始 ID（确保 LangGraph add_messages reducer 正确更新）。
 
+    如果提供了 session_memory，将其作为首条 SystemMessage 插入，确保
+    LLM 始终能看到工作记忆摘要（R7）。
+
     Args:
         messages: LangChain 消息列表（HumanMessage / SystemMessage / AIMessage 等）
         max_messages: 触发裁剪的阈值，默认读取 settings.HISTORY_MAX_MESSAGES
         keep_recent: 保留完整内容的最近消息数，默认读取 settings.HISTORY_KEEP_RECENT
+        session_memory: 如果非空，作为首条 SystemMessage 插入（R7）
 
     Returns:
         裁剪后的消息列表（长度不变，只有旧消息的 content 被截短）
     """
     if not messages:
+        if session_memory:
+            from langchain_core.messages import SystemMessage
+            return [SystemMessage(content=f"[工作记忆]\n\n{session_memory}")]
         return messages
 
     if max_messages is None:
@@ -106,8 +114,14 @@ def snip_history(
         from config.settings import settings
         keep_recent = settings.HISTORY_KEEP_RECENT
 
+    # Prefix: inject session memory as first message
+    prefix: List = []
+    if session_memory:
+        from langchain_core.messages import SystemMessage
+        prefix.append(SystemMessage(content=f"[工作记忆]\n\n{session_memory}"))
+
     if len(messages) <= max_messages:
-        return messages
+        return (prefix + list(messages)) if prefix else messages
 
     # 需要截断的索引范围：所有早于 keep_recent 的消息
     cutoff = len(messages) - keep_recent
@@ -138,4 +152,4 @@ def snip_history(
             new_msg = msg
         result.append(new_msg)
 
-    return result
+    return prefix + result

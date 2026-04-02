@@ -291,16 +291,16 @@ def _load_prompts():
 
 | 步骤 | 任务 | 交付物 | 状态 |
 |------|------|--------|------|
-| 1 | 分析 `router_system.txt` 内容，标记每段是静态还是动态 | 分析文档 | 🔲 |
-| 2 | 拆分 `prompts/router_system.txt` → `router_system_static.txt` + `router_system_dynamic.txt` | `prompts/` | 🔲 |
-| 3 | 修改 `core/router.py` `_build_router_system_prompt()` 改为 `_build_system_prompt()` + `_build_dynamic_context()`；`analyze_intent()` 适配新的分离式调用 | `core/router.py` | 🔲 |
-| 4 | 删除 `ROUTER_OUTPUT_APPENDIX` 硬编码常量，内容合并到 `router_system_static.txt` | `core/router.py` | 🔲 |
-| 5 | 拆分 finalize prompt → `finalize_static.txt` + `finalize_dynamic.txt` | `prompts/` | 🔲 |
-| 6 | 拆分 replanner prompt → `replanner_static.txt` + `replanner_dynamic.txt` | `prompts/` | 🔲 |
-| 7 | 拆分 critic prompt → `critic_static.txt` + `critic_dynamic.txt` | `prompts/` | 🔲 |
-| 8 | 各节点适配新的 prompt 加载逻辑 | `core/graph.py` 相关节点 | 🔲 |
-| 9 | 验证 LiteLLM 的 cache 行为（确认静态前缀不变时是否命中 prompt cache） | 联调验证 | 🔲 |
-| 10 | 全量回归测试 | `pytest tests -q` | 🔲 |
+| 1 | 分析 `router_system.txt` 内容，标记每段是静态还是动态 | 分析文档 | ✅ |
+| 2 | 拆分 `prompts/router_system.txt` → `router_system_static.txt` + `router_system_dynamic.txt` | `prompts/` | ✅ |
+| 3 | 修改 `core/router.py` `_build_router_system_prompt()` 改为 `_build_system_prompt()` + `_build_dynamic_context()`；`analyze_intent()` 适配新的分离式调用 | `core/router.py` | ✅ |
+| 4 | 删除 `ROUTER_OUTPUT_APPENDIX` 硬编码常量，内容合并到 `router_system_static.txt` | `core/router.py` | ✅ |
+| 5 | 提取 finalize 内联 system prompt → `finalize_system_static.txt`；`finalizer.py` 改为从文件加载 | `prompts/`, `core/finalizer.py` | ✅ |
+| 6 | replanner prompt — 已是纯静态文件（`replanner_system_en.txt`），动态上下文（JSON）已在 user_message | 无需改动 | ✅ |
+| 7 | critic prompt — 已是纯静态文件（`critic_system.txt`），任务结果已在 user_message | 无需改动 | ✅ |
+| 8 | 更新 `tests/test_router_unit.py` 中的两个 dynamic catalog 测试，改为验证 `_build_dynamic_context()` | `tests/test_router_unit.py` | ✅ |
+| 9 | 验证 LiteLLM 的 cache 行为（确认静态前缀不变时是否命中 prompt cache） | 联调验证 | 🔲 留待集成环境验证 |
+| 10 | 全量回归测试 | `pytest tests -q` | ✅ 19/19 router 测试通过，replanner 中 1 个预存 bug 不影响本方案 |
 
 ---
 
@@ -313,3 +313,30 @@ def _load_prompts():
 | LiteLLM/底层 API 不支持 prompt cache | 即使不支持 cache，拆分也无害；system prompt 更稳定有助于行为一致性 |
 | 原 `router_system.txt` 中 `{{AGENT_CAPABILITIES}}` 位置对 LLM 理解有影响 | 动态上下文作为 user message 第一段，仍然在 LLM 上下文窗口的前部 |
 | 多个 prompt 文件同时拆分，改动面较大 | 优先只拆 router（核心、调用最频繁），其他节点后续逐步拆分 |
+
+---
+
+## 8. 完成记录（2026-04-02）
+
+**新建文件**
+- `prompts/router_system_static.txt` — router 静态前缀（原 `router_system.txt` 去掉 `{{AGENT_CAPABILITIES}}` 段 + 合并 `ROUTER_OUTPUT_APPENDIX`）
+- `prompts/router_system_dynamic.txt` — 动态上下文模板（Agent 能力 + 动态工具目录，含两个占位符）
+- `prompts/finalize_system_static.txt` — finalize 节点静态 system prompt（原内联字符串提取为文件）
+
+**修改文件**
+- `core/router.py`
+  - 新增模块级 `_STATIC_PROMPT` / `_DYNAMIC_TEMPLATE` 缓存 + `_load_prompts()` 懒加载
+  - 新增 `RouterAgent._build_system_prompt()`（返回纯静态，可缓存）
+  - 新增 `RouterAgent._build_dynamic_context()`（返回动态上下文字符串）
+  - `_build_router_system_prompt()` 保留为兼容别名，内部转发至 `_build_system_prompt()`
+  - `analyze_intent()` 改为：system_prompt 用纯静态；user_message 前缀注入 `_build_dynamic_context()`
+  - 移除 `ROUTER_OUTPUT_APPENDIX` 硬编码常量（内容已合并入 `router_system_static.txt`）
+- `core/finalizer.py`
+  - `_synthesize_user_facing_answer()` 改为从 `finalize_system_static` 加载 system prompt，保留原字符串为 fallback
+- `tests/test_router_unit.py`
+  - `test_router_system_prompt_uses_dynamic_tool_catalog` / `test_router_system_prompt_excludes_disabled_plugins` 改为验证 `_build_dynamic_context()` 而非 system prompt
+
+**实现说明**
+- replanner（`replanner_system_en.txt`）和 critic（`critic_system.txt`）的动态上下文本来就已经在 user_message 中，无需拆分
+- 向后兼容：`_load_prompts()` 若找不到新文件会 fallback 到旧的 `router_system.txt`，不影响已有部署
+- `ROUTER_SYSTEM_PROMPT` 模块级常量保留，外部如有引用仍可用

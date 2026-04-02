@@ -16,37 +16,53 @@ from core.tool_registry import build_dynamic_tool_prompt_lines, get_builtin_tool
 from utils.logger import log_agent_action, logger
 from utils.url_utils import extract_first_url
 
-# Router Agent 的系统提示词
-# 从 prompts/router_system.txt 加载
-_ROUTER_PROMPT_PATH = Path(__file__).resolve().parent.parent / "prompts" / "router_system.txt"
+# R6: System Prompt 静态/动态分离
+# 静态前缀从 prompts/router_system_static.txt 加载（跨请求不变，可缓存）
+# 动态上下文模板从 prompts/router_system_dynamic.txt 加载（每次调用时注入到 user_message 前缀）
+_PROMPTS_DIR = Path(__file__).resolve().parent.parent / "prompts"
+_ROUTER_PROMPT_PATH = _PROMPTS_DIR / "router_system.txt"
+_ROUTER_STATIC_PATH = _PROMPTS_DIR / "router_system_static.txt"
+_ROUTER_DYNAMIC_PATH = _PROMPTS_DIR / "router_system_dynamic.txt"
+
+# 模块级缓存，只加载一次
+_STATIC_PROMPT: str | None = None
+_DYNAMIC_TEMPLATE: str | None = None
 
 
 def _load_router_system_prompt() -> str:
+    """Legacy loader — used as fallback when static file is missing."""
     try:
         prompt = _ROUTER_PROMPT_PATH.read_text(encoding="utf-8-sig").strip()
         if prompt:
             return prompt
     except OSError:
         pass
-
-    # Fallback: minimal built-in prompt to keep runtime available.
     return (
         "You are OmniCore's router. Detect user intent, decompose tasks when needed, "
         "and when no task is needed provide a direct answer. Output must be JSON."
     )
 
 
-ROUTER_SYSTEM_PROMPT = _load_router_system_prompt()
+def _load_prompts() -> None:
+    """Load static prompt and dynamic template once into module-level cache."""
+    global _STATIC_PROMPT, _DYNAMIC_TEMPLATE
+    if _STATIC_PROMPT is not None:
+        return
 
-ROUTER_OUTPUT_APPENDIX = """
-## Tool Planning Output Upgrade
-- Prefer `tool_name` and `tool_args` for each task.
-- Treat `task_type` as a compatibility fallback only.
-- Do not emit `task_type` unless you cannot avoid it.
-- Always include top-level `direct_answer` in JSON output.
-- If `tasks` is empty, `direct_answer` must be a user-facing final reply.
-- If `tasks` is non-empty, set `direct_answer` to an empty string.
-"""
+    try:
+        _STATIC_PROMPT = _ROUTER_STATIC_PATH.read_text(encoding="utf-8").strip()
+    except OSError:
+        # Fallback: use legacy full prompt as static (no caching benefit, but functionally correct)
+        _STATIC_PROMPT = _load_router_system_prompt()
+
+    try:
+        _DYNAMIC_TEMPLATE = _ROUTER_DYNAMIC_PATH.read_text(encoding="utf-8").strip()
+    except OSError:
+        _DYNAMIC_TEMPLATE = "{{AGENT_CAPABILITIES}}\n{{DYNAMIC_TOOL_LINES}}"
+
+
+# Keep for backward compatibility with any external callers
+ROUTER_SYSTEM_PROMPT = _load_router_system_prompt()
 
 FACT_VERIFICATION_GUARD_PROMPT = """
 You decide whether a user question must be verified online before giving a direct final answer.
@@ -646,16 +662,28 @@ class RouterAgent:
         return any(hint in path for hint in path_hints) or "search" in str(parsed.netloc or "").lower()
 
     @staticmethod
+    def _build_system_prompt() -> str:
+        """Return the pure static system prompt (cacheable across requests)."""
+        _load_prompts()
+        return _STATIC_PROMPT
+
+    @staticmethod
+    def _build_dynamic_context() -> str:
+        """Return the dynamic context string to be prepended to the user message."""
+        _load_prompts()
+        from core.agent_registry import get_agent_registry
+        registry = get_agent_registry()
+        agent_caps = registry.build_router_agent_descriptions(lang="zh")
+        dynamic_tools = "\n".join(build_dynamic_tool_prompt_lines())
+        context = _DYNAMIC_TEMPLATE
+        context = context.replace("{{AGENT_CAPABILITIES}}", agent_caps)
+        context = context.replace("{{DYNAMIC_TOOL_LINES}}", dynamic_tools)
+        return context
+
+    @staticmethod
     def _build_router_system_prompt() -> str:
-        dynamic_catalog = "\n".join(build_dynamic_tool_prompt_lines())
-        base_prompt = ROUTER_SYSTEM_PROMPT
-        # Inject agent descriptions from registry if placeholder exists
-        if "{{AGENT_CAPABILITIES}}" in base_prompt:
-            from core.agent_registry import get_agent_registry
-            registry = get_agent_registry()
-            agent_descriptions = registry.build_router_agent_descriptions(lang="zh")
-            base_prompt = base_prompt.replace("{{AGENT_CAPABILITIES}}", agent_descriptions)
-        return f"{base_prompt}\n\n{ROUTER_OUTPUT_APPENDIX}\n{dynamic_catalog}"
+        """Legacy method kept for backward compatibility. Prefer _build_system_prompt()."""
+        return RouterAgent._build_system_prompt()
 
     @classmethod
     def _build_deterministic_tool_hints(
@@ -725,7 +753,10 @@ class RouterAgent:
         log_agent_action(self.name, "开始分析用户意图", user_input[:50] + "...")
 
         # 构建包含对话历史的用户消息
-        user_message = ""
+        # R6: 动态上下文（Agent 能力 + 工具目录）作为 user_message 前缀注入，
+        # system_prompt 保持纯静态（可被 LLM API 缓存）
+        dynamic_ctx = self._build_dynamic_context()
+        user_message = dynamic_ctx + "\n\n---\n" if dynamic_ctx else ""
         if conversation_history:
             history_lines = []
             for turn in conversation_history:
@@ -982,7 +1013,7 @@ class RouterAgent:
         from config.settings import settings
 
         response = self.llm.chat_with_system(
-            system_prompt=self._build_router_system_prompt(),
+            system_prompt=self._build_system_prompt(),
             user_message=user_message,
             temperature=0.3,
             max_tokens=settings.LLM_ROUTER_MAX_TOKENS,

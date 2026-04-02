@@ -42,7 +42,15 @@ def replanner_node(state: OmniCoreState) -> OmniCoreState:
     if should_skip_for_resume(state, "replanner"):
         return state
     from utils.context_budget import snip_history
-    state["messages"] = snip_history(state["messages"])
+    # R7: inject session memory into history snip
+    session_memory = ""
+    from config.settings import settings as _r7_settings
+    if _r7_settings.SESSION_MEMORY_ENABLED:
+        _sid = state.get("session_id", "")
+        if _sid:
+            from core.session_memory import SessionMemoryManager
+            session_memory = SessionMemoryManager(_sid).load()
+    state["messages"] = snip_history(state["messages"], session_memory=session_memory)
     sl = get_structured_logger()
     job_id = state.get("job_id", "")
     with LogContext(job_id=job_id, stage="replanner"):

@@ -1,0 +1,7 @@
+## 当前可用工具与能力
+
+### Agent 能力
+{{AGENT_CAPABILITIES}}
+
+### 动态工具
+{{DYNAMIC_TOOL_LINES}}

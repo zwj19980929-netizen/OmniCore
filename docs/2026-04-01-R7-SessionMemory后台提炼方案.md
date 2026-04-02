@@ -495,14 +495,14 @@ SESSION_MEMORY_INTERVAL = int(os.getenv("SESSION_MEMORY_INTERVAL", "8"))
 
 | 步骤 | 任务 | 交付物 | 状态 |
 |------|------|--------|------|
-| 1 | 新建 `core/session_memory.py`（SessionMemoryManager 核心类） | `core/session_memory.py` | 🔲 |
-| 2 | 新建 `prompts/session_memory_extract.txt`（提炼 prompt） | `prompts/session_memory_extract.txt` | 🔲 |
-| 3 | `config/settings.py` 新增 `SESSION_MEMORY_ENABLED` / `SESSION_MEMORY_INTERVAL` | `config/settings.py` | 🔲 |
-| 4 | 修改 `utils/context_budget.py` `snip_history()` 支持 `session_memory` 参数 | `utils/context_budget.py` | 🔲 |
-| 5 | 在 parallel_executor_node 中集成提炼触发检查 | `core/graph.py` 或 `core/graph_nodes.py` | 🔲 |
-| 6 | 在 route_node / replanner_node / finalize_node 的 LLM 调用中注入 session memory | 各节点文件 | 🔲 |
-| 7 | finalize_node 中执行最终提炼 | `core/graph.py` 或 `core/finalizer.py` | 🔲 |
-| 8 | 单元测试：提炼触发逻辑、session memory 保存/加载、snip 集成 | `tests/test_session_memory_unit.py` | 🔲 |
+| 1 | 新建 `core/session_memory.py`（SessionMemoryManager 核心类） | `core/session_memory.py` | ✅ |
+| 2 | 新建 `prompts/session_memory_extract.txt`（提炼 prompt） | `prompts/session_memory_extract.txt` | ✅ |
+| 3 | `config/settings.py` 新增 `SESSION_MEMORY_ENABLED` / `SESSION_MEMORY_INTERVAL` | `config/settings.py` | ✅ |
+| 4 | 修改 `utils/context_budget.py` `snip_history()` 支持 `session_memory` 参数 | `utils/context_budget.py` | ✅ |
+| 5 | 在 parallel_executor_node 中集成提炼触发检查 | `core/graph_nodes.py` | ✅ |
+| 6 | 在 route_node / replanner_node / finalize_node 的 LLM 调用中注入 session memory | `core/graph_nodes.py`, `core/replanner.py`, `core/finalizer.py` | ✅ |
+| 7 | finalize_node 中执行最终提炼 | `core/finalizer.py` | ✅ |
+| 8 | 单元测试：提炼触发逻辑、session memory 保存/加载、snip 集成 | `tests/test_session_memory_unit.py` | ✅ |
 
 ---
 

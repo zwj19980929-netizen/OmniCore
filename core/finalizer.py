@@ -20,6 +20,7 @@ from core.message_bus import (
     MSG_TIME_CONTEXT, MSG_LOCATION_CONTEXT, MSG_WORK_CONTEXT,
 )
 from utils.logger import log_agent_action, log_success, log_error, log_warning
+from utils.prompt_manager import get_prompt
 from utils.structured_logger import get_structured_logger, LogContext
 from utils.text_repair import normalize_text_value, normalize_payload, payload_preview
 from utils.structured_extract import (
@@ -427,18 +428,19 @@ def _synthesize_user_facing_answer(
         if str(item or "").strip()
     ]
 
+    _FINALIZE_SYSTEM_PROMPT_FALLBACK = (
+        "You are OmniCore's user-facing answer synthesizer.\n"
+        "Write a direct answer for the user based only on executed evidence.\n"
+        "Do not mention internal runtime components such as Router, Worker, Critic, "
+        "Validator, task queue, or delivery package.\n"
+        "If the evidence is partial, say so explicitly.\n"
+        "If files or artifacts were produced, briefly mention where they are.\n"
+        "If answer guidance is provided, follow it only when the executed evidence supports it."
+    )
     try:
         llm = LLMClient()
         response = llm.chat_with_system(
-            system_prompt=(
-                "You are OmniCore's user-facing answer synthesizer.\n"
-                "Write a direct answer for the user based only on executed evidence.\n"
-                "Do not mention internal runtime components such as Router, Worker, Critic, "
-                "Validator, task queue, or delivery package.\n"
-                "If the evidence is partial, say so explicitly.\n"
-                "If files or artifacts were produced, briefly mention where they are.\n"
-                "If answer guidance is provided, follow it only when the executed evidence supports it."
-            ),
+            system_prompt=get_prompt("finalize_system_static", _FINALIZE_SYSTEM_PROMPT_FALLBACK),
             user_message=(
                 f"Original user request:\n{state.get('user_input', '')}\n\n"
                 f"Execution headline:\n{package.get('headline', '')}\n\n"
@@ -613,6 +615,23 @@ def finalize_node(state: OmniCoreState) -> OmniCoreState:
                     )
     except Exception as exc:
         log_warning(f"Knowledge indexing failed (non-blocking): {exc}")
+
+    # R7: final session memory extraction (capture end state)
+    try:
+        from config.settings import settings as _r7_settings
+        if _r7_settings.SESSION_MEMORY_ENABLED:
+            _sid = state.get("session_id", "")
+            if _sid:
+                from core.session_memory import SessionMemoryManager
+                from core.loop_state import LoopState
+                _loop = LoopState.from_dict(state.get("loop_state", {}))
+                SessionMemoryManager(_sid).extract(
+                    messages=state.get("messages", []),
+                    task_queue=state.get("task_queue", []),
+                    turn_count=_loop.turn_count,
+                )
+    except Exception:
+        pass  # non-blocking
 
     # R5: mark plan file as completed
     from core.plan_manager import complete_plan

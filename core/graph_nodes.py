@@ -45,7 +45,9 @@ def route_node(state: OmniCoreState) -> OmniCoreState:
     if should_skip_for_resume(state, "route"):
         return state
     from utils.context_budget import snip_history
-    state["messages"] = snip_history(state["messages"])
+    # R7: inject session memory into history snip
+    session_memory = _load_session_memory(state)
+    state["messages"] = snip_history(state["messages"], session_memory=session_memory)
     sl = get_structured_logger()
     job_id = state.get("job_id", "")
     with LogContext(job_id=job_id, stage="router"):
@@ -104,6 +106,9 @@ def parallel_executor_node(state: OmniCoreState) -> OmniCoreState:
     """Batch executor: run all ready tasks in the current batch."""
     if should_skip_for_resume(state, "parallel_executor"):
         return state
+
+    # R7: trigger session memory extraction if due
+    _maybe_extract_session_memory(state)
 
     # R5: inject plan reminder before execution
     from core.plan_reminder import generate_reminder
@@ -340,3 +345,45 @@ def human_confirm_node_v2(state: OmniCoreState) -> OmniCoreState:
     sl.log_event("stage_end", detail=f"approved={state.get('human_approved', False)}")
     save_runtime_checkpoint(state, "human_confirm", "Human confirmation handled")
     return state
+
+
+# ---------------------------------------------------------------------------
+# R7: Session Memory helpers
+# ---------------------------------------------------------------------------
+
+def _load_session_memory(state: OmniCoreState) -> str:
+    """Load session memory for the current session (returns empty string if disabled/absent)."""
+    from config.settings import settings
+    if not settings.SESSION_MEMORY_ENABLED:
+        return ""
+    session_id = state.get("session_id", "")
+    if not session_id:
+        return ""
+    from core.session_memory import SessionMemoryManager
+    return SessionMemoryManager(session_id).load()
+
+
+def _maybe_extract_session_memory(state: OmniCoreState) -> None:
+    """Trigger session memory extraction if the interval condition is met."""
+    from config.settings import settings
+    if not settings.SESSION_MEMORY_ENABLED:
+        return
+    session_id = state.get("session_id", "")
+    if not session_id:
+        return
+
+    from core.loop_state import LoopState
+    loop = LoopState.from_dict(state.get("loop_state", {}))
+    from core.session_memory import SessionMemoryManager
+    manager = SessionMemoryManager(session_id)
+    if not manager.should_extract(loop.turn_count):
+        return
+
+    try:
+        manager.extract(
+            messages=state.get("messages", []),
+            task_queue=state.get("task_queue", []),
+            turn_count=loop.turn_count,
+        )
+    except Exception:
+        pass  # extraction failure must not block main flow
