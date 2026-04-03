@@ -1,22 +1,20 @@
-﻿# OmniCore
+# OmniCore
 
 面向个人场景的通用 Agent Runtime。
 
-当前版本的定位不是“演示型 AI 原型”，而是一个已经可以长期试运行的个人数字员工底座：它能接收自然语言任务，进行规划、调度工具、后台运行、等待审批、等待事件、复用历史成果，并围绕持续工作上下文推进事情。
+OmniCore 不是"演示型 AI 原型"，而是一个可长期运行的个人数字员工底座：接收自然语言任务，进行规划、调度工具、后台运行、等待审批、复用历史成果，并围绕持续工作上下文推进事情。
 
-## 当前定位
+## 核心能力
 
-OmniCore 现在已经具备这些核心能力：
-
-- `Tool-First` 调度：任务优先按 `tool_name` 规划和执行，而不是死绑固定 Worker。
-- 长期运行：支持 `Session / Job / Artifact`、队列、后台 worker、计划任务、checkpoint、恢复。
-- 工作闭环：支持 `Goal / Project / Todo`、独立 `Artifact Store`、成功路径复用。
-- 真实工作接入：支持 `api.call`、审批态、目录监听、工作模板、通知。
-- 运维与工作台：支持 `Session History`、`Workbench`、`Daily Dashboard`。
-
-一句话概括：
-
-**这是一个面向你自己长期使用的通用 Agent Runtime，而不是一个继续无限扩功能的实验项目。**
+- **Tool-First 调度** — 任务按 `tool_name` 规划和执行，不绑定固定 Worker
+- **多模型路由** — 通过 LiteLLM 支持 OpenAI / Anthropic / Gemini / DeepSeek / MiniMax / Kimi，按任务复杂度和成本智能选模型
+- **长期运行** — Session / Job / Artifact、队列、后台 Worker、计划任务、Checkpoint 与恢复
+- **工作闭环** — Goal / Project / Todo 持续上下文、Artifact Store、成功路径复用
+- **浏览器自动化** — 三层架构（感知 → 决策 → 执行），支持视觉模型、iframe/Shadow DOM、反检测
+- **知识与记忆** — Chroma 向量库 RAG、Skill Library 经验复用、Session Memory 提炼
+- **安全与审批** — Policy Engine 风险分级、Human-in-the-Loop 审批态、MCP 信任分层
+- **事件驱动** — 网页变更监听、Webhook、邮件事件源，自动创建任务
+- **运维仪表盘** — Session History、Workbench、Daily Dashboard、Runtime Metrics
 
 ## 快速开始
 
@@ -24,12 +22,8 @@ OmniCore 现在已经具备这些核心能力：
 
 ```bash
 python -m venv venv
-
-# Windows
-venv\Scripts\activate
-
-# Linux / macOS
-# source venv/bin/activate
+source venv/bin/activate     # macOS / Linux
+# venv\Scripts\activate      # Windows
 
 pip install -r requirements.txt
 playwright install chromium
@@ -38,180 +32,83 @@ playwright install chromium
 ### 2. 配置环境变量
 
 ```bash
-# Windows PowerShell
-Copy-Item .env.example .env
-
-# Linux / macOS
-# cp .env.example .env
+cp .env.example .env
 ```
 
-Windows 下清理测试残留目录：
+至少填入你要使用的模型 API Key（`OPENAI_API_KEY` / `DEEPSEEK_API_KEY` / `ANTHROPIC_API_KEY` 等）。
 
-```powershell
-.\scripts\cleanup_test_artifacts.ps1
-.\scripts\cleanup_test_artifacts.ps1 -IncludeDebug -IncludeLogs
+代理配置建议使用项目级环境变量，而非全局 shell 代理：
+
+```
+ALLOW_SYSTEM_PROXY=false          # 默认禁用系统代理
+OMNICORE_HTTP_PROXY=...           # 项目级代理
 ```
 
-至少补上你要使用的模型 API Key，例如：
-
-- `OPENAI_API_KEY`
-- `DEEPSEEK_API_KEY`
-- `ANTHROPIC_API_KEY`
-- `GEMINI_API_KEY`
-- `MINIMAX_API_KEY`
-
-如果你需要代理，建议只通过项目自己的代理环境变量配置，而不是依赖外部 shell 的全局代理：
-
-- `ALLOW_SYSTEM_PROXY=false`（默认）
-- `OMNICORE_HTTP_PROXY=...`
-- `OMNICORE_HTTPS_PROXY=...`
-- `OMNICORE_ALL_PROXY=...`
-- `OMNICORE_NO_PROXY=localhost,127.0.0.1,::1`
-
-这样可以避免外部环境里残留的无效代理把模型请求全部打挂。
-
-### 3. 运行方式
+### 3. 运行
 
 ```bash
-# 交互式 CLI
-python main.py
-
-# 直接执行单条任务
-python main.py "去 Hacker News 抓取前 10 条新闻并整理成报告"
-
-# 启动主 UI
-streamlit run ui/app.py
-
-# 单独启动前台队列 worker
-python main.py worker
-
-# 单独启动进程模式队列 worker
-python main.py worker --process-loop
+python main.py                        # 交互式 CLI
+python main.py "任务描述"              # 单次执行
+python main.py worker                 # 前台队列 Worker
+python main.py worker --process-loop  # 长期运行 Worker
+streamlit run ui/app.py               # Streamlit UI
 ```
 
-## 你现在能做什么
+### 4. 测试
 
-### 任务执行
+```bash
+pytest tests -q                       # 全量测试
+pytest tests/test_router_unit.py -q   # 单文件
+python -m utils.encoding_health       # 编码健康检查
+```
 
-你可以直接用自然语言交代任务，例如：
+## 架构概览（7 层）
 
-- `抓取今天的安全漏洞信息并输出为表格`
-- `整理这个目录里的新文件并生成摘要`
-- `比较几个网页上的同类信息并输出报告`
-- `调用某个 HTTP API 获取数据，然后落盘`
+| 层 | 职责 | 关键模块 |
+|---|---|---|
+| 1. 交互层 | CLI、Streamlit UI、Dashboard | `main.py`, `ui/` |
+| 2. 运行时与编排 | 任务队列、Worker、Checkpoint、DAG 执行图 | `core/runtime.py`, `core/graph.py` |
+| 3. 规划与决策 | 意图路由、任务规划、验证、风险策略 | `core/router.py`, `core/task_planner.py`, `core/policy_engine.py` |
+| 4. 工具调度 | Tool Protocol、Registry、Adapters、Pipeline | `core/tool_registry.py`, `core/tool_pipeline.py`, `core/task_executor.py` |
+| 5. 工具能力 | Web、Browser、File、System、Terminal、MCP | `agents/` |
+| 6. 状态与记忆 | Session/Job/Artifact、Goal/Project/Todo、向量记忆 | `core/state.py`, `memory/`, `utils/*_store.py` |
+| 7. 自动化与协作 | 计划任务、事件监听、模板、审批、通知 | `utils/workflow_automation_store.py`, `utils/event_sources/` |
 
-### 持续工作
+## 项目结构
 
-你也可以把任务挂到持续上下文里运行：
-
-- `Goal`：长期目标
-- `Project`：某个工作主题
-- `Todo`：待推进事项
-
-这意味着多个 Job 不再是互相孤立的，而是可以围绕同一个事项持续推进。
-
-### 自动化与协作
-
-当前版本已经支持：
-
-- 计划任务：`once / interval / daily`
-- 目录监听：检测新文件并自动创建任务
-- 工作模板：把成功流程保存成可复用模板
-- 审批态：高风险动作先进入 `waiting_for_approval`
-- 等待态：支持 `waiting_for_event` 和 `blocked`
-
-## 当前架构（简版）
-
-系统当前可以理解为 7 层：
-
-1. 交互层  
-CLI、主聊天页、Session History、Workbench、Daily Dashboard。
-
-2. 运行时与编排层  
-负责任务提交、队列、worker、checkpoint、任务生命周期。
-
-3. 规划与决策层  
-Router、Task Planner、Validator、Critic、Policy Engine。
-
-4. 工具调度层  
-Tool Protocol、Tool Registry、Tool Adapters、Task Executor。
-
-5. 工具能力层  
-Web、Browser、File、System、API，以及插件工具。
-
-6. 状态与工作上下文层  
-Session / Job / Artifact、Goal / Project / Todo、Artifact Store、Work Context。
-
-7. 自动化与协作层  
-计划任务、目录监听、模板、审批态、通知。
-
-## 主要目录
-
-```text
+```
 OmniCore/
-├─ config/         配置
-├─ core/           运行时、规划、调度、状态、工具协议
-├─ agents/         具体执行能力
-├─ memory/         记忆相关能力
-├─ utils/          存储、自动化、日志、浏览器等基础设施
-├─ ui/             Streamlit 页面
-├─ tests/          测试
-├─ docs/           架构、状态、收尾说明
-└─ main.py         CLI / worker 入口
+├── config/         配置（settings.py, models.yaml, agents.yaml）
+├── core/           运行时、规划、调度、状态、工具协议（~40 模块）
+├── agents/         执行能力（Browser、Web、File、System、Terminal）
+├── memory/         向量记忆与知识库（Chroma、Skill Store）
+├── utils/          基础设施（存储、日志、浏览器工具、事件源）
+├── prompts/        LLM Prompt 模板（.txt）
+├── templates/      Jinja2 报告模板
+├── ui/             Streamlit 页面（主页 + 4 个子页面）
+├── tests/          测试（unit / integration）
+├── docs/           文档（architecture / design / archive）
+└── main.py         CLI / Worker 入口
 ```
 
-## 常用页面
+## 文档
 
-- `ui/app.py`  
-主聊天入口，适合直接交代任务。
+文档按类型组织在 `docs/` 子目录中，详见 [docs/README.md](docs/README.md)：
 
-- `ui/pages/2_Session_History.py`  
-看 Session / Job / Artifact、队列、worker 状态、通知、审批、checkpoint。
+- **[核心架构说明](docs/architecture/2026-03-04-通用Agent当前架构说明.md)** — 权威架构参考
+- **[设计方案](docs/design/)** — 功能设计与规划
+- **[历史归档](docs/archive/)** — 已完成的阶段文档与修复报告
 
-- `ui/pages/3_Workbench.py`  
-管理 Goal / Project / Todo、模板、目录监听、工作资源。
+## 关键配置
 
-- `ui/pages/4_Daily_Dashboard.py`  
-看今日完成、待审批、等待事件、阻塞事项和推荐下一步。
-
-## 测试
-
-当前建议直接跑全量测试：
-
-```bash
-pytest tests -q
-```
-
-提交前建议再跑一遍编码健康检查：
-
-```bash
-python -m utils.encoding_health
-```
-
-当前仓库已收敛到统一测试缓存目录。若出现 `PytestCacheWarning`，通常只和缓存写权限有关，不影响功能判断。
-
-## 文档入口
-
-当前请优先看下面这几份文档：
-
-- [当前架构说明](docs/2026-03-04-通用Agent当前架构说明.md)
-- [当前版本收尾说明](docs/2026-03-04-通用Agent当前版本收尾说明.md)
-- [文档索引](docs/2026-03-04-通用Agent文档索引.md)
-- [路线图状态](docs/2026-03-04-通用Agent路线图状态.md)
-
-早期的路线图和阶段落地说明仍保留在 `docs/` 中，但现在只作为历史参考，不再代表当前系统全貌。
-
-## 当前阶段建议
-
-当前主功能阶段已经完成。
-
-这意味着后续的正确节奏不是继续无上限开新功能，而是：
-
-1. 用真实工作去跑
-2. 观察真实卡点
-3. 只修稳定性、恢复性、默认行为和交互问题
-4. 把它收成一个你自己长期敢用的版本
+| 文件 | 用途 |
+|---|---|
+| `.env` | API Key、代理、模型路由、功能开关 |
+| `config/models.yaml` | 模型能力与定价元数据 |
+| `config/agents.yaml` | Agent 类型注册 |
+| `config/settings.py` | 运行时配置（所有可调参数集中管理） |
+| `prompts/` | LLM Prompt 模板 |
 
 ## License
 
-按仓库实际授权策略处理；如需补充，请在后续单独加入明确许可证文件。
+按仓库实际授权策略处理；如需补充，请单独加入许可证文件。
