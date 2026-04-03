@@ -140,7 +140,10 @@ class ModelRegistry:
                 or litellm_info.get("max_tokens")
             )
         if not model.output_token_limit:
-            model.output_token_limit = litellm_info.get("max_output_tokens")
+            model.output_token_limit = (
+                model_override.get("max_output_tokens")
+                or litellm_info.get("max_output_tokens")
+            )
 
         return model
 

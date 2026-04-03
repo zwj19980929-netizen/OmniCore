@@ -41,44 +41,54 @@ capability_overrides:
     moonshot-v1-8k:
       capabilities: [text_chat]
       max_tokens: 8000
+      max_output_tokens: 8000
       cost_tier: low
     moonshot-v1-32k:
       capabilities: [text_chat]
       max_tokens: 32000
+      max_output_tokens: 8192
       cost_tier: low
     moonshot-v1-128k:
       capabilities: [text_chat, text_long]
       max_tokens: 128000
+      max_output_tokens: 8192
       cost_tier: medium
     kimi-latest:
       capabilities: [text_chat, text_long, vision]
       max_tokens: 128000
+      max_output_tokens: 8192
       cost_tier: medium
 
   openai:
     gpt-5.4:
       capabilities: [text_chat, text_long, vision, code, reasoning]
       max_tokens: 200000
+      max_output_tokens: 4096
       cost_tier: high
     gpt-4o:
       capabilities: [text_chat, text_long, vision, code]
       max_tokens: 128000
+      max_output_tokens: 16384
       cost_tier: medium
     gpt-4o-mini:
       capabilities: [text_chat, text_long, vision]
       max_tokens: 128000
+      max_output_tokens: 16384
       cost_tier: low
     gpt-4-turbo:
       capabilities: [text_chat, text_long, vision, code]
       max_tokens: 128000
+      max_output_tokens: 4096
       cost_tier: medium
     o1:
       capabilities: [text_chat, code, reasoning]
       max_tokens: 200000
+      max_output_tokens: 100000
       cost_tier: medium
     o1-mini:
       capabilities: [text_chat, code, reasoning]
       max_tokens: 128000
+      max_output_tokens: 65536
       cost_tier: medium
     dall-e-3:
       capabilities: [image_gen]
@@ -97,14 +107,17 @@ capability_overrides:
     deepseek-chat:
       capabilities: [text_chat, text_long, code]
       max_tokens: 64000
+      max_output_tokens: 8192
       cost_tier: low
     deepseek-coder:
       capabilities: [code]
       max_tokens: 64000
+      max_output_tokens: 8192
       cost_tier: low
     deepseek-reasoner:
       capabilities: [text_chat, code, reasoning]
       max_tokens: 64000
+      max_output_tokens: 8192
       cost_tier: medium
 
   zhipu:
@@ -113,26 +126,31 @@ capability_overrides:
       capabilities: [text_chat, text_long, vision, code]
       cost_tier: high
       max_tokens: 128000
+      max_output_tokens: 4096
     glm-4v:
       type: llm
       capabilities: [text_chat, vision]
       cost_tier: medium
       max_tokens: 8192
+      max_output_tokens: 4096
     glm-4v-flash:
       type: llm
       capabilities: [text_chat, vision]
       cost_tier: low
       max_tokens: 8192
+      max_output_tokens: 4096
     glm-4-plus:
       type: llm
       capabilities: [text_chat, text_long, code, reasoning]
       cost_tier: high
       max_tokens: 128000
+      max_output_tokens: 4096
     glm-4:
       type: llm
       capabilities: [text_chat, text_long, code]
       cost_tier: medium
       max_tokens: 128000
+      max_output_tokens: 4096
 
   minimax:
     MiniMax-M2.5:

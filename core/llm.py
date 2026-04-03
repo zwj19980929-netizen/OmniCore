@@ -352,32 +352,31 @@ class LLMClient:
         known_limit = self._get_known_max_output_tokens()
         if known_limit:
             return min(requested, known_limit)
-
-        model_lower = self.model.lower()
-        if "deepseek" in model_lower:
-            return min(requested, 8192)
-        if "claude" in model_lower:
-            return min(requested, 8192)
-        if "moonshot" in model_lower or "kimi" in model_lower:
-            return min(requested, 8192)
         return requested
 
     def _get_known_max_output_tokens(self) -> Optional[int]:
-        """尝试从 LiteLLM 元数据或本地经验规则推断输出 token 上限。"""
+        """从 ModelRegistry（含 models.yaml 静态配置）和 LiteLLM 元数据获取输出 token 上限。"""
         provider = self._get_provider_from_model()
         model_id = self.model.split("/")[-1] if "/" in self.model else self.model
-        model_id_lower = model_id.lower()
 
-        if provider == "openai" and model_id_lower.startswith("gpt-5"):
-            return 4096
+        # 1. 优先从 ModelRegistry 获取（已合并 models.yaml + litellm）
+        try:
+            from core.model_registry import get_registry
+            registry = get_registry()
+            info = registry.get_model_info(provider, model_id)
+            if not info:
+                info = registry.get_model_info(provider, model_id.lower())
+            if info and info.output_token_limit:
+                return info.output_token_limit
+        except Exception:
+            pass
 
+        # 2. 兜底：直接查 litellm.model_cost
         lookup_keys = [
             self._get_litellm_model(),
             self.model,
             model_id,
-            model_id_lower,
             f"{provider}/{model_id}",
-            f"{provider}/{model_id_lower}",
         ]
 
         seen = set()

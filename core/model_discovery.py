@@ -360,10 +360,22 @@ class ModelDiscovery:
             "minimax": self.list_minimax_models,
         }
         fn = method_map.get(provider)
-        if not fn:
-            logger.error(f"不支持的厂家: {provider}")
-            return []
-        return fn()
+        if fn:
+            return fn()
+
+        # 通用处理：从 models.yaml 的 static_models 构建
+        cfg = self._get_provider_cfg(provider)
+        static_ids = cfg.get("static_models", [])
+        if static_ids:
+            models = [
+                ModelInfo(id=mid, provider=provider, display_name=mid)
+                for mid in static_ids if mid
+            ]
+            self._set_cache(provider, models)
+            return models
+
+        logger.error(f"不支持的厂家: {provider}")
+        return []
 
     def list_all(self) -> Dict[str, List[ModelInfo]]:
         """获取所有厂家的模型"""
