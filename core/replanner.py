@@ -26,6 +26,7 @@ from core.message_bus import (
 )
 from utils.logger import log_agent_action, log_success, log_error, log_warning
 from utils.structured_logger import get_structured_logger, LogContext
+from core.prompt_registry import build_single_section_prompt
 from utils.prompt_manager import get_prompt
 from utils.text_repair import normalize_payload
 
@@ -147,7 +148,9 @@ def replanner_node(state: OmniCoreState) -> OmniCoreState:
     }
 
     llm = LLMClient()
-    replanner_en_prompt = get_prompt("replanner_system_en")
+    replanner_en_prompt = build_single_section_prompt(
+        "replanner_system", get_prompt("replanner_system_en"),
+    )
     response = llm.chat_with_system(
         system_prompt=replanner_en_prompt,
         user_message=json.dumps(structured_context, ensure_ascii=False, indent=2) + (

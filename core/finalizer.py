@@ -20,6 +20,7 @@ from core.message_bus import (
     MSG_TIME_CONTEXT, MSG_LOCATION_CONTEXT, MSG_WORK_CONTEXT,
 )
 from utils.logger import log_agent_action, log_success, log_error, log_warning
+from core.prompt_registry import build_single_section_prompt
 from utils.prompt_manager import get_prompt
 from utils.structured_logger import get_structured_logger, LogContext
 from utils.text_repair import normalize_text_value, normalize_payload, payload_preview
@@ -440,7 +441,10 @@ def _synthesize_user_facing_answer(
     try:
         llm = LLMClient()
         response = llm.chat_with_system(
-            system_prompt=get_prompt("finalize_system_static", _FINALIZE_SYSTEM_PROMPT_FALLBACK),
+            system_prompt=build_single_section_prompt(
+                "finalize_system",
+                get_prompt("finalize_system_static", _FINALIZE_SYSTEM_PROMPT_FALLBACK),
+            ),
             user_message=(
                 f"Original user request:\n{state.get('user_input', '')}\n\n"
                 f"Execution headline:\n{package.get('headline', '')}\n\n"

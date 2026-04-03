@@ -12,6 +12,7 @@ from urllib.parse import parse_qs, urlparse
 from core.state import OmniCoreState, TaskItem
 from core.task_planner import build_policy_decision_from_task, build_task_item_from_plan
 from core.llm import LLMClient
+from core.prompt_registry import PromptRegistry, PromptSection
 from core.tool_registry import build_dynamic_tool_prompt_lines, get_builtin_tool_registry
 from utils.logger import log_agent_action, logger
 from utils.url_utils import extract_first_url
@@ -662,23 +663,59 @@ class RouterAgent:
         return any(hint in path for hint in path_hints) or "search" in str(parsed.netloc or "").lower()
 
     @staticmethod
-    def _build_system_prompt() -> str:
-        """Return the pure static system prompt (cacheable across requests)."""
+    def _build_prompt_registry() -> PromptRegistry:
+        """Build a PromptRegistry with all router sections (static + dynamic)."""
+        from config.settings import settings
         _load_prompts()
-        return _STATIC_PROMPT
+
+        registry = PromptRegistry(total_budget=settings.PROMPT_TOKEN_BUDGET)
+
+        # --- static sections (cacheable, ordered by priority high→low) ---
+        registry.register(PromptSection(
+            name="router_static",
+            content=_STATIC_PROMPT,
+            cacheable=True,
+            priority=100,
+        ))
+
+        # --- dynamic sections (non-cacheable) ---
+        from core.agent_registry import get_agent_registry
+        agent_registry = get_agent_registry()
+        agent_caps = agent_registry.build_router_agent_descriptions(lang="zh")
+        dynamic_tools = "\n".join(build_dynamic_tool_prompt_lines())
+
+        registry.register(PromptSection(
+            name="agent_capabilities",
+            content=f"## 当前可用工具与能力\n\n### Agent 能力\n{agent_caps}",
+            cacheable=False,
+            priority=80,
+        ))
+        registry.register(PromptSection(
+            name="tool_catalog",
+            content=f"### 动态工具\n{dynamic_tools}",
+            cacheable=False,
+            priority=70,
+        ))
+
+        if settings.DEBUG_PROMPT:
+            registry.log_report()
+
+        return registry
+
+    @staticmethod
+    def _build_system_prompt() -> str:
+        """Return the assembled system prompt via PromptRegistry."""
+        return RouterAgent._build_prompt_registry().render()
 
     @staticmethod
     def _build_dynamic_context() -> str:
-        """Return the dynamic context string to be prepended to the user message."""
-        _load_prompts()
-        from core.agent_registry import get_agent_registry
-        registry = get_agent_registry()
-        agent_caps = registry.build_router_agent_descriptions(lang="zh")
-        dynamic_tools = "\n".join(build_dynamic_tool_prompt_lines())
-        context = _DYNAMIC_TEMPLATE
-        context = context.replace("{{AGENT_CAPABILITIES}}", agent_caps)
-        context = context.replace("{{DYNAMIC_TOOL_LINES}}", dynamic_tools)
-        return context
+        """Return the dynamic context string to be prepended to the user message.
+
+        Note: With PromptRegistry, dynamic sections are now included in the
+        system prompt via render(). This method is kept for backward
+        compatibility but returns an empty string.
+        """
+        return ""
 
     @staticmethod
     def _build_router_system_prompt() -> str:

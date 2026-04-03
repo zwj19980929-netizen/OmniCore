@@ -340,6 +340,14 @@ class Settings:
     KNOWLEDGE_DISTANCE_THRESHOLD = float(os.getenv("KNOWLEDGE_DISTANCE_THRESHOLD", "0.5"))
     KNOWLEDGE_MIN_CONTENT_LENGTH = _env_int("KNOWLEDGE_MIN_CONTENT_LENGTH", 50)
 
+    # === Prompt Section Registry（S1）===
+    # Section 级 prompt 缓存开关
+    PROMPT_SECTION_CACHE_ENABLED = os.getenv("PROMPT_SECTION_CACHE_ENABLED", "true").lower() == "true"
+    # System prompt 总 token 预算（0=不限制）
+    PROMPT_TOKEN_BUDGET = _env_int("PROMPT_TOKEN_BUDGET", 4000)
+    # 是否输出 prompt section 详细 token 报告
+    DEBUG_PROMPT = os.getenv("DEBUG_PROMPT", "false").lower() == "true"
+
     # === 上下文成本控制（R1）===
     # 工具返回结果最大字符数（超出则截断，保留头 60% + 尾 30%）
     TOOL_RESULT_MAX_CHARS = max(_env_int("TOOL_RESULT_MAX_CHARS", 8000), 500)

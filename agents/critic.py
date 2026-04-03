@@ -9,6 +9,7 @@ from pathlib import Path
 from core.statuses import BLOCKED, WAITING_FOR_APPROVAL, WAITING_FOR_EVENT
 from core.state import OmniCoreState
 from core.llm import LLMClient
+from core.prompt_registry import build_single_section_prompt
 from utils.logger import log_agent_action, logger
 from utils.prompt_manager import get_prompt
 from utils.url_utils import extract_all_urls
@@ -24,7 +25,8 @@ class CriticAgent:
     def __init__(self, llm_client: LLMClient = None):
         self.llm = llm_client or LLMClient()
         self.name = "Critic"
-        self.system_prompt = get_prompt("critic_system", "")
+        raw = get_prompt("critic_system", "")
+        self.system_prompt = build_single_section_prompt("critic_system", raw)
 
     @staticmethod
     def _task_has_direct_url(task_description: str) -> bool:

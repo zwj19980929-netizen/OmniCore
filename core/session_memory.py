@@ -121,11 +121,13 @@ class SessionMemoryManager:
     @staticmethod
     def _load_system_prompt() -> str:
         from utils.prompt_manager import get_prompt
+        from core.prompt_registry import build_single_section_prompt
         fallback = (
             "你是一个工作记忆提炼助手。从对话历史和任务状态中提炼关键工作记忆。"
             "输出 Markdown，包含：当前工作状态、关键决策记录、已确认的约束、失败路径。"
         )
-        return get_prompt("session_memory_extract", fallback)
+        raw = get_prompt("session_memory_extract", fallback)
+        return build_single_section_prompt("session_memory_extract", raw)
 
     @staticmethod
     def _build_extract_prompt(
