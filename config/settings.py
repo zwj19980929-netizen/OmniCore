@@ -348,6 +348,56 @@ class Settings:
     # 是否输出 prompt section 详细 token 报告
     DEBUG_PROMPT = os.getenv("DEBUG_PROMPT", "false").lower() == "true"
 
+    # === Tool Pipeline（S4）===
+    # 严格模式：校验失败直接拒绝而非降级执行
+    TOOL_PIPELINE_STRICT_MODE = os.getenv("TOOL_PIPELINE_STRICT_MODE", "false").lower() == "true"
+    # 是否启用 Pipeline（false 时走旧路径，用于渐进迁移）
+    TOOL_PIPELINE_ENABLED = os.getenv("TOOL_PIPELINE_ENABLED", "true").lower() == "true"
+
+    # === Session Event Sourcing（S3）===
+    # Event sourcing 开关（默认关闭，双写模式：event log + 原 snapshot）
+    SESSION_EVENT_LOG_ENABLED = os.getenv("SESSION_EVENT_LOG_ENABLED", "false").lower() == "true"
+    # Event 批量 flush 间隔（秒）
+    SESSION_EVENT_FLUSH_INTERVAL = _env_int("SESSION_EVENT_FLUSH_INTERVAL", 5)
+
+    # === 多 Agent 协作（S5）===
+    # 是否启用 Coordinator 模式（复杂任务自动拆分为子 agent 并行执行）
+    COORDINATOR_ENABLED = os.getenv("COORDINATOR_ENABLED", "false").lower() == "true"
+    # 子 agent 最大嵌套深度（防止无限递归）
+    MAX_SUBAGENT_DEPTH = max(_env_int("MAX_SUBAGENT_DEPTH", 1), 1)
+    # 同时运行的子 agent 数量上限
+    MAX_PARALLEL_SUBAGENTS = max(_env_int("MAX_PARALLEL_SUBAGENTS", 3), 1)
+    # 单个子 agent 最大执行轮次
+    SUBAGENT_MAX_TURNS = max(_env_int("SUBAGENT_MAX_TURNS", 10), 1)
+    # 单个子 agent 超时时间（秒）
+    SUBAGENT_TIMEOUT = max(_env_int("SUBAGENT_TIMEOUT", 300), 30)
+    # 子 agent 失败策略: fail_fast（取消其余）或 best_effort（继续其余）
+    SUBAGENT_FAILURE_STRATEGY = os.getenv("SUBAGENT_FAILURE_STRATEGY", "best_effort").strip().lower()
+
+    # === Fail-Closed 安全分层（S6）===
+    # MCP 工具描述最大字符数（超出自动截断）
+    MCP_DESCRIPTION_MAX_LENGTH = _env_int("MCP_DESCRIPTION_MAX_LENGTH", 2048)
+    # MCP 工具默认信任等级（builtin / local / mcp_local / mcp_remote）
+    MCP_TRUST_LEVEL = os.getenv("MCP_TRUST_LEVEL", "mcp_local").strip().lower()
+    # 网络请求域名白名单（逗号分隔，空=不限制）
+    ALLOWED_DOMAINS = _env_csv("ALLOWED_DOMAINS")
+    # 是否启用工具执行审计日志（data/audit/{date}.jsonl）
+    AUDIT_LOG_ENABLED = os.getenv("AUDIT_LOG_ENABLED", "true").lower() == "true"
+    # MCP Server 认证失败缓存时间（秒，防认证雪崩）
+    MCP_AUTH_FAILURE_CACHE_SECONDS = _env_int("MCP_AUTH_FAILURE_CACHE_SECONDS", 900)
+    # MCP Server 单个连接超时（秒）
+    MCP_CONNECT_TIMEOUT = _env_int("MCP_CONNECT_TIMEOUT", 30)
+    # MCP Server startup 总超时（秒）
+    MCP_STARTUP_TIMEOUT = _env_int("MCP_STARTUP_TIMEOUT", 60)
+
+    # === 上下文预算制 + 压缩重注入（S2）===
+    # 为 auto-compact 预留的 token 数
+    CONTEXT_RESERVE_TOKENS = _env_int("CONTEXT_RESERVE_TOKENS", 20000)
+    # 触发 compact 的上下文使用率阈值
+    CONTEXT_COMPACT_THRESHOLD = float(os.getenv("CONTEXT_COMPACT_THRESHOLD", "0.85"))
+    # Compact 连续失败熔断次数
+    COMPACT_MAX_CONSECUTIVE_FAILURES = _env_int("COMPACT_MAX_CONSECUTIVE_FAILURES", 3)
+
     # === 上下文成本控制（R1）===
     # 工具返回结果最大字符数（超出则截断，保留头 60% + 尾 30%）
     TOOL_RESULT_MAX_CHARS = max(_env_int("TOOL_RESULT_MAX_CHARS", 8000), 500)

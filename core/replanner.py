@@ -42,6 +42,9 @@ def replanner_node(state: OmniCoreState) -> OmniCoreState:
     """Reflect on failed execution and produce a better next plan."""
     if should_skip_for_resume(state, "replanner"):
         return state
+    # S2: auto-compact if context budget exceeded
+    from core.graph_nodes import _maybe_auto_compact
+    _maybe_auto_compact(state)
     from utils.context_budget import snip_history
     # R7: inject session memory into history snip
     session_memory = ""
@@ -239,6 +242,22 @@ def replanner_node(state: OmniCoreState) -> OmniCoreState:
     state["messages"].append(
         SystemMessage(content=f"Replanner 重规划完成（第 {state['replan_count']} 次）")
     )
+    # S3: emit plan_updated event
+    try:
+        from core.event_log import emit_event, EventType
+        task_queue = state.get("task_queue", [])
+        emit_event(
+            EventType.PLAN_UPDATED,
+            session_id=state.get("session_id", ""),
+            job_id=state.get("job_id", ""),
+            data={
+                "plan_summary": f"Replan #{state.get('replan_count', 0)}: {len(task_queue)} tasks",
+                "task_ids": [t.get("task_id", "") for t in task_queue[:20]],
+            },
+        )
+    except Exception:
+        pass
+
     sl = get_structured_logger()
     sl.log_event("stage_end", detail=f"new_tasks={len(state.get('task_queue', []))}")
     save_runtime_checkpoint(state, "replanner", "Replanner completed")

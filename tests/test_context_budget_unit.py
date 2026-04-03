@@ -157,3 +157,178 @@ def test_snip_history_uses_settings_defaults():
     # Some older messages should have been truncated
     truncated_count = sum(1 for m in result if m.content.endswith("...(snipped)"))
     assert truncated_count > 0
+
+
+# ===========================================================================
+# S2: ContextBudget
+# ===========================================================================
+
+from utils.context_budget import ContextBudget, AutoCompactor, SlotUsage
+from utils.context_budget import (
+    SLOT_SYSTEM_PROMPT, SLOT_MEMORY, SLOT_HISTORY, SLOT_TOOL_RESULTS,
+)
+
+
+class TestContextBudget:
+    """Unit tests for ContextBudget (S2-1)."""
+
+    def test_init_with_explicit_total(self):
+        budget = ContextBudget(total_tokens=100000, reserve_tokens=20000)
+        assert budget.total_tokens == 100000
+        assert budget.reserve_tokens == 20000
+        assert budget.effective_tokens == 80000
+
+    def test_slot_allocation_ratios(self):
+        budget = ContextBudget(total_tokens=100000, reserve_tokens=0)
+        # Default ratios: system_prompt=15%, memory=10%, history=55%, tool_results=20%
+        assert budget.get_slot_budget(SLOT_SYSTEM_PROMPT) == 15000
+        assert budget.get_slot_budget(SLOT_MEMORY) == 10000
+        assert budget.get_slot_budget(SLOT_HISTORY) == 55000
+        assert budget.get_slot_budget(SLOT_TOOL_RESULTS) == 20000
+
+    def test_custom_ratios(self):
+        budget = ContextBudget(
+            total_tokens=100000, reserve_tokens=0,
+            slot_ratios={"history": 0.8, "system_prompt": 0.2},
+        )
+        assert budget.get_slot_budget("history") == 80000
+        assert budget.get_slot_budget("system_prompt") == 20000
+
+    def test_update_and_check_usage(self):
+        budget = ContextBudget(total_tokens=100000, reserve_tokens=0)
+        budget.update_usage(SLOT_HISTORY, 40000)
+        budget.update_usage(SLOT_SYSTEM_PROMPT, 10000)
+        report = budget.check_usage()
+
+        assert report[SLOT_HISTORY]["used"] == 40000
+        assert report[SLOT_SYSTEM_PROMPT]["used"] == 10000
+        assert report["_total"]["total_used"] == 50000
+
+    def test_should_compact_below_threshold(self):
+        budget = ContextBudget(total_tokens=100000, reserve_tokens=0)
+        budget.update_usage(SLOT_HISTORY, 50000)
+        assert not budget.should_compact(threshold=0.85)
+
+    def test_should_compact_above_threshold(self):
+        budget = ContextBudget(total_tokens=100000, reserve_tokens=0)
+        budget.update_usage(SLOT_HISTORY, 86000)
+        assert budget.should_compact(threshold=0.85)
+
+    def test_should_compact_exact_threshold(self):
+        budget = ContextBudget(total_tokens=100000, reserve_tokens=0)
+        budget.update_usage(SLOT_HISTORY, 85000)
+        assert budget.should_compact(threshold=0.85)
+
+    def test_total_used(self):
+        budget = ContextBudget(total_tokens=100000, reserve_tokens=0)
+        budget.update_usage(SLOT_HISTORY, 10000)
+        budget.update_usage(SLOT_MEMORY, 5000)
+        assert budget.total_used() == 15000
+
+    def test_reserve_reduces_effective(self):
+        budget = ContextBudget(total_tokens=64000, reserve_tokens=20000)
+        assert budget.effective_tokens == 44000
+        # Slots are allocated from effective, not total
+        total_budget = sum(
+            budget.get_slot_budget(s) for s in
+            [SLOT_SYSTEM_PROMPT, SLOT_MEMORY, SLOT_HISTORY, SLOT_TOOL_RESULTS]
+        )
+        assert total_budget <= budget.effective_tokens
+
+    def test_unknown_slot_returns_zero(self):
+        budget = ContextBudget(total_tokens=100000, reserve_tokens=0)
+        assert budget.get_slot_budget("nonexistent") == 0
+
+    def test_zero_effective_tokens_should_compact_false(self):
+        budget = ContextBudget(total_tokens=10000, reserve_tokens=10000)
+        assert budget.effective_tokens == 0
+        assert not budget.should_compact()
+
+    def test_log_report_does_not_raise(self):
+        budget = ContextBudget(total_tokens=100000, reserve_tokens=20000)
+        budget.update_usage(SLOT_HISTORY, 30000)
+        budget.log_report()  # should not raise
+
+
+class TestSlotUsage:
+    def test_remaining(self):
+        s = SlotUsage(budget=1000, used=600)
+        assert s.remaining == 400
+
+    def test_remaining_over_budget(self):
+        s = SlotUsage(budget=1000, used=1200)
+        assert s.remaining == 0
+
+    def test_utilization(self):
+        s = SlotUsage(budget=1000, used=500)
+        assert s.utilization == 0.5
+
+    def test_utilization_zero_budget(self):
+        s = SlotUsage(budget=0, used=100)
+        assert s.utilization == 0.0
+
+
+# ===========================================================================
+# S2: AutoCompactor
+# ===========================================================================
+
+class TestAutoCompactor:
+    """Unit tests for AutoCompactor (S2-2)."""
+
+    def test_compact_too_few_messages(self):
+        """Should return messages unchanged if <= 4."""
+        compactor = AutoCompactor(max_consecutive_failures=3)
+        msgs = _make_messages(3)
+        result = compactor.compact(msgs)
+        assert result is msgs
+
+    def test_circuit_breaker_trips_after_max_failures(self):
+        compactor = AutoCompactor(max_consecutive_failures=2)
+        assert not compactor.is_tripped
+
+        # Force failures by mocking _do_llm_compact
+        original = compactor._do_llm_compact
+        compactor._do_llm_compact = lambda msgs: (_ for _ in ()).throw(
+            RuntimeError("mock failure")
+        )
+
+        msgs = _make_messages(10)
+        compactor.compact(msgs)
+        assert compactor.consecutive_failures == 1
+        assert not compactor.is_tripped
+
+        compactor.compact(msgs)
+        assert compactor.consecutive_failures == 2
+        assert compactor.is_tripped
+
+        # After tripping, compact should return messages unchanged
+        result = compactor.compact(msgs)
+        assert result is msgs
+
+    def test_reset_clears_circuit_breaker(self):
+        compactor = AutoCompactor(max_consecutive_failures=1)
+        compactor._do_llm_compact = lambda msgs: (_ for _ in ()).throw(
+            RuntimeError("fail")
+        )
+        compactor.compact(_make_messages(10))
+        assert compactor.is_tripped
+
+        compactor.reset()
+        assert not compactor.is_tripped
+        assert compactor.consecutive_failures == 0
+
+    def test_ptl_fallback_truncates_old_messages(self):
+        compactor = AutoCompactor(max_consecutive_failures=3)
+        msgs = _make_messages(10)
+        result = compactor._ptl_fallback(msgs)
+        # Old messages (before last 6) should have been truncated
+        for msg in result[:4]:  # first 4 are old
+            assert len(msg.content) < 500 or "PTL" in msg.content
+
+    def test_ptl_fallback_drops_oldest_when_many_messages(self):
+        compactor = AutoCompactor(max_consecutive_failures=3)
+        msgs = _make_messages(25)
+        result = compactor._ptl_fallback(msgs)
+        # Should have dropped ~20% of 25 = 5 messages, replaced with summary
+        assert len(result) < len(msgs)
+        assert "PTL" in result[0].content
