@@ -545,6 +545,24 @@ def _finalize_runtime_result(result: Dict[str, Any], user_input: str) -> Dict[st
     finalized["policy_decisions"] = policy_decisions
     finalized["delivery_package"] = delivery_package
 
+    # S3: emit job completion event + flush
+    try:
+        from core.event_log import emit_event, flush_events, EventType
+        emit_event(
+            EventType.JOB_STATUS_CHANGED,
+            session_id=session_id,
+            job_id=job_id,
+            data={
+                "new_status": sanitize_text(finalized.get("status") or ""),
+                "intent": sanitize_text(finalized.get("intent") or ""),
+                "error": sanitize_text(finalized.get("error") or "")[:500],
+                "output": sanitize_text(finalized.get("output") or "")[:500],
+            },
+        )
+        flush_events()
+    except Exception:
+        pass
+
     try:
         from utils.runtime_state_store import get_runtime_state_store
 
@@ -912,6 +930,17 @@ def submit_task(
             "project_id": sanitize_text(job_record.get("project_id") or ""),
             "todo_id": sanitize_text(job_record.get("todo_id") or ""),
         }
+        # S3: emit job_submitted event
+        try:
+            from core.event_log import emit_event, EventType
+            emit_event(
+                EventType.JOB_SUBMITTED,
+                session_id=runtime_session_id,
+                job_id=submission["job_id"],
+                data={"user_input": clean_user_input[:500]},
+            )
+        except Exception:
+            pass
         if auto_start_worker and submission["job_id"]:
             start_background_worker()
         return submission
@@ -1661,6 +1690,35 @@ def resume_job_from_checkpoint(
     conversation_history: Optional[List[Dict[str, Any]]] = None,
     checkpoint_id: Optional[str] = None,
 ) -> Optional[Dict[str, Any]]:
+    # S3: try event-log-based resume first (if enabled)
+    try:
+        from core.event_log import get_event_reader, emit_event, EventType
+        from config.settings import settings as _s3_settings
+        if getattr(_s3_settings, "SESSION_EVENT_LOG_ENABLED", False):
+            reader = get_event_reader()
+            # We need session_id to locate events; get it from state_store
+            from utils.runtime_state_store import get_runtime_state_store
+            _job = get_runtime_state_store().get_job(job_id)
+            if _job:
+                _sid = _job.get("session_id", "")
+                if _sid and reader.has_events(_sid):
+                    events = reader.load_job_events(_sid, job_id)
+                    if events:
+                        last = reader.last_event(_sid)
+                        interrupted = last and last.event_type != EventType.SESSION_END
+                        rebuilt = reader.rebuild_job_state(events, job_id)
+                        log_agent_action("EventLog", f"Rebuilt job state from {len(events)} events")
+                        # S3: emit session resume event
+                        emit_event(
+                            EventType.JOB_STATUS_CHANGED,
+                            session_id=_sid, job_id=job_id,
+                            data={"new_status": "resuming", "source": "event_log"},
+                        )
+                        # Fall through to checkpoint-based resume below
+                        # (event log provides audit, checkpoint provides actual state)
+    except Exception as e:
+        log_warning(f"Event-log resume attempt failed, falling back to checkpoint: {e}")
+
     try:
         from utils.runtime_state_store import get_runtime_state_store
 
@@ -1874,6 +1932,18 @@ def _execute_submitted_job(
             )
     except Exception as e:
         log_warning(f"Runtime state start_job failed: {e}")
+
+    # S3: emit job running event
+    try:
+        from core.event_log import emit_event, EventType
+        emit_event(
+            EventType.JOB_STATUS_CHANGED,
+            session_id=runtime_session_id,
+            job_id=runtime_job_id,
+            data={"new_status": "running", "user_input": clean_user_input[:500]},
+        )
+    except Exception:
+        pass
 
     special = None if initial_state_override else _handle_scoped_memory_command(
         clean_user_input,

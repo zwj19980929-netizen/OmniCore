@@ -89,6 +89,18 @@ def save_runtime_checkpoint(state: OmniCoreState, stage: str, note: str = "") ->
     except Exception as exc:
         log_warning(f"Runtime checkpoint persistence failed: {exc}")
 
+    # S3: emit checkpoint event
+    try:
+        from core.event_log import emit_event, EventType
+        emit_event(
+            EventType.CHECKPOINT_SAVED,
+            session_id=session_id,
+            job_id=job_id,
+            data={"stage": stage, "note": note},
+        )
+    except Exception:
+        pass
+
 
 # ---------------------------------------------------------------------------
 # Resume / skip logic
