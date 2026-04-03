@@ -513,27 +513,6 @@ class BrowserAgent:
     def _task_mentions_interaction(self, task: str) -> bool:
         return self.decision._task_mentions_interaction(task)
 
-    def _task_mentions_auth(self, task: str) -> bool:
-        normalized = self._normalize_text(self._strip_urls_from_text(task))
-        if not normalized:
-            return False
-        auth_tokens = (
-            "login",
-            "log in",
-            "sign in",
-            "signin",
-            "password",
-            "username",
-            "account",
-            "\u767b\u5f55",
-            "\u767b\u5165",
-            "\u7528\u6237\u540d",
-            "\u8d26\u53f7",
-            "\u8d26\u6237",
-            "\u5bc6\u7801",
-        )
-        return any(token in normalized for token in auth_tokens)
-
     @staticmethod
     def _is_search_engine_url(url: str) -> bool:
         return is_search_engine_domain(url or "")
@@ -1172,7 +1151,7 @@ class BrowserAgent:
         target_text = self._extract_click_target_text(task)
         extracted_url = self._extract_url_from_task(task)
         field_kinds = {self._normalize_auth_field_name(key) for key in fields}
-        auth_like = self._task_mentions_auth(task) or "password" in field_kinds
+        auth_like = "password" in field_kinds
 
         if extracted_url:
             if auth_like:

@@ -2728,7 +2728,7 @@ class BrowserDecisionLayer:
                 score -= 4.0
             if target_hint and target_hint in haystack:
                 score += 4.0
-            if self._task_mentions_auth(task) and any(token in haystack for token in ("login", "\u767b\u5f55", "\u767b\u5165")):
+            if intent and intent.intent_type == "auth" and any(token in haystack for token in ("login", "\u767b\u5f55", "\u767b\u5165")):
                 score += 2.0
             if selector:
                 if "form > button" in selector:
@@ -2749,7 +2749,7 @@ class BrowserDecisionLayer:
     ) -> Optional[PageElement]:
         active_intent = intent or TaskIntent(intent_type="form", query="", confidence=0.0)
         primary_submit = self._find_primary_submit_control(elements)
-        if active_intent.intent_type != "auth" and not self._task_mentions_auth(task):
+        if active_intent.intent_type != "auth":
             return primary_submit
 
         auth_submit = self._find_auth_submit_control(task, elements, active_intent)
