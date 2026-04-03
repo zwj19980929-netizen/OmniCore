@@ -10,6 +10,7 @@ import asyncio
 import atexit
 import json
 import os
+import time
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional
 
@@ -65,17 +66,20 @@ class MCPClient:
     # -- 生命周期 -------------------------------------------------
 
     async def connect(self) -> None:
-        """建立与 MCP Server 的连接。"""
+        """建立与 MCP Server 的连接。S6: 单个连接有超时保护。"""
+        from config.settings import settings
+        connect_timeout = getattr(settings, "MCP_CONNECT_TIMEOUT", 30)
+
         if self.config.transport == "stdio":
-            await self._connect_stdio()
+            await asyncio.wait_for(self._connect_stdio(), timeout=float(connect_timeout))
         elif self.config.transport == "sse":
-            await self._connect_sse()
+            await asyncio.wait_for(self._connect_sse(), timeout=float(connect_timeout))
         elif self.config.transport == "streamable_http":
-            await self._connect_http()
+            await asyncio.wait_for(self._connect_http(), timeout=float(connect_timeout))
         else:
             raise ValueError(f"Unsupported MCP transport: {self.config.transport}")
 
-        await self._initialize_handshake()
+        await asyncio.wait_for(self._initialize_handshake(), timeout=float(connect_timeout))
         self._initialized = True
         log_agent_action("MCP", f"Connected to server '{self.config.name}' via {self.config.transport}")
 
@@ -292,6 +296,8 @@ class MCPClientManager:
         self._clients: Dict[str, MCPClient] = {}
         self._tool_to_server: Dict[str, str] = {}   # full_tool_name -> server_name
         self._loaded: bool = False
+        # S6: 认证/连接失败缓存 — server_name -> failure_timestamp
+        self._failure_cache: Dict[str, float] = {}
 
     @classmethod
     async def get_instance(cls) -> "MCPClientManager":
@@ -349,9 +355,29 @@ class MCPClientManager:
             self._loaded = True
             return
 
+        # S6: startup 总超时保护
+        startup_timeout = getattr(settings, "MCP_STARTUP_TIMEOUT", 60)
+        auth_cache_seconds = getattr(settings, "MCP_AUTH_FAILURE_CACHE_SECONDS", 900)
+        startup_deadline = time.monotonic() + startup_timeout
+
         for name, server_cfg in servers_cfg.items():
             if not server_cfg.get("enabled", False):
                 continue
+
+            # S6: 检查认证失败缓存
+            cached_failure_time = self._failure_cache.get(name)
+            if cached_failure_time and (time.monotonic() - cached_failure_time) < auth_cache_seconds:
+                log_warning(
+                    f"[S6] MCP server '{name}' skipped: auth failure cached "
+                    f"(retry after {auth_cache_seconds}s)"
+                )
+                continue
+
+            # S6: 检查 startup 总超时
+            remaining = startup_deadline - time.monotonic()
+            if remaining <= 0:
+                log_warning(f"[S6] MCP startup timeout ({startup_timeout}s) reached, skipping '{name}'")
+                break
 
             config = MCPServerConfig(
                 name=name,
@@ -369,13 +395,15 @@ class MCPClientManager:
 
             client = MCPClient(config)
             try:
-                await client.connect()
+                await asyncio.wait_for(client.connect(), timeout=min(remaining, 30.0))
                 tools = await client.discover_tools()
                 self._clients[name] = client
                 for tool in tools:
                     full_name = f"mcp.{name}.{tool.name}"
                     self._tool_to_server[full_name] = name
             except Exception as e:
+                # S6: 缓存失败时间戳
+                self._failure_cache[name] = time.monotonic()
                 log_error(f"Failed to connect MCP server '{name}': {e}")
 
         if self._clients:
@@ -403,11 +431,26 @@ class MCPClientManager:
 
     # -- 工具调用 -------------------------------------------------
 
+    def is_server_failure_cached(self, server_name: str) -> bool:
+        """S6: 检查 MCP Server 是否在认证失败缓存期内。"""
+        from config.settings import settings
+        cache_seconds = getattr(settings, "MCP_AUTH_FAILURE_CACHE_SECONDS", 900)
+        cached_time = self._failure_cache.get(server_name)
+        if cached_time and (time.monotonic() - cached_time) < cache_seconds:
+            return True
+        return False
+
     async def call_tool(self, full_tool_name: str, arguments: Dict[str, Any]) -> Any:
         """路由工具调用到对应 Server。full_tool_name 格式: mcp.{server}.{tool}"""
         server_name = self._tool_to_server.get(full_tool_name)
         if not server_name:
             raise ValueError(f"Unknown MCP tool: {full_tool_name}")
+
+        # S6: 检查认证失败缓存
+        if self.is_server_failure_cached(server_name):
+            raise ConnectionError(
+                f"MCP server '{server_name}' is in auth failure cooldown"
+            )
 
         client = self._clients.get(server_name)
         if client is None or not client.is_connected:

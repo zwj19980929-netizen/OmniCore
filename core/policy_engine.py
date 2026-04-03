@@ -210,8 +210,23 @@ def evaluate_task_policy(task: Dict[str, Any]) -> PolicyDecision:
             affected_resources=[target] if target else [],
         )
 
-    # MCP 工具策略：基于工具名和 Server 配置的 risk_level
+    # MCP 工具策略：基于工具名、Server 配置的 risk_level 和 S6 trust_level
     if tool_name.startswith("mcp.") or task_type == "mcp_handler":
+        # S6: 获取 trust_level
+        trust_level = "mcp_local"
+        is_destructive = True
+        if registered_tool is not None:
+            trust_level = getattr(registered_tool.spec, "trust_level", "mcp_local")
+            is_destructive = getattr(registered_tool.spec, "destructive", True)
+
+        # S6: mcp_remote + destructive 必须人工审批，不允许自动批准
+        if trust_level == "mcp_remote" and is_destructive:
+            return PolicyDecision(
+                requires_confirmation=True,
+                reason=f"MCP remote tool '{tool_name}' is destructive — requires human approval (S6 trust policy)",
+                risk_level="high",
+            )
+
         mcp_high_risk_tokens = (
             "delete", "remove", "drop", "send_message", "post",
             "create_issue", "merge", "close", "write", "push",
@@ -224,7 +239,16 @@ def evaluate_task_policy(task: Dict[str, Any]) -> PolicyDecision:
                 reason=f"MCP tool '{tool_name}' involves a high-risk operation",
                 risk_level="high",
             )
-        # read-only MCP 操作自动放行
+
+        # S6: mcp_remote 非 destructive 的也要更高审核阈值
+        if trust_level == "mcp_remote":
+            return PolicyDecision(
+                requires_confirmation=False,
+                reason=f"MCP remote tool '{tool_name}' read-only (trust: {trust_level})",
+                risk_level="medium",
+            )
+
+        # mcp_local read-only 操作自动放行
         return PolicyDecision(
             requires_confirmation=False,
             reason="MCP tool read-only operation",

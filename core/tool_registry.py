@@ -46,6 +46,17 @@ class ToolRegistry:
         self._by_task_type: Dict[str, RegisteredTool] = {}
 
     def register(self, tool: RegisteredTool) -> None:
+        # S6: 未显式声明 capabilities 的工具输出 debug warning
+        # （fall-closed 默认值会生效，但提醒开发者显式声明）
+        spec = tool.spec
+        if spec.trust_level not in ("builtin",) and spec.destructive and not spec.concurrent_safe:
+            # 如果同时命中所有 fail-closed 默认值，可能是未声明
+            import logging
+            logging.getLogger("omnicore.security").debug(
+                "[S6] Tool '%s' registered with all fail-closed defaults — "
+                "consider explicitly declaring capabilities (concurrent_safe, destructive)",
+                spec.name,
+            )
         self._by_name[tool.spec.name] = tool
         if tool.spec.task_type:
             self._by_task_type[tool.spec.task_type] = tool
@@ -247,6 +258,8 @@ def _register_builtin_tools(registry: ToolRegistry) -> None:
                 concurrent_safe=True,
                 output_type="text_extraction",
                 needs_network=True,
+                destructive=False,  # S6: 显式 opt-out fail-closed 默认
+                trust_level="builtin",
             ),
             adapter_name="web_worker",
             max_parallelism=4,
@@ -273,6 +286,8 @@ def _register_builtin_tools(registry: ToolRegistry) -> None:
                 concurrent_safe=True,
                 output_type="text_extraction",
                 needs_network=True,
+                destructive=False,
+                trust_level="builtin",
             ),
             adapter_name="enhanced_web_worker",
             max_parallelism=2,
@@ -298,6 +313,8 @@ def _register_builtin_tools(registry: ToolRegistry) -> None:
                 concurrent_safe=False,
                 output_type="text_extraction",
                 needs_network=True,
+                destructive=False,
+                trust_level="builtin",
             ),
             adapter_name="browser_agent",
             max_parallelism=2,
@@ -339,6 +356,7 @@ def _register_builtin_tools(registry: ToolRegistry) -> None:
                 concurrent_safe=True,
                 output_type="file_download",
                 destructive=True,
+                trust_level="builtin",
             ),
             adapter_name="file_worker",
             max_parallelism=4,
@@ -366,6 +384,8 @@ def _register_builtin_tools(registry: ToolRegistry) -> None:
                 concurrent_safe=True,
                 output_type="text_extraction",
                 needs_network=True,
+                destructive=False,
+                trust_level="builtin",
             ),
             adapter_name="api_worker",
             max_parallelism=4,
@@ -392,6 +412,7 @@ def _register_builtin_tools(registry: ToolRegistry) -> None:
                 concurrent_safe=False,
                 output_type="command_output",
                 destructive=True,
+                trust_level="builtin",
             ),
             adapter_name="system_worker",
             max_parallelism=1,
@@ -421,6 +442,7 @@ def _register_builtin_tools(registry: ToolRegistry) -> None:
                 concurrent_safe=False,
                 output_type="command_output",
                 destructive=True,
+                trust_level="builtin",
             ),
             adapter_name="terminal_worker",
             max_parallelism=1,
@@ -448,6 +470,8 @@ def _register_builtin_tools(registry: ToolRegistry) -> None:
                 },
                 concurrent_safe=True,
                 output_type="text_extraction",
+                destructive=False,
+                trust_level="builtin",
             ),
             adapter_name="terminal_worker",
             max_parallelism=4,
@@ -477,6 +501,7 @@ def _register_builtin_tools(registry: ToolRegistry) -> None:
                 concurrent_safe=False,
                 output_type="command_output",
                 destructive=True,
+                trust_level="builtin",
             ),
             adapter_name="terminal_worker",
             max_parallelism=1,
@@ -505,6 +530,8 @@ def _register_builtin_tools(registry: ToolRegistry) -> None:
                 },
                 concurrent_safe=True,
                 output_type="text_extraction",
+                destructive=False,
+                trust_level="builtin",
             ),
             adapter_name="terminal_worker",
             max_parallelism=4,
@@ -581,26 +608,58 @@ def _register_mcp_tools(registry: ToolRegistry) -> None:
         log_warning(f"MCP tool registration skipped: {exc}")
         return
 
+    # S6: MCP 安全约束
+    max_desc_len = getattr(settings, "MCP_DESCRIPTION_MAX_LENGTH", 2048)
+
     for tool in manager.get_all_tools():
         full_name = f"mcp.{tool.server_name}.{tool.name}"
         client = manager.get_client(tool.server_name)
         if not client:
             continue
 
+        # S6: 名称冲突检查 — 内置工具名优先
+        if registry.get(tool.name) is not None:
+            from utils.logger import log_warning as _log_warn
+            _log_warn(
+                f"[S6] MCP tool '{tool.name}' conflicts with builtin tool, "
+                f"registered as '{full_name}' (prefixed)"
+            )
+
+        # S6: description 截断
+        desc = tool.description or f"MCP tool: {tool.name}"
+        if len(desc) > max_desc_len:
+            from utils.logger import log_warning as _log_warn2
+            _log_warn2(
+                f"[S6] MCP tool '{full_name}' description truncated: "
+                f"{len(desc)} > {max_desc_len} chars"
+            )
+            desc = desc[:max_desc_len] + "…[truncated]"
+
+        # S6: 信任分层 — stdio → mcp_local, sse/http → mcp_remote
+        if client.config.transport == "stdio":
+            trust = "mcp_local"
+        else:
+            trust = "mcp_remote"
+
         risk = client.config.risk_level
+        # S6: MCP 未声明 risk_level 时默认 medium（fail-closed）
+        if not risk or risk == "low":
+            risk = "medium"
+
         registry.register(
             RegisteredTool(
                 spec=ToolSpec(
                     name=full_name,
                     task_type="mcp_handler",
-                    description=tool.description or f"MCP tool: {tool.name}",
+                    description=desc,
                     risk_level=risk,
                     tags=["mcp", tool.server_name],
                     input_schema=tool.input_schema,
-                    concurrent_safe=risk != "high",
+                    concurrent_safe=False,       # S6: fail-closed
                     output_type="text_extraction",
                     needs_network=True,
-                    destructive=risk in ("medium", "high"),
+                    destructive=True,             # S6: fail-closed
+                    trust_level=trust,
                 ),
                 adapter_name="mcp_adapter",
                 max_parallelism=client.config.max_parallelism,
