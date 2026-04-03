@@ -263,6 +263,7 @@ def _select_batch_indexes(state: OmniCoreState, ready_indexes: List[int]) -> Lis
 async def _execute_registered_tool_async(
     local_task: Dict[str, Any],
     shared_memory_snapshot: Dict[str, Any],
+    state: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     registered_tool = _resolve_registered_tool(local_task)
     if registered_tool is None:
@@ -291,6 +292,32 @@ async def _execute_registered_tool_async(
     )
     local_task["params"] = normalized_params
     local_task["tool_args"] = copy.deepcopy(normalized_params)
+
+    # S4: 通过 Pipeline 执行（可通过 TOOL_PIPELINE_ENABLED=false 回退旧路径）
+    if settings.TOOL_PIPELINE_ENABLED:
+        from core.tool_pipeline import ToolPipeline
+        pipeline = ToolPipeline()
+        pipeline_state = state or {}
+        ctx = await pipeline.execute(
+            tool_name=registered_tool.spec.name,
+            params=normalized_params,
+            state=pipeline_state,
+            registered_tool=registered_tool,
+            shared_memory_snapshot=shared_memory_snapshot,
+        )
+        # Pipeline 返回的 raw_result 就是 adapter 的 outcome dict，直接复用
+        if ctx.raw_result is not None:
+            return ctx.raw_result
+        # 校验阶段 fatal 失败（未到执行阶段）
+        if ctx.normalized_result is not None:
+            return ctx.normalized_result.to_outcome_dict(
+                task_type=registered_tool.spec.task_type,
+                tool_name=registered_tool.spec.name,
+                params=normalized_params,
+                execution_trace=local_task.get("execution_trace", []),
+                risk_level=registered_tool.spec.risk_level,
+            )
+
     return await execute_tool_via_adapter(
         local_task,
         shared_memory_snapshot,
@@ -301,12 +328,13 @@ async def _execute_registered_tool_async(
 async def _execute_single_task_async(
     task: Dict[str, Any],
     shared_memory_snapshot: Dict[str, Any],
+    state: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     """Dispatch a task through the registered tool path."""
     local_task = copy.deepcopy(task)
     local_task["status"] = str(TaskStatus.RUNNING)
     try:
-        return await _execute_registered_tool_async(local_task, shared_memory_snapshot)
+        return await _execute_registered_tool_async(local_task, shared_memory_snapshot, state=state)
     except Exception as e:
         error_message = str(e)
         return {
@@ -552,13 +580,13 @@ async def run_ready_batch_async(state: OmniCoreState) -> OmniCoreState:
         outcomes: List[Tuple[int, Dict[str, Any]]] = []
         for idx in batch_indexes:
             outcome = await _execute_single_task_async(
-                state["task_queue"][idx], shared_memory_snapshot
+                state["task_queue"][idx], shared_memory_snapshot, state=state
             )
             outcomes.append((idx, outcome))
     else:
         # 并行执行
         tasks = [
-            _execute_single_task_async(state["task_queue"][idx], shared_memory_snapshot)
+            _execute_single_task_async(state["task_queue"][idx], shared_memory_snapshot, state=state)
             for idx in batch_indexes
         ]
         results = await asyncio.gather(*tasks, return_exceptions=True)

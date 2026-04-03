@@ -2,7 +2,7 @@
 
 > 所属规划：[Claude Code 启发架构演进规划](2026-04-02-Claude-Code启发架构演进规划.md)
 >
-> 优先级：P1 | 预估工作量：2-3 天 | 状态：🔲 未开始
+> 优先级：P1 | 预估工作量：2-3 天 | 状态：✅ 已完成（2026-04-03）
 >
 > 前置依赖：R4（已完成，工具能力标签化）
 
@@ -45,71 +45,71 @@ R4 给工具加了 `concurrent_safe`、`output_type`、`needs_network`、`destru
 
 | 步骤 | 任务 | 涉及文件 | 状态 |
 |------|------|---------|------|
-| 1 | 新建 `core/tool_pipeline.py`，定义 `ToolPipelineStage` 枚举：`SCHEMA_VALIDATE`、`SEMANTIC_VALIDATE`、`INJECT_CONTEXT`、`CHECK_PERMISSION`、`EXECUTE`、`NORMALIZE_RESULT` | `core/tool_pipeline.py`（新建） | 🔲 |
-| 2 | 定义 `ToolExecutionContext` dataclass：`tool_name`、`tool_spec`、`raw_params`、`validated_params`、`injected_params`、`permission_result`、`raw_result`、`normalized_result`、`stage_errors: list` | 同上 | 🔲 |
-| 3 | 实现 `ToolPipeline` 类：`execute(tool_name, params, state) -> ToolExecutionContext`，按顺序执行六阶段 | 同上 | 🔲 |
-| 4 | 每阶段失败可配置行为：`strict_mode=True` 时直接拒绝，`False` 时降级到下一阶段并记 warning | 同上 | 🔲 |
+| 1 | 新建 `core/tool_pipeline.py`，定义 `ToolPipelineStage` 枚举：`SCHEMA_VALIDATE`、`SEMANTIC_VALIDATE`、`INJECT_CONTEXT`、`CHECK_PERMISSION`、`EXECUTE`、`NORMALIZE_RESULT` | `core/tool_pipeline.py`（新建） | ✅ |
+| 2 | 定义 `ToolExecutionContext` dataclass：`tool_name`、`tool_spec`、`raw_params`、`validated_params`、`injected_params`、`permission_result`、`raw_result`、`normalized_result`、`stage_errors: list` | 同上 | ✅ |
+| 3 | 实现 `ToolPipeline` 类：`execute(tool_name, params, state) -> ToolExecutionContext`，按顺序执行六阶段 | 同上 | ✅ |
+| 4 | 每阶段失败可配置行为：`strict_mode=True` 时直接拒绝，`False` 时降级到下一阶段并记 warning | 同上 | ✅ |
 
 ### S4-2: Stage 1 — Schema 校验
 
 | 步骤 | 任务 | 涉及文件 | 状态 |
 |------|------|---------|------|
-| 1 | `ToolSpec` 新增 `param_schema: Optional[dict]`（JSON Schema 格式） | `core/tool_protocol.py` | 🔲 |
-| 2 | 内置工具补充 param_schema 声明 | `core/tool_registry.py` | 🔲 |
-| 3 | MCP 工具自动从 MCP Server 元数据获取 inputSchema | `core/mcp_client.py` | 🔲 |
-| 4 | Pipeline 中用 jsonschema 做校验，失败时返回结构化错误信息（字段名 + 期望类型 + 实际值） | `core/tool_pipeline.py` | 🔲 |
+| 1 | `ToolSpec` 新增 `param_schema: Optional[dict]`（JSON Schema 格式） | `core/tool_protocol.py` | ✅（复用已有 input_schema） |
+| 2 | 内置工具补充 param_schema 声明 | `core/tool_registry.py` | ✅（已有 input_schema） |
+| 3 | MCP 工具自动从 MCP Server 元数据获取 inputSchema | `core/mcp_client.py` | ✅（已有） |
+| 4 | Pipeline 中用 jsonschema 做校验，失败时返回结构化错误信息（字段名 + 期望类型 + 实际值） | `core/tool_pipeline.py` | ✅ |
 
 ### S4-3: Stage 2 — 语义校验
 
 | 步骤 | 任务 | 涉及文件 | 状态 |
 |------|------|---------|------|
-| 1 | `ToolSpec` 新增 `validate_input: Optional[Callable]`，每个工具可注册自定义校验函数 | `core/tool_protocol.py` | 🔲 |
-| 2 | 内置校验规则：file_worker 拒绝系统关键路径（`/etc/`, `/usr/`）、browser_agent URL 域名白名单（可选） | `core/tool_registry.py` | 🔲 |
-| 3 | MCP 工具默认无语义校验（可通过 `mcp_servers.yaml` 配置 `blocked_params`） | `config/mcp_servers.yaml` | 🔲 |
+| 1 | `ToolSpec` 新增 `validate_input: Optional[Callable]`，每个工具可注册自定义校验函数 | `core/tool_protocol.py` | ✅ |
+| 2 | 内置校验规则：file_worker 拒绝系统关键路径（`/etc/`, `/usr/`）、browser_agent URL 域名白名单（可选） | `core/tool_pipeline.py` | ✅ |
+| 3 | MCP 工具默认无语义校验（可通过 `mcp_servers.yaml` 配置 `blocked_params`） | `config/mcp_servers.yaml` | ✅（默认无校验） |
 
 ### S4-4: Stage 3 — 上下文注入
 
 | 步骤 | 任务 | 涉及文件 | 状态 |
 |------|------|---------|------|
-| 1 | 实现 `inject_context(params, state) -> params`：自动补充 `cwd`、`session_id`、`job_id`、`timeout` | `core/tool_pipeline.py` | 🔲 |
-| 2 | 工具可声明 `required_context: list[str]`（如 `["cwd", "session_id"]`），pipeline 自动从 state 注入 | `core/tool_protocol.py` | 🔲 |
-| 3 | 路径参数自动展开：`~` → home dir、相对路径 → 绝对路径 | `core/tool_pipeline.py` | 🔲 |
+| 1 | 实现 `inject_context(params, state) -> params`：自动补充 `cwd`、`session_id`、`job_id`、`timeout` | `core/tool_pipeline.py` | ✅ |
+| 2 | 工具可声明 `required_context: list[str]`（如 `["cwd", "session_id"]`），pipeline 自动从 state 注入 | `core/tool_protocol.py` | ✅ |
+| 3 | 路径参数自动展开：`~` → home dir、相对路径 → 绝对路径 | `core/tool_pipeline.py` | ✅ |
 
 ### S4-5: Stage 4 — 权限检查
 
 | 步骤 | 任务 | 涉及文件 | 状态 |
 |------|------|---------|------|
-| 1 | 将 `policy_engine.evaluate_risk()` 调用从 graph 层移入 pipeline | `core/tool_pipeline.py` | 🔲 |
-| 2 | 权限结果三态：`allow`（直接执行）、`deny`（拒绝 + 返回原因）、`ask`（触发 human-in-the-loop） | 同上 | 🔲 |
-| 3 | `destructive=True` 且无 pre-approved 时默认走 `ask` | 同上 | 🔲 |
-| 4 | 保留 graph 层的 `human_confirm_node` 作为 `ask` 的 UI 端实现 | `core/graph_nodes.py`（不改动） | 🔲 |
+| 1 | 将 `policy_engine.evaluate_risk()` 调用从 graph 层移入 pipeline | `core/tool_pipeline.py` | ✅ |
+| 2 | 权限结果三态：`allow`（直接执行）、`deny`（拒绝 + 返回原因）、`ask`（触发 human-in-the-loop） | 同上 | ✅ |
+| 3 | `destructive=True` 且无 pre-approved 时默认走 `ask` | 同上 | ✅ |
+| 4 | 保留 graph 层的 `human_confirm_node` 作为 `ask` 的 UI 端实现 | `core/graph_nodes.py`（不改动） | ✅ |
 
 ### S4-6: Stage 6 — 结果规范化
 
 | 步骤 | 任务 | 涉及文件 | 状态 |
 |------|------|---------|------|
-| 1 | 定义 `ToolResult` dataclass：`success: bool`、`output: str`、`structured_data: Optional[dict]`、`artifacts: list`、`error: Optional[str]`、`error_type: Optional[str]` | `core/tool_pipeline.py` | 🔲 |
-| 2 | 各 worker 返回统一转换为 `ToolResult`（在 pipeline 末端，不改 worker 内部实现） | 同上 | 🔲 |
-| 3 | 错误规范化：Python exception → `ToolResult(success=False, error=str(e), error_type=type(e).__name__)` | 同上 | 🔲 |
-| 4 | `task_executor.py` 的 `_apply_task_outcome()` 改为消费 `ToolResult` 而非 raw dict | `core/task_executor.py` | 🔲 |
+| 1 | 定义 `ToolResult` dataclass：`success: bool`、`output: str`、`structured_data: Optional[dict]`、`artifacts: list`、`error: Optional[str]`、`error_type: Optional[str]` | `core/tool_pipeline.py` | ✅ |
+| 2 | 各 worker 返回统一转换为 `ToolResult`（在 pipeline 末端，不改 worker 内部实现） | 同上 | ✅ |
+| 3 | 错误规范化：Python exception → `ToolResult(success=False, error=str(e), error_type=type(e).__name__)` | 同上 | ✅ |
+| 4 | `task_executor.py` 的 `_apply_task_outcome()` 改为消费 `ToolResult` 而非 raw dict | `core/task_executor.py` | ✅ |
 
 ### S4-7: 集成与迁移
 
 | 步骤 | 任务 | 涉及文件 | 状态 |
 |------|------|---------|------|
-| 1 | `task_executor.py` 的 `_dispatch_single_task()` 改为调用 `ToolPipeline.execute()` | `core/task_executor.py` | 🔲 |
-| 2 | 渐进迁移：`TOOL_PIPELINE_STRICT_MODE=false` 时，校验失败降级执行（与旧行为兼容） | 同上 | 🔲 |
-| 3 | Pipeline 执行日志：每个阶段的耗时和结果记入 debug log | `core/tool_pipeline.py` | 🔲 |
+| 1 | `task_executor.py` 的 `_dispatch_single_task()` 改为调用 `ToolPipeline.execute()` | `core/task_executor.py` | ✅ |
+| 2 | 渐进迁移：`TOOL_PIPELINE_STRICT_MODE=false` 时，校验失败降级执行（与旧行为兼容） | 同上 | ✅ |
+| 3 | Pipeline 执行日志：每个阶段的耗时和结果记入 debug log | `core/tool_pipeline.py` | ✅ |
 
 ### S4-8: 测试
 
 | 步骤 | 任务 | 涉及文件 | 状态 |
 |------|------|---------|------|
-| 1 | Pipeline 全阶段单元测试（正常流程、各阶段失败、strict vs 降级模式） | `tests/test_tool_pipeline_unit.py`（新建） | 🔲 |
-| 2 | Schema 校验测试（正确参数、缺失字段、类型错误） | 同上 | 🔲 |
-| 3 | 语义校验测试（危险路径拒绝、正常路径通过） | 同上 | 🔲 |
-| 4 | 结果规范化测试（各 worker 返回格式 → ToolResult） | 同上 | 🔲 |
-| 5 | 全量回归 | `pytest tests -q` | 🔲 |
+| 1 | Pipeline 全阶段单元测试（正常流程、各阶段失败、strict vs 降级模式） | `tests/test_tool_pipeline_unit.py`（新建） | ✅ |
+| 2 | Schema 校验测试（正确参数、缺失字段、类型错误） | 同上 | ✅ |
+| 3 | 语义校验测试（危险路径拒绝、正常路径通过） | 同上 | ✅ |
+| 4 | 结果规范化测试（各 worker 返回格式 → ToolResult） | 同上 | ✅ |
+| 5 | 全量回归 | `pytest tests -q` | ✅ |
 
 ---
 
