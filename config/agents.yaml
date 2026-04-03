@@ -81,6 +81,17 @@ agents:
     max_parallelism: 4
     risk_level: "medium"
 
+  coordinator:
+    adapter: "coordinator"
+    description: "Coordinator agent that decomposes complex tasks into parallel subagents"
+    description_zh: "协调器 Agent，将复杂任务拆分为多个子 Agent 并行执行后汇总"
+    capabilities:
+      - task_decomposition
+      - parallel_coordination
+      - result_synthesis
+    max_parallelism: 1
+    risk_level: "low"
+
   mcp_handler:
     adapter: "mcp_adapter"
     description: "Execute tools via MCP (Model Context Protocol) servers"

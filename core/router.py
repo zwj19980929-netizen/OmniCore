@@ -1301,6 +1301,9 @@ class RouterAgent:
         state["needs_human_confirm"] = analysis.get("is_high_risk", False) or any(
             task.get("requires_confirmation", False) for task in task_queue
         )
+        # S5: LLM-driven coordinator decision
+        if analysis.get("needs_coordinator", False):
+            state["_use_coordinator"] = True
         # Publish router results to MessageBus
         direct_answer = str(analysis.get("direct_answer", "") or "").strip()
         if direct_answer:

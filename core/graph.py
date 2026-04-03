@@ -26,6 +26,7 @@ from core.graph_nodes import (                          # noqa: F401
     validator_node,
     human_confirm_node,
     human_confirm_node_v2,
+    coordinator_node,
 )
 from core.replanner import replanner_node               # noqa: F401
 from core.finalizer import finalize_node                # noqa: F401
@@ -80,8 +81,9 @@ def build_graph() -> StateGraph:
 
     graph = StateGraph(OmniCoreState)
 
-    # Nodes (8)
+    # Nodes (9)
     graph.add_node("router", route_node)
+    graph.add_node("coordinator", coordinator_node)  # S5
     graph.add_node("plan_validator", plan_validator_node)
     graph.add_node("human_confirm", human_confirm_node_v2)
     graph.add_node("parallel_executor", parallel_executor_node)
@@ -93,11 +95,15 @@ def build_graph() -> StateGraph:
     # Entry
     graph.set_entry_point("router")
 
-    # Router → plan_validator | finalize
+    # Router → coordinator | plan_validator | finalize (S5: added coordinator)
     graph.add_conditional_edges("router", should_continue_after_route, {
+        "coordinator": "coordinator",
         "plan_validator": "plan_validator",
         "finalize": "finalize",
     })
+
+    # Coordinator → finalize (coordinator handles full lifecycle)
+    graph.add_edge("coordinator", "finalize")
 
     # plan_validator → human_confirm
     graph.add_edge("plan_validator", "human_confirm")
@@ -174,15 +180,21 @@ def build_graph_from_registry(registry: StageRegistry = None):
 
     graph.set_entry_point(stages[0].name)
 
-    # Router → plan_validator | finalize
+    # Router → coordinator | plan_validator | finalize (S5: added coordinator)
     if "router" in stage_names:
         targets = {}
+        if "coordinator" in stage_names:
+            targets["coordinator"] = "coordinator"
         if "plan_validator" in stage_names:
             targets["plan_validator"] = "plan_validator"
         if "finalize" in stage_names:
             targets["finalize"] = "finalize"
         if targets:
             graph.add_conditional_edges("router", should_continue_after_route, targets)
+
+    # Coordinator → finalize (S5)
+    if "coordinator" in stage_names and "finalize" in stage_names:
+        graph.add_edge("coordinator", "finalize")
 
     # plan_validator → human_confirm
     if "plan_validator" in stage_names and "human_confirm" in stage_names:

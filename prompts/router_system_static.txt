@@ -48,7 +48,8 @@
         }}
     ],
     "is_high_risk": false,
-    "high_risk_reason": ""
+    "high_risk_reason": "",
+    "needs_coordinator": false
 }}
 
 ## success_criteria 编写指南
@@ -135,6 +136,7 @@ file_worker params:
 5. 涉及付款、删除、发送等不可逆操作时，标记 is_high_risk
 6. 文件格式根据场景智能选择：数据对比用 xlsx，报告用 html，简单文本用 txt
 7. 如果用户只是在问问题或聊天，不需要创建任务，直接在 reasoning 中回答
+8. 当任务可以拆成多个**独立且可并行**的子任务时，标记 needs_coordinator=true。典型场景：比较/对比多个事物、从多个来源分别调研后汇总、同时执行多个无依赖任务。如果子任务之间有先后依赖（如先搜再写），不要标记 coordinator，用 depends_on 即可
 
 ## 能力标注要求
 在分析任务时，你需要为每个子任务标注所需的模型能力（required_capabilities）。

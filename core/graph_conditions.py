@@ -22,7 +22,10 @@ MAX_REPLAN = 3
 # Router
 # ---------------------------------------------------------------------------
 
-def should_continue_after_route(state: OmniCoreState) -> Literal["plan_validator", "finalize"]:
+def should_continue_after_route(state: OmniCoreState) -> Literal["coordinator", "plan_validator", "finalize"]:
+    # S5: If coordinator mode is flagged, route to coordinator
+    if state.get("_use_coordinator"):
+        return "coordinator"
     if not state["task_queue"]:
         return "finalize"
     return "plan_validator"

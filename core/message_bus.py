@@ -35,6 +35,15 @@ MSG_AGENT_REQUEST = "agent_request"
 MSG_AGENT_RESPONSE = "agent_response"
 MSG_AGENT_STATUS = "agent_status"
 
+# Subagent / Coordinator message types (S5)
+MSG_SUBAGENT_STARTED = "subagent_started"
+MSG_SUBAGENT_COMPLETED = "subagent_completed"
+MSG_SUBAGENT_FAILED = "subagent_failed"
+MSG_SUBAGENT_APPROVAL_REQUEST = "subagent_approval_request"
+MSG_SUBAGENT_APPROVAL_RESPONSE = "subagent_approval_response"
+MSG_COORDINATOR_DISPATCH = "coordinator_dispatch"
+MSG_COORDINATOR_SYNTHESIS = "coordinator_synthesis"
+
 # R2: Context data message types (replacing shared_memory keys)
 MSG_CONVERSATION_HISTORY = "conversation_history"
 MSG_RELATED_HISTORY = "related_history"
