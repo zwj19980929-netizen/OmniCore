@@ -1,6 +1,10 @@
 """
 测试 web_worker 的页面感知能力（阶段1修复验证）
 """
+import pytest
+
+pytestmark = pytest.mark.skip(reason="integration test requiring browser and LLM — run manually")
+
 import asyncio
 import sys
 from pathlib import Path

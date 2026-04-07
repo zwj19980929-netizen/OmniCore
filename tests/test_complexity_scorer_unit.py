@@ -259,11 +259,15 @@ class TestMonthlyCostGuard:
         assert record["job_id"] == "job-1"
 
     def test_corrupt_line_ignored(self):
+        from datetime import datetime, timezone
         guard, tmpdir = self._make_guard()
         cost_file = os.path.join(tmpdir, "monthly_cost.jsonl")
         os.makedirs(tmpdir, exist_ok=True)
+        # Use current month so the record passes the year/month filter
+        now = datetime.now(timezone.utc)
+        ts = now.strftime("%Y-%m-01T00:00:00+00:00")
         with open(cost_file, "w") as f:
             f.write("NOT JSON\n")
-            f.write(json.dumps({"ts": "2026-03-01T00:00:00+00:00", "cost_usd": 0.1, "model": "x"}) + "\n")
+            f.write(json.dumps({"ts": ts, "cost_usd": 0.1, "model": "x"}) + "\n")
         total = guard.get_current_month_cost()
         assert total == pytest.approx(0.1)

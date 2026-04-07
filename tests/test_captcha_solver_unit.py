@@ -1,4 +1,5 @@
 from types import SimpleNamespace
+from unittest.mock import patch
 
 from utils.captcha_solver import CaptchaSolver
 
@@ -7,31 +8,24 @@ def test_analyze_captcha_with_vision_falls_back_to_default_model():
     solver = CaptchaSolver()
     solver.vision_model = "bad-model"
 
-    class _FakeCompletions:
-        def __init__(self):
-            self.calls = []
+    calls = []
 
-        def create(self, *, model, messages):
-            self.calls.append(model)
-            assert messages
-            if model == "bad-model":
+    class _FakeLLMClient:
+        def __init__(self, model=None, **kwargs):
+            self._model = model
+
+        def chat_with_image(self, prompt, image_bytes):
+            calls.append(self._model)
+            if self._model == "bad-model":
                 raise Exception("invalid model ID")
             return SimpleNamespace(
-                choices=[
-                    SimpleNamespace(
-                        message=SimpleNamespace(
-                            content='{"captcha_type":"text","solution":"AB12","confidence":0.91,"instructions":"ok"}'
-                        )
-                    )
-                ]
+                content='{"captcha_type":"text","solution":"AB12","confidence":0.91,"instructions":"ok"}'
             )
 
-    fake_completions = _FakeCompletions()
-    solver.client = SimpleNamespace(chat=SimpleNamespace(completions=fake_completions))
+    with patch("core.llm.LLMClient", _FakeLLMClient):
+        result = solver.analyze_captcha_with_vision("ZmFrZQ==")
 
-    result = solver.analyze_captcha_with_vision("ZmFrZQ==")
-
-    assert fake_completions.calls[:2] == ["bad-model", "gpt-4o"]
+    assert calls[:2] == ["bad-model", "gpt-4o"]
     assert result["solution"] == "AB12"
     assert result["confidence"] == 0.91
 

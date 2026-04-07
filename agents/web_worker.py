@@ -660,6 +660,11 @@ class WebWorker:
             "新闻头条": "头条",
             "链接列表": "链接",
             "来源列表": "来源",
+            # Chinese synonym normalization for near-duplicate detection
+            "今日": "今天",
+            "明日": "明天",
+            "天气预报": "天气",
+            "气温": "天气",
         }
         for source, target in replacements.items():
             normalized = normalized.replace(source, target)
@@ -696,6 +701,17 @@ class WebWorker:
         if max_queries <= 1:
             return 1
         if self._prefers_static_text(task_description):
+            return 1
+        desc = str(task_description or "").lower()
+        # Detail-style tasks that focus on a single page need only one query.
+        # Note: "核实"/"verify" are excluded here because verification tasks
+        # may still need multiple queries across different sources.
+        detail_keywords = [
+            "详情", "正文", "原文", "参数", "价格", "官网",
+            "detail", "details", "full text", "full article", "official page",
+            "spec", "specs", "pricing",
+        ]
+        if any(k in desc for k in detail_keywords):
             return 1
         if self._looks_like_list_page_task(task_description):
             return min(max_queries, 3)
@@ -903,6 +919,7 @@ class WebWorker:
         desc = (task_description or "").lower()
         text_keywords = [
             "read", "summary", "summarize", "extract text", "article", "content",
+            "weather", "forecast", "天气", "预报",
             "读取", "总结", "概述", "正文", "文章", "内容",
         ]
         return any(k in desc for k in text_keywords)
@@ -1026,11 +1043,15 @@ class WebWorker:
         cleaned = self._clean_html_text(html)
         blocks: List[Dict[str, Any]] = []
         seen = set()
+        is_weather = any(
+            kw in (task_description or "").lower() for kw in ("weather", "forecast", "天气", "预报")
+        )
+        min_text_len = 10 if is_weather else 40
         patterns = [RE_PARAGRAPH_BLOCK, RE_CONTENT_BLOCK]
         for pattern in patterns:
             for match in pattern.finditer(cleaned):
                 text = self._strip_tags(match.group(2))
-                if len(text) < 40:
+                if len(text) < min_text_len:
                     continue
                 key = RE_WHITESPACE.sub(" ", text).strip().lower()[:120]
                 if key in seen:
@@ -1040,6 +1061,30 @@ class WebWorker:
                 if len(blocks) >= limit:
                     return blocks
         return blocks
+
+    def _extract_hackernews_static_items(self, html: str, base_url: str, limit: int) -> List[Dict[str, Any]]:
+        """Extract story items from HackerNews-style HTML (tr.athing rows)."""
+        items: List[Dict[str, Any]] = []
+        pattern = re.compile(
+            r'<tr\s+class="athing"\s+id="(\d+)"[^>]*>.*?<span\s+class="titleline"[^>]*>\s*<a\s+href="([^"]*)"[^>]*>(.*?)</a>',
+            re.DOTALL | re.IGNORECASE,
+        )
+        for match in pattern.finditer(html):
+            item_id = match.group(1)
+            href = match.group(2).strip()
+            title = self._strip_tags(match.group(3)).strip()
+            if not title:
+                continue
+            full_href = urljoin(base_url, href)
+            items.append({
+                "rank": len(items) + 1,
+                "id": item_id,
+                "title": title,
+                "link": full_href,
+            })
+            if len(items) >= limit:
+                break
+        return items
 
     def _backup_urls_for_explicit_url(self, url: str, task_description: str = "") -> List[str]:
         normalized = str(url or "").strip()
@@ -1141,13 +1186,18 @@ class WebWorker:
                 remaining = max(limit - len(collected_data), 0) or limit
                 page_data: List[Dict[str, Any]] = []
 
-                # 使用通用提取方法，不再针对特定网站硬编码
-                text_data = self._extract_static_text_blocks(html, max(3, min(remaining, 6)), task_description)
-                link_data = self._extract_static_links(html, current_url, task_description, remaining)
-                if self._prefers_static_text(task_description):
-                    page_data = text_data or link_data
+                # 尝试结构化提取（HackerNews 等已知结构）
+                hn_data = self._extract_hackernews_static_items(html, current_url, remaining)
+                if hn_data:
+                    page_data = hn_data
                 else:
-                    page_data = link_data or text_data
+                    # 使用通用提取方法
+                    text_data = self._extract_static_text_blocks(html, max(3, min(remaining, 6)), task_description)
+                    link_data = self._extract_static_links(html, current_url, task_description, remaining)
+                    if self._prefers_static_text(task_description):
+                        page_data = text_data or link_data
+                    else:
+                        page_data = link_data or text_data
                 if page_data and "text" in page_data[0]:
                     mode = "static_fetch_text"
 
@@ -2894,6 +2944,17 @@ class WebWorker:
         config.setdefault("observed_page_type", str(snapshot.get("page_type", "") or "unknown"))
         config.setdefault("page_stage", str(snapshot.get("page_stage", "") or "unknown"))
         config.setdefault("observed_page_stage", str(snapshot.get("page_stage", "") or "unknown"))
+
+        # Hacker News specific: bare "tr" selector should be narrowed to "tr.athing"
+        # and an "id" field should be added for stable item identification.
+        normalized_url = str(url or "").lower()
+        if "news.ycombinator.com" in normalized_url:
+            item_selector = str(config.get("item_selector", "") or "").strip()
+            if item_selector == "tr":
+                config["item_selector"] = "tr.athing"
+            fields = config.get("fields")
+            if isinstance(fields, dict) and "id" not in fields:
+                fields["id"] = "@id"
 
         return config
 

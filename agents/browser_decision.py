@@ -61,6 +61,44 @@ PAGE_ASSESSMENT_PROMPT = get_prompt("browser_page_assessment")
 VISION_ACTION_PROMPT = get_prompt("browser_vision_decision")
 UNIFIED_PLAN_PROMPT = get_prompt("browser_unified_plan")
 
+# Load section-based prompt files for task-specific rules and stage hints
+REFLECTION_PROMPT = get_prompt("browser_reflection") or ""
+_TASK_RULES_RAW = get_prompt("browser_task_rules") or ""
+_STAGE_HINTS_RAW = get_prompt("browser_stage_hints") or ""
+
+
+def _parse_sections(raw: str) -> Dict[str, str]:
+    """Parse a section-based prompt file into {section_name: content}."""
+    sections: Dict[str, str] = {}
+    current_key = ""
+    lines: List[str] = []
+    for line in raw.splitlines():
+        stripped = line.strip()
+        if stripped.startswith("[") and stripped.endswith("]"):
+            if current_key:
+                sections[current_key] = "\n".join(lines).strip()
+            current_key = stripped[1:-1]
+            lines = []
+        else:
+            lines.append(line)
+    if current_key:
+        sections[current_key] = "\n".join(lines).strip()
+    return sections
+
+
+_TASK_RULES = _parse_sections(_TASK_RULES_RAW)
+_STAGE_HINTS = _parse_sections(_STAGE_HINTS_RAW)
+
+
+def _get_task_specific_rules(intent_type: str) -> str:
+    """Return task-specific decision rules for the given intent type."""
+    return _TASK_RULES.get(intent_type, _TASK_RULES.get("default", ""))
+
+
+def _get_stage_hint(stage: str) -> str:
+    """Return stage-specific hint for the given page stage."""
+    return _STAGE_HINTS.get(stage, _STAGE_HINTS.get("default", ""))
+
 
 class BrowserDecisionLayer:
     """Decides next browser action based on current state and task context.
@@ -93,6 +131,9 @@ class BrowserDecisionLayer:
         # State synced from orchestrator (via _sync_state_to_layers)
         self.last_semantic_snapshot: Optional[Dict[str, Any]] = None
         self.last_observation = None  # PageObservation
+
+        # Pending reflection text injected into LLM prompts (set by _reflect_on_failures)
+        self._pending_reflection: str = ""
 
     # ── Text / normalization helpers ─────────────────────────
 
@@ -279,14 +320,14 @@ class BrowserDecisionLayer:
 
         # --- combine (weighted) ---
         score = (
-            0.55 * token_ratio
-            + 0.30 * ngram_ratio
-            + 0.15 * number_bonus
+            settings.TEXT_RELEVANCE_WEIGHT_TOKEN * token_ratio
+            + settings.TEXT_RELEVANCE_WEIGHT_NGRAM * ngram_ratio
+            + settings.TEXT_RELEVANCE_WEIGHT_NUMBER * number_bonus
         )
 
         # Strong-hit multiplier: if 2+ important tokens hit, boost
         if strong_hits >= 2:
-            score = min(1.0, score * 1.25)
+            score = min(1.0, score * settings.TEXT_RELEVANCE_STRONG_HIT_MULTIPLIER)
 
         return min(1.0, score)
 
@@ -297,19 +338,19 @@ class BrowserDecisionLayer:
         score = 0.0
 
         if any(host_norm.endswith(suffix) for suffix in [".gov", ".edu", ".org"]):
-            score += 2.0
+            score += settings.SEARCH_AUTHORITY_BONUS_GOV_EDU_ORG
         return score
 
     def _score_search_result_card(self, task: str, query: str, card: SearchResultCard) -> float:
         haystack = " ".join([card.title, card.snippet, card.source, card.host, card.date])
         relevance = self._score_text_relevance(query, haystack)  # 0~1
         authority = self._score_source_authority(task, card.host, card.source)
-        # Normalize authority to 0~1 range (max raw ~6.0)
-        authority_norm = min(1.0, authority / 6.0)
+        # Normalize authority to 0~1 range
+        authority_norm = min(1.0, authority / settings.SEARCH_AUTHORITY_MAX)
         rank_bonus = 0.0
         if card.rank > 0:
-            rank_bonus = max(0.12 - ((card.rank - 1) * 0.01), 0.0)
-        return min(1.0, 0.65 * relevance + 0.20 * authority_norm + rank_bonus)
+            rank_bonus = max(settings.SEARCH_RANK_BONUS_BASE - ((card.rank - 1) * settings.SEARCH_RANK_BONUS_DECAY), 0.0)
+        return min(1.0, settings.SEARCH_RANK_WEIGHT_RELEVANCE * relevance + settings.SEARCH_RANK_WEIGHT_AUTHORITY * authority_norm + rank_bonus)
 
     def _score_element_for_context(self, task: str, element: PageElement) -> float:
         attrs = element.attributes or {}
@@ -320,19 +361,19 @@ class BrowserDecisionLayer:
         score = 0.0
         for token in self._extract_task_tokens(task):
             if token in haystack:
-                score += 2.0
+                score += settings.ELEMENT_SCORE_TASK_TOKEN_MATCH
         if element.element_type == "input":
-            score += 1.0
+            score += settings.ELEMENT_SCORE_INPUT_TYPE
         if not element.is_visible:
-            score -= 2.0
+            score += settings.ELEMENT_SCORE_NOT_VISIBLE
         if not element.is_clickable:
-            score -= 1.5
+            score += settings.ELEMENT_SCORE_NOT_CLICKABLE
         if attrs.get("placeholder"):
-            score += 0.8
+            score += settings.ELEMENT_SCORE_HAS_PLACEHOLDER
         if attrs.get("labelText") or attrs.get("ariaLabel"):
-            score += 0.8
+            score += settings.ELEMENT_SCORE_HAS_LABEL
         if element.element_type in {"button", "link"}:
-            score += 0.4
+            score += settings.ELEMENT_SCORE_BUTTON_LINK
         return score
 
     def _prioritize_elements(self, task: str, elements: List[PageElement], limit: int = 12) -> List[PageElement]:
@@ -431,9 +472,11 @@ class BrowserDecisionLayer:
         }
         return json.dumps(compact, ensure_ascii=False, sort_keys=True)
 
-    def _format_recent_steps_for_llm(self, steps: Optional[List[Dict[str, Any]]], max_items: int = 4) -> str:
+    def _format_recent_steps_for_llm(self, steps: Optional[List[Dict[str, Any]]], max_items: int = 0) -> str:
         if not steps:
             return "(none)"
+        if max_items <= 0:
+            max_items = settings.BROWSER_LLM_RECENT_STEPS
         lines: List[str] = []
         for step in steps[-max_items:]:
             parts = [f"step={step.get('step', '?')}"]
@@ -451,6 +494,18 @@ class BrowserDecisionLayer:
             result = str(step.get("result") or step.get("observation") or "")
             if result:
                 parts.append(f"result={result[:24]}")
+            # Failure reason — helps LLM understand WHY an action failed
+            failure_reason = str(step.get("failure_reason") or "")
+            if failure_reason and result == "failed":
+                parts.append(f"reason={failure_reason[:80]}")
+            # Page change indicator
+            if step.get("page_changed"):
+                parts.append("page_changed=yes")
+            # Data progress delta
+            data_before = step.get("data_before_count", 0)
+            data_after = step.get("data_after_count", 0)
+            if isinstance(data_before, int) and isinstance(data_after, int) and data_after > data_before:
+                parts.append(f"data_gained=+{data_after - data_before}")
             url = str(step.get("url") or "")
             if url:
                 parts.append(f"url={url[:120]}")
@@ -869,7 +924,8 @@ class BrowserDecisionLayer:
         )
         split_patterns = (
             r"\s+(?=(?:wait(?:ing)?(?:\s+for)?|render(?:ing)?|load(?:ing|ed)?|open|visit|navigate|go\s+to|click|input|type|fill|submit|extract|show|display|return|report|summari[sz]e|collect|scrape)\b)",
-            r"[\s，,。；;]+(?=(?:等待|渲染|加载|打开|访问|进入|点击|输入|填写|提交|提取|展示|显示|返回|总结|收集|抓取))",
+            r"[\s，,。．；;！!？?]+(?:并且?|然后|再|同时|完整(?:地)?|请(?:先)?|还要?|接着)?(?:[\u4e00-\u9fff]{0,4})?(?=(?:等待|渲染|加载|打开|访问|进入|点击|输入|填写|提交|提取|展示|显示|返回|总结|收集|抓取))",
+            r"[\s，,。．；;！!？?]+(?=(?:请(?:先)?)?(?:打开|访问|进入|点击|输入|填写|提交|展示|显示|等待))",
             r"[\s，,。；;]+(?=(?:and then|then|next)\b)",
         )
         for pattern in split_patterns:
@@ -2075,6 +2131,9 @@ class BrowserDecisionLayer:
                 collections=prompt_context.get("collections", "(no collections)"),
                 controls=prompt_context.get("controls", "(no controls)"),
                 elements=prompt_context.get("elements", "(no actionable elements)"),
+                task_specific_rules=_get_task_specific_rules(active_intent.intent_type),
+                stage_hint=_get_stage_hint(page_state.stage),
+                reflection=self._pending_reflection,
             )
             if web_debug_recorder.is_enabled():
                 page_html = await self.perception.get_page_html() if self.perception else ""
@@ -2230,6 +2289,9 @@ class BrowserDecisionLayer:
                     headings=self._format_headings_for_llm(active_snapshot),
                     regions=self._format_regions_for_llm(active_snapshot),
                     vision_description=getattr(obs, 'vision_description', '') if obs else '',
+                    task_specific_rules=_get_task_specific_rules(active_intent.intent_type),
+                    stage_hint=_get_stage_hint(page_state.stage),
+                    reflection=self._pending_reflection,
                 )},
             ]
             web_debug_recorder.write_json("browser_action_decision_budget", prompt_budget)
@@ -2303,6 +2365,7 @@ class BrowserDecisionLayer:
         main_text = self.perception.get_snapshot_main_text(active_snapshot) if self.perception else ""
 
         try:
+            _unified_page_stage = str(active_snapshot.get("page_stage", "unknown") or "unknown")
             prompt = UNIFIED_PLAN_PROMPT.format(
                 task=task, intent=active_intent.intent_type,
                 query=active_intent.query or self._derive_primary_query(task),
@@ -2310,7 +2373,7 @@ class BrowserDecisionLayer:
                 requires_interaction=str(bool(active_intent.requires_interaction)).lower(),
                 url=current_url or "", title=title or "",
                 page_type=active_snapshot.get("page_type", "unknown"),
-                page_stage=active_snapshot.get("page_stage", "unknown"),
+                page_stage=_unified_page_stage,
                 snapshot_version=obs.snapshot_version,
                 headings=self._format_headings_for_llm(active_snapshot),
                 regions=self._format_regions_for_llm(active_snapshot),
@@ -2324,6 +2387,9 @@ class BrowserDecisionLayer:
                 last_action=(last_action.description or last_action.action_type.value) if last_action else "none",
                 recent_steps=self._format_recent_steps_for_llm(recent_steps),
                 data_progress=data_progress,
+                task_specific_rules=_get_task_specific_rules(active_intent.intent_type),
+                stage_hint=_get_stage_hint(_unified_page_stage),
+                reflection=self._pending_reflection,
             )
             web_debug_recorder.write_text("browser_unified_plan_prompt", prompt)
 
@@ -2346,6 +2412,71 @@ class BrowserDecisionLayer:
             log_warning(f"unified plan call failed: {exc}")
             return None
 
+    # ── Reflection mechanism ───────────────────────────────────
+
+    @staticmethod
+    def _should_reflect(recent_steps: Optional[List[Dict[str, Any]]]) -> bool:
+        """Check if recent consecutive failures warrant a reflection call."""
+        if not settings.BROWSER_REFLECTION_ENABLED or not recent_steps:
+            return False
+        threshold = settings.BROWSER_REFLECTION_FAIL_THRESHOLD
+        consecutive_fails = 0
+        for step in reversed(recent_steps):
+            if step.get("result") == "failed":
+                consecutive_fails += 1
+            else:
+                break
+        return consecutive_fails >= threshold
+
+    async def _reflect_on_failures(
+        self, task: str, current_url: str,
+        recent_steps: Optional[List[Dict[str, Any]]],
+        snapshot: Optional[Dict[str, Any]] = None,
+    ) -> str:
+        """Analyze recent failures and return reflection text for LLM context."""
+        if not REFLECTION_PROMPT or not recent_steps:
+            return ""
+        consecutive_fails = 0
+        for step in reversed(recent_steps):
+            if step.get("result") == "failed":
+                consecutive_fails += 1
+            else:
+                break
+        active_snapshot = snapshot or self.last_semantic_snapshot or {}
+        page_type = str(active_snapshot.get("page_type", "unknown") or "unknown")
+        try:
+            prompt = REFLECTION_PROMPT.format(
+                task=task or "",
+                url=current_url or "",
+                page_type=page_type,
+                recent_steps=self._format_recent_steps_for_llm(recent_steps),
+                fail_count=consecutive_fails,
+            )
+            llm = self._get_llm()
+            response = await llm.achat(
+                messages=[
+                    {"role": "system", "content": "Return JSON only."},
+                    {"role": "user", "content": prompt},
+                ],
+                temperature=0.2, json_mode=True,
+            )
+            payload = llm.parse_json_response(response)
+            if not payload:
+                return ""
+            parts = []
+            if payload.get("root_cause"):
+                parts.append(f"Root cause: {payload['root_cause']}")
+            if payload.get("suggestion"):
+                parts.append(f"Suggestion: {payload['suggestion']}")
+            if payload.get("avoid"):
+                parts.append(f"Avoid: {payload['avoid']}")
+            reflection = "\n".join(parts)
+            web_debug_recorder.write_text("browser_reflection", reflection)
+            return reflection
+        except Exception as exc:
+            log_warning(f"reflection call failed: {exc}")
+            return ""
+
     async def _plan_next_action(
         self, task: str, current_url: str, title: str,
         elements: List[PageElement], intent: Optional[TaskIntent],
@@ -2355,6 +2486,16 @@ class BrowserDecisionLayer:
     ) -> Tuple[Optional[BrowserAction], str]:
         active_snapshot = snapshot or self.last_semantic_snapshot or {}
         observation = self.last_observation
+
+        # Reflection: analyze consecutive failures before planning next action
+        if self._should_reflect(recent_steps):
+            self._pending_reflection = await self._reflect_on_failures(
+                task, current_url, recent_steps, snapshot=active_snapshot,
+            )
+            if self._pending_reflection:
+                self._pending_reflection = f"Reflection on recent failures:\n{self._pending_reflection}"
+        else:
+            self._pending_reflection = ""
 
         async def _try_unified() -> Optional[BrowserAction]:
             if observation is None:

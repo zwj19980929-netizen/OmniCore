@@ -2,6 +2,10 @@
 """
 测试增强的命令行输入功能
 """
+import pytest
+
+pytestmark = pytest.mark.skip(reason="interactive test requiring stdin — run manually")
+
 import sys
 import os
 

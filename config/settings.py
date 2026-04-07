@@ -233,6 +233,37 @@ class Settings:
     TEXT_BLOCKS_DISPLAY_LIMIT = _env_int("TEXT_BLOCKS_DISPLAY_LIMIT", 18)
     TEXT_BLOCK_DISPLAY_CHARS = _env_int("TEXT_BLOCK_DISPLAY_CHARS", 400)
 
+    # === 浏览器决策配置 ===
+    # 传给 LLM 的最近步骤数
+    BROWSER_LLM_RECENT_STEPS = _env_int("BROWSER_LLM_RECENT_STEPS", 6)
+    # 反思机制开关
+    BROWSER_REFLECTION_ENABLED = os.getenv("BROWSER_REFLECTION_ENABLED", "true").lower() == "true"
+    # 触发反思的连续失败阈值
+    BROWSER_REFLECTION_FAIL_THRESHOLD = _env_int("BROWSER_REFLECTION_FAIL_THRESHOLD", 2)
+
+    # === 搜索结果与文本相关性评分权重 ===
+    # 文本相关性：token 匹配 / 字符 n-gram 重叠 / 数字匹配
+    TEXT_RELEVANCE_WEIGHT_TOKEN = float(os.getenv("TEXT_RELEVANCE_WEIGHT_TOKEN", "0.55"))
+    TEXT_RELEVANCE_WEIGHT_NGRAM = float(os.getenv("TEXT_RELEVANCE_WEIGHT_NGRAM", "0.30"))
+    TEXT_RELEVANCE_WEIGHT_NUMBER = float(os.getenv("TEXT_RELEVANCE_WEIGHT_NUMBER", "0.15"))
+    TEXT_RELEVANCE_STRONG_HIT_MULTIPLIER = float(os.getenv("TEXT_RELEVANCE_STRONG_HIT_MULTIPLIER", "1.25"))
+    # 搜索结果卡片排名
+    SEARCH_RANK_WEIGHT_RELEVANCE = float(os.getenv("SEARCH_RANK_WEIGHT_RELEVANCE", "0.65"))
+    SEARCH_RANK_WEIGHT_AUTHORITY = float(os.getenv("SEARCH_RANK_WEIGHT_AUTHORITY", "0.20"))
+    SEARCH_RANK_BONUS_BASE = float(os.getenv("SEARCH_RANK_BONUS_BASE", "0.12"))
+    SEARCH_RANK_BONUS_DECAY = float(os.getenv("SEARCH_RANK_BONUS_DECAY", "0.01"))
+    # 来源权威性加分
+    SEARCH_AUTHORITY_BONUS_GOV_EDU_ORG = float(os.getenv("SEARCH_AUTHORITY_BONUS_GOV_EDU_ORG", "2.0"))
+    SEARCH_AUTHORITY_MAX = float(os.getenv("SEARCH_AUTHORITY_MAX", "6.0"))
+    # 元素优先级评分
+    ELEMENT_SCORE_TASK_TOKEN_MATCH = float(os.getenv("ELEMENT_SCORE_TASK_TOKEN_MATCH", "2.0"))
+    ELEMENT_SCORE_INPUT_TYPE = float(os.getenv("ELEMENT_SCORE_INPUT_TYPE", "1.0"))
+    ELEMENT_SCORE_NOT_VISIBLE = float(os.getenv("ELEMENT_SCORE_NOT_VISIBLE", "-2.0"))
+    ELEMENT_SCORE_NOT_CLICKABLE = float(os.getenv("ELEMENT_SCORE_NOT_CLICKABLE", "-1.5"))
+    ELEMENT_SCORE_HAS_PLACEHOLDER = float(os.getenv("ELEMENT_SCORE_HAS_PLACEHOLDER", "0.8"))
+    ELEMENT_SCORE_HAS_LABEL = float(os.getenv("ELEMENT_SCORE_HAS_LABEL", "0.8"))
+    ELEMENT_SCORE_BUTTON_LINK = float(os.getenv("ELEMENT_SCORE_BUTTON_LINK", "0.4"))
+
     # === 浏览器执行配置 ===
     # 连续失败容忍次数：连续多少次操作失败后放弃任务
     BROWSER_MAX_CONSECUTIVE_FAILS = _env_int("BROWSER_MAX_CONSECUTIVE_FAILS", 4)

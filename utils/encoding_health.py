@@ -33,10 +33,12 @@ DEFAULT_EXCLUDE_DIRS = {
     "data",
     "venv",
     ".venv",
+    "model",
 }
 
 DEFAULT_EXCLUDE_FILES = {
     "utils/encoding_health.py",
+    "error.txt",
 }
 
 IGNORE_LINE_MARKER = "encoding-health: ignore-line"

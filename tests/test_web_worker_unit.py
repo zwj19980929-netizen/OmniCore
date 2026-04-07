@@ -60,10 +60,14 @@ def test_static_fetch_returns_text_mode_when_summary_task(monkeypatch):
     </html>
     """
 
-    def _fake_get(*_args, **_kwargs):
-        return FakeResponse(html)
+    class _FakeSession:
+        def __init__(self):
+            self.headers = {}
 
-    monkeypatch.setattr("agents.web_worker.requests.get", _fake_get)
+        def get(self, *_args, **_kwargs):
+            return FakeResponse(html)
+
+    monkeypatch.setattr("agents.web_worker.requests.Session", lambda: _FakeSession())
 
     result = worker._static_fetch("https://example.com/article", "summary this article", limit=5)
 
@@ -103,10 +107,14 @@ def test_static_fetch_rejects_link_only_weather_payload(monkeypatch):
     </html>
     """
 
-    def _fake_get(*_args, **_kwargs):
-        return FakeResponse(html)
+    class _FakeSession:
+        def __init__(self):
+            self.headers = {}
 
-    monkeypatch.setattr("agents.web_worker.requests.get", _fake_get)
+        def get(self, *_args, **_kwargs):
+            return FakeResponse(html)
+
+    monkeypatch.setattr("agents.web_worker.requests.Session", lambda: _FakeSession())
 
     result = worker._static_fetch("https://www.weather.com.cn/weather/101220101.shtml", "合肥天气预报", limit=5)
 
@@ -769,6 +777,9 @@ def test_smart_scrape_reuses_search_page_and_opens_target_in_new_tab(monkeypatch
         async def detect_captcha(self):
             return self._result(True, {"has_captcha": False})
 
+        async def detect_robot_challenge(self):
+            return self._result(True, {"detected": False})
+
         async def scroll_down(self, *_args, **_kwargs):
             return self._result(True)
 
@@ -844,8 +855,13 @@ def test_smart_scrape_retries_next_search_candidate_from_same_search_page(monkey
             "serp_sufficient": False,
         }
 
+    class _FakeContext:
+        """Minimal context with empty pages so _return_to_search_results_tab uses close_tab fallback."""
+        pages = []
+
     class _FakeToolkit:
         page = None
+        context = _FakeContext()
 
         @staticmethod
         def _result(success=True, data=None, error=""):
@@ -886,6 +902,9 @@ def test_smart_scrape_retries_next_search_candidate_from_same_search_page(monkey
 
         async def detect_captcha(self):
             return self._result(True, {"has_captcha": False})
+
+        async def detect_robot_challenge(self):
+            return self._result(True, {"detected": False})
 
         async def scroll_down(self, *_args, **_kwargs):
             return self._result(True)
@@ -980,6 +999,9 @@ def test_smart_scrape_does_not_search_when_explicit_homepage_url_is_provided(mon
         async def detect_captcha(self):
             return type("Result", (), {"success": True, "data": {"has_captcha": False}})()
 
+        async def detect_robot_challenge(self):
+            return type("Result", (), {"success": True, "data": {"detected": False}})()
+
         async def scroll_down(self, *_args, **_kwargs):
             return type("Result", (), {"success": True})()
 
@@ -1051,6 +1073,9 @@ def test_smart_scrape_skips_url_analysis_when_explicit_non_weather_url_is_provid
 
         async def detect_captcha(self):
             return type("Result", (), {"success": True, "data": {"has_captcha": False}})()
+
+        async def detect_robot_challenge(self):
+            return type("Result", (), {"success": True, "data": {"detected": False}})()
 
         async def scroll_down(self, *_args, **_kwargs):
             return type("Result", (), {"success": True})()
@@ -1130,6 +1155,9 @@ def test_smart_scrape_explicit_url_overrides_need_search_hint(monkeypatch):
 
         async def detect_captcha(self):
             return type("Result", (), {"success": True, "data": {"has_captcha": False}})()
+
+        async def detect_robot_challenge(self):
+            return type("Result", (), {"success": True, "data": {"detected": False}})()
 
         async def scroll_down(self, *_args, **_kwargs):
             return type("Result", (), {"success": True})()
@@ -1258,6 +1286,9 @@ def test_smart_scrape_prefers_detail_text_blocks_before_news_fallback(monkeypatc
 
         async def detect_captcha(self):
             return self._result(True, {"has_captcha": False})
+
+        async def detect_robot_challenge(self):
+            return self._result(True, {"detected": False})
 
         async def scroll_down(self, *_args, **_kwargs):
             return self._result(True)

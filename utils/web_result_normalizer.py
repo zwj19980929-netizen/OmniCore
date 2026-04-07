@@ -535,6 +535,32 @@ def canonicalize_item(item: Dict[str, Any], requested_fields: List[str]) -> Dict
     return normalized
 
 
+_WEATHER_TASK_HINTS = re.compile(
+    r"天气|气温|温度|湿度|风力|weather|forecast|temperature|humidity|wind",
+    re.IGNORECASE,
+)
+
+_WEATHER_PATTERNS: List[Tuple[str, "re.Pattern[str]"]] = [
+    ("weather", re.compile(r"(多云|晴|阴|小雨|中雨|大雨|暴雨|雷阵雨|雪|小雪|中雪|大雪|雾|霾|cloudy|sunny|rainy|overcast|rain|snow|fog)", re.IGNORECASE)),
+    ("temperature", re.compile(r"(-?\d+(?:\.\d+)?/-?\d+(?:\.\d+)?°[CF])")),
+    ("wind", re.compile(r"(\d+-\d+级)")),
+    ("humidity", re.compile(r"(?:湿度|humidity)\s*(\d+%)", re.IGNORECASE)),
+    ("aqi", re.compile(r"(?:AQI|空气质量指数)\s*(\d+)", re.IGNORECASE)),
+]
+
+
+def _extract_weather_fields(item: Dict[str, Any]) -> None:
+    """Try to extract structured weather fields from text-based items."""
+    text = item.get("text", "") or item.get("summary", "") or item.get("title", "")
+    if not text:
+        return
+    for field_name, pattern in _WEATHER_PATTERNS:
+        if field_name not in item:
+            m = pattern.search(text)
+            if m:
+                item[field_name] = m.group(1)
+
+
 def normalize_web_results(
     results: List[Dict[str, Any]],
     task_description: str,
@@ -543,6 +569,7 @@ def normalize_web_results(
     understanding: Optional[Dict[str, Any]] = None,
 ) -> List[Dict[str, Any]]:
     requested_fields = infer_requested_fields(task_description, understanding or {})
+    is_weather_task = bool(_WEATHER_TASK_HINTS.search(task_description or ""))
     cleaned: List[Tuple[int, Dict[str, Any]]] = []
     seen: Set[Tuple[str, str]] = set()
 
@@ -552,6 +579,8 @@ def normalize_web_results(
         item = canonicalize_item(raw_item, requested_fields)
         if not item:
             continue
+        if is_weather_task:
+            _extract_weather_fields(item)
         if is_noise_item(item, requested_fields):
             continue
         key = (

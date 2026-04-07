@@ -45,6 +45,14 @@ Recent execution history:
 {recent_steps}
 {data_progress}
 
+Task-specific guidance:
+{task_specific_rules}
+
+Stage hint:
+{stage_hint}
+
+{reflection}
+
 Decision rules:
 - Base decisions on the current visible state and recent history, not assumptions.
 - CRITICAL: Before choosing any action, check these sources IN ORDER for the answer: (1) Main text, (2) Collections, (3) Search result cards, (4) Visible text blocks. If ANY of them already contains the data the task asks for (prices, temperatures, facts, etc.), choose EXTRACT or DONE immediately. Do NOT keep scrolling or navigating when the answer is already visible.

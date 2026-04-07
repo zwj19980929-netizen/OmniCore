@@ -588,7 +588,7 @@ class BrowserAgent:
     def _step_action_signature(self, step: Dict[str, Any]) -> str:
         return self.decision._step_action_signature(step)
 
-    def _format_recent_steps_for_llm(self, steps: Optional[List[Dict[str, Any]]], max_items: int = 4) -> str:
+    def _format_recent_steps_for_llm(self, steps: Optional[List[Dict[str, Any]]], max_items: int = 0) -> str:
         return self.decision._format_recent_steps_for_llm(steps, max_items)
 
     def _action_requires_direct_target(self, action: BrowserAction) -> bool:
@@ -2603,6 +2603,12 @@ class BrowserAgent:
             except Exception:
                 pass
 
+        # Track state before action for richer step history
+        _url_before = current_url_r.data or ""
+        _title_before = title_r.data or ""
+        _data_count_before = len(accumulated_data)
+        _failure_reason = ""
+
         _is_input_action = action.action_type in {ActionType.INPUT, ActionType.FILL_FORM}
         _is_wait_action = action.action_type == ActionType.WAIT
         if _is_input_action:
@@ -2625,9 +2631,13 @@ class BrowserAgent:
         if success and not _is_input_action and not _is_wait_action:
             await self._wait_for_page_ready()
             success = await self._verify_action_effect(before, action)
+            if not success:
+                _failure_reason = "action executed but no page effect detected"
         elif success and _is_input_action:
             await self.toolkit.wait_for_load("domcontentloaded", timeout=3000)
             success = True
+        elif not success:
+            _failure_reason = "action execution failed (element not found or interaction error)"
         if not success:
             recovery = self._recover_action(task, action, elements)
             if recovery:
@@ -2641,6 +2651,7 @@ class BrowserAgent:
                     self._record_action(action)
                     last_action = action
                     action_source = "local_recovery"
+                    _failure_reason = ""
         if not success:
             visual_recovery = await self._decide_action_with_vision(
                 task,
@@ -2663,8 +2674,13 @@ class BrowserAgent:
                     self._record_action(action)
                     last_action = action
                     action_source = "vision_recovery"
+                    _failure_reason = ""
 
         url_r = await tk.get_current_url()
+        _title_after_r = await tk.get_title()
+        _url_after = url_r.data or ""
+        _title_after = _title_after_r.data or ""
+        _page_changed = (_url_before != _url_after) or (_title_before != _title_after)
         steps.append({
             "step": step_no,
             "plan": action.description or action.action_type.value,
@@ -2678,6 +2694,11 @@ class BrowserAgent:
             "description": action.description,
             "result": "success" if success else "failed",
             "url": url_r.data or "",
+            "url_before": _url_before,
+            "failure_reason": _failure_reason if not success else "",
+            "page_changed": _page_changed,
+            "data_before_count": _data_count_before,
+            "data_after_count": len(accumulated_data),
         })
         from utils.structured_logger import get_structured_logger, LogContext
         _sl = get_structured_logger()

@@ -1,0 +1,32 @@
+[search]
+- You are on a SEARCH task. Prioritize finding and clicking the most relevant search result.
+- If search results are visible, evaluate relevance by title and snippet match before clicking.
+- If no good results, consider refining the search query rather than clicking randomly.
+- Avoid clicking ads or sponsored results unless explicitly asked.
+
+[read]
+- You are on an INFORMATION EXTRACTION task. Prioritize reading visible content.
+- Check Main text FIRST — it often already contains the answer.
+- Only scroll or navigate if the visible content is clearly insufficient.
+- Prefer EXTRACT over further navigation when partial data is available.
+
+[form]
+- You are on a FORM INTERACTION task. Focus on filling fields correctly.
+- Map Structured fields to visible form inputs by label matching.
+- Fill all required fields before submitting. Check for validation errors after submit.
+- If a field is pre-filled, do not overwrite unless the task explicitly requires it.
+
+[auth]
+- You are on an AUTHENTICATION task. Focus on login/signup flow.
+- Identify username/email and password fields. Use Structured fields for credentials.
+- After submission, wait for redirect or error message before deciding next action.
+- If CAPTCHA or 2FA appears, report it rather than trying to bypass.
+
+[navigate]
+- You are on a NAVIGATION task. Focus on reaching the target page.
+- Use the task description to identify what page you need to reach.
+- If you're already on the target page, use DONE.
+
+[default]
+- Evaluate the current page state and choose the most appropriate action.
+- Check visible content before navigating further.

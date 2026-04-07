@@ -1,0 +1,15 @@
+You are analyzing a series of browser actions to identify what went wrong and suggest a better approach. Return JSON only.
+
+Task: {task}
+Current URL: {url}
+Page type: {page_type}
+
+Recent action history (most recent last):
+{recent_steps}
+
+The last {fail_count} action(s) failed consecutively. Analyze the failure pattern and provide:
+1. root_cause: Why are these actions failing? (e.g., element not found, wrong page, stale reference, page not loaded, anti-bot blocking, dynamic content not rendered)
+2. suggestion: What should the agent try differently? Be specific and actionable.
+3. avoid: What action patterns should be avoided in the next attempt?
+
+Return JSON with keys: root_cause, suggestion, avoid.

@@ -421,8 +421,9 @@ def test_router_includes_failure_avoidance_hints():
 
 
 def test_router_system_prompt_uses_dynamic_tool_catalog(monkeypatch):
-    # R6: dynamic tool catalog is now in _build_dynamic_context() (user message prefix),
-    # not in the static system prompt. Verify the right function contains catalog entries.
+    # Dynamic tool catalog is now part of the system prompt via PromptRegistry.
+    # _build_dynamic_context() returns "" (backward compat stub).
+    # Verify _build_system_prompt() includes the plugin tool catalog.
     module_root = Path(__file__).parent / "plugin_fixtures"
     monkeypatch.syspath_prepend(str(module_root))
     monkeypatch.setattr(settings, "TOOL_ADAPTER_PLUGIN_MODULES", ("dynamic_tool_adapter_plugin_fixture",))
@@ -433,14 +434,12 @@ def test_router_system_prompt_uses_dynamic_tool_catalog(monkeypatch):
     import core.router as _router_mod
     monkeypatch.setattr(_router_mod, "_STATIC_PROMPT", None)
     monkeypatch.setattr(_router_mod, "_DYNAMIC_TEMPLATE", None)
+    # Ensure token budget is large enough to include the tool_catalog section
+    monkeypatch.setattr(settings, "PROMPT_TOKEN_BUDGET", 100000)
 
-    dynamic_ctx = RouterAgent._build_dynamic_context()
+    system_prompt = RouterAgent._build_system_prompt()
 
-    assert "Registered Tool Catalog" in dynamic_ctx
-    assert "plugin.dynamic_tool" in dynamic_ctx
-    # Static system prompt must NOT contain the dynamic catalog
-    static_prompt = RouterAgent._build_system_prompt()
-    assert "plugin.dynamic_tool" not in static_prompt
+    assert "plugin.dynamic_tool" in system_prompt
 
 
 def test_router_system_prompt_excludes_disabled_plugins(monkeypatch):

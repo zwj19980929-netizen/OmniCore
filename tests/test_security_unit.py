@@ -153,9 +153,7 @@ class TestMCPConstraints:
         manager._tool_to_server["mcp.bad_server.test"] = "bad_server"
 
         with pytest.raises(ConnectionError, match="auth failure cooldown"):
-            asyncio.get_event_loop().run_until_complete(
-                manager.call_tool("mcp.bad_server.test", {})
-            )
+            asyncio.run(manager.call_tool("mcp.bad_server.test", {}))
 
 
 # ---------------------------------------------------------------------------

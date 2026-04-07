@@ -1,0 +1,26 @@
+[searching]
+- You are entering a search query. Use the shortest effective query. Focus on the core entity name.
+
+[selecting_source]
+- You are selecting which source to visit. Pick the most relevant search result based on title/snippet match. Prefer authoritative sources (.gov, .edu, official sites).
+
+[extracting]
+- You are extracting data from the current page. Focus on whether the visible content answers the task. If yes, EXTRACT. If partial, consider if more data is on this page (scroll) or elsewhere (navigate).
+
+[collecting_more]
+- You need more data items. Look for pagination (next page) or load-more buttons. If neither exists, try scrolling to trigger lazy loading.
+
+[interacting]
+- You are interacting with a form or widget. Focus on completing the interaction flow. Check for required fields, validation messages, and submit buttons.
+
+[completing]
+- The goal appears satisfied. Verify by checking collected data against the task requirement. If satisfied, use DONE. If not, reconsider.
+
+[blocked]
+- The page appears blocked (CAPTCHA, login wall, access denied). Report the blockage rather than repeatedly trying the same approach.
+
+[dismiss_modal]
+- A modal or popup is blocking the page. Dismiss it using close/accept/continue buttons before proceeding with the main task.
+
+[default]
+- Assess the current page state and determine the most productive next action.

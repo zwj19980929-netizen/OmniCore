@@ -52,7 +52,7 @@ def test_search_engine_domain_filter():
 def test_format_semantic_snapshot_for_llm_includes_main_text_blocks_and_stage():
     worker = WebWorker()
 
-    text = worker._format_semantic_snapshot_for_llm(
+    text = asyncio.run(worker._format_semantic_snapshot_for_llm(
         {
             "page_type": "detail",
             "page_stage": "extracting",
@@ -65,7 +65,7 @@ def test_format_semantic_snapshot_for_llm_includes_main_text_blocks_and_stage():
             ],
             "blocked_signals": ["body:captcha"],
         }
-    )
+    ))
 
     assert "页面阶段: extracting" in text
     assert "主体文本: This is the main article text." in text

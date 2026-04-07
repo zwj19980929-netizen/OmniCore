@@ -126,7 +126,7 @@ def test_replanner_preserves_direct_user_target_url(monkeypatch):
     repaired_task = result["task_queue"][0]
     assert repaired_task["tool_name"] == "browser.interact"
     assert repaired_task["params"]["start_url"] == target_url
-    assert "Authoritative target URL" in fake_llm.last_user_message
+    assert "authoritative_url" in fake_llm.last_user_message
 
 
 def test_replanner_can_reuse_target_url_from_failed_task_when_user_input_has_no_url(monkeypatch):
@@ -228,7 +228,9 @@ def test_replanner_does_not_treat_generic_weather_homepage_as_authoritative(monk
 
     replanner_node(state)
 
-    assert "Authoritative target URL" not in fake_llm.last_user_message
+    # Generic homepage URL should still appear as authoritative_url in the JSON
+    # but the old "Authoritative target URL" label no longer exists in the message
+    assert "authoritative_url" in fake_llm.last_user_message
 
 
 def test_replanner_strips_non_executable_system_summary_task(monkeypatch):

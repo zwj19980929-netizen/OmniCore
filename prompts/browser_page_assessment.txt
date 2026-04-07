@@ -35,6 +35,14 @@ Controls:
 Candidate elements:
 {elements}
 
+Task-specific guidance:
+{task_specific_rules}
+
+Stage hint:
+{stage_hint}
+
+{reflection}
+
 Rules:
 - The context below is a prioritized, partial view of the page. Do not assume omitted content is absent.
 - Use only the visible data, search result cards, and candidate elements provided above. READ THE VISIBLE DATA SECTION CAREFULLY — it includes Main text which often already contains the answer (prices, statistics, facts).

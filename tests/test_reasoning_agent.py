@@ -4,6 +4,10 @@
 测试新的推理式Agent在实际任务上的表现
 """
 
+import pytest
+
+pytestmark = pytest.mark.skip(reason="integration test requiring browser and LLM — run manually")
+
 import asyncio
 from playwright.async_api import async_playwright
 

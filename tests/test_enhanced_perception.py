@@ -1,6 +1,10 @@
 """
 测试增强版 Web Worker 的三层感知能力
 """
+import pytest
+
+pytestmark = pytest.mark.skip(reason="integration test requiring browser and LLM — run manually")
+
 import asyncio
 from agents.enhanced_web_worker import EnhancedWebWorker
 from utils.browser_toolkit import BrowserToolkit

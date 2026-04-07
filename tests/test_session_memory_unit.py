@@ -34,31 +34,40 @@ def manager(tmp_sessions_dir):
 
 class TestShouldExtract:
 
+    def _patch_settings(self, enabled=True, interval=8):
+        """Patch settings instance to avoid class-vs-instance attribute issues."""
+        from config.settings import settings
+        return (
+            patch.object(settings, "SESSION_MEMORY_ENABLED", enabled),
+            patch.object(settings, "SESSION_MEMORY_INTERVAL", interval),
+        )
+
     def test_disabled_returns_false(self, manager):
-        with patch("config.settings.Settings.SESSION_MEMORY_ENABLED", False):
+        p1, p2 = self._patch_settings(enabled=False)
+        with p1, p2:
             assert manager.should_extract(turn_count=16) is False
 
     def test_zero_turn_returns_false(self, manager):
-        with patch("config.settings.Settings.SESSION_MEMORY_ENABLED", True):
-            with patch("config.settings.Settings.SESSION_MEMORY_INTERVAL", 8):
-                assert manager.should_extract(turn_count=0) is False
+        p1, p2 = self._patch_settings()
+        with p1, p2:
+            assert manager.should_extract(turn_count=0) is False
 
     def test_before_interval_returns_false(self, manager):
-        with patch("config.settings.Settings.SESSION_MEMORY_ENABLED", True):
-            with patch("config.settings.Settings.SESSION_MEMORY_INTERVAL", 8):
-                assert manager.should_extract(turn_count=5) is False
+        p1, p2 = self._patch_settings()
+        with p1, p2:
+            assert manager.should_extract(turn_count=5) is False
 
     def test_at_interval_returns_true(self, manager):
-        with patch("config.settings.Settings.SESSION_MEMORY_ENABLED", True):
-            with patch("config.settings.Settings.SESSION_MEMORY_INTERVAL", 8):
-                assert manager.should_extract(turn_count=8) is True
+        p1, p2 = self._patch_settings()
+        with p1, p2:
+            assert manager.should_extract(turn_count=8) is True
 
     def test_respects_last_extract_turn(self, manager):
-        with patch("config.settings.Settings.SESSION_MEMORY_ENABLED", True):
-            with patch("config.settings.Settings.SESSION_MEMORY_INTERVAL", 8):
-                manager._last_extract_turn = 8
-                assert manager.should_extract(turn_count=12) is False
-                assert manager.should_extract(turn_count=16) is True
+        p1, p2 = self._patch_settings()
+        with p1, p2:
+            manager._last_extract_turn = 8
+            assert manager.should_extract(turn_count=12) is False
+            assert manager.should_extract(turn_count=16) is True
 
 
 # ---------------------------------------------------------------------------

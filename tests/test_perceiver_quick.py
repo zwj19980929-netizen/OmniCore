@@ -1,6 +1,10 @@
 """
 快速验证 PagePerceiver 是否正常工作
 """
+import pytest
+
+pytestmark = pytest.mark.skip(reason="integration test requiring browser and LLM — run manually")
+
 import asyncio
 import sys
 from pathlib import Path

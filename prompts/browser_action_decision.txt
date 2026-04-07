@@ -30,6 +30,14 @@ Page regions:
 Vision description:
 {vision_description}
 
+Task-specific guidance:
+{task_specific_rules}
+
+Stage hint:
+{stage_hint}
+
+{reflection}
+
 Important decision rules:
 - The context above includes page regions, main text, collections, and visible text blocks. READ THE MAIN TEXT CAREFULLY — it often already contains the answer (prices, temperatures, facts, statistics). Do not ignore it just because "collected data" is zero.
 - The context is a prioritized, partial view of the page. Do not assume omitted content is absent.
