@@ -19,6 +19,10 @@ Last action: {last_action}
 Recent execution history:
 {recent_steps}
 {data_progress}
+
+Repeated actions (BLACKLISTED — do NOT propose any of them again):
+{repeated_actions}
+
 Context coverage: {context_coverage}
 Visible data:
 {data}
@@ -51,6 +55,7 @@ Rules:
 - Use controls when pagination, load-more, or search-box actions are clearly relevant.
 - Prefer `target_ref` over `target_selector` whenever a relevant ref is available.
 - Avoid proposing the same failed action unless the page clearly changed.
+- Actions listed under "Repeated actions" are BLACKLISTED. Do NOT propose any of them again; choose a different target, action type, or "extract"/"done".
 - If the visible data already likely answers the task, choose action.type="extract".
 - If the task is already complete without further extraction, choose action.type="done".
 - If the page is a search results page and the snippets are relevant enough to answer the task, prefer "extract" over clicking through.

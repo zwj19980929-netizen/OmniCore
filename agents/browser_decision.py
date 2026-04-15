@@ -18,6 +18,7 @@ import asyncio
 import hashlib
 import json
 import re
+from collections import OrderedDict
 from typing import Any, Dict, List, Optional, Tuple
 from urllib.parse import parse_qs, urlparse
 
@@ -60,6 +61,11 @@ ACTION_DECISION_PROMPT = get_prompt("browser_action_decision")
 PAGE_ASSESSMENT_PROMPT = get_prompt("browser_page_assessment")
 VISION_ACTION_PROMPT = get_prompt("browser_vision_decision")
 UNIFIED_PLAN_PROMPT = get_prompt("browser_unified_plan")
+# P2: single consolidated prompt (optional, controlled by BROWSER_UNIFIED_ACT_ENABLED)
+BROWSER_ACT_PROMPT = get_prompt("browser_act", "") or ""
+# P1: task-level plan prompts
+TASK_PLAN_PROMPT = get_prompt("browser_task_plan", "") or ""
+STEP_ADVANCE_PROMPT = get_prompt("browser_step_advance", "") or ""
 
 # Load section-based prompt files for task-specific rules and stage hints
 REFLECTION_PROMPT = get_prompt("browser_reflection") or ""
@@ -125,6 +131,11 @@ class BrowserDecisionLayer:
         # Action history for loop detection
         self._action_history: List[str] = []
 
+        # P0: Step fingerprint memory for dedup. Maps fingerprint -> executed count.
+        self._step_fingerprints: "OrderedDict[str, int]" = OrderedDict()
+        # P1: Optional task-level plan (lazy-assigned by BrowserAgent)
+        self._task_plan = None
+
         # Page assessment cache
         self._page_assessment_cache: Dict[str, Optional[BrowserAction]] = {}
 
@@ -171,10 +182,70 @@ class BrowserDecisionLayer:
     def record_action(self, action: BrowserAction) -> None:
         self._action_history.append(self._action_signature(action))
         self._action_history = self._action_history[-6:]
+        # P0: also record fingerprint for dedup detection
+        try:
+            url, stage = self._current_url_and_stage()
+            fp = self._fingerprint_action(action, url, stage)
+            if fp:
+                self._step_fingerprints[fp] = self._step_fingerprints.get(fp, 0) + 1
+                self._step_fingerprints.move_to_end(fp)
+                max_size = max(1, settings.BROWSER_STEP_MEMORY_SIZE)
+                while len(self._step_fingerprints) > max_size:
+                    self._step_fingerprints.popitem(last=False)
+        except Exception:
+            pass
 
     def reset_history(self) -> None:
         self._action_history = []
         self._page_assessment_cache.clear()
+        self._step_fingerprints.clear()
+        self._task_plan = None
+
+    # ── P0: Action fingerprint & dedup ────────────────────────
+
+    def _current_url_and_stage(self) -> Tuple[str, str]:
+        url = ""
+        obs = self.last_observation
+        if obs is not None:
+            url = getattr(obs, "url", "") or ""
+        snapshot = self.last_semantic_snapshot or {}
+        stage = str(snapshot.get("page_stage", "") or snapshot.get("page_type", "") or "")
+        return url, stage
+
+    def _fingerprint_action(
+        self, action: Optional[BrowserAction], url: str = "", page_stage: str = ""
+    ) -> str:
+        if action is None or action.action_type == ActionType.FAILED:
+            return ""
+        try:
+            parsed = urlparse(url or "")
+            url_key = f"{parsed.netloc}{parsed.path}"[:120]
+        except Exception:
+            url_key = (url or "")[:120]
+        target = (action.target_ref or action.target_selector or "")[:80]
+        value = self._normalize_text(action.value or "")[:80]
+        return "|".join([
+            url_key, (page_stage or "")[:40],
+            action.action_type.value,
+            target, value,
+        ])
+
+    def _is_repeat_action(self, fp: str) -> bool:
+        if not fp:
+            return False
+        threshold = max(1, settings.BROWSER_DEDUP_THRESHOLD)
+        return self._step_fingerprints.get(fp, 0) >= threshold
+
+    def get_repeated_action_signatures(self) -> List[str]:
+        """Return list of fingerprints that have been executed ≥ dedup threshold times."""
+        threshold = max(1, settings.BROWSER_DEDUP_THRESHOLD)
+        return [fp for fp, count in self._step_fingerprints.items() if count >= threshold]
+
+    def format_repeated_actions_for_llm(self) -> str:
+        repeats = self.get_repeated_action_signatures()
+        if not repeats:
+            return "(none)"
+        return "\n".join(f"- {sig}" for sig in repeats[-10:])
 
     # ── Cycle detection ──────────────────────────────────────
 
@@ -476,7 +547,11 @@ class BrowserDecisionLayer:
         if not steps:
             return "(none)"
         if max_items <= 0:
-            max_items = settings.BROWSER_LLM_RECENT_STEPS
+            # P0: prefer the dedicated prompt-injection size; fall back to legacy setting.
+            max_items = max(
+                getattr(settings, "BROWSER_RECENT_STEPS_IN_PROMPT", 8),
+                getattr(settings, "BROWSER_LLM_RECENT_STEPS", 6),
+            )
         lines: List[str] = []
         for step in steps[-max_items:]:
             parts = [f"step={step.get('step', '?')}"]
@@ -1319,6 +1394,28 @@ class BrowserDecisionLayer:
         if self._recent_failed_action_matches(action, recent_steps):
             return None
 
+        # P0: Reject actions whose fingerprint has already been executed
+        # BROWSER_DEDUP_THRESHOLD times at the same (url, page_stage).
+        if action.action_type not in {ActionType.DONE, ActionType.EXTRACT, ActionType.WAIT}:
+            fp_url = current_url or ""
+            fp_stage = str((snapshot or {}).get("page_stage", "") or (snapshot or {}).get("page_type", "") or "")
+            if not fp_stage:
+                _, fp_stage = self._current_url_and_stage()
+            fp = self._fingerprint_action(action, fp_url, fp_stage)
+            if fp and self._is_repeat_action(fp):
+                try:
+                    web_debug_recorder.record_event(
+                        "browser_dedup_rejected",
+                        fingerprint=fp,
+                        count=self._step_fingerprints.get(fp, 0),
+                        action_type=action.action_type.value,
+                        url=fp_url,
+                        page_stage=fp_stage,
+                    )
+                except Exception:
+                    pass
+                return None
+
         active_intent = intent or TaskIntent(intent_type="read", query="", confidence=0.0)
         active_snapshot = snapshot or {}
         current_elements = elements or []
@@ -2125,6 +2222,7 @@ class BrowserDecisionLayer:
                 last_action=(last_action.description or last_action.action_type.value) if last_action else "none",
                 recent_steps=self._format_recent_steps_for_llm(recent_steps),
                 data_progress=data_progress,
+                repeated_actions=self.format_repeated_actions_for_llm(),
                 context_coverage=prompt_context.get("context_coverage", ""),
                 data=prompt_context.get("data", "(no visible data)"),
                 cards=prompt_context.get("cards", "(no cards)"),
@@ -2280,6 +2378,7 @@ class BrowserDecisionLayer:
                     page_type=page_state.page_type, page_stage=page_state.stage,
                     last_action=(last_action.description or last_action.action_type.value) if last_action else "none",
                     recent_steps=self._format_recent_steps_for_llm(recent_steps),
+                    repeated_actions=self.format_repeated_actions_for_llm(),
                     context_coverage=prompt_context.get("context_coverage", ""),
                     data=prompt_context.get("data", "(no visible data)"),
                     cards=prompt_context.get("cards", "(no cards)"),
@@ -2387,6 +2486,7 @@ class BrowserDecisionLayer:
                 last_action=(last_action.description or last_action.action_type.value) if last_action else "none",
                 recent_steps=self._format_recent_steps_for_llm(recent_steps),
                 data_progress=data_progress,
+                repeated_actions=self.format_repeated_actions_for_llm(),
                 task_specific_rules=_get_task_specific_rules(active_intent.intent_type),
                 stage_hint=_get_stage_hint(_unified_page_stage),
                 reflection=self._pending_reflection,
@@ -2477,6 +2577,114 @@ class BrowserDecisionLayer:
             log_warning(f"reflection call failed: {exc}")
             return ""
 
+    async def _act_with_llm(
+        self, task: str, current_url: str, title: str,
+        elements: List[PageElement], intent: Optional[TaskIntent],
+        data: List[Dict[str, str]], observation=None,
+        last_action: Optional[BrowserAction] = None,
+        recent_steps: Optional[List[Dict[str, Any]]] = None,
+    ) -> Tuple[Optional[BrowserAction], bool]:
+        """P2: Single-call consolidated LLM planner.
+
+        Returns (action, goal_satisfied). Falls back to _unified_plan_action
+        when the browser_act prompt is not present.
+        """
+        if not BROWSER_ACT_PROMPT:
+            act = await self._unified_plan_action(
+                task, current_url, title, elements, intent, data,
+                observation=observation, last_action=last_action, recent_steps=recent_steps,
+            )
+            return act, False
+
+        obs = observation or self.last_observation
+        if obs is None:
+            return None, False
+
+        active_snapshot = obs.snapshot or {}
+        active_intent = intent or TaskIntent(
+            intent_type="read", query=self._derive_primary_query(task), confidence=0.0,
+        )
+        current_data = list(data or [])
+        data_collected = len(current_data)
+        target_match = re.search(r'(\d+)\s*(?:个|条|款|项|条数据|items?|results?)', task or "")
+        if target_match:
+            data_target = int(target_match.group(1))
+            data_progress = f"Data progress: collected {data_collected} / target {data_target}"
+            if data_collected >= data_target:
+                data_progress += " (ENOUGH - consider using DONE)"
+        else:
+            data_progress = f"Data collected: {data_collected} items"
+
+        cards = self.perception.cards_from_snapshot(active_snapshot) if self.perception else []
+        elements_text = self._format_assessment_elements_for_llm(task, current_url, elements)
+        prompt_context, _ = await self._build_budgeted_browser_prompt_context(
+            task=task, current_url=current_url, data=current_data,
+            cards=cards, snapshot=active_snapshot, elements_text=elements_text,
+            total_tokens=settings.ACTION_DECISION_CONTEXT_TOKENS,
+        )
+        text_blocks = self.perception.get_snapshot_visible_text_blocks(active_snapshot) if self.perception else []
+        tb_limit = settings.TEXT_BLOCKS_DISPLAY_LIMIT
+        tb_chars = settings.TEXT_BLOCK_DISPLAY_CHARS
+        text_blocks_str = "\n".join(
+            f"{i}. {t[:tb_chars]}" for i, t in enumerate(text_blocks[:tb_limit], 1)
+        ) if text_blocks else "(none)"
+        main_text = self.perception.get_snapshot_main_text(active_snapshot) if self.perception else ""
+
+        plan_context = "(no active plan)"
+        if self._task_plan is not None:
+            try:
+                plan_context = self._task_plan.format_for_prompt()
+            except Exception:
+                plan_context = "(plan unavailable)"
+
+        try:
+            page_stage = str(active_snapshot.get("page_stage", "unknown") or "unknown")
+            prompt = BROWSER_ACT_PROMPT.format(
+                task=task or "", intent=active_intent.intent_type,
+                query=active_intent.query or self._derive_primary_query(task),
+                fields=self._format_intent_fields_for_llm(active_intent.fields),
+                requires_interaction=str(bool(active_intent.requires_interaction)).lower(),
+                url=current_url or "", title=title or "",
+                page_type=active_snapshot.get("page_type", "unknown"),
+                page_stage=page_stage,
+                snapshot_version=getattr(obs, "snapshot_version", ""),
+                headings=self._format_headings_for_llm(active_snapshot),
+                regions=self._format_regions_for_llm(active_snapshot),
+                main_text=main_text[:settings.MAIN_TEXT_LIMIT_DETAIL] if main_text else "(none)",
+                visible_text_blocks=text_blocks_str,
+                vision_description=getattr(obs, "vision_description", "") or "(not available)",
+                cards=prompt_context.get("cards", "(no cards)"),
+                collections=prompt_context.get("collections", "(no collections)"),
+                controls=prompt_context.get("controls", "(no controls)"),
+                elements=prompt_context.get("elements", "(no actionable elements)"),
+                last_action=(last_action.description or last_action.action_type.value) if last_action else "none",
+                recent_steps=self._format_recent_steps_for_llm(recent_steps),
+                data_progress=data_progress,
+                repeated_actions=self.format_repeated_actions_for_llm(),
+                plan_context=plan_context,
+                task_specific_rules=_get_task_specific_rules(active_intent.intent_type),
+                stage_hint=_get_stage_hint(page_stage),
+                reflection=self._pending_reflection,
+            )
+            web_debug_recorder.write_text("browser_act_prompt", prompt)
+            llm = self._get_llm()
+            response = await llm.achat(
+                messages=[{"role": "system", "content": "Return JSON only."}, {"role": "user", "content": prompt}],
+                temperature=0.1, json_mode=True,
+            )
+            web_debug_recorder.write_text("browser_act_response", self._stringify_llm_response(response))
+            payload = llm.parse_json_response(response) or {}
+            goal_satisfied = bool(payload.get("goal_satisfied", False))
+            action = self._action_from_llm(payload, elements)
+            action = self.validate_action(action, obs)
+            web_debug_recorder.write_json("browser_act_action", self._action_to_debug_payload(action))
+            if action and action.action_type != ActionType.FAILED:
+                return action, goal_satisfied
+            return None, goal_satisfied
+        except Exception as exc:
+            log_warning(f"browser_act call failed: {exc}")
+            return None, False
+
     async def _plan_next_action(
         self, task: str, current_url: str, title: str,
         elements: List[PageElement], intent: Optional[TaskIntent],
@@ -2523,22 +2731,43 @@ class BrowserDecisionLayer:
                 )
             return act
 
-        unified_result, assessed_result = await asyncio.gather(_try_unified(), _try_assess())
-        if unified_result is not None and unified_result.action_type not in {ActionType.WAIT, ActionType.FAILED}:
-            return unified_result, "unified_plan"
-        if assessed_result is not None and assessed_result.action_type not in {ActionType.WAIT, ActionType.FAILED}:
-            return assessed_result, "page_assessment_llm"
+        if settings.BROWSER_UNIFIED_ACT_ENABLED and BROWSER_ACT_PROMPT:
+            # P2: single-call consolidated decision. Fall back to rule-based
+            # strategies below when the LLM proposes WAIT/FAILED.
+            act_result, _goal_satisfied = await self._act_with_llm(
+                task, current_url, title, elements, intent, data,
+                observation=observation, last_action=last_action, recent_steps=recent_steps,
+            )
+            if act_result is not None:
+                act_result = self._sanitize_planned_action(
+                    task, current_url, elements, intent, data, act_result,
+                    snapshot=active_snapshot, recent_steps=recent_steps,
+                )
+            if act_result is not None and act_result.action_type not in {ActionType.WAIT, ActionType.FAILED}:
+                return act_result, "browser_act"
+            unified_result = None
+            assessed_result = act_result
+        else:
+            unified_result, assessed_result = await asyncio.gather(_try_unified(), _try_assess())
+            if unified_result is not None and unified_result.action_type not in {ActionType.WAIT, ActionType.FAILED}:
+                return unified_result, "unified_plan"
+            if assessed_result is not None and assessed_result.action_type not in {ActionType.WAIT, ActionType.FAILED}:
+                return assessed_result, "page_assessment_llm"
 
-        llm_action = await self._decide_action_with_llm(
-            task, elements, intent=intent, data=data, snapshot=active_snapshot,
-            current_url=current_url, title=title, last_action=last_action, recent_steps=recent_steps,
-        )
-        llm_action = self._sanitize_planned_action(
-            task, current_url, elements, intent, data, llm_action,
-            snapshot=active_snapshot, recent_steps=recent_steps,
-        )
-        if llm_action is not None and llm_action.action_type not in {ActionType.WAIT, ActionType.FAILED}:
-            return llm_action, "action_llm"
+        if settings.BROWSER_UNIFIED_ACT_ENABLED and BROWSER_ACT_PROMPT:
+            # P2: skip the third LLM call — go straight to rule-based fallbacks.
+            llm_action = None
+        else:
+            llm_action = await self._decide_action_with_llm(
+                task, elements, intent=intent, data=data, snapshot=active_snapshot,
+                current_url=current_url, title=title, last_action=last_action, recent_steps=recent_steps,
+            )
+            llm_action = self._sanitize_planned_action(
+                task, current_url, elements, intent, data, llm_action,
+                snapshot=active_snapshot, recent_steps=recent_steps,
+            )
+            if llm_action is not None and llm_action.action_type not in {ActionType.WAIT, ActionType.FAILED}:
+                return llm_action, "action_llm"
 
         observation_action = self._choose_observation_driven_action(task, current_url, elements, intent, data, snapshot=active_snapshot)
         observation_action = self._sanitize_planned_action(

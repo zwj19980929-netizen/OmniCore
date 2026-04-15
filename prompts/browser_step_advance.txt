@@ -1,0 +1,26 @@
+You are tracking progress of a browser automation plan. Given the current plan step and the latest observation, decide whether the step is complete. Return JSON only.
+
+Task: {task}
+Current step index: {step_index}
+Step goal: {step_goal}
+Step success criteria: {step_success}
+Step hint: {step_hint}
+
+Latest observation (url, title, data, etc.):
+{observation}
+
+Decide:
+- "advance": true if the success criteria are demonstrably satisfied. false otherwise.
+- "skip": true if the step no longer applies (e.g. the answer already appeared, the target page structure changed).
+- "need_replan": true ONLY if the step is demonstrably infeasible under the current plan and the remaining steps should be rewritten.
+- "reason": short explanation in ≤ 120 characters.
+
+Do not set advance=true unless you can point to concrete evidence in the observation (URL match, visible text, collected data, etc.).
+
+Return schema:
+{{
+  "advance": boolean,
+  "skip": boolean,
+  "need_replan": boolean,
+  "reason": "string"
+}}

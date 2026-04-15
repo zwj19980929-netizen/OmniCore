@@ -241,6 +241,23 @@ class Settings:
     # 触发反思的连续失败阈值
     BROWSER_REFLECTION_FAIL_THRESHOLD = _env_int("BROWSER_REFLECTION_FAIL_THRESHOLD", 2)
 
+    # === 浏览器自我规划优化（P0 指纹去重 + P1 任务级 Plan + P2 Prompt 合一）===
+    # 指纹窗口大小：保留最近 N 步执行指纹用于去重
+    BROWSER_STEP_MEMORY_SIZE = _env_int("BROWSER_STEP_MEMORY_SIZE", 20)
+    # 同指纹重复多少次后拒绝再次执行
+    BROWSER_DEDUP_THRESHOLD = _env_int("BROWSER_DEDUP_THRESHOLD", 2)
+    # Prompt 中注入的最近步数（替代原 BROWSER_LLM_RECENT_STEPS 的默认值）
+    BROWSER_RECENT_STEPS_IN_PROMPT = _env_int("BROWSER_RECENT_STEPS_IN_PROMPT", 8)
+    # P1 任务级 Plan
+    BROWSER_PLAN_ENABLED = os.getenv("BROWSER_PLAN_ENABLED", "true").lower() == "true"
+    BROWSER_MAX_PLAN_STEPS = _env_int("BROWSER_MAX_PLAN_STEPS", 8)
+    BROWSER_MAX_REPLANS = _env_int("BROWSER_MAX_REPLANS", 2)
+    BROWSER_STEP_STUCK_THRESHOLD = _env_int("BROWSER_STEP_STUCK_THRESHOLD", 4)
+    # P2 单 Prompt（browser_act.txt）决策开关：默认关闭，待实地回放稳定后可切换为 true
+    BROWSER_UNIFIED_ACT_ENABLED = os.getenv("BROWSER_UNIFIED_ACT_ENABLED", "false").lower() == "true"
+    # P3 跨会话长期记忆（默认关闭）
+    BROWSER_PLAN_MEMORY_ENABLED = os.getenv("BROWSER_PLAN_MEMORY_ENABLED", "false").lower() == "true"
+
     # === 搜索结果与文本相关性评分权重 ===
     # 文本相关性：token 匹配 / 字符 n-gram 重叠 / 数字匹配
     TEXT_RELEVANCE_WEIGHT_TOKEN = float(os.getenv("TEXT_RELEVANCE_WEIGHT_TOKEN", "0.55"))

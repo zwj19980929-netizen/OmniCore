@@ -2902,6 +2902,23 @@ class BrowserAgent:
                 return init["early_result"]
 
             task_intent = init["task_intent"]
+            # P1: build initial task-level plan (best-effort; failure is non-fatal)
+            if settings.BROWSER_PLAN_ENABLED:
+                try:
+                    from agents.browser_task_plan import build_initial_plan
+                    llm_for_plan = self._get_llm()
+                    _plan = await build_initial_plan(
+                        task,
+                        getattr(task_intent, "intent_type", "unknown"),
+                        llm_for_plan,
+                        start_url=expected_url or "",
+                    )
+                    if _plan is not None:
+                        self.decision._task_plan = _plan
+                        web_debug_recorder.write_json("browser_task_plan", _plan.to_debug_payload())
+                        log_agent_action(self.name, "任务级 Plan 已生成", f"{len(_plan.steps)} steps")
+                except Exception as _plan_err:
+                    log_warning(f"task plan initialization skipped: {_plan_err}")
             accumulated_data: List[Dict[str, str]] = []
             seen_keys: set = set()
             last_action: Optional[BrowserAction] = None
@@ -2909,6 +2926,7 @@ class BrowserAgent:
             from utils.image_diff import VisualProgressTracker
             visual_tracker = VisualProgressTracker(window_size=settings.VISION_PROGRESS_WINDOW)
 
+            _plan_stuck_counter: Dict[int, int] = {}
             for step_no in range(1, max_steps + 1):
                 step_result = await self._execute_step(
                     step_no, task, task_intent, expected_url, steps,
@@ -2917,6 +2935,51 @@ class BrowserAgent:
                 if step_result["status"] == "exit":
                     return step_result["result"]
                 last_action = step_result.get("last_action", last_action)
+
+                # P1: advance or replan the task plan based on the latest observation.
+                plan = getattr(self.decision, "_task_plan", None)
+                if plan is not None and settings.BROWSER_PLAN_ENABLED:
+                    try:
+                        cur_step = plan.current_step()
+                        if cur_step is None:
+                            pass
+                        else:
+                            from agents.browser_task_plan import step_advance, replan
+                            last_step_record = steps[-1] if steps else {}
+                            obs_summary = json.dumps({
+                                "url": last_step_record.get("url", ""),
+                                "title": last_step_record.get("title", ""),
+                                "result": last_step_record.get("result", ""),
+                                "failure_reason": last_step_record.get("failure_reason", ""),
+                                "data_count": len(accumulated_data),
+                                "last_action": last_step_record.get("action_type", ""),
+                            }, ensure_ascii=False)
+                            decision = await step_advance(plan, obs_summary, self._get_llm())
+                            if decision.advance:
+                                plan.advance()
+                                _plan_stuck_counter[cur_step.index] = 0
+                                log_agent_action(self.name, f"plan step {cur_step.index} 完成", decision.reason[:60])
+                            elif decision.skip:
+                                plan.skip_current()
+                                log_agent_action(self.name, f"plan step {cur_step.index} 跳过", decision.reason[:60])
+                            else:
+                                _plan_stuck_counter[cur_step.index] = _plan_stuck_counter.get(cur_step.index, 0) + 1
+                                stuck_thresh = max(1, settings.BROWSER_STEP_STUCK_THRESHOLD)
+                                if decision.need_replan or _plan_stuck_counter[cur_step.index] >= stuck_thresh:
+                                    replanned = await replan(
+                                        plan,
+                                        decision.reason or f"step {cur_step.index} stuck",
+                                        self._get_llm(),
+                                    )
+                                    if replanned:
+                                        _plan_stuck_counter.clear()
+                                        web_debug_recorder.write_json(
+                                            f"browser_task_plan_revision_{plan.revisions}",
+                                            plan.to_debug_payload(),
+                                        )
+                                        log_agent_action(self.name, f"plan replanned (#{plan.revisions})", decision.reason[:60])
+                    except Exception as _plan_hook_err:
+                        log_warning(f"task plan hook failed: {_plan_hook_err}")
 
             return await self._build_final_result(task, task_intent, expected_url, steps, accumulated_data, seen_keys)
         except Exception as exc:

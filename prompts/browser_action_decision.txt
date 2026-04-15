@@ -12,6 +12,10 @@ Last action: {last_action}
 Recent execution history:
 {recent_steps}
 {data_progress}
+
+Repeated actions (BLACKLISTED — do NOT propose any of them again):
+{repeated_actions}
+
 Context coverage: {context_coverage}
 Visible data & page content:
 {data}
@@ -46,6 +50,7 @@ Important decision rules:
 - Base the next action on the current visible state and the recent execution history, not on generic assumptions about the website.
 - Prefer `target_ref` over `target_selector` whenever a relevant card or element ref is available.
 - Avoid repeating the same failed action unless the page clearly changed.
+- Actions listed under "Repeated actions" are BLACKLISTED. Do NOT propose any of them again; choose a different target, a different action type, or DONE/EXTRACT.
 - If the page type is `serp` and a search result card clearly looks like the best source, CLICK that card's `target_ref`.
 - If the task specifies a numeric target and you haven't reached it, and you see pagination controls, CLICK the next page button.
 - If the task specifies a numeric target and you haven't reached it, and no pagination is visible, use SCROLL (value="800") to trigger lazy loading, then EXTRACT.

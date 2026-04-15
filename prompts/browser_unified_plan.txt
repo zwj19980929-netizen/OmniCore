@@ -45,6 +45,9 @@ Recent execution history:
 {recent_steps}
 {data_progress}
 
+Repeated actions (BLACKLISTED — do NOT propose any of them again):
+{repeated_actions}
+
 Task-specific guidance:
 {task_specific_rules}
 
@@ -59,6 +62,7 @@ Decision rules:
 - "Collected data: 0" does NOT mean "no useful data on the page". It means structured extraction hasn't run yet. The Main text may already contain everything needed.
 - Prefer `target_ref` over `target_selector` when available.
 - Avoid repeating the same failed action unless the page clearly changed.
+- Actions listed under "Repeated actions" are BLACKLISTED. Do NOT propose any of them again; choose a different target, a different action type, or DONE/EXTRACT.
 - If page_type is `serp` and a card clearly matches, CLICK the card's `target_ref`.
 - If the task specifies a numeric target and you haven't reached it, and pagination is visible, CLICK next page.
 - If the task specifies a numeric target and you haven't reached it, and no pagination is visible, SCROLL then EXTRACT.

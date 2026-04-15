@@ -89,6 +89,44 @@ LLM prompt templates are `.txt` files under `prompts/`. Prompt section registry 
 - `CHROMA_PERSIST_DIR` — vector memory path
 - `VISION_MODEL`, `VISION_PERCEPTION_MODEL` — vision model selection
 - `LLM_MAX_TOKENS`, `LLM_ROUTER_MAX_TOKENS` — token limits
+- `BROWSER_STEP_MEMORY_SIZE` / `BROWSER_DEDUP_THRESHOLD` / `BROWSER_RECENT_STEPS_IN_PROMPT` — Browser 自我规划优化 P0 指纹去重
+- `BROWSER_PLAN_ENABLED` / `BROWSER_MAX_PLAN_STEPS` / `BROWSER_MAX_REPLANS` / `BROWSER_STEP_STUCK_THRESHOLD` — P1 任务级 Plan
+- `BROWSER_UNIFIED_ACT_ENABLED` — P2 单 Prompt 决策开关（默认关闭，稳定后切换）
+- `BROWSER_PLAN_MEMORY_ENABLED` — P3 跨会话长期 Plan 记忆（尚未实现，预留）
+
+## 架构演进记录
+
+| 阶段 | 完成日期 | 关键内容 |
+|---|---|---|
+| S1–S6 | 2026-03 | 基础 Runtime、Tool Dispatch、Coordinator/Subagent、Fail-Closed 安全分层（见 `docs/archive/` 历史记录） |
+| P2-2 成本感知路由 | 2026-03-31 | `core/complexity_scorer.py`、`utils/cost_tracker.py`、`/cost` 命令 |
+| Browser 自我规划优化 P0+P2+P1 | 2026-04-14 | 指纹去重 + 单 Prompt + 任务级 Plan（详见 `docs/design/2026-04-14-browser-planning-optimization.md`） |
+
+### Browser 规划优化落地情况（2026-04-14）
+
+P0 指纹去重（已上线）
+- `agents/browser_decision.py`：新增 `_step_fingerprints` OrderedDict、`_fingerprint_action`、`_is_repeat_action`、`format_repeated_actions_for_llm`；`record_action` 自动写入指纹
+- `_sanitize_planned_action` 末尾拦截命中 ≥ `BROWSER_DEDUP_THRESHOLD` 的动作，写 `web_debug_recorder` 事件 `browser_dedup_rejected`
+- 三份 Prompt（`browser_unified_plan.txt` / `browser_page_assessment.txt` / `browser_action_decision.txt`）新增 `{repeated_actions}` 区块与"BLACKLISTED"规则
+- `_format_recent_steps_for_llm` 默认使用 `BROWSER_RECENT_STEPS_IN_PROMPT`（默认 8）
+- 测试 `tests/test_browser_step_dedup_unit.py`（8 用例，全部通过）
+
+P2 三合一 Prompt 收敛（代码已落地，默认开关关闭）
+- 新增 `prompts/browser_act.txt`：合并 unified_plan + page_assessment，返回 `{thinking, goal_satisfied, action, confidence, need_replan}`
+- 新增 `BrowserDecisionLayer._act_with_llm(...)`：单次 LLM 调用
+- `_plan_next_action`：`BROWSER_UNIFIED_ACT_ENABLED=true` 时跳过 `asyncio.gather(unified, assess)` 和 `_decide_action_with_llm`，单步 LLM 调用从 2–4 次降到 1 次；默认保持旧三路径以便回滚
+- 旧 Prompt 文件保留（按设计 2 周稳定期后再物理删除）
+
+P1 任务级 Plan（已接入执行循环）
+- 新增 `agents/browser_task_plan.py`：`PlanStep` / `TaskPlan` / `build_initial_plan` / `step_advance` / `replan`
+- 新增 `prompts/browser_task_plan.txt` 与 `prompts/browser_step_advance.txt`
+- `BrowserAgent.run` 入口在 `BROWSER_PLAN_ENABLED=true` 时构造 `TaskPlan` 挂到 `decision._task_plan`
+- 每个 `_execute_step` 返回后调用 `step_advance` 推进 / 跳过；连续卡顿 ≥ `BROWSER_STEP_STUCK_THRESHOLD` 或 LLM 明示 `need_replan` 触发 `replan()`；`BROWSER_MAX_REPLANS` 控制最多 replan 次数
+- `browser_act.txt` 通过 `{plan_context}` 变量注入当前 step/completed/remaining，LLM 据此选择下一动作
+- 测试 `tests/test_browser_task_plan_unit.py`（7 用例，全部通过）
+
+P3 跨会话 Plan 记忆（未实现）
+- 仅预留 `BROWSER_PLAN_MEMORY_ENABLED` 开关；等 P0/P1/P2 线上回放稳定后再落地
 
 ## Coding Conventions
 
