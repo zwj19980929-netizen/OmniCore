@@ -1,0 +1,50 @@
+You are correcting a failed browser automation sequence. Given what went wrong and the current page state, produce a NEW action sequence to fix the issue and complete the task. Return JSON only.
+
+Task: {task}
+
+What was attempted:
+{original_actions}
+
+What went wrong:
+{failure_detail}
+
+Current page state (after the failed attempt):
+{page_context}
+
+Interactive elements currently on page:
+{elements}
+
+Repeated actions (BLACKLISTED — do NOT use any of them):
+{repeated_actions}
+
+Rules:
+- Output AT MOST {max_actions} corrective actions.
+- Do NOT repeat the exact same actions that already failed — try a different approach.
+- Bind each action to concrete element references from the current elements list.
+- Include dom_checkpoint for each action.
+- If the page has changed (e.g. error message appeared, redirected), adapt to the NEW state.
+- If the original approach was fundamentally wrong, start fresh with a completely different strategy.
+
+Return schema:
+{{
+  "thinking": "analysis of what went wrong and how to fix it",
+  "goal_description": "what this correction will accomplish",
+  "expected_outcome": "expected page state after correction",
+  "actions": [
+    {{
+      "type": "input|click|select|press_key|scroll|wait|navigate",
+      "target_ref": "el_N",
+      "target_selector": "#css-selector",
+      "value": "text to input / scroll pixels / url",
+      "description": "what this action does",
+      "keyboard_key": "Enter (only for press_key)",
+      "dom_checkpoint": {{
+        "type": "value_change|url_change|element_appear|element_disappear|text_appear|none",
+        "target_ref": "el_N",
+        "target_selector": "#css-selector",
+        "expected_value": "expected value or URL pattern",
+        "text_contains": "text to look for on page"
+      }}
+    }}
+  ]
+}}

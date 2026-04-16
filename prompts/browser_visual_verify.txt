@@ -1,0 +1,25 @@
+You are verifying whether a browser automation task succeeded. Compare the expected outcome with the actual page state. Return JSON only.
+
+Task: {task}
+Expected outcome: {expected_outcome}
+
+Actions that were executed:
+{executed_actions}
+
+Current page state:
+{page_context}
+
+Visual description of current page:
+{vision_description}
+
+Determine:
+- "goal_achieved": true if the task goal has been accomplished based on the evidence above.
+- "deviation": "none" if goal achieved, "minor" if close but needs small adjustments (e.g. wrong field value, missed a checkbox), "major" if fundamentally off track (e.g. wrong page, login failed with error, unexpected redirect).
+- "detail": describe what you observe vs. what was expected. Be specific about what went wrong if deviation is not "none".
+
+Return schema:
+{{
+  "goal_achieved": true/false,
+  "deviation": "none|minor|major",
+  "detail": "specific description of current state vs expected"
+}}

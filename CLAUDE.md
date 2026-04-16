@@ -93,6 +93,8 @@ LLM prompt templates are `.txt` files under `prompts/`. Prompt section registry 
 - `BROWSER_PLAN_ENABLED` / `BROWSER_MAX_PLAN_STEPS` / `BROWSER_MAX_REPLANS` / `BROWSER_STEP_STUCK_THRESHOLD` — P1 任务级 Plan
 - `BROWSER_UNIFIED_ACT_ENABLED` — P2 单 Prompt 决策开关（默认关闭，稳定后切换）
 - `BROWSER_PLAN_MEMORY_ENABLED` — P3 跨会话长期 Plan 记忆（尚未实现，预留）
+- `BROWSER_BATCH_EXECUTE_ENABLED` / `BROWSER_SEQUENCE_MODEL` / `BROWSER_MAX_SEQUENCE_ACTIONS` / `BROWSER_MAX_CORRECTIONS` — P4 批量执行与按需纠偏
+- `BROWSER_DOM_CHECKPOINT_ENABLED` / `BROWSER_VISUAL_VERIFY_ENABLED` / `BROWSER_CORRECTION_ESCALATE_TO_REASONING` — P4 检查点与验证配置
 
 ## 架构演进记录
 
@@ -101,6 +103,7 @@ LLM prompt templates are `.txt` files under `prompts/`. Prompt section registry 
 | S1–S6 | 2026-03 | 基础 Runtime、Tool Dispatch、Coordinator/Subagent、Fail-Closed 安全分层（见 `docs/archive/` 历史记录） |
 | P2-2 成本感知路由 | 2026-03-31 | `core/complexity_scorer.py`、`utils/cost_tracker.py`、`/cost` 命令 |
 | Browser 自我规划优化 P0+P2+P1 | 2026-04-14 | 指纹去重 + 单 Prompt + 任务级 Plan（详见 `docs/design/2026-04-14-browser-planning-optimization.md`） |
+| Browser 批量执行 P4 | 2026-04-15 | 一次规划批量执行 + DOM 检查点 + 视觉纠偏（详见 `docs/design/2026-04-15-browser-batch-execute-optimization.md`） |
 
 ### Browser 规划优化落地情况（2026-04-14）
 
@@ -127,6 +130,18 @@ P1 任务级 Plan（已接入执行循环）
 
 P3 跨会话 Plan 记忆（未实现）
 - 仅预留 `BROWSER_PLAN_MEMORY_ENABLED` 开关；等 P0/P1/P2 线上回放稳定后再落地
+
+P4 批量执行与按需纠偏（已落地，默认开关关闭）
+- 核心思路：**一次 LLM 规划完整动作序列 → 批量执行不调模型 → DOM 检查点零成本校验 → 视觉模型验证结果 → 偏差时纠偏**
+- 解决问题：原架构每步浏览器动作调 2-3 次 LLM（deepseek-reasoner），登录任务 15-20 次调用；批量模式降至 2-3 次
+- 新增 `agents/browser_action_sequence.py`：`ActionSequence` / `SequenceAction` / `DomCheckpoint` 数据结构，`generate_action_sequence` / `visual_verify` / `plan_correction` 三个 LLM 入口
+- 新增 `utils/dom_checkpoint.py`：6 种检查点类型（`value_change` / `url_change` / `element_appear` / `element_disappear` / `text_appear` / `attribute_change`），纯 DOM 查询零 LLM 成本
+- 新增 Prompt：`prompts/browser_action_sequence.txt`（动作序列生成）、`prompts/browser_visual_verify.txt`（视觉验证）、`prompts/browser_correction.txt`（纠偏规划）
+- `BrowserAgent.run()`：`BROWSER_BATCH_EXECUTE_ENABLED=true` 时进入 `_run_batch_mode`，生成序列失败自动回退到逐步模式
+- 分层模型：`BROWSER_SEQUENCE_MODEL` 可指定快模型做序列生成，`BROWSER_CORRECTION_ESCALATE_TO_REASONING=true` 时 major 偏差升级到推理模型
+- 纠偏流程：视觉验证返回 `deviation`（`none` / `minor` / `major`），`minor` 用快模型局部调整，`major` 用推理模型重规划，最多 `BROWSER_MAX_CORRECTIONS` 次
+- 与 P0/P1/P2 兼容：指纹去重在批量模式下仍生效；TaskPlan 仍保留为宏观指引；`BROWSER_BATCH_EXECUTE_ENABLED` 优先级高于 `BROWSER_UNIFIED_ACT_ENABLED`
+- 测试 `tests/test_browser_batch_execute_unit.py`（28 用例，全部通过）
 
 ## Coding Conventions
 

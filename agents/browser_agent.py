@@ -2871,6 +2871,287 @@ class BrowserAgent:
             "_page_screenshot": _final_screenshot,
         }
 
+    # ── P4: Batch execution mode ──────────────────────────────
+
+    def _sequence_action_to_browser_action(self, seq_action) -> BrowserAction:
+        type_map = {
+            "click": ActionType.CLICK,
+            "input": ActionType.INPUT,
+            "select": ActionType.SELECT,
+            "scroll": ActionType.SCROLL,
+            "wait": ActionType.WAIT,
+            "navigate": ActionType.NAVIGATE,
+            "press_key": ActionType.PRESS_KEY,
+            "done": ActionType.DONE,
+            "extract": ActionType.EXTRACT,
+        }
+        action_type = type_map.get(seq_action.action_type, ActionType.CLICK)
+        return BrowserAction(
+            action_type=action_type,
+            target_ref=seq_action.target_ref,
+            target_selector=seq_action.target_selector,
+            value=seq_action.value,
+            description=seq_action.description,
+            confidence=0.8,
+            keyboard_key=seq_action.keyboard_key,
+        )
+
+    async def _get_sequence_llm(self):
+        from core.llm import LLMClient
+        seq_model = settings.BROWSER_SEQUENCE_MODEL
+        if seq_model:
+            return LLMClient(model=seq_model)
+        return self._get_llm()
+
+    async def _get_correction_llm(self, deviation: str = "minor"):
+        from core.llm import LLMClient
+        if deviation == "major" and settings.BROWSER_CORRECTION_ESCALATE_TO_REASONING:
+            return self._get_llm()
+        seq_model = settings.BROWSER_SEQUENCE_MODEL
+        if seq_model:
+            return LLMClient(model=seq_model)
+        return self._get_llm()
+
+    async def _build_page_context_for_sequence(self) -> str:
+        tk = self.toolkit
+        url_r = await tk.get_current_url()
+        title_r = await tk.get_title()
+        snapshot = self._last_semantic_snapshot or {}
+        page_type = snapshot.get("page_type", "unknown")
+        main_text = self._get_snapshot_main_text(snapshot)
+        lines = [
+            f"URL: {url_r.data or ''}",
+            f"Title: {title_r.data or ''}",
+            f"Page type: {page_type}",
+        ]
+        if main_text:
+            lines.append(f"Main text: {main_text[:500]}")
+        headings = snapshot.get("headings", [])
+        if headings:
+            lines.append(f"Headings: {', '.join(str(h) for h in headings[:10])}")
+        return "\n".join(lines)
+
+    async def _run_batch_mode(
+        self,
+        task: str,
+        task_intent,
+        expected_url: str,
+        steps: List[Dict[str, Any]],
+        max_corrections: int = 0,
+    ) -> Dict[str, Any]:
+        from agents.browser_action_sequence import (
+            generate_action_sequence, visual_verify, plan_correction,
+        )
+        from utils.dom_checkpoint import verify_dom_checkpoint
+
+        tk = self.toolkit
+        accumulated_data: List[Dict[str, str]] = []
+        seen_keys: set = set()
+        max_corrections = max_corrections or settings.BROWSER_MAX_CORRECTIONS
+
+        def _merge_new_data(new_items):
+            for item in (new_items or []):
+                vals = [str(v)[:80] for v in list(item.values())[:2] if v]
+                key = "|".join(vals)
+                if key and key not in seen_keys:
+                    seen_keys.add(key)
+                    accumulated_data.append(item)
+
+        elements = await self._extract_interactive_elements()
+        snapshot = await self._get_semantic_snapshot() if self._last_semantic_snapshot is None else self._last_semantic_snapshot
+        page_context = await self._build_page_context_for_sequence()
+        elements_text = self.decision._format_assessment_elements_for_llm(task, "", elements)
+        repeated_actions = self.decision.format_repeated_actions_for_llm()
+        plan_context = "(no plan)"
+        plan = getattr(self.decision, "_task_plan", None)
+        if plan is not None:
+            try:
+                plan_context = plan.format_for_prompt()
+            except Exception:
+                pass
+
+        log_agent_action(self.name, "batch mode", "generating action sequence")
+        seq_llm = await self._get_sequence_llm()
+        sequence = await generate_action_sequence(
+            task=task,
+            page_context=page_context,
+            elements_text=elements_text,
+            llm=seq_llm,
+            repeated_actions=repeated_actions,
+            plan_context=plan_context,
+        )
+        if sequence is None:
+            log_warning("batch mode: action sequence generation failed, falling back to step mode")
+            return None
+
+        web_debug_recorder.write_json("browser_action_sequence", sequence.to_dict())
+        log_agent_action(
+            self.name, "动作序列已生成",
+            f"{len(sequence.actions)} actions, goal: {sequence.goal_description[:60]}",
+        )
+
+        if not sequence.actions:
+            log_agent_action(self.name, "batch mode", "empty sequence — goal already satisfied")
+            _merge_new_data(await self._extract_data_for_intent(task_intent))
+            url_r = await tk.get_current_url()
+            title_r = await tk.get_title()
+            return {
+                "success": True,
+                "message": sequence.goal_description or "goal already satisfied",
+                "url": url_r.data or "", "title": title_r.data or "",
+                "expected_url": expected_url, "steps": steps, "data": accumulated_data,
+            }
+
+        for correction_round in range(max_corrections + 1):
+            batch_failed_at = None
+            for seq_action in sequence.remaining():
+                browser_action = self._sequence_action_to_browser_action(seq_action)
+                self._record_action(browser_action)
+
+                success = await self._execute_action(browser_action)
+                step_record = {
+                    "action_type": seq_action.action_type,
+                    "description": seq_action.description,
+                    "target_ref": seq_action.target_ref,
+                    "success": success,
+                    "batch_mode": True,
+                }
+
+                if not success:
+                    recovery = self._recover_action(task, browser_action, elements)
+                    if recovery:
+                        success = await self._execute_action(recovery)
+                        step_record["recovery"] = True
+
+                if success and settings.BROWSER_DOM_CHECKPOINT_ENABLED:
+                    page = getattr(tk, '_page', None)
+                    if page and seq_action.dom_checkpoint.check_type != "none":
+                        cp_result = await verify_dom_checkpoint(page, seq_action.dom_checkpoint)
+                        step_record["checkpoint"] = cp_result.detail
+                        if not cp_result.passed:
+                            log_warning(f"batch mode: DOM checkpoint failed at action {sequence.execution_index}: {cp_result.detail}")
+                            step_record["checkpoint_passed"] = False
+                            batch_failed_at = seq_action
+                            steps.append(step_record)
+                            sequence.advance()
+                            break
+                elif not success:
+                    log_warning(f"batch mode: action failed at index {sequence.execution_index}: {seq_action.description}")
+                    step_record["success"] = False
+                    batch_failed_at = seq_action
+                    steps.append(step_record)
+                    sequence.advance()
+                    break
+
+                steps.append(step_record)
+                sequence.advance()
+
+            if settings.BROWSER_VISUAL_VERIFY_ENABLED:
+                url_r = await tk.get_current_url()
+                title_r = await tk.get_title()
+                page_context_now = await self._build_page_context_for_sequence()
+                vision_desc = ""
+                try:
+                    page = getattr(tk, '_page', None)
+                    if page and self._can_use_vision():
+                        screenshot_bytes = await page.screenshot(type="jpeg", quality=50, full_page=False)
+                        if screenshot_bytes:
+                            vision_desc = await self._describe_screenshot(screenshot_bytes, task) or ""
+                except Exception:
+                    pass
+
+                verify_llm = await self._get_sequence_llm()
+                verify_result = await visual_verify(
+                    task=task,
+                    expected_outcome=sequence.expected_outcome,
+                    executed_actions_summary=sequence.format_executed_for_prompt(),
+                    current_page_context=page_context_now,
+                    vision_description=vision_desc,
+                    llm=verify_llm,
+                )
+                web_debug_recorder.write_json("browser_batch_verify", {
+                    "goal_achieved": verify_result.goal_achieved,
+                    "deviation": verify_result.deviation,
+                    "detail": verify_result.detail,
+                    "correction_round": correction_round,
+                })
+                log_agent_action(
+                    self.name, "batch verify",
+                    f"achieved={verify_result.goal_achieved}, deviation={verify_result.deviation}",
+                )
+
+                if verify_result.goal_achieved:
+                    _merge_new_data(await self._extract_data_for_intent(task_intent))
+                    _final_screenshot = await self._capture_final_screenshot()
+                    return {
+                        "success": True,
+                        "message": "batch execution completed",
+                        "url": url_r.data or "", "title": title_r.data or "",
+                        "expected_url": expected_url, "steps": steps,
+                        "data": accumulated_data,
+                        "_page_screenshot": _final_screenshot,
+                    }
+
+                if correction_round >= max_corrections:
+                    break
+
+                log_agent_action(self.name, "batch correction", f"round {correction_round + 1}, deviation={verify_result.deviation}")
+                elements = await self._extract_interactive_elements()
+                page_context_now = await self._build_page_context_for_sequence()
+                elements_text_now = self.decision._format_assessment_elements_for_llm(task, url_r.data or "", elements)
+                repeated_actions_now = self.decision.format_repeated_actions_for_llm()
+
+                corr_llm = await self._get_correction_llm(verify_result.deviation)
+                correction_seq = await plan_correction(
+                    task=task,
+                    original_sequence_summary=sequence.format_executed_for_prompt(),
+                    failure_detail=verify_result.detail,
+                    page_context=page_context_now,
+                    elements_text=elements_text_now,
+                    llm=corr_llm,
+                    repeated_actions=repeated_actions_now,
+                )
+                if correction_seq is None or not correction_seq.actions:
+                    log_warning("batch mode: correction planning failed")
+                    break
+
+                web_debug_recorder.write_json(f"browser_correction_sequence_{correction_round + 1}", correction_seq.to_dict())
+                log_agent_action(
+                    self.name, f"纠偏序列已生成 (round {correction_round + 1})",
+                    f"{len(correction_seq.actions)} actions",
+                )
+                sequence = correction_seq
+                continue
+
+            else:
+                if batch_failed_at is None:
+                    _merge_new_data(await self._extract_data_for_intent(task_intent))
+                    url_r = await tk.get_current_url()
+                    title_r = await tk.get_title()
+                    _final_screenshot = await self._capture_final_screenshot()
+                    return {
+                        "success": True,
+                        "message": "batch execution completed (no visual verify)",
+                        "url": url_r.data or "", "title": title_r.data or "",
+                        "expected_url": expected_url, "steps": steps,
+                        "data": accumulated_data,
+                        "_page_screenshot": _final_screenshot,
+                    }
+                break
+
+        _merge_new_data(await self._extract_data_for_intent(task_intent))
+        url_r = await tk.get_current_url()
+        title_r = await tk.get_title()
+        _final_screenshot = await self._capture_final_screenshot()
+        return {
+            "success": len(accumulated_data) > 0,
+            "message": "batch execution finished with corrections exhausted",
+            "url": url_r.data or "", "title": title_r.data or "",
+            "expected_url": expected_url, "steps": steps,
+            "data": accumulated_data,
+            "_page_screenshot": _final_screenshot,
+        }
+
     async def run(self, task: str, start_url: Optional[str] = None, max_steps: int = 8) -> Dict[str, Any]:
         # Reset per-run vision budget
         self._vision_budget = VisionBudget(
@@ -2919,6 +3200,16 @@ class BrowserAgent:
                         log_agent_action(self.name, "任务级 Plan 已生成", f"{len(_plan.steps)} steps")
                 except Exception as _plan_err:
                     log_warning(f"task plan initialization skipped: {_plan_err}")
+            # P4: batch execution mode — one LLM call to plan, execute all, then verify
+            if settings.BROWSER_BATCH_EXECUTE_ENABLED:
+                log_agent_action(self.name, "batch mode enabled", "一次规划批量执行")
+                batch_result = await self._run_batch_mode(
+                    task, task_intent, expected_url, steps,
+                )
+                if batch_result is not None:
+                    return batch_result
+                log_warning("batch mode returned None, falling back to step-by-step mode")
+
             accumulated_data: List[Dict[str, str]] = []
             seen_keys: set = set()
             last_action: Optional[BrowserAction] = None

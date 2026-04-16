@@ -258,6 +258,15 @@ class Settings:
     # P3 跨会话长期记忆（默认关闭）
     BROWSER_PLAN_MEMORY_ENABLED = os.getenv("BROWSER_PLAN_MEMORY_ENABLED", "false").lower() == "true"
 
+    # === P4 批量执行与按需纠偏 ===
+    BROWSER_BATCH_EXECUTE_ENABLED = os.getenv("BROWSER_BATCH_EXECUTE_ENABLED", "false").lower() == "true"
+    BROWSER_SEQUENCE_MODEL = os.getenv("BROWSER_SEQUENCE_MODEL", "")
+    BROWSER_MAX_SEQUENCE_ACTIONS = _env_int("BROWSER_MAX_SEQUENCE_ACTIONS", 10)
+    BROWSER_MAX_CORRECTIONS = _env_int("BROWSER_MAX_CORRECTIONS", 2)
+    BROWSER_DOM_CHECKPOINT_ENABLED = os.getenv("BROWSER_DOM_CHECKPOINT_ENABLED", "true").lower() == "true"
+    BROWSER_VISUAL_VERIFY_ENABLED = os.getenv("BROWSER_VISUAL_VERIFY_ENABLED", "true").lower() == "true"
+    BROWSER_CORRECTION_ESCALATE_TO_REASONING = os.getenv("BROWSER_CORRECTION_ESCALATE_TO_REASONING", "true").lower() == "true"
+
     # === 搜索结果与文本相关性评分权重 ===
     # 文本相关性：token 匹配 / 字符 n-gram 重叠 / 数字匹配
     TEXT_RELEVANCE_WEIGHT_TOKEN = float(os.getenv("TEXT_RELEVANCE_WEIGHT_TOKEN", "0.55"))
