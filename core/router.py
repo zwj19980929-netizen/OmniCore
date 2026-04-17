@@ -759,6 +759,163 @@ class RouterAgent:
             hints.append(f"- {tool_name}: {description}")
         return hints
 
+    @staticmethod
+    def _build_top_entities_block() -> str:
+        """A2: render top-K recently-seen entities as a reference hint.
+
+        Pulls from ``EntityIndex.top_entities`` — the inverted index written
+        alongside every task_result. Helps the router re-use the subjects
+        the user has been working with instead of re-deriving them from
+        raw history each turn.
+        """
+        from config.settings import settings as _settings
+        if not _settings.MEMORY_INJECT_TOP_ENTITIES or not _settings.MEMORY_ENTITY_INDEX_ENABLED:
+            return ""
+        try:
+            from memory.entity_index import EntityIndex
+            index = EntityIndex()
+            entities = index.top_entities(limit=int(_settings.MEMORY_ENTITY_TOP_K))
+        except Exception:
+            return ""
+        if not entities:
+            return ""
+
+        # Group by entity_type for readability; cap at top_k overall already
+        by_type: Dict[str, List[str]] = {}
+        for rec in entities:
+            if rec.occurrence_count <= 0:
+                continue
+            by_type.setdefault(rec.entity_type or "KEYWORD", []).append(
+                f"{rec.entity_text} (x{rec.occurrence_count})"
+            )
+        if not by_type:
+            return ""
+
+        lines = ["## Recently-active entities (reuse when the task refers to them):"]
+        for etype, items in by_type.items():
+            lines.append(f"- {etype}: {', '.join(items[:5])}")
+        lines.append("")
+        return "\n".join(lines) + "\n---\n"
+
+    @staticmethod
+    def _build_inferred_preferences_block() -> str:
+        """A5: surface learned preferences (``source=inferred``) as hints.
+
+        Reads from the ``preference`` memory type written by
+        ``MemoryManager.persist_inferred_preferences``. Only confidence-
+        filtered entries are listed; if none are available, returns ``""``.
+        """
+        from config.settings import settings as _settings
+        if not _settings.PREFERENCE_INJECT_TO_ROUTER or not _settings.PREFERENCE_LEARNING_ENABLED:
+            return ""
+        try:
+            from memory.scoped_chroma_store import ChromaMemory
+            # Prefer semantic tier when tiered store is active — it's where
+            # preferences are written. Otherwise fall back to the legacy
+            # single collection.
+            collection = (
+                _settings.MEMORY_TIER_SEMANTIC_COLLECTION
+                if _settings.MEMORY_TIERED_ENABLED
+                else _settings.MEMORY_TIER_LEGACY_COLLECTION
+            )
+            store = ChromaMemory(collection_name=collection, silent=True)
+            raw = store._collection.get()
+        except Exception:
+            return ""
+        ids = raw.get("ids") or []
+        documents = raw.get("documents") or []
+        metadatas = raw.get("metadatas") or []
+
+        inferred: List[tuple] = []  # (confidence, key, value, notes)
+        min_conf = float(_settings.PREFERENCE_LEARNING_MIN_CONFIDENCE)
+        for idx in range(len(ids)):
+            meta = metadatas[idx] if idx < len(metadatas) else {}
+            if not isinstance(meta, dict):
+                continue
+            if str(meta.get("type", "") or "") != "preference":
+                continue
+            if str(meta.get("source", "") or "") != "inferred":
+                continue
+            try:
+                conf = float(meta.get("confidence", 0.0) or 0.0)
+            except (TypeError, ValueError):
+                conf = 0.0
+            if conf < min_conf:
+                continue
+            key = str(meta.get("preference_key", "") or "").strip()
+            value = str(meta.get("preference_value", "") or "").strip()
+            if not key or not value:
+                # Some preference rows store the payload in the document body
+                doc = str(documents[idx] if idx < len(documents) else "") or ""
+                if not key and ":" in doc:
+                    key, _, value = doc.partition(":")
+                    key = key.strip()
+                    value = value.strip()
+            if not key or not value:
+                continue
+            notes = str(meta.get("notes", "") or "").strip()
+            inferred.append((conf, key, value, notes))
+
+        if not inferred:
+            return ""
+        inferred.sort(key=lambda x: x[0], reverse=True)
+        inferred = inferred[: max(5, 0)]
+
+        lines = [
+            "## Inferred preferences (learned from past runs — adopt when they fit):",
+        ]
+        for conf, key, value, notes in inferred:
+            line = f"- {key}: {value}  (confidence={conf:.0%})"
+            if notes:
+                line += f" | {notes[:120]}"
+            lines.append(line)
+        lines.append("")
+        return "\n".join(lines) + "\n---\n"
+
+    @staticmethod
+    def _build_skill_hint_block(user_input: str) -> str:
+        """A3: render top-k skill matches as a reference-only hint block.
+
+        Returns an empty string when disabled, no matches, or any error.
+        The skills shown here are *suggestions*, not mandates — the prompt
+        instructs the LLM to treat them as reference material.
+        """
+        from config.settings import settings as _settings
+        if not _settings.SKILL_HINT_ENABLED or not _settings.SKILL_LIBRARY_ENABLED:
+            return ""
+        try:
+            from memory.skill_store import SkillStore
+            store = SkillStore()
+            matches = store.match_top_k(
+                user_input,
+                k=int(_settings.SKILL_HINT_TOP_K),
+                min_score=float(_settings.SKILL_HINT_MIN_SCORE),
+            )
+        except Exception:
+            return ""
+        if not matches:
+            return ""
+
+        lines = [
+            "## Related skill templates (reference only — adopt only if the task truly matches):",
+        ]
+        for m in matches:
+            rate_str = f"{m.success_rate:.0%}" if m.total_uses > 0 else "new"
+            seq_str = " → ".join(m.tool_sequence[:6]) if m.tool_sequence else "(no tools)"
+            lines.append(
+                f"- [{m.name}] score={m.score:.2f}  uses={m.total_uses}  success={rate_str}  "
+                f"tools: {seq_str}"
+            )
+            desc = (m.description or "").strip().replace("\n", " ")
+            if desc:
+                lines.append(f"  description: {desc[:200]}")
+        lines.append(
+            "Rule: if the user's task is essentially one of these, prefer the matching "
+            "tool sequence; otherwise ignore these hints."
+        )
+        lines.append("")
+        return "\n".join(lines) + "\n---\n"
+
     def analyze_intent(
         self,
         user_input: str,
@@ -1043,6 +1200,24 @@ class RouterAgent:
         if knowledge_context:
             user_message += knowledge_context
             user_message += "\n\n---\n"
+
+        # A2: inject top entities when enabled — reminds the planner of the
+        # subjects the user has been working with across sessions.
+        entities_block = self._build_top_entities_block()
+        if entities_block:
+            user_message += entities_block
+
+        # A5: surface learned preferences as a reference hint.
+        inferred_prefs_block = self._build_inferred_preferences_block()
+        if inferred_prefs_block:
+            user_message += inferred_prefs_block
+
+        # A3: inject top-k skill hints so the planner can sanity-check its
+        # decomposition against past successful task templates, even when no
+        # single skill was an exact match.
+        skill_hint_block = self._build_skill_hint_block(user_input)
+        if skill_hint_block:
+            user_message += skill_hint_block
 
         user_message += f"请分析以下用户指令并拆解任务：\n\n{user_input}"
 

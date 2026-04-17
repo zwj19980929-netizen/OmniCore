@@ -23,6 +23,20 @@ from utils.text import sanitize_text, sanitize_value
 # ---------------------------------------------------------------------------
 
 @dataclass
+class SkillMatch:
+    """A skill hit together with its retrieval score and summary fields."""
+
+    skill_id: str
+    name: str
+    description: str
+    score: float            # 0..1, higher is better
+    success_rate: float
+    total_uses: int
+    tool_sequence: List[str] = field(default_factory=list)
+    source_intent: str = ""
+
+
+@dataclass
 class SkillDefinition:
     """一个可复用的任务技能。"""
 
@@ -188,6 +202,70 @@ class SkillStore:
     # ------------------------------------------------------------------
     # 2. Skill 匹配 (Router 阶段调用)
     # ------------------------------------------------------------------
+
+    def match_top_k(
+        self,
+        user_input: str,
+        *,
+        k: int = 3,
+        min_score: float = 0.0,
+    ) -> List[SkillMatch]:
+        """
+        Retrieve top-k skill hints for planner context injection (A3).
+
+        Unlike ``match``, this returns multiple candidates with scores so
+        the caller can surface them to the LLM as reference hints even
+        when no single skill is a confident full match.
+        """
+        if not settings.SKILL_LIBRARY_ENABLED:
+            return []
+        clean = sanitize_text(user_input or "")
+        if not clean or k <= 0:
+            return []
+
+        raw = self._chroma.search_memory(
+            query=clean,
+            n_results=max(k * 2, k),
+            memory_type="skill_definition",
+        )
+        matches: List[SkillMatch] = []
+        for item in raw:
+            meta = item.get("metadata") or {}
+            if str(meta.get("deprecated", "false") or "false") == "true":
+                continue
+            succ = int(meta.get("success_count", 0) or 0)
+            fail = int(meta.get("failure_count", 0) or 0)
+            total = succ + fail
+            # drop skills with established failure pattern
+            if total >= 3 and succ / total < 0.3:
+                continue
+            skill = self._skill_from_metadata(meta)
+            if skill is None:
+                continue
+            distance = item.get("distance")
+            score = max(0.0, 1.0 - float(distance if distance is not None else 1.0))
+            if score < float(min_score):
+                continue
+            tool_seq = [
+                str(step.get("tool_name", "") or "")
+                for step in (skill.task_template or [])
+                if step.get("tool_name")
+            ]
+            matches.append(
+                SkillMatch(
+                    skill_id=skill.skill_id,
+                    name=skill.name,
+                    description=sanitize_text(str(item.get("content") or "")),
+                    score=score,
+                    success_rate=skill.success_rate,
+                    total_uses=skill.total_uses,
+                    tool_sequence=tool_seq,
+                    source_intent=skill.source_intent,
+                )
+            )
+            if len(matches) >= k:
+                break
+        return matches
 
     def match(self, user_input: str, top_k: int = 3) -> Optional[SkillDefinition]:
         """

@@ -11,6 +11,7 @@ from typing import List, Dict, Optional
 from core.statuses import WAITING_JOB_STATUSES
 from core.runtime import (
     get_background_worker_status,
+    purge_session_working_memory,
     run_background_worker_forever,
     run_task,
     start_background_worker,
@@ -492,6 +493,18 @@ def print_banner():
     console.print(Panel(banner, style="cyan", title="OmniCore"))
 
 
+def _purge_working_memory_on_exit(session_id: Optional[str]) -> None:
+    """A4: best-effort cleanup of working-tier memory at CLI session exit."""
+    if not session_id:
+        return
+    try:
+        deleted = purge_session_working_memory(session_id)
+        if deleted:
+            console.print(f"[dim]Cleared {deleted} working-tier memories for session {session_id}.[/dim]")
+    except Exception:
+        pass
+
+
 def interactive_mode():
     """交互式命令行模式 - 支持历史记录和优雅退出"""
     print_banner()
@@ -539,6 +552,7 @@ def interactive_mode():
 
             if user_input.lower() in ["quit", "exit", "q"]:
                 console.print("\n[yellow]再见！👋[/yellow]")
+                _purge_working_memory_on_exit(session_id)
                 break
 
             # 终端内置快捷命令（!cmd, /cd, /ls, /cwd, /allow, /shell）
@@ -615,6 +629,7 @@ def interactive_mode():
 
         except (KeyboardInterrupt, EOFError):
             console.print("\n[yellow]再见！[/yellow]")
+            _purge_working_memory_on_exit(session_id)
             break
         except Exception as e:
             error_detail = traceback.format_exc()
@@ -647,12 +662,62 @@ def worker_mode():
             console.print("[yellow]Queue worker was not running[/yellow]")
 
 
+def _run_preference_learn(dry_run: bool = False) -> None:
+    """A5: one-shot preference learning entrypoint."""
+    from memory.preference_learner import infer_preferences
+    from memory.manager import MemoryManager
+    memory = ChromaMemory(silent=True)
+    candidates = infer_preferences(memory)
+    if not candidates:
+        console.print("[yellow]Preference learner: no candidates above threshold.[/yellow]")
+        return
+    console.print(f"[green]Preference learner: {len(candidates)} candidates[/green]")
+    for cand in candidates:
+        console.print(
+            f"  · {cand.key}={cand.value}  conf={cand.confidence:.2f}  {cand.notes}"
+        )
+    if dry_run:
+        console.print("[dim](dry-run — not persisted)[/dim]")
+        return
+    manager = MemoryManager(chroma_memory=memory)
+    written = manager.persist_inferred_preferences(candidates)
+    console.print(f"[green]Persisted {len(written)} preferences.[/green]")
+
+
+def _run_memory_consolidate(dry_run: bool = False) -> None:
+    """A1: one-shot memory consolidation entrypoint."""
+    from memory.consolidator import consolidate_expired
+    memory = ChromaMemory(silent=True)
+    report = consolidate_expired(memory, dry_run=dry_run)
+    data = report.as_dict()
+    tag = "[dry-run] " if dry_run else ""
+    console.print(f"[green]{tag}Memory consolidation:[/green]")
+    console.print(
+        f"  scanned={data['scanned']}  "
+        f"deleted_never_used={data['deleted_never_used']}  "
+        f"consolidated_groups={data['consolidated_groups']}  "
+        f"consolidated_memories={data['consolidated_memories']}  "
+        f"skipped_diverse={data['skipped_diverse']}  "
+        f"errors={data['errors']}"
+    )
+    for detail in data.get("details", [])[:10]:
+        console.print(f"  · [{detail['scope_key']}] x{detail['archived_count']}: {detail['summary_preview']}")
+
+
 def main():
     if len(sys.argv) >= 3 and sys.argv[1].lower() == "worker" and sys.argv[2] == "--process-loop":
         run_background_worker_forever()
         return
     if len(sys.argv) == 2 and sys.argv[1].lower() == "worker":
         worker_mode()
+        return
+    if len(sys.argv) >= 2 and sys.argv[1].lower() == "memory-consolidate":
+        dry = "--dry-run" in sys.argv[2:]
+        _run_memory_consolidate(dry_run=dry)
+        return
+    if len(sys.argv) >= 2 and sys.argv[1].lower() == "preference-learn":
+        dry = "--dry-run" in sys.argv[2:]
+        _run_preference_learn(dry_run=dry)
         return
     """主函数"""
     if len(sys.argv) > 1:

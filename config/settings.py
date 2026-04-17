@@ -500,6 +500,49 @@ class Settings:
     SKILL_MIN_STEPS_TO_EXTRACT = _env_int("SKILL_MIN_STEPS_TO_EXTRACT", 2)
     SKILL_AUTO_DEPRECATE_THRESHOLD = float(os.getenv("SKILL_AUTO_DEPRECATE_THRESHOLD", "0.3"))
     SKILL_AUTO_DEPRECATE_MIN_USES = _env_int("SKILL_AUTO_DEPRECATE_MIN_USES", 3)
+    # A3: inject top-k skills as hints into router even when no exact match
+    SKILL_HINT_ENABLED = os.getenv("SKILL_HINT_ENABLED", "true").lower() == "true"
+    SKILL_HINT_TOP_K = _env_int("SKILL_HINT_TOP_K", 3)
+    SKILL_HINT_MIN_SCORE = float(os.getenv("SKILL_HINT_MIN_SCORE", "0.4"))
+
+    # === 记忆衰减与归档（A1）===
+    MEMORY_DECAY_ENABLED = os.getenv("MEMORY_DECAY_ENABLED", "true").lower() == "true"
+    MEMORY_HALF_LIFE_DAYS = float(os.getenv("MEMORY_HALF_LIFE_DAYS", "30"))
+    MEMORY_RERANK_POOL_MULTIPLIER = max(_env_int("MEMORY_RERANK_POOL_MULTIPLIER", 3), 1)
+    MEMORY_TTL_DAYS = _env_int("MEMORY_TTL_DAYS", 90)
+    MEMORY_CONSOLIDATION_ENABLED = os.getenv("MEMORY_CONSOLIDATION_ENABLED", "false").lower() == "true"
+    MEMORY_CONSOLIDATION_MODEL = os.getenv("MEMORY_CONSOLIDATION_MODEL", "")
+    MEMORY_CONSOLIDATION_BATCH_SIZE = max(_env_int("MEMORY_CONSOLIDATION_BATCH_SIZE", 10), 2)
+    MEMORY_CONSOLIDATION_MIN_HITS = max(_env_int("MEMORY_CONSOLIDATION_MIN_HITS", 1), 0)
+
+    # === 记忆实体倒排索引（A2）===
+    MEMORY_ENTITY_INDEX_ENABLED = os.getenv("MEMORY_ENTITY_INDEX_ENABLED", "true").lower() == "true"
+    MEMORY_ENTITY_INDEX_COLLECTION = os.getenv("MEMORY_ENTITY_INDEX_COLLECTION", "omnicore_entities")
+    MEMORY_INJECT_TOP_ENTITIES = os.getenv("MEMORY_INJECT_TOP_ENTITIES", "false").lower() == "true"
+    MEMORY_ENTITY_TOP_K = max(_env_int("MEMORY_ENTITY_TOP_K", 5), 1)
+
+    # === 记忆分层（A4）===
+    # 默认开启:TieredMemoryStore 在命中为空时回退读 legacy,保证切换无数据断层
+    MEMORY_TIERED_ENABLED = os.getenv("MEMORY_TIERED_ENABLED", "true").lower() == "true"
+    MEMORY_TIER_LEGACY_FALLBACK = os.getenv("MEMORY_TIER_LEGACY_FALLBACK", "true").lower() == "true"
+    MEMORY_TIER_LEGACY_COLLECTION = os.getenv("MEMORY_TIER_LEGACY_COLLECTION", "omnicore_memory")
+    MEMORY_TIER_WORKING_COLLECTION = os.getenv("MEMORY_TIER_WORKING_COLLECTION", "omnicore_working")
+    MEMORY_TIER_EPISODIC_COLLECTION = os.getenv("MEMORY_TIER_EPISODIC_COLLECTION", "omnicore_episodic")
+    MEMORY_TIER_SEMANTIC_COLLECTION = os.getenv("MEMORY_TIER_SEMANTIC_COLLECTION", "omnicore_semantic")
+    MEMORY_TIER_WEIGHT_WORKING = float(os.getenv("MEMORY_TIER_WEIGHT_WORKING", "1.0"))
+    MEMORY_TIER_WEIGHT_EPISODIC = float(os.getenv("MEMORY_TIER_WEIGHT_EPISODIC", "1.0"))
+    MEMORY_TIER_WEIGHT_SEMANTIC = float(os.getenv("MEMORY_TIER_WEIGHT_SEMANTIC", "1.2"))
+
+    # === 用户偏好自动学习（A5）===
+    # 默认开启:通过 persist_job_outcome 末尾的 gated 触发器周期性推断,成本极低
+    PREFERENCE_LEARNING_ENABLED = os.getenv("PREFERENCE_LEARNING_ENABLED", "true").lower() == "true"
+    # 自动触发节流:距上次运行 < N 小时不重复执行
+    PREFERENCE_LEARNING_MIN_INTERVAL_HOURS = max(_env_int("PREFERENCE_LEARNING_MIN_INTERVAL_HOURS", 24), 1)
+    PREFERENCE_LEARNING_WINDOW_DAYS = max(_env_int("PREFERENCE_LEARNING_WINDOW_DAYS", 7), 1)
+    PREFERENCE_LEARNING_MIN_CONFIDENCE = float(os.getenv("PREFERENCE_LEARNING_MIN_CONFIDENCE", "0.6"))
+    PREFERENCE_LEARNING_MODEL = os.getenv("PREFERENCE_LEARNING_MODEL", "")
+    PREFERENCE_LEARNING_MIN_SAMPLES = max(_env_int("PREFERENCE_LEARNING_MIN_SAMPLES", 5), 2)
+    PREFERENCE_INJECT_TO_ROUTER = os.getenv("PREFERENCE_INJECT_TO_ROUTER", "false").lower() == "true"
 
     # === 意图分类 ===
     INTENT_TYPES = [

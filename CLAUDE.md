@@ -104,6 +104,7 @@ LLM prompt templates are `.txt` files under `prompts/`. Prompt section registry 
 | P2-2 成本感知路由 | 2026-03-31 | `core/complexity_scorer.py`、`utils/cost_tracker.py`、`/cost` 命令 |
 | Browser 自我规划优化 P0+P2+P1 | 2026-04-14 | 指纹去重 + 单 Prompt + 任务级 Plan（详见 `docs/design/2026-04-14-browser-planning-optimization.md`） |
 | Browser 批量执行 P4 | 2026-04-15 | 一次规划批量执行 + DOM 检查点 + 视觉纠偏（详见 `docs/design/2026-04-15-browser-batch-execute-optimization.md`） |
+| 记忆能力优化 A 组 | 2026-04-16 | A1 衰减+TTL+归档 / A2 实体倒排索引 + Router 注入 + `delete_by_entity` / A3 Skill 前置注入 / A4 三层记忆 + session-close purge 钩子 / A5 偏好学习(规则+LLM 层)+ Router 注入（详见 `docs/design/2026-04-16-memory-and-browser-optimization.md`） |
 
 ### Browser 规划优化落地情况（2026-04-14）
 

@@ -384,6 +384,13 @@ class ChromaMemory:
             return []
         log_agent_action(self.name, "Search memory", clean_query[:60])
 
+        # A1: when decay rerank is enabled, collect a larger candidate pool
+        # across all scope levels and rerank by decay_score instead of
+        # early-returning by scope order.
+        decay_enabled = bool(getattr(settings, "MEMORY_DECAY_ENABLED", False))
+        pool_mult = max(int(getattr(settings, "MEMORY_RERANK_POOL_MULTIPLIER", 3) or 3), 1)
+        fetch_per_spec = n_results * (pool_mult if decay_enabled else 2)
+
         search_specs: List[tuple[str, Optional[Dict[str, Any]]]] = []
         for scope_match, scope_candidate in self._scope_candidates(scope):
             if scope_match == "global":
@@ -409,14 +416,14 @@ class ChromaMemory:
             for item in self._query_collection(
                 query=clean_query,
                 where_filter=where_filter,
-                n_results=n_results * 2,
+                n_results=fetch_per_spec,
                 scope_match=scope_match,
             ):
                 if item["id"] in seen_ids:
                     continue
                 seen_ids.add(item["id"])
                 memories.append(item)
-                if len(memories) >= n_results:
+                if not decay_enabled and len(memories) >= n_results:
                     self._touch_memories(memories[:n_results])
                     return memories[:n_results]
 
@@ -424,7 +431,7 @@ class ChromaMemory:
             legacy_items = self._query_collection(
                 query=clean_query,
                 where_filter=self._build_where_filter(memory_type=memory_type),
-                n_results=n_results,
+                n_results=fetch_per_spec,
                 scope_match="legacy_unscoped",
             )
             for item in legacy_items:
@@ -432,8 +439,13 @@ class ChromaMemory:
                     continue
                 seen_ids.add(item["id"])
                 memories.append(item)
-                if len(memories) >= n_results:
+                if not decay_enabled and len(memories) >= n_results:
                     break
+
+        if decay_enabled and memories:
+            from memory.decay import rerank_by_decay
+            half_life = float(getattr(settings, "MEMORY_HALF_LIFE_DAYS", 30.0) or 30.0)
+            memories = rerank_by_decay(memories, half_life_days=half_life)
 
         self._touch_memories(memories[:n_results])
         return memories[:n_results]

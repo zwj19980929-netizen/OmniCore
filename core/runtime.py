@@ -1057,6 +1057,30 @@ def update_user_preferences(
     return updated
 
 
+def purge_session_working_memory(session_id: str) -> int:
+    """A4: drop working-tier memories scoped to ``session_id``.
+
+    Called at CLI/UI session teardown so short-lived scratch entries
+    don't outlive the session. No-ops when tiered memory is disabled or
+    the session_id is empty.
+    """
+    sid = sanitize_text(session_id or "")
+    if not sid:
+        return 0
+    try:
+        memory_store = _resolve_runtime_memory()
+        if memory_store is None:
+            return 0
+        manager = MemoryManager(memory_store)
+        tiered = manager.tiered_store
+        if tiered is None:
+            return 0
+        return int(tiered.purge_working(sid))
+    except Exception as e:
+        log_warning(f"purge_session_working_memory failed: {e}")
+        return 0
+
+
 def get_notification_feed(
     *,
     session_id: Optional[str] = None,

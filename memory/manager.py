@@ -12,6 +12,8 @@ from utils.text import sanitize_text, sanitize_value
 if TYPE_CHECKING:
     from memory.scoped_chroma_store import ChromaMemory
     from memory.entity_extractor import EntityExtractor
+    from memory.entity_index import EntityIndex, EntityRecord
+    from memory.tiered_store import TieredMemoryStore
 
 
 _SCOPE_KEYS = ("session_id", "goal_id", "project_id", "todo_id")
@@ -117,9 +119,33 @@ class MemoryManager:
         self,
         chroma_memory: Optional["ChromaMemory"] = None,
         entity_extractor: Optional["EntityExtractor"] = None,
+        entity_index: Optional["EntityIndex"] = None,
+        tiered_store: Optional["TieredMemoryStore"] = None,
     ):
         self.chroma_memory = chroma_memory
         self._entity_extractor = entity_extractor
+        self._entity_index = entity_index
+        self._tiered_store = tiered_store
+
+    @property
+    def tiered_store(self) -> Optional["TieredMemoryStore"]:
+        """A4: Lazy-load TieredMemoryStore when ``MEMORY_TIERED_ENABLED``.
+
+        When tiered is off this returns None and callers fall back to the
+        legacy ``chroma_memory`` path.
+        """
+        from config.settings import settings as _settings
+        if not _settings.MEMORY_TIERED_ENABLED:
+            return None
+        if self._tiered_store is None:
+            try:
+                from memory.tiered_store import TieredMemoryStore
+                # Pass the legacy chroma_memory in as the fallback reader
+                # so pre-migration data stays visible.
+                self._tiered_store = TieredMemoryStore(legacy=self.chroma_memory)
+            except Exception:
+                pass
+        return self._tiered_store
 
     @property
     def entity_extractor(self) -> Optional["EntityExtractor"]:
@@ -132,6 +158,57 @@ class MemoryManager:
                 pass
         return self._entity_extractor
 
+    @property
+    def entity_index(self) -> Optional["EntityIndex"]:
+        """Lazy-load EntityIndex; returns None when the feature is disabled."""
+        from config.settings import settings as _settings
+        if not _settings.MEMORY_ENTITY_INDEX_ENABLED:
+            return None
+        if self._entity_index is None:
+            try:
+                from memory.entity_index import EntityIndex
+                self._entity_index = EntityIndex()
+            except Exception:
+                pass
+        return self._entity_index
+
+    def search_by_entity(
+        self,
+        entity_text: str,
+        *,
+        entity_type: Optional[str] = None,
+        limit: int = 10,
+    ) -> List["EntityRecord"]:
+        index = self.entity_index
+        if index is None:
+            return []
+        return index.search(entity_text, entity_type=entity_type, limit=limit)
+
+    def list_top_entities(
+        self,
+        *,
+        entity_type: Optional[str] = None,
+        limit: int = 10,
+    ) -> List["EntityRecord"]:
+        index = self.entity_index
+        if index is None:
+            return []
+        return index.top_entities(entity_type=entity_type, limit=limit)
+
+    def _writer_for(self, memory_type: str) -> Optional["ChromaMemory"]:
+        """A4: pick the right backing store for a write by memory_type.
+
+        When tiered is on, routes to the tier-specific collection so new
+        writes accumulate where future reads expect them; falls back to
+        the legacy ``chroma_memory`` otherwise.
+        """
+        tiered = self.tiered_store
+        if tiered is not None:
+            target = tiered.store_for_type(memory_type)
+            if target is not None:
+                return target
+        return self.chroma_memory
+
     def search_related_history(
         self,
         query: str,
@@ -139,6 +216,22 @@ class MemoryManager:
         scope: Optional[Dict[str, Any]] = None,
         n_results: int = 3,
     ) -> List[Dict[str, Any]]:
+        # A4: prefer tiered search when enabled; TieredMemoryStore merges
+        # working/episodic/semantic by tier-weighted score and falls back
+        # to the legacy collection when the tiers are still empty.
+        tiered = self.tiered_store
+        if tiered is not None:
+            try:
+                return sanitize_value(
+                    tiered.search(
+                        query,
+                        scope=scope,
+                        n_results=n_results,
+                        include_global_fallback=True,
+                    )
+                )
+            except Exception:
+                pass  # fall through to legacy path
         if self.chroma_memory is None:
             return []
         return sanitize_value(
@@ -151,6 +244,50 @@ class MemoryManager:
             )
         )
 
+    def persist_inferred_preferences(
+        self,
+        candidates: List[Any],
+        *,
+        session_id: str = "",
+    ) -> List[str]:
+        """A5: write preference candidates above the confidence threshold.
+
+        Each candidate is a ``PreferenceCandidate`` (from
+        ``memory.preference_learner``). The record is marked
+        ``source=inferred`` so it can be distinguished from user-supplied
+        preferences and bulk-removed if the learner misbehaves.
+        """
+        if self.chroma_memory is None or not candidates:
+            return []
+        from config.settings import settings as _settings
+        threshold = float(_settings.PREFERENCE_LEARNING_MIN_CONFIDENCE)
+        scope = build_memory_scope(session_id=session_id)
+        writer = self._writer_for("preference") or self.chroma_memory
+        written: List[str] = []
+        for cand in candidates:
+            key = sanitize_text(str(getattr(cand, "key", "") or ""))
+            value = sanitize_text(str(getattr(cand, "value", "") or ""))
+            confidence = float(getattr(cand, "confidence", 0.0) or 0.0)
+            if not key or not value or confidence < threshold:
+                continue
+            evidence_ids = getattr(cand, "evidence_ids", None) or []
+            notes = sanitize_text(str(getattr(cand, "notes", "") or ""))
+            metadata = {
+                "source": "inferred",
+                "confidence": round(confidence, 4),
+                "evidence_ids": ",".join(str(x) for x in list(evidence_ids)[:10]),
+                "notes": notes,
+            }
+            memory_id = writer.save_user_preference(
+                key,
+                value,
+                scope=scope,
+                metadata=metadata,
+            )
+            if memory_id:
+                written.append(memory_id)
+        return written
+
     def persist_preferences(
         self,
         preferences: Dict[str, Any],
@@ -161,6 +298,7 @@ class MemoryManager:
             return []
 
         scope = build_memory_scope(session_id=session_id)
+        writer = self._writer_for("preference") or self.chroma_memory
         memory_ids: List[str] = []
         for key, value in (preferences or {}).items():
             cleaned_key = sanitize_text(key or "")
@@ -169,7 +307,7 @@ class MemoryManager:
             rendered_value = _json_text(value)
             if not rendered_value:
                 continue
-            memory_id = self.chroma_memory.save_user_preference(
+            memory_id = writer.save_user_preference(
                 cleaned_key,
                 rendered_value,
                 scope=scope,
@@ -223,11 +361,13 @@ class MemoryManager:
 
             # --- Entity extraction (best-effort) ---
             entity_metadata: Dict[str, Any] = {}
+            raw_entities: List[Dict[str, Any]] = []
             extractor = self.entity_extractor
             if extractor is not None:
                 try:
                     extraction = extractor.extract(f"{cleaned_input}\n{summary_text[:2000]}")
                     entities = extraction.get("entities") or []
+                    raw_entities = list(entities)[:20]
                     if entities:
                         # Store entity names grouped by type for metadata filtering
                         by_type: Dict[str, List[str]] = {}
@@ -252,7 +392,8 @@ class MemoryManager:
             }
             task_metadata.update(entity_metadata)
 
-            memory_id = self.chroma_memory.save_task_result(
+            task_writer = self._writer_for("task_result") or self.chroma_memory
+            memory_id = task_writer.save_task_result(
                 task_description=cleaned_input,
                 result=summary_text,
                 success=success,
@@ -265,6 +406,21 @@ class MemoryManager:
             if memory_id:
                 created["task_memories"].append(memory_id)
 
+            # A2: also record entities in the inverted index so we can do
+            # faceted retrieval later.
+            if raw_entities and memory_id:
+                index = self.entity_index
+                if index is not None:
+                    try:
+                        index.record_many(
+                            raw_entities,
+                            memory_id=memory_id,
+                            scope=normalized_scope,
+                        )
+                    except Exception:
+                        pass  # never block main write path
+
+        artifact_writer = self._writer_for("artifact_reference") or self.chroma_memory
         for artifact in artifact_refs[:5]:
             label = artifact.get("name") or artifact.get("path") or artifact.get("preview")
             if not label:
@@ -274,7 +430,7 @@ class MemoryManager:
             if location:
                 content += f"\nLocation: {location}"
             fingerprint = artifact.get("path") or artifact.get("artifact_id") or label
-            memory_id = self.chroma_memory.add_memory(
+            memory_id = artifact_writer.add_memory(
                 content=content,
                 metadata={
                     "artifact_id": artifact.get("artifact_id", ""),
@@ -291,5 +447,15 @@ class MemoryManager:
             )
             if memory_id:
                 created["artifact_memories"].append(memory_id)
+
+        # A5: opportunistic preference learning triggered after writes, gated
+        # by ``PREFERENCE_LEARNING_MIN_INTERVAL_HOURS`` so it runs at most
+        # once per configured window. Failures never propagate.
+        if created["task_memories"] or created["artifact_memories"]:
+            try:
+                from memory.preference_learner import maybe_run_learner
+                maybe_run_learner(self)
+            except Exception:
+                pass
 
         return created
