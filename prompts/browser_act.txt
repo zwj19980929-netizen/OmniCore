@@ -40,6 +40,12 @@ Controls:
 Elements:
 {elements}
 
+Available iframes (non-main frames on this page — select one with SWITCH_IFRAME if the target is inside):
+{available_frames}
+
+Available tabs (open pages in the same context; * marks the active one — switch with SWITCH_TAB, close old ones with CLOSE_TAB):
+{available_tabs}
+
 Last action: {last_action}
 Recent execution history:
 {recent_steps}
@@ -73,6 +79,8 @@ Decision rules (read ALL before deciding):
 - SCROLL value is pixels (e.g. "800").
 - SEARCH INPUT RULE: use the shortest effective query — typically just the core entity. BAD: "meta开源模型地址". GOOD: "meta".
 - If a task plan is provided above, advance the current plan step; set need_replan=true only when the current step is demonstrably infeasible.
+- If the target element is clearly inside a non-main iframe listed above, emit SWITCH_IFRAME with target_selector set to the iframe's name or an unambiguous CSS selector. After the switch the next step operates inside that frame; use EXIT_IFRAME to go back.
+- If a relevant tab (auth callback, OAuth popup, new window) appears above with a more useful URL, emit SWITCH_TAB with value set to the tab index, or "last". Use CLOSE_TAB to dispose of stale tabs.
 
 Return keys: thinking, goal_satisfied, action, confidence, need_replan, requires_human_confirm.
 The action object should contain:
@@ -87,4 +95,5 @@ The action object should contain:
 - keyboard_key
 - expected_page_type
 - expected_text
-Allowed action types: click, input, fill_form, press_key, scroll, wait, extract, done, navigate.
+Allowed action types: click, input, fill_form, press_key, scroll, wait, extract, done, navigate, switch_iframe, exit_iframe, switch_tab, close_tab.
+{site_hints}

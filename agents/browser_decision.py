@@ -194,6 +194,9 @@ class BrowserDecisionLayer:
                     self._step_fingerprints.popitem(last=False)
         except Exception:
             pass
+        # B1: record the selector in the site-knowledge store (no-op when
+        # BROWSER_PLAN_MEMORY_ENABLED=false, so existing runs pay no cost).
+        self._record_site_selector_from_action(action)
 
     def reset_history(self) -> None:
         self._action_history = []
@@ -246,6 +249,69 @@ class BrowserDecisionLayer:
         if not repeats:
             return "(none)"
         return "\n".join(f"- {sig}" for sig in repeats[-10:])
+
+    # ── B1: Site-knowledge hint injection ──────────────────────
+
+    def _build_site_hints_block(self, url: str) -> str:
+        """Return an optional ``## Site hints`` markdown block for LLM prompts.
+
+        Queries ``SiteKnowledgeStore`` for selectors this domain has
+        historically succeeded with, and formats them as a reference-only
+        hint. Empty string when the feature is disabled, no store is
+        available, or no qualifying hints exist.
+        """
+        if not settings.BROWSER_PLAN_MEMORY_ENABLED or not settings.BROWSER_SITE_HINTS_INJECT:
+            return ""
+        try:
+            from utils.site_knowledge_store import get_site_knowledge_store
+            store = get_site_knowledge_store()
+            if store is None:
+                return ""
+            hints = store.get_selector_hints(url or "")
+        except Exception:
+            return ""
+        if not hints:
+            return ""
+        lines = [
+            "",
+            "## Site hints (selectors that succeeded here before — reference only, LLM decides):",
+        ]
+        for h in hints:
+            rate_pct = int(round(h["success_rate"] * 100))
+            lines.append(
+                f"- [{h['role']}] {h['selector']}  (hits={h['hit_count']}, "
+                f"success={rate_pct}%)"
+            )
+        return "\n".join(lines) + "\n"
+
+    def _record_site_selector_from_action(self, action: Optional[BrowserAction]) -> None:
+        """B1: best-effort write-back of a successful action's selector.
+
+        Called from ``record_action``. Silently no-ops when the feature is
+        disabled, the action has no selector, or the store is unavailable.
+        Actions with ``FAILED`` type are skipped entirely.
+        """
+        if not settings.BROWSER_PLAN_MEMORY_ENABLED:
+            return
+        if action is None or action.action_type == ActionType.FAILED:
+            return
+        selector = (action.target_selector or action.target_ref or "").strip()
+        if not selector:
+            return
+        # Use the action type as the role bucket — consistent with how
+        # hints are queried by action context downstream.
+        role = (action.action_type.value or "").lower()
+        url, _ = self._current_url_and_stage()
+        if not url:
+            return
+        try:
+            from utils.site_knowledge_store import get_site_knowledge_store
+            store = get_site_knowledge_store()
+            if store is None:
+                return
+            store.record_selector_success(url, role, selector)
+        except Exception:
+            pass
 
     # ── Cycle detection ──────────────────────────────────────
 
@@ -687,6 +753,54 @@ class BrowserDecisionLayer:
                 parts.append(f"({', '.join(metrics)})")
             lines.append(" ".join(parts))
         return "\n".join(lines) if lines else "(no regions)"
+
+    def _format_available_frames_for_llm(self, snapshot: Dict[str, Any]) -> str:
+        """B4: render the list of child iframes so the LLM can SWITCH_IFRAME."""
+        if not settings.BROWSER_IFRAME_ENABLED:
+            return "(iframe tracking disabled)"
+        frames = snapshot.get("available_frames") or []
+        children = [
+            f for f in frames
+            if isinstance(f, dict) and not f.get("is_main") and not f.get("is_detached")
+        ]
+        if not children:
+            return "(no iframes)"
+        lines: List[str] = []
+        for f in children[:8]:
+            domain = str(f.get("domain", "") or "")
+            name = str(f.get("name", "") or "")
+            url = str(f.get("url", "") or "")
+            idx = f.get("index", "?")
+            label_parts = [f"#{idx}"]
+            if domain:
+                label_parts.append(f"domain={domain}")
+            if name:
+                label_parts.append(f'name="{name[:40]}"')
+            if url and not domain:
+                label_parts.append(f"url={url[:80]}")
+            lines.append(" ".join(label_parts))
+        return "\n".join(lines)
+
+    def _format_available_tabs_for_llm(self, snapshot: Dict[str, Any]) -> str:
+        """B4: render the list of open tabs so the LLM can SWITCH_TAB / CLOSE_TAB."""
+        if not settings.BROWSER_TAB_MANAGEMENT_ENABLED:
+            return "(tab tracking disabled)"
+        tabs = snapshot.get("available_tabs") or []
+        if not tabs:
+            return "(no tabs)"
+        if len(tabs) == 1:
+            return "(1 tab; no switch needed)"
+        lines: List[str] = []
+        for t in tabs[:8]:
+            if not isinstance(t, dict):
+                continue
+            active = "*" if t.get("is_active") else " "
+            idx = t.get("index", "?")
+            title = str(t.get("title", "") or "").strip()
+            url = str(t.get("url", "") or "")
+            label = title[:60] if title else url[:60]
+            lines.append(f"{active} #{idx} {label}")
+        return "\n".join(lines) if lines else "(no tabs)"
 
     def _format_collections_for_llm(self, snapshot: Optional[Dict[str, Any]], max_items: int = 4) -> str:
         lines: List[str] = []
@@ -2387,10 +2501,13 @@ class BrowserDecisionLayer:
                     elements=prompt_context.get("elements", "(no actionable elements)"),
                     headings=self._format_headings_for_llm(active_snapshot),
                     regions=self._format_regions_for_llm(active_snapshot),
+                    available_frames=self._format_available_frames_for_llm(active_snapshot),
+                    available_tabs=self._format_available_tabs_for_llm(active_snapshot),
                     vision_description=getattr(obs, 'vision_description', '') if obs else '',
                     task_specific_rules=_get_task_specific_rules(active_intent.intent_type),
                     stage_hint=_get_stage_hint(page_state.stage),
                     reflection=self._pending_reflection,
+                    site_hints=self._build_site_hints_block(resolved_url),
                 )},
             ]
             web_debug_recorder.write_json("browser_action_decision_budget", prompt_budget)
@@ -2650,6 +2767,8 @@ class BrowserDecisionLayer:
                 snapshot_version=getattr(obs, "snapshot_version", ""),
                 headings=self._format_headings_for_llm(active_snapshot),
                 regions=self._format_regions_for_llm(active_snapshot),
+                available_frames=self._format_available_frames_for_llm(active_snapshot),
+                available_tabs=self._format_available_tabs_for_llm(active_snapshot),
                 main_text=main_text[:settings.MAIN_TEXT_LIMIT_DETAIL] if main_text else "(none)",
                 visible_text_blocks=text_blocks_str,
                 vision_description=getattr(obs, "vision_description", "") or "(not available)",
@@ -2665,6 +2784,7 @@ class BrowserDecisionLayer:
                 task_specific_rules=_get_task_specific_rules(active_intent.intent_type),
                 stage_hint=_get_stage_hint(page_stage),
                 reflection=self._pending_reflection,
+                site_hints=self._build_site_hints_block(current_url or ""),
             )
             web_debug_recorder.write_text("browser_act_prompt", prompt)
             llm = self._get_llm()

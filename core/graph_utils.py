@@ -300,10 +300,10 @@ def derive_authoritative_target_url(state: OmniCoreState) -> str:
 def repair_replan_task_params(
     tasks: List[Dict[str, Any]],
     target_url: str,
+    user_request: str = "",
 ) -> List[Dict[str, Any]]:
     target_url = sanitize_extracted_url(target_url)
-    if not target_url:
-        return tasks
+    user_request = str(user_request or "").strip()
 
     repaired = []
     for raw_task in tasks or []:
@@ -314,15 +314,24 @@ def repair_replan_task_params(
 
         tool_name = str(task_data.get("tool_name", "") or "").strip()
         task_type = str(task_data.get("task_type", "") or "").strip()
-        if (
-            (tool_name == "browser.interact" or task_type == "browser_agent")
-            and not str(params.get("start_url", "") or "").strip()
-        ):
+        is_browser_task = tool_name == "browser.interact" or task_type == "browser_agent"
+
+        if is_browser_task:
             params = dict(params)
-            params["start_url"] = target_url
+            if target_url and not str(params.get("start_url", "") or "").strip():
+                params["start_url"] = target_url
+            # Ensure the browser agent sees the original user goal rather than
+            # the replanner's rationale text, so intent inference / search
+            # bootstrap can pick up a meaningful query.
+            if user_request:
+                current_task_param = str(params.get("task", "") or "").strip()
+                description = str(task_data.get("description", "") or "").strip()
+                if not current_task_param or current_task_param == description:
+                    params["task"] = user_request
             task_data["params"] = params
         elif (
             tool_name in {"web.fetch_and_extract", "web.smart_extract"}
+            and target_url
             and not str(params.get("url", "") or "").strip()
         ):
             params = dict(params)

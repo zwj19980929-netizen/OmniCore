@@ -1830,6 +1830,22 @@ class WebWorker:
         ranked, _ = self._rerank_search_results(query, query, filtered, max_results=max_results)
         return ranked
 
+    def _record_anti_bot_block(self, url: str, *, kind: str = "unknown") -> None:
+        """B2: feed a block event into the anti-bot profile store.
+
+        Safe to call from hot paths: silently no-ops when the feature flag
+        is off or the store initialization fails. Block kinds map to the
+        enum in ``utils.anti_bot_profile.BLOCK_KINDS``.
+        """
+        try:
+            from utils.anti_bot_profile import get_anti_bot_profile_store
+            store = get_anti_bot_profile_store()
+            if store is None:
+                return
+            store.record_block(url or "", kind=kind)
+        except Exception:
+            pass
+
     def _looks_like_search_blocked_page(self, url: str, title: str = "", body_text: str = "") -> bool:
         normalized_url = str(url or "").lower()
         normalized_title = str(title or "").lower()
@@ -1913,6 +1929,9 @@ class WebWorker:
                 if snapshot:
                     last_snapshot = snapshot
                 if self._looks_like_search_blocked_page(current_url, title, body_text):
+                    # B2: record the block event in the anti-bot profile so
+                    # future requests to this domain throttle adaptively.
+                    self._record_anti_bot_block(current_url, kind="captcha")
                     # 尝试绕过反机器人验证
                     bypass_r = await tk.bypass_robot_challenge(max_retries=2)
                     if bypass_r.success:
@@ -3460,6 +3479,8 @@ class WebWorker:
                         # 优先使用 anti-robot bypass 处理各类验证挑战
                         robot_r = await tk.detect_robot_challenge()
                         if robot_r.success and robot_r.data and robot_r.data.get("has_challenge"):
+                            # B2: feed the block event into the anti-bot profile
+                            self._record_anti_bot_block(next_url, kind="captcha")
                             bypass_r = await tk.bypass_robot_challenge(max_retries=3)
                             if bypass_r.success:
                                 await tk.human_delay(250, 3000)
@@ -3639,6 +3660,8 @@ class WebWorker:
                 )
                 if robot_r.success and robot_r.data and robot_r.data.get("has_challenge"):
                     log_agent_action(self.name, f"检测到反机器人挑战: {robot_r.data.get('challenge_type')}")
+                    # B2: feed the block event into the anti-bot profile
+                    self._record_anti_bot_block(url, kind="captcha")
                     bypass_r = await tk.bypass_robot_challenge(max_retries=3)
                     web_debug_recorder.write_json(
                         "anti_robot_bypass",

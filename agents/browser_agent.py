@@ -400,6 +400,13 @@ class BrowserAgent:
         self._snapshot_version: int = 0
         self._last_snapshot_hash: str = ""
         self._last_observation: Optional[PageObservation] = None
+        # B6: per-run shared assessment cache, keyed by page_hash. Current
+        # observation pipeline reuses ``_last_observation`` within a single
+        # strategy; this cache is available to strategies that need to
+        # share results across the fall-through chain (e.g. LoginReplay
+        # → Legacy hand-off on the same page).
+        from agents.page_assessment_cache import PageAssessmentCache
+        self._assessment_cache = PageAssessmentCache(max_entries=16)
 
         # Build or accept toolkit
         if toolkit:
@@ -2189,6 +2196,31 @@ class BrowserAgent:
         """
         tk = self.toolkit
 
+        # B2: consult anti-bot profile for the target domain *before* launching
+        # the browser. Applying a hint here lets us (a) flip headless→headed
+        # (which keys the BrowserRuntimePool to a separate browser) and (b)
+        # seed a UA override for new_context. Fully gated by ANTI_BOT_PROFILE_ENABLED.
+        if settings.ANTI_BOT_PROFILE_ENABLED:
+            try:
+                from utils.anti_bot_profile import get_anti_bot_profile_store
+                store = get_anti_bot_profile_store()
+                if store is not None and expected_url:
+                    hint = store.suggest_throttle(expected_url)
+                    if hint and hint.headed and self.toolkit.headless:
+                        self.toolkit.headless = False
+                        log_agent_action(
+                            self.name,
+                            "anti-bot",
+                            f"headed mode for {expected_url[:60]} (blocks={hint.block_rate:.2f})",
+                        )
+                    self.toolkit.apply_throttle_hint(hint)
+                    if hint and (hint.delay_sec > 0 or hint.ua or hint.headed):
+                        web_debug_recorder.record_event(
+                            "browser_anti_bot_hint", **hint.as_dict()
+                        )
+            except Exception as hint_err:
+                log_warning(f"anti-bot hint lookup skipped: {hint_err}")
+
         r = await tk.create_page()
         if not r.success:
             web_debug_recorder.record_event("browser_create_page_failed", error=r.error)
@@ -2266,14 +2298,21 @@ class BrowserAgent:
 
         task_intent = await self._infer_task_intent(task)
         task_intent = self._coerce_intent_for_direct_page(task, task_intent, expected_url)
-        if (
-            task_intent.intent_type == "search"
-            and not self._extract_url_from_task(task)
+        landed_blank = (not current_url) or current_url.strip().lower() in {"about:blank", "chrome://newtab/"}
+        should_bootstrap_search = (
+            not self._extract_url_from_task(task)
             and not expected_url
-        ):
-            await self._bootstrap_search_results(task_intent.query or self._derive_primary_query(task))
-            current_url_r = await tk.get_current_url()
-            current_url = current_url_r.data or ""
+            and (
+                task_intent.intent_type == "search"
+                or (landed_blank and task_intent.intent_type in {"read", "navigate", "unknown"})
+            )
+        )
+        if should_bootstrap_search:
+            query = task_intent.query or self._derive_primary_query(task)
+            if query:
+                await self._bootstrap_search_results(query)
+                current_url_r = await tk.get_current_url()
+                current_url = current_url_r.data or ""
 
         initial_data = await self._extract_data_for_intent(task_intent)
         if self._is_read_only_task(task, task_intent):
@@ -3152,6 +3191,163 @@ class BrowserAgent:
             "_page_screenshot": _final_screenshot,
         }
 
+    async def get_or_compute_assessment(self, page_hash: str, compute_fn):
+        """Strategy-facing passthrough to the per-run PageAssessmentCache (B6).
+
+        Strategies that want to share an expensive observation result
+        across the fall-through chain call this instead of the underlying
+        compute function directly. Empty ``page_hash`` bypasses the cache.
+        """
+        return await self._assessment_cache.get_or_compute(page_hash, compute_fn)
+
+    async def _run_per_step_loop(
+        self,
+        task: str,
+        task_intent,
+        expected_url: str,
+        steps: List[Dict[str, Any]],
+        max_steps: int,
+    ) -> Dict[str, Any]:
+        """Original per-step loop body extracted from ``run()`` (B6).
+
+        Returns the terminal result dict ready to be returned by ``run``.
+        Mutates ``steps`` in-place.
+        """
+        accumulated_data: List[Dict[str, str]] = []
+        seen_keys: set = set()
+        last_action: Optional[BrowserAction] = None
+        prefetched: Dict[str, Any] = {"elements": None, "snapshot": None}
+        from utils.image_diff import VisualProgressTracker
+        visual_tracker = VisualProgressTracker(window_size=settings.VISION_PROGRESS_WINDOW)
+
+        _plan_stuck_counter: Dict[int, int] = {}
+        for step_no in range(1, max_steps + 1):
+            step_result = await self._execute_step(
+                step_no, task, task_intent, expected_url, steps,
+                accumulated_data, seen_keys, prefetched, visual_tracker, last_action,
+            )
+            if step_result["status"] == "exit":
+                return step_result["result"]
+            last_action = step_result.get("last_action", last_action)
+
+            plan = getattr(self.decision, "_task_plan", None)
+            if plan is not None and settings.BROWSER_PLAN_ENABLED:
+                try:
+                    cur_step = plan.current_step()
+                    if cur_step is None:
+                        pass
+                    else:
+                        from agents.browser_task_plan import step_advance, replan
+                        last_step_record = steps[-1] if steps else {}
+                        obs_summary = json.dumps({
+                            "url": last_step_record.get("url", ""),
+                            "title": last_step_record.get("title", ""),
+                            "result": last_step_record.get("result", ""),
+                            "failure_reason": last_step_record.get("failure_reason", ""),
+                            "data_count": len(accumulated_data),
+                            "last_action": last_step_record.get("action_type", ""),
+                        }, ensure_ascii=False)
+                        decision = await step_advance(plan, obs_summary, self._get_llm())
+                        if decision.advance:
+                            plan.advance()
+                            _plan_stuck_counter[cur_step.index] = 0
+                            log_agent_action(self.name, f"plan step {cur_step.index} 完成", decision.reason[:60])
+                        elif decision.skip:
+                            plan.skip_current()
+                            log_agent_action(self.name, f"plan step {cur_step.index} 跳过", decision.reason[:60])
+                        else:
+                            _plan_stuck_counter[cur_step.index] = _plan_stuck_counter.get(cur_step.index, 0) + 1
+                            stuck_thresh = max(1, settings.BROWSER_STEP_STUCK_THRESHOLD)
+                            if decision.need_replan or _plan_stuck_counter[cur_step.index] >= stuck_thresh:
+                                replanned = await replan(
+                                    plan,
+                                    decision.reason or f"step {cur_step.index} stuck",
+                                    self._get_llm(),
+                                )
+                                if replanned:
+                                    _plan_stuck_counter.clear()
+                                    web_debug_recorder.write_json(
+                                        f"browser_task_plan_revision_{plan.revisions}",
+                                        plan.to_debug_payload(),
+                                    )
+                                    log_agent_action(self.name, f"plan replanned (#{plan.revisions})", decision.reason[:60])
+                except Exception as _plan_hook_err:
+                    log_warning(f"task plan hook failed: {_plan_hook_err}")
+
+        return await self._build_final_result(
+            task, task_intent, expected_url, steps, accumulated_data, seen_keys,
+        )
+
+    async def _run_with_strategies(
+        self,
+        task: str,
+        task_intent,
+        expected_url: str,
+        steps: List[Dict[str, Any]],
+        max_steps: int,
+    ) -> Dict[str, Any]:
+        """Strategy-driven orchestrator (B6).
+
+        Walks the StrategyPicker chain, stopping at the first strategy
+        that returns a non-None result. Falls back to the legacy loop
+        via the terminal ``LegacyPerStepStrategy`` injected by the picker.
+        """
+        from agents.browser_strategies import StrategyContext, StrategyPicker
+
+        ctx = StrategyContext(
+            task=task,
+            task_intent=task_intent,
+            expected_url=expected_url,
+            steps=steps,
+            max_steps=max_steps,
+        )
+        chain = StrategyPicker().build_chain(self, ctx)
+        last_result: Optional[Dict[str, Any]] = None
+        final_strategy = None
+        for strategy in chain:
+            try:
+                outcome = await strategy.execute(self, ctx)
+            except Exception as exc:
+                log_warning(f"strategy {strategy.name} raised: {exc}")
+                await strategy.on_failure(self, ctx, f"exception: {exc}")
+                continue
+            if outcome is None:
+                await strategy.on_failure(self, ctx, "yielded (None)")
+                continue
+            last_result = outcome
+            final_strategy = strategy
+            break
+
+        if last_result is None:
+            last_result = {
+                "success": False,
+                "message": "no strategy produced a result",
+                "url": "", "expected_url": expected_url,
+                "steps": steps, "data": [],
+            }
+        else:
+            # B1 tail hook: persist a reusable action template when the run
+            # succeeded AND the task intent is one we can meaningfully replay.
+            try:
+                from utils.browser_template_recorder import record_template_from_run
+                record_template_from_run(
+                    task_intent=task_intent,
+                    steps=steps,
+                    final_url=str(last_result.get("url") or expected_url or ""),
+                    success=bool(last_result.get("success")),
+                )
+            except Exception as _tpl_err:
+                log_warning(f"template tail hook failed: {_tpl_err}")
+
+        if final_strategy is not None:
+            try:
+                await final_strategy.on_success(self, ctx, last_result)
+            except Exception as _hook_err:
+                log_warning(f"strategy {final_strategy.name} on_success raised: {_hook_err}")
+        last_result["_strategy"] = getattr(final_strategy, "name", "none")
+        last_result["_strategy_chain"] = list(ctx.attempted)
+        return last_result
+
     async def run(self, task: str, start_url: Optional[str] = None, max_steps: int = 8) -> Dict[str, Any]:
         # Reset per-run vision budget
         self._vision_budget = VisionBudget(
@@ -3159,7 +3355,16 @@ class BrowserAgent:
             max_total_tokens=settings.VISION_MAX_TOKENS_PER_RUN,
             cooldown_seconds=settings.VISION_COOLDOWN_SECONDS,
         )
+        # Reset per-run assessment cache (B6).
+        self._assessment_cache.clear()
         tk = self.toolkit
+        # Surface the task description to the perception layer so the
+        # vision-cache (B3) can decide whether to bypass for sensitive flows.
+        if hasattr(self, "perception") and self.perception is not None:
+            try:
+                self.perception.current_task = task or ""
+            except Exception:
+                pass
         expected_url = start_url or self._extract_url_from_task(task) or ""
         steps: List[Dict[str, Any]] = []
         trace = web_debug_recorder.start_trace(
@@ -3200,6 +3405,14 @@ class BrowserAgent:
                         log_agent_action(self.name, "任务级 Plan 已生成", f"{len(_plan.steps)} steps")
                 except Exception as _plan_err:
                     log_warning(f"task plan initialization skipped: {_plan_err}")
+
+            # B6: strategy-driven orchestration (default-off flag)
+            if settings.BROWSER_STRATEGY_REFACTOR_ENABLED:
+                log_agent_action(self.name, "strategy refactor enabled", "StrategyPicker")
+                return await self._run_with_strategies(
+                    task, task_intent, expected_url, steps, max_steps,
+                )
+
             # P4: batch execution mode — one LLM call to plan, execute all, then verify
             if settings.BROWSER_BATCH_EXECUTE_ENABLED:
                 log_agent_action(self.name, "batch mode enabled", "一次规划批量执行")
@@ -3210,69 +3423,9 @@ class BrowserAgent:
                     return batch_result
                 log_warning("batch mode returned None, falling back to step-by-step mode")
 
-            accumulated_data: List[Dict[str, str]] = []
-            seen_keys: set = set()
-            last_action: Optional[BrowserAction] = None
-            prefetched: Dict[str, Any] = {"elements": None, "snapshot": None}
-            from utils.image_diff import VisualProgressTracker
-            visual_tracker = VisualProgressTracker(window_size=settings.VISION_PROGRESS_WINDOW)
-
-            _plan_stuck_counter: Dict[int, int] = {}
-            for step_no in range(1, max_steps + 1):
-                step_result = await self._execute_step(
-                    step_no, task, task_intent, expected_url, steps,
-                    accumulated_data, seen_keys, prefetched, visual_tracker, last_action,
-                )
-                if step_result["status"] == "exit":
-                    return step_result["result"]
-                last_action = step_result.get("last_action", last_action)
-
-                # P1: advance or replan the task plan based on the latest observation.
-                plan = getattr(self.decision, "_task_plan", None)
-                if plan is not None and settings.BROWSER_PLAN_ENABLED:
-                    try:
-                        cur_step = plan.current_step()
-                        if cur_step is None:
-                            pass
-                        else:
-                            from agents.browser_task_plan import step_advance, replan
-                            last_step_record = steps[-1] if steps else {}
-                            obs_summary = json.dumps({
-                                "url": last_step_record.get("url", ""),
-                                "title": last_step_record.get("title", ""),
-                                "result": last_step_record.get("result", ""),
-                                "failure_reason": last_step_record.get("failure_reason", ""),
-                                "data_count": len(accumulated_data),
-                                "last_action": last_step_record.get("action_type", ""),
-                            }, ensure_ascii=False)
-                            decision = await step_advance(plan, obs_summary, self._get_llm())
-                            if decision.advance:
-                                plan.advance()
-                                _plan_stuck_counter[cur_step.index] = 0
-                                log_agent_action(self.name, f"plan step {cur_step.index} 完成", decision.reason[:60])
-                            elif decision.skip:
-                                plan.skip_current()
-                                log_agent_action(self.name, f"plan step {cur_step.index} 跳过", decision.reason[:60])
-                            else:
-                                _plan_stuck_counter[cur_step.index] = _plan_stuck_counter.get(cur_step.index, 0) + 1
-                                stuck_thresh = max(1, settings.BROWSER_STEP_STUCK_THRESHOLD)
-                                if decision.need_replan or _plan_stuck_counter[cur_step.index] >= stuck_thresh:
-                                    replanned = await replan(
-                                        plan,
-                                        decision.reason or f"step {cur_step.index} stuck",
-                                        self._get_llm(),
-                                    )
-                                    if replanned:
-                                        _plan_stuck_counter.clear()
-                                        web_debug_recorder.write_json(
-                                            f"browser_task_plan_revision_{plan.revisions}",
-                                            plan.to_debug_payload(),
-                                        )
-                                        log_agent_action(self.name, f"plan replanned (#{plan.revisions})", decision.reason[:60])
-                    except Exception as _plan_hook_err:
-                        log_warning(f"task plan hook failed: {_plan_hook_err}")
-
-            return await self._build_final_result(task, task_intent, expected_url, steps, accumulated_data, seen_keys)
+            return await self._run_per_step_loop(
+                task, task_intent, expected_url, steps, max_steps,
+            )
         except Exception as exc:
             log_error(f"browser task failed: {exc}")
             url_r = await tk.get_current_url()

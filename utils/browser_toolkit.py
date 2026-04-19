@@ -7,6 +7,7 @@ import asyncio
 import random
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Tuple
+from urllib.parse import urlparse
 
 from playwright.async_api import (
     Browser,
@@ -67,6 +68,13 @@ class BrowserToolkit:
         self._captcha_solver = None  # lazy
         self._anti_robot = None  # lazy
         self._semantic_ref_map: Dict[str, Dict[str, Any]] = {}
+
+        # B2 anti-bot throttle hooks — populated via apply_throttle_hint()
+        # before launch / goto. All optional; no effect unless the hint is
+        # applied by an upstream layer.
+        self._ua_override: str = ""
+        self._pending_delay_sec: float = 0.0
+        self._response_listener_installed: bool = False
 
     # ── context manager support ──────────────────────────────
 
@@ -145,6 +153,11 @@ class BrowserToolkit:
                 return r
 
             import os
+            default_ua = (
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) "
+                "Chrome/122.0.0.0 Safari/537.36"
+            )
             context_kwargs = {
                 "viewport": {"width": 1366, "height": 768},
                 "screen": {"width": 1366, "height": 768},
@@ -155,11 +168,7 @@ class BrowserToolkit:
                 "timezone_id": "Asia/Shanghai",
                 "color_scheme": "light",
                 "reduced_motion": "no-preference",
-                "user_agent": (
-                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                    "AppleWebKit/537.36 (KHTML, like Gecko) "
-                    "Chrome/122.0.0.0 Safari/537.36"
-                ),
+                "user_agent": (self._ua_override or default_ua),
                 "extra_http_headers": {
                     "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
                     "Upgrade-Insecure-Requests": "1",
@@ -388,6 +397,7 @@ class BrowserToolkit:
 
             self._current_frame = None
             self._in_iframe = False
+            self._install_response_listener(self._page)
             return ToolkitResult(success=True, data=self._page)
         except Exception as e:
             cleanup_result = await self.close()
@@ -455,6 +465,111 @@ class BrowserToolkit:
         import os
         return os.path.join(self.user_data_dir, "storage_state.json")
 
+    # ── B2 throttle hooks ────────────────────────────────────
+
+    def apply_throttle_hint(self, hint: Any) -> None:
+        """Apply a ThrottleHint (from AntiBotProfileStore.suggest_throttle) to
+        the toolkit. Must be called before ``create_page()`` / ``goto()`` to
+        take effect on the upcoming request. No-op when hint is falsy.
+        """
+        if not hint:
+            return
+        try:
+            ua = str(getattr(hint, "ua", "") or "").strip()
+            delay = float(getattr(hint, "delay_sec", 0) or 0)
+        except (TypeError, ValueError):
+            return
+        if ua:
+            self._ua_override = ua
+        if delay > 0:
+            # keep the larger of any pending delay (e.g. two hints stacking)
+            self._pending_delay_sec = max(self._pending_delay_sec, delay)
+
+    def _install_response_listener(self, page: Optional[Page]) -> None:
+        """Attach a Playwright response listener that records HTTP 429/503 on
+        the main document as anti-bot blocks. Silent no-op when profile
+        tracking is disabled."""
+        if page is None:
+            return
+        if not getattr(settings, "ANTI_BOT_PROFILE_ENABLED", False):
+            return
+
+        def _on_response(response):  # sync callback
+            try:
+                status = response.status
+                if status not in (429, 503):
+                    return
+                req = getattr(response, "request", None)
+                if req is not None and getattr(req, "resource_type", "") != "document":
+                    return
+                url = response.url or ""
+                kind = "rate_limit" if status == 429 else "service_unavailable"
+                from utils.anti_bot_profile import get_anti_bot_profile_store
+                store = get_anti_bot_profile_store()
+                if store is not None:
+                    store.record_block(url, kind=kind)
+            except Exception:
+                pass
+
+        try:
+            page.on("response", _on_response)
+            self._response_listener_installed = True
+        except Exception:
+            pass
+
+    async def _apply_pending_delay(self) -> None:
+        """Honor any pending pre-goto delay, then clear it."""
+        delay = self._pending_delay_sec
+        if delay and delay > 0:
+            self._pending_delay_sec = 0.0
+            try:
+                await asyncio.sleep(min(delay, 30.0))
+            except Exception:
+                pass
+
+    def _record_nav_outcome(self, url: str, success: bool) -> None:
+        """Forward a navigation outcome to the anti-bot profile store.
+
+        Only positive (success=True) signals are recorded here — blocks are
+        captured by the response listener or by higher-level detectors in
+        web_worker / browser_agent.
+        """
+        if not getattr(settings, "ANTI_BOT_PROFILE_ENABLED", False):
+            return
+        if not success:
+            return
+        try:
+            from utils.anti_bot_profile import get_anti_bot_profile_store
+            store = get_anti_bot_profile_store()
+            if store is not None:
+                store.record_request(url, success=True)
+        except Exception:
+            pass
+
+    async def _enforce_tab_cap(self) -> None:
+        """Close the oldest non-active tab if context exceeds BROWSER_MAX_TAB_COUNT."""
+        cap = int(getattr(settings, "BROWSER_MAX_TAB_COUNT", 10) or 0)
+        if cap <= 0:
+            return
+        if not self._context:
+            return
+        try:
+            pages = [p for p in self._context.pages if not p.is_closed()]
+        except Exception:
+            return
+        if len(pages) <= cap:
+            return
+        # Preserve current active page; close the oldest other
+        for candidate in pages:
+            if candidate is self._page:
+                continue
+            try:
+                await candidate.close()
+            except Exception:
+                pass
+            # one-at-a-time; next call will continue trimming if still over cap
+            break
+
     @property
     def page(self) -> Optional[Page]:
         return self._page
@@ -476,8 +591,12 @@ class BrowserToolkit:
         try:
             timeout_ms = timeout if timeout is not None else settings.BROWSER_NAVIGATION_TIMEOUT
             self._semantic_ref_map.clear()  # 导航会切换页面，旧 ref 失效
+            await self._apply_pending_delay()
             await self._page.goto(url, wait_until=wait_until, timeout=self._timeout(timeout_ms))
-            return ToolkitResult(success=True, data=self._page.url)
+            final_url = self._page.url
+            self._record_nav_outcome(final_url, success=True)
+            await self._enforce_tab_cap()
+            return ToolkitResult(success=True, data=final_url)
         except Exception as e:
             return ToolkitResult(success=False, error=str(e))
 
@@ -957,6 +1076,67 @@ class BrowserToolkit:
         except Exception as e:
             return ToolkitResult(success=False, error=str(e))
 
+    async def list_frames(self, include_main: bool = True) -> ToolkitResult:
+        """List all frames (optionally including main) with role metadata.
+
+        Returns ``[{index, url, name, is_main, is_detached, domain}]``.
+        Index is stable within the current snapshot and can be passed back
+        in as ``{frame_index: N}`` by the decision layer if we later extend
+        the SWITCH_IFRAME action.
+        """
+        try:
+            page = self._page
+            if page is None:
+                return ToolkitResult(success=True, data=[])
+            out: List[Dict[str, Any]] = []
+            for idx, frame in enumerate(page.frames):
+                is_main = frame == page.main_frame
+                if is_main and not include_main:
+                    continue
+                try:
+                    host = urlparse(frame.url or "").hostname or ""
+                except Exception:
+                    host = ""
+                out.append({
+                    "index": idx,
+                    "url": frame.url or "",
+                    "name": frame.name or "",
+                    "is_main": bool(is_main),
+                    "is_detached": bool(frame.is_detached()),
+                    "domain": host.lower(),
+                })
+            return ToolkitResult(success=True, data=out)
+        except Exception as e:
+            return ToolkitResult(success=False, error=str(e))
+
+    async def list_tabs(self) -> ToolkitResult:
+        """List open pages (tabs) in the current context.
+
+        Returns ``[{index, url, title, is_active, is_closed}]``.
+        Cross-origin title access may fail silently and leaves ``title`` empty.
+        """
+        try:
+            if not self._context:
+                return ToolkitResult(success=True, data=[])
+            out: List[Dict[str, Any]] = []
+            for idx, tab in enumerate(self._context.pages):
+                if tab.is_closed():
+                    continue
+                try:
+                    title = await asyncio.wait_for(tab.title(), timeout=0.8)
+                except Exception:
+                    title = ""
+                out.append({
+                    "index": idx,
+                    "url": tab.url or "",
+                    "title": (title or "")[:120],
+                    "is_active": tab is self._page,
+                    "is_closed": False,
+                })
+            return ToolkitResult(success=True, data=out)
+        except Exception as e:
+            return ToolkitResult(success=False, error=str(e))
+
     async def exit_iframe(self) -> ToolkitResult:
         self._current_frame = None
         self._in_iframe = False
@@ -978,6 +1158,7 @@ class BrowserToolkit:
             self._page = target
             self._current_frame = None
             self._in_iframe = False
+            self._install_response_listener(self._page)
             await self._page.bring_to_front()
             return ToolkitResult(success=True)
         except Exception as e:
@@ -995,6 +1176,7 @@ class BrowserToolkit:
                 self._page = candidates[-1]
                 self._current_frame = None
                 self._in_iframe = False
+                self._install_response_listener(self._page)
                 await self._page.bring_to_front()
                 return ToolkitResult(success=True)
             self._page = None
@@ -1010,8 +1192,12 @@ class BrowserToolkit:
             self._page = page
             self._current_frame = None
             self._in_iframe = False
+            self._install_response_listener(self._page)
             if url:
+                await self._apply_pending_delay()
                 await page.goto(url, wait_until="domcontentloaded", timeout=self._timeout(30000))
+                self._record_nav_outcome(page.url, success=True)
+            await self._enforce_tab_cap()
             return ToolkitResult(success=True, data=page)
         except Exception as e:
             return ToolkitResult(success=False, error=str(e))

@@ -13,11 +13,13 @@ Responsibilities:
 import asyncio
 import hashlib
 import json
+import time
 from typing import Any, Dict, List, Optional, Tuple
 
 from config.settings import settings
 from utils.browser_toolkit import BrowserToolkit, ToolkitResult
 from utils.logger import log_agent_action, log_error, log_warning
+from utils.site_knowledge_store import normalize_domain
 from utils.search_engine_profiles import (
     build_direct_search_urls,
     decode_search_redirect_url,
@@ -95,6 +97,233 @@ class BrowserExecutionLayer:
                 return element
         return None
 
+    # ── B1/B5 strategy-stats + site-hints helpers ────────────
+
+    @staticmethod
+    def _canonical_strategy_name(name: str) -> str:
+        """Collapse dynamic strategy labels (e.g. "role:button:Submit") to a
+        stable key ("role") used as the bucket for B5 success-rate stats."""
+        base = (name or "").split(":", 1)[0]
+        return base or name or ""
+
+    async def _current_domain(self) -> str:
+        """Resolve the registered domain of the current page, or empty."""
+        try:
+            r = await self._call_toolkit("get_current_url")
+        except Exception:
+            return ""
+        if not r.success:
+            return ""
+        return normalize_domain(str(r.data or ""))
+
+    def _load_site_hint_selectors(self, role: str, domain: str) -> List[str]:
+        """Return selectors proven to work on this (domain, role) — empty
+        when the feature is off or the store has nothing."""
+        if (
+            not domain
+            or not settings.BROWSER_PLAN_MEMORY_ENABLED
+            or not settings.BROWSER_SITE_HINTS_EXEC_INJECT
+        ):
+            return []
+        try:
+            from utils.site_knowledge_store import get_site_knowledge_store
+            store = get_site_knowledge_store()
+            if store is None:
+                return []
+            hints = store.get_selector_hints(domain, role=role)
+        except Exception:
+            return []
+        out: List[str] = []
+        for h in hints:
+            sel = str(h.get("selector") or "").strip()
+            if sel:
+                out.append(sel)
+        return out
+
+    def _reorder_strategies(
+        self,
+        strategies: List[Tuple[str, Any]],
+        domain: str,
+        role: str,
+    ) -> List[Tuple[str, Any]]:
+        """B5: apply ranked/skip hints from strategy_stats.
+
+        - ``site_hint`` entries are always pinned to the front (site-specific
+          evidence outranks generic ranking).
+        - Entries whose canonical name is in ``skip_strategies`` are dropped.
+        - Remaining entries whose canonical name is in ``ranked_strategies``
+          are promoted (in ranked order); others keep their original order.
+        """
+        if not settings.BROWSER_STRATEGY_LEARNING_ENABLED or not domain:
+            return strategies
+        try:
+            from utils.strategy_stats import get_strategy_stats_store
+            store = get_strategy_stats_store()
+            if store is None:
+                return strategies
+            ranked = store.ranked_strategies(domain, role)
+            skip = store.skip_strategies(domain, role)
+        except Exception:
+            return strategies
+        if not ranked and not skip:
+            return strategies
+        ranked_pos = {name: i for i, name in enumerate(ranked)}
+
+        pinned: List[Tuple[str, Any]] = []
+        ranked_bucket: List[Tuple[int, Tuple[str, Any]]] = []
+        rest: List[Tuple[str, Any]] = []
+        for s in strategies:
+            canonical = self._canonical_strategy_name(s[0])
+            if canonical == "site_hint":
+                pinned.append(s)
+                continue
+            if canonical in skip:
+                continue
+            if canonical in ranked_pos:
+                ranked_bucket.append((ranked_pos[canonical], s))
+            else:
+                rest.append(s)
+        ranked_bucket.sort(key=lambda t: t[0])
+        return pinned + [s for _, s in ranked_bucket] + rest
+
+    def _record_strategy_outcome(
+        self, domain: str, role: str, canonical: str, success: bool, latency_ms: int
+    ) -> None:
+        if not domain or not settings.BROWSER_STRATEGY_LEARNING_ENABLED:
+            return
+        try:
+            from utils.strategy_stats import get_strategy_stats_store
+            store = get_strategy_stats_store()
+            if store is None:
+                return
+            store.record(domain, role, canonical, success=success, latency_ms=latency_ms)
+        except Exception:
+            pass
+
+    def _record_site_hint_outcome(
+        self, domain: str, role: str, selector: str, success: bool
+    ) -> None:
+        if not domain or not selector or not settings.BROWSER_PLAN_MEMORY_ENABLED:
+            return
+        try:
+            from utils.site_knowledge_store import get_site_knowledge_store
+            store = get_site_knowledge_store()
+            if store is None:
+                return
+            if success:
+                store.record_selector_success(domain, role, selector)
+            else:
+                store.record_selector_failure(domain, role, selector)
+        except Exception:
+            pass
+
+    # ── B4 iframe auto-scan ──────────────────────────────────
+
+    async def _iframe_auto_scan_click(
+        self, selector: str, action: Optional[BrowserAction]
+    ) -> bool:
+        """Try the click selector inside each non-main iframe, in order.
+
+        Leaves the toolkit switched into the frame on success; restores main
+        frame when none of them match. No-op unless
+        ``BROWSER_IFRAME_AUTO_SCAN_ON_STUCK`` is enabled and a selector is
+        present (text/role-only clicks would need richer heuristics).
+        """
+        if not settings.BROWSER_IFRAME_AUTO_SCAN_ON_STUCK or not selector:
+            return False
+        tk = self.toolkit
+        if getattr(tk, "_in_iframe", False):
+            # already inside an iframe; auto-scan only kicks in from main frame
+            return False
+        try:
+            frames_r = await self._call_toolkit("list_frames", include_main=False)
+        except Exception:
+            return False
+        if not frames_r.success or not isinstance(frames_r.data, list):
+            return False
+        children = [
+            f for f in frames_r.data
+            if isinstance(f, dict) and not f.get("is_main") and not f.get("is_detached")
+        ]
+        if not children:
+            return False
+        for frame in children:
+            name = str(frame.get("name") or "").strip()
+            url = str(frame.get("url") or "").strip()
+            # Prefer a name-based selector; fall back to an url-matching one.
+            frame_selector = ""
+            if name:
+                frame_selector = f'iframe[name="{name}"]'
+            elif url:
+                frame_selector = f'iframe[src*="{url[-60:]}"]' if len(url) >= 8 else ""
+            if not frame_selector:
+                continue
+            try:
+                switch_r = await tk.switch_to_iframe(frame_selector)
+            except Exception:
+                switch_r = ToolkitResult(success=False, error="switch exception")
+            if not switch_r.success:
+                continue
+            try:
+                click_r = await tk.click(selector)
+            except Exception:
+                click_r = ToolkitResult(success=False, error="click exception")
+            if click_r.success:
+                return True
+            # did not match inside this frame — restore main frame before next iter
+            try:
+                await tk.exit_iframe()
+            except Exception:
+                pass
+        return False
+
+    async def _iframe_auto_scan_input(
+        self, selector: str, value: str, action: Optional[BrowserAction]
+    ) -> bool:
+        if not settings.BROWSER_IFRAME_AUTO_SCAN_ON_STUCK or not selector:
+            return False
+        tk = self.toolkit
+        if getattr(tk, "_in_iframe", False):
+            return False
+        try:
+            frames_r = await self._call_toolkit("list_frames", include_main=False)
+        except Exception:
+            return False
+        if not frames_r.success or not isinstance(frames_r.data, list):
+            return False
+        children = [
+            f for f in frames_r.data
+            if isinstance(f, dict) and not f.get("is_main") and not f.get("is_detached")
+        ]
+        if not children:
+            return False
+        for frame in children:
+            name = str(frame.get("name") or "").strip()
+            url = str(frame.get("url") or "").strip()
+            if name:
+                frame_selector = f'iframe[name="{name}"]'
+            elif url and len(url) >= 8:
+                frame_selector = f'iframe[src*="{url[-60:]}"]'
+            else:
+                continue
+            try:
+                switch_r = await tk.switch_to_iframe(frame_selector)
+            except Exception:
+                switch_r = ToolkitResult(success=False, error="switch exception")
+            if not switch_r.success:
+                continue
+            try:
+                input_r = await tk.input_text(selector, value)
+            except Exception:
+                input_r = ToolkitResult(success=False, error="input exception")
+            if input_r.success:
+                return True
+            try:
+                await tk.exit_iframe()
+            except Exception:
+                pass
+        return False
+
     # ── Click with fallbacks ─────────────────────────────────
 
     async def try_click_with_fallbacks(self, selector: str, action: Optional[BrowserAction] = None) -> bool:
@@ -128,17 +357,47 @@ class BrowserExecutionLayer:
         if action and action.use_keyboard_fallback and action.keyboard_key:
             strategies.append((f"keyboard:{action.keyboard_key}", lambda k=action.keyboard_key: tk.press_key(k)))
 
+        # B1: prepend site_hint selectors harvested from prior successes.
+        # B5: reorder & skip according to per-(domain, role) success stats.
+        domain = await self._current_domain()
+        hint_name_to_selector: Dict[str, str] = {}
+        hint_strategies: List[Tuple[str, Any]] = []
+        for sel in self._load_site_hint_selectors("click", domain):
+            hint_name = f"site_hint:{sel[:40]}"
+            hint_strategies.append((hint_name, lambda s=sel: tk.click(s)))
+            hint_name_to_selector[hint_name] = sel
+        strategies = hint_strategies + strategies
+        strategies = self._reorder_strategies(strategies, domain, "click")
+
         for name, handler in strategies:
+            canonical = self._canonical_strategy_name(name)
+            t0 = time.monotonic()
+            success = False
             try:
                 r = await handler()
-                if isinstance(r, ToolkitResult) and r.success:
-                    log_agent_action(self.name, "click", name)
-                    return True
-                elif not isinstance(r, ToolkitResult):
-                    log_agent_action(self.name, "click", name)
-                    return True
+                if isinstance(r, ToolkitResult):
+                    success = bool(r.success)
+                else:
+                    success = True
             except Exception:
-                continue
+                success = False
+            latency_ms = int((time.monotonic() - t0) * 1000)
+            self._record_strategy_outcome(domain, "click", canonical, success, latency_ms)
+            if canonical == "site_hint":
+                self._record_site_hint_outcome(
+                    domain, "click", hint_name_to_selector.get(name, ""), success
+                )
+            if success:
+                log_agent_action(self.name, "click", name)
+                return True
+
+        # B4 heuristic fallback: if all strategies failed on the main frame
+        # and iframe auto-scan is enabled, try the same selector inside each
+        # child iframe. Leaves the toolkit in whichever frame succeeded (so
+        # the follow-up perception cycle sees it); restores main frame on miss.
+        if await self._iframe_auto_scan_click(selector, action):
+            log_agent_action(self.name, "click", "iframe_auto_scan")
+            return True
         return False
 
     # ── Input with fallbacks ─────────────────────────────────
@@ -216,16 +475,44 @@ class BrowserExecutionLayer:
             )
         strategies.append(("keyboard_type_js", _try_keyboard_type))
 
+        # B1: prepend site_hint selectors; B5: reorder/skip by success stats.
+        domain = await self._current_domain()
+        hint_name_to_selector: Dict[str, str] = {}
+        hint_strategies: List[Tuple[str, Any]] = []
+        for sel in self._load_site_hint_selectors("input", domain):
+            hint_name = f"site_hint:{sel[:40]}"
+            hint_strategies.append((hint_name, lambda s=sel: tk.input_text(s, value)))
+            hint_name_to_selector[hint_name] = sel
+        strategies = hint_strategies + strategies
+        strategies = self._reorder_strategies(strategies, domain, "input")
+
         for name, handler in strategies:
+            canonical = self._canonical_strategy_name(name)
+            t0 = time.monotonic()
+            success = False
             try:
                 r = await handler()
                 if isinstance(r, ToolkitResult) and r.success:
-                    if name == "keyboard_type_js" and r.data is False:
-                        continue
-                    log_agent_action(self.name, "input", name)
-                    return True
+                    if canonical == "keyboard_type_js" and r.data is False:
+                        success = False
+                    else:
+                        success = True
             except Exception:
-                continue
+                success = False
+            latency_ms = int((time.monotonic() - t0) * 1000)
+            self._record_strategy_outcome(domain, "input", canonical, success, latency_ms)
+            if canonical == "site_hint":
+                self._record_site_hint_outcome(
+                    domain, "input", hint_name_to_selector.get(name, ""), success
+                )
+            if success:
+                log_agent_action(self.name, "input", name)
+                return True
+
+        # B4 heuristic fallback: try the input selector inside each child iframe.
+        if await self._iframe_auto_scan_input(selector, value, action):
+            log_agent_action(self.name, "input", "iframe_auto_scan")
+            return True
         return False
 
     # ── Form filling ─────────────────────────────────────────

@@ -92,9 +92,15 @@ LLM prompt templates are `.txt` files under `prompts/`. Prompt section registry 
 - `BROWSER_STEP_MEMORY_SIZE` / `BROWSER_DEDUP_THRESHOLD` / `BROWSER_RECENT_STEPS_IN_PROMPT` — Browser 自我规划优化 P0 指纹去重
 - `BROWSER_PLAN_ENABLED` / `BROWSER_MAX_PLAN_STEPS` / `BROWSER_MAX_REPLANS` / `BROWSER_STEP_STUCK_THRESHOLD` — P1 任务级 Plan
 - `BROWSER_UNIFIED_ACT_ENABLED` — P2 单 Prompt 决策开关（默认关闭，稳定后切换）
-- `BROWSER_PLAN_MEMORY_ENABLED` — P3 跨会话长期 Plan 记忆（尚未实现，预留）
+- `BROWSER_PLAN_MEMORY_ENABLED` — P3 跨会话长期 Plan 记忆主开关（B1 / B6 复用）
+- `BROWSER_STRATEGY_REFACTOR_ENABLED` — B6 三模式策略链（LoginReplay → Batch/Unified → Legacy），默认关闭
 - `BROWSER_BATCH_EXECUTE_ENABLED` / `BROWSER_SEQUENCE_MODEL` / `BROWSER_MAX_SEQUENCE_ACTIONS` / `BROWSER_MAX_CORRECTIONS` — P4 批量执行与按需纠偏
 - `BROWSER_DOM_CHECKPOINT_ENABLED` / `BROWSER_VISUAL_VERIFY_ENABLED` / `BROWSER_CORRECTION_ESCALATE_TO_REASONING` — P4 检查点与验证配置
+- `BROWSER_SITE_KNOWLEDGE_DB` / `BROWSER_SELECTOR_HINT_TOP_K` / `BROWSER_SELECTOR_MIN_SUCCESS_RATE` / `BROWSER_SELECTOR_DECAY_DAYS` / `BROWSER_SITE_HINTS_INJECT` / `BROWSER_SITE_HINTS_EXEC_INJECT` / `BROWSER_LOGIN_REPLAY_ENABLED` — B1 站点选择器 / 登录流 / 决策注入 / 执行层 fallback 注入（主开关复用 `BROWSER_PLAN_MEMORY_ENABLED`）
+- `BROWSER_STRATEGY_LEARNING_ENABLED` / `BROWSER_STRATEGY_DB` / `BROWSER_STRATEGY_MIN_SAMPLES` / `BROWSER_STRATEGY_SKIP_THRESHOLD` — B5 失败策略自适应学习（per-(domain, role) 成功率驱动 fallback 重排 + skip）
+- `ANTI_BOT_PROFILE_ENABLED` / `ANTI_BOT_PROFILE_DB` / `ANTI_BOT_INITIAL_DELAY_SEC` / `ANTI_BOT_MAX_DELAY_SEC` / `ANTI_BOT_UA_POOL_FILE` / `ANTI_BOT_BLOCK_DECAY_DAYS` / `ANTI_BOT_SUCCESS_TO_COOLDOWN` — B2 反爬 domain 画像与 UA 池
+- `BROWSER_VISION_CACHE_ENABLED` / `BROWSER_VISION_CACHE_DB` / `BROWSER_VISION_CACHE_TTL_DAYS` / `BROWSER_VISION_CACHE_BYPASS_KEYWORDS` — B3 视觉描述缓存（按 page fingerprint 复用同模板页面的视觉描述）
+- `BROWSER_IFRAME_ENABLED` / `BROWSER_TAB_MANAGEMENT_ENABLED` / `BROWSER_IFRAME_AUTO_SCAN_ON_STUCK` / `BROWSER_MAX_TAB_COUNT` — B4 iframe / 多 tab 感知层暴露 + 执行层自动扫描兜底 + tab 回收
 
 ## 架构演进记录
 
@@ -105,6 +111,11 @@ LLM prompt templates are `.txt` files under `prompts/`. Prompt section registry 
 | Browser 自我规划优化 P0+P2+P1 | 2026-04-14 | 指纹去重 + 单 Prompt + 任务级 Plan（详见 `docs/design/2026-04-14-browser-planning-optimization.md`） |
 | Browser 批量执行 P4 | 2026-04-15 | 一次规划批量执行 + DOM 检查点 + 视觉纠偏（详见 `docs/design/2026-04-15-browser-batch-execute-optimization.md`） |
 | 记忆能力优化 A 组 | 2026-04-16 | A1 衰减+TTL+归档 / A2 实体倒排索引 + Router 注入 + `delete_by_entity` / A3 Skill 前置注入 / A4 三层记忆 + session-close purge 钩子 / A5 偏好学习(规则+LLM 层)+ Router 注入（详见 `docs/design/2026-04-16-memory-and-browser-optimization.md`） |
+| 网页操作优化 B 组(数据层) | 2026-04-16 | B1 `utils/site_knowledge_store.py` 站点选择器 + 登录流 + 动作模板 SQLite 存储，`browser_decision._build_site_hints_block` 注入 LLM prompt，`record_action` 自动写回；B2 `utils/anti_bot_profile.py` domain 画像 + 指数退避 + UA 池，`web_worker._record_anti_bot_block` 三处阻断反馈（详见 `docs/design/2026-04-16-memory-and-browser-optimization.md` §B1/B2） |
+| Browser 视觉缓存 B3 | 2026-04-17 | `utils/page_fingerprint.py`（域名+归一化路径+DOM 结构签名）+ `utils/vision_cache.py`（SQLite，TTL 默认 7 天 + 高风险关键词 bypass），`browser_perception.observe()` 视觉调用前查缓存命中即跳过 vision LLM；`BrowserAgent.run()` 把 task 透传到感知层用于 bypass 判定（详见 `docs/design/2026-04-16-memory-and-browser-optimization.md` §B3） |
+| B1 执行层 + B5 失败策略自适应学习 | 2026-04-17 | 新增 `utils/strategy_stats.py`（SQLite per-(domain, role, strategy) 成功率/延迟统计）；改造 `agents/browser_execution.py` 的 `try_click/input_with_fallbacks`：site_hint 前置（B1）+ ranked/skip 重排（B5）+ 每次尝试埋点回写 strategy_stats 和 site_knowledge_store；双开关 `BROWSER_PLAN_MEMORY_ENABLED` / `BROWSER_STRATEGY_LEARNING_ENABLED` 默认 off 零开销（详见 `docs/design/2026-04-16-memory-and-browser-optimization.md` §B1.7/§B5.7） |
+| B2 接入 + B4 iframe/多 tab | 2026-04-17 | `utils/browser_toolkit.py` 加 `apply_throttle_hint` / response listener(429→rate_limit, 503→service_unavailable) / `goto()` 成功埋点 `record_request(True)` / `_enforce_tab_cap()` 超限关老 tab；`agents/browser_agent._initialize_session` 在 create_page 前调 `suggest_throttle` 覆盖 UA+flip headless；感知层 `observe()` 把 `list_frames`/`list_tabs` 挂到 snapshot，`browser_decision` 两个 prompt 注入 `{available_frames}` / `{available_tabs}` 并扩展 `switch_iframe/switch_tab/close_tab` 合法动作；执行层 `try_click/input_with_fallbacks` 主 frame 失败后可选择自动扫 iframe 兜底(详见 `docs/design/2026-04-16-memory-and-browser-optimization.md` §B2.7/§B4) |
+| B1 login_replay + record_template + B6 三模式解耦 | 2026-04-18 | 新增 `agents/browser_login_replay.py`（`try_replay_login` 按 `get_login_flow` 逐步 replay + `dom_checkpoint` 校验 + 成功/失败自动 `record_login_flow`）；新增 `utils/browser_template_recorder.py` `record_template_from_run`（search/navigate/form 意图尾部抓取 `record_template`）；新增 `agents/browser_strategies/` 包（`DecisionStrategy` 抽象 + `LegacyPerStepStrategy` / `UnifiedActStrategy` / `BatchExecuteStrategy` / `LoginReplayStrategy`）与 `StrategyPicker.build_chain`（LoginReplay → Batch/Unified → Legacy）；新增 `agents/page_assessment_cache.py` 并在 `BrowserAgent.__init__` 挂 per-run 实例 + `run()` 开头 `clear()` + `get_or_compute_assessment` 暴露给策略；`prompts/browser_act.txt` / `prompts/browser_action_decision.txt` 把 `site_hints` 从 append-after 迁到 `{site_hints}` 模板 kwarg；`browser_agent.py` 提取 `_run_per_step_loop` + 新增 `_run_with_strategies` 入口，`BROWSER_STRATEGY_REFACTOR_ENABLED=true` 时走策略链，默认 off 零影响；新增测试 `test_browser_login_replay_unit` 16 条 / `test_browser_template_recorder_unit` 23 条 / `test_strategy_picker_unit` 24 条，回归 179 条浏览器单测 + 全量 1110 条全绿 |
 
 ### Browser 规划优化落地情况（2026-04-14）
 

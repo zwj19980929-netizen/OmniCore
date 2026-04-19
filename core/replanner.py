@@ -169,6 +169,7 @@ def replanner_node(state: OmniCoreState) -> OmniCoreState:
         repaired_tasks = repair_replan_task_params(
             result.get("tasks", []),
             authoritative_target_url,
+            user_request=str(state.get("user_input", "") or ""),
         )
         result["tasks"], finalize_instructions = extract_finalize_instructions_from_replan_tasks(
             repaired_tasks

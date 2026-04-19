@@ -257,6 +257,74 @@ class Settings:
     BROWSER_UNIFIED_ACT_ENABLED = os.getenv("BROWSER_UNIFIED_ACT_ENABLED", "false").lower() == "true"
     # P3 跨会话长期记忆（默认关闭）
     BROWSER_PLAN_MEMORY_ENABLED = os.getenv("BROWSER_PLAN_MEMORY_ENABLED", "false").lower() == "true"
+    # B6 三模式解耦（默认关闭,稳定后切换）
+    BROWSER_STRATEGY_REFACTOR_ENABLED = os.getenv(
+        "BROWSER_STRATEGY_REFACTOR_ENABLED", "false"
+    ).lower() == "true"
+
+    # === B1 站点选择器 + 登录流持久化 ===
+    BROWSER_SITE_KNOWLEDGE_DB = os.getenv(
+        "BROWSER_SITE_KNOWLEDGE_DB", str(DATA_DIR / "site_knowledge.db")
+    )
+    BROWSER_SELECTOR_HINT_TOP_K = max(_env_int("BROWSER_SELECTOR_HINT_TOP_K", 5), 1)
+    BROWSER_LOGIN_REPLAY_ENABLED = os.getenv("BROWSER_LOGIN_REPLAY_ENABLED", "true").lower() == "true"
+    BROWSER_SELECTOR_MIN_SUCCESS_RATE = float(os.getenv("BROWSER_SELECTOR_MIN_SUCCESS_RATE", "0.6"))
+    BROWSER_SELECTOR_DECAY_DAYS = max(_env_int("BROWSER_SELECTOR_DECAY_DAYS", 30), 1)
+    BROWSER_SITE_HINTS_INJECT = os.getenv("BROWSER_SITE_HINTS_INJECT", "true").lower() == "true"
+    # B1 执行层:fallback 链前置 site_hint 策略(需 BROWSER_PLAN_MEMORY_ENABLED=true)
+    BROWSER_SITE_HINTS_EXEC_INJECT = os.getenv(
+        "BROWSER_SITE_HINTS_EXEC_INJECT", "true"
+    ).lower() == "true"
+
+    # === B5 失败策略自适应学习 ===
+    BROWSER_STRATEGY_LEARNING_ENABLED = os.getenv(
+        "BROWSER_STRATEGY_LEARNING_ENABLED", "false"
+    ).lower() == "true"
+    BROWSER_STRATEGY_DB = os.getenv(
+        "BROWSER_STRATEGY_DB", str(DATA_DIR / "browser_strategy.db")
+    )
+    BROWSER_STRATEGY_MIN_SAMPLES = max(_env_int("BROWSER_STRATEGY_MIN_SAMPLES", 5), 1)
+    BROWSER_STRATEGY_SKIP_THRESHOLD = float(
+        os.getenv("BROWSER_STRATEGY_SKIP_THRESHOLD", "0.1")
+    )
+
+    # === B2 反爬 domain 画像 + 自适应节流 ===
+    ANTI_BOT_PROFILE_ENABLED = os.getenv("ANTI_BOT_PROFILE_ENABLED", "false").lower() == "true"
+    ANTI_BOT_PROFILE_DB = os.getenv(
+        "ANTI_BOT_PROFILE_DB", str(DATA_DIR / "anti_bot.db")
+    )
+    ANTI_BOT_INITIAL_DELAY_SEC = float(os.getenv("ANTI_BOT_INITIAL_DELAY_SEC", "0"))
+    ANTI_BOT_MAX_DELAY_SEC = float(os.getenv("ANTI_BOT_MAX_DELAY_SEC", "5"))
+    ANTI_BOT_UA_POOL_FILE = os.getenv("ANTI_BOT_UA_POOL_FILE", "config/ua_pool.yaml")
+    ANTI_BOT_BLOCK_DECAY_DAYS = max(_env_int("ANTI_BOT_BLOCK_DECAY_DAYS", 14), 1)
+    ANTI_BOT_SUCCESS_TO_COOLDOWN = max(_env_int("ANTI_BOT_SUCCESS_TO_COOLDOWN", 5), 1)
+
+    # === B4 iframe / 多 tab 支持 ===
+    # Enables the decision layer to see {available_frames}/{available_tabs} in prompts.
+    # Execution path for SWITCH_IFRAME / SWITCH_TAB / CLOSE_TAB is always on
+    # (existed before B4); these flags only control prompt injection and
+    # heuristic fallbacks.
+    BROWSER_IFRAME_ENABLED = os.getenv("BROWSER_IFRAME_ENABLED", "true").lower() == "true"
+    BROWSER_TAB_MANAGEMENT_ENABLED = os.getenv("BROWSER_TAB_MANAGEMENT_ENABLED", "true").lower() == "true"
+    # Auto-scan non-main frames when a click/input gets stuck on the main frame.
+    # Default off — first rely on the LLM choosing SWITCH_IFRAME from the prompt.
+    BROWSER_IFRAME_AUTO_SCAN_ON_STUCK = os.getenv(
+        "BROWSER_IFRAME_AUTO_SCAN_ON_STUCK", "false"
+    ).lower() == "true"
+    # Per-context tab cap; oldest non-active tab is closed when exceeded.
+    # Set to 0 to disable.
+    BROWSER_MAX_TAB_COUNT = max(_env_int("BROWSER_MAX_TAB_COUNT", 10), 0)
+
+    # === B3 视觉描述缓存 ===
+    BROWSER_VISION_CACHE_ENABLED = os.getenv("BROWSER_VISION_CACHE_ENABLED", "false").lower() == "true"
+    BROWSER_VISION_CACHE_DB = os.getenv(
+        "BROWSER_VISION_CACHE_DB", str(DATA_DIR / "vision_cache.db")
+    )
+    BROWSER_VISION_CACHE_TTL_DAYS = max(_env_int("BROWSER_VISION_CACHE_TTL_DAYS", 7), 1)
+    BROWSER_VISION_CACHE_BYPASS_KEYWORDS = os.getenv(
+        "BROWSER_VISION_CACHE_BYPASS_KEYWORDS",
+        "login,signin,sign-in,password,payment,checkout,verify,auth,2fa,otp",
+    )
 
     # === P4 批量执行与按需纠偏 ===
     BROWSER_BATCH_EXECUTE_ENABLED = os.getenv("BROWSER_BATCH_EXECUTE_ENABLED", "false").lower() == "true"

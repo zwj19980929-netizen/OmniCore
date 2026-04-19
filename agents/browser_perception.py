@@ -22,6 +22,8 @@ from utils.enhanced_page_perceiver import EnhancedPagePerceiver, PageContent
 from utils.logger import log_agent_action, log_warning
 from utils.prompt_manager import get_prompt
 from utils.perception_scripts import SCRIPT_EXTRACT_INTERACTIVE_ELEMENTS
+from utils.page_fingerprint import compute_page_hash, normalize_url_path
+from utils.vision_cache import get_vision_cache, should_bypass_for_task
 import utils.web_debug_recorder as web_debug_recorder
 
 from agents.browser_agent import (
@@ -69,6 +71,10 @@ class BrowserPerceptionLayer:
 
         # Track URL for new-page vision trigger
         self._last_vision_url: str = ""
+
+        # Task description for vision-cache bypass decisions (B3).
+        # Owner (BrowserAgent) sets this at the start of each run.
+        self.current_task: str = ""
 
     # ── toolkit call helper ──────────────────────────────────
 
@@ -510,6 +516,24 @@ class BrowserPerceptionLayer:
         except Exception as exc:
             log_warning(f"iframe element extraction failed: {exc}")
 
+        # B4: attach frames/tabs metadata so the decision prompt can surface
+        # SWITCH_IFRAME / SWITCH_TAB actions. Both enumerations are best-effort
+        # and gate behind config flags.
+        if settings.BROWSER_IFRAME_ENABLED:
+            try:
+                frames_r = await self._call_toolkit("list_frames", include_main=True)
+                if frames_r.success and isinstance(frames_r.data, list):
+                    snapshot["available_frames"] = frames_r.data
+            except Exception as exc:
+                log_warning(f"list_frames failed: {exc}")
+        if settings.BROWSER_TAB_MANAGEMENT_ENABLED:
+            try:
+                tabs_r = await self._call_toolkit("list_tabs")
+                if tabs_r.success and isinstance(tabs_r.data, list):
+                    snapshot["available_tabs"] = tabs_r.data
+            except Exception as exc:
+                log_warning(f"list_tabs failed: {exc}")
+
         # Perceiver content
         page_content: Optional[PageContent] = None
         headings: List[Dict[str, str]] = []
@@ -536,15 +560,40 @@ class BrowserPerceptionLayer:
                 or page_type == "unknown"
             )
             if need_vision:
-                try:
-                    vision_description = await self.get_vision_description(page)
-                    if vision_description:
-                        if current_url:
-                            self._last_vision_url = self._normalize_url_for_compare(current_url)
-                        trigger = "new_page" if is_new_page else ("complexity" if complexity > settings.VISION_PERCEPTION_COMPLEXITY_THRESHOLD else "unknown_type")
-                        log_agent_action(self.name, "observe", f"vision_len={len(vision_description)} trigger={trigger}")
-                except Exception as exc:
-                    log_warning(f"vision perception failed: {exc}")
+                bypass = should_bypass_for_task(self.current_task)
+                cache = None if bypass else get_vision_cache()
+                page_hash = ""
+                cache_hit = False
+                if cache is not None:
+                    try:
+                        page_hash = compute_page_hash(current_url, snapshot)
+                    except Exception as exc:
+                        log_warning(f"page hash failed: {exc}")
+                        page_hash = ""
+                    if page_hash:
+                        cached = cache.get(page_hash)
+                        if cached is not None and cached.description:
+                            vision_description = cached.description
+                            cache_hit = True
+                            if current_url:
+                                self._last_vision_url = self._normalize_url_for_compare(current_url)
+                            log_agent_action(
+                                self.name,
+                                "observe",
+                                f"vision_cache_hit hash={page_hash[:8]} hits={cached.hit_count}",
+                            )
+                if not cache_hit:
+                    try:
+                        vision_description = await self.get_vision_description(page)
+                        if vision_description:
+                            if current_url:
+                                self._last_vision_url = self._normalize_url_for_compare(current_url)
+                            trigger = "new_page" if is_new_page else ("complexity" if complexity > settings.VISION_PERCEPTION_COMPLEXITY_THRESHOLD else "unknown_type")
+                            log_agent_action(self.name, "observe", f"vision_len={len(vision_description)} trigger={trigger}")
+                            if cache is not None and page_hash:
+                                cache.set(page_hash, vision_description, normalize_url_path(current_url))
+                    except Exception as exc:
+                        log_warning(f"vision perception failed: {exc}")
 
         # Apply versioned refs
         version = self._snapshot_version
