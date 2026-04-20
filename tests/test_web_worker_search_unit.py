@@ -347,7 +347,7 @@ def test_search_for_result_cards_honors_headless_override(monkeypatch):
     assert cards[0]["link"] == "https://www.reuters.com/world/article-123"
 
 
-def test_search_for_result_cards_falls_back_when_bing_is_blank(monkeypatch):
+def test_search_for_result_cards_falls_back_when_duckduckgo_is_blank(monkeypatch):
     visited = []
 
     class _FakeToolkit:
@@ -427,7 +427,7 @@ def test_search_for_result_cards_falls_back_when_bing_is_blank(monkeypatch):
     )
 
     assert any("google.com" in url for url in visited)
-    assert any("bing.com" in url for url in visited)
+    assert any("duckduckgo.com" in url for url in visited)
     assert cards[0]["link"] == "https://www.reuters.com/world/article-123"
 
 

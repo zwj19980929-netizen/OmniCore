@@ -433,6 +433,12 @@ class CriticAgent:
                 all_approved = False
                 continue
 
+            if task.get("skipped_by_adaptive_reroute") or (
+                isinstance(task.get("result"), dict)
+                and task["result"].get("skipped_by_adaptive_reroute")
+            ):
+                continue
+
             completed_count += 1
             if task["result"]:
                 # 提取截图供视觉复核，之后清理避免大数据留在 state 中

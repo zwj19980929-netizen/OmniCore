@@ -916,6 +916,56 @@ class RouterAgent:
         lines.append("")
         return "\n".join(lines) + "\n---\n"
 
+    @staticmethod
+    def _build_tool_health_block() -> str:
+        """C2: render recent per-tool failure hints as a planner reference block.
+
+        Returns "" when disabled, no qualifying hints, or any error. Source is
+        ``utils/tool_failure_profile.py`` (SQLite). Top-K and thresholds come
+        from settings (``TOOL_FAILURE_HINT_TOP_K`` /
+        ``TOOL_FAILURE_SKIP_THRESHOLD`` / ``TOOL_FAILURE_WARN_THRESHOLD``).
+        """
+        from config.settings import settings as _settings
+        if not getattr(_settings, "TOOL_FAILURE_PROFILE_ENABLED", False):
+            return ""
+        try:
+            from utils.tool_failure_profile import (
+                format_tool_health_block,
+                get_tool_failure_profile_store,
+            )
+            store = get_tool_failure_profile_store()
+            if store is None:
+                return ""
+            hints = store.get_recommendations(
+                top_k=int(_settings.TOOL_FAILURE_HINT_TOP_K),
+            )
+            return format_tool_health_block(hints)
+        except Exception:
+            return ""
+
+    @staticmethod
+    def _build_episode_brief_block(user_input: str) -> str:
+        """C1: render past episodic traces (success + failure) as a reference block.
+
+        Returns "" when disabled, no matches, or any error. Episodes are
+        sourced from ``memory/episode_store.py`` (SQLite). Token-overlap
+        retrieval keeps this off the LLM critical path.
+        """
+        from config.settings import settings as _settings
+        if not getattr(_settings, "EPISODE_REPLAY_ENABLED", False):
+            return ""
+        try:
+            from memory.episode_store import format_episode_brief, get_episode_store
+            store = get_episode_store()
+            episodes = store.fetch_brief_pair(
+                user_input=user_input,
+                max_age_days=int(_settings.EPISODE_REPLAY_MAX_AGE_DAYS),
+                min_similarity=float(_settings.EPISODE_REPLAY_MIN_SIMILARITY),
+            )
+            return format_episode_brief(episodes)
+        except Exception:
+            return ""
+
     def analyze_intent(
         self,
         user_input: str,
@@ -1218,6 +1268,17 @@ class RouterAgent:
         skill_hint_block = self._build_skill_hint_block(user_input)
         if skill_hint_block:
             user_message += skill_hint_block
+
+        # C1: inject 1 success + 1 failure past trace for the same task class.
+        episode_brief_block = self._build_episode_brief_block(user_input)
+        if episode_brief_block:
+            user_message += episode_brief_block
+
+        # C2: warn planner about tools whose recent runs have been timing out
+        # or failing — purely advisory, planner can still pick them.
+        tool_health_block = self._build_tool_health_block()
+        if tool_health_block:
+            user_message += tool_health_block
 
         user_message += f"请分析以下用户指令并拆解任务：\n\n{user_input}"
 

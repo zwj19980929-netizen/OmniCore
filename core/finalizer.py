@@ -30,6 +30,7 @@ from utils.structured_extract import (
     extract_requested_item_count,
 )
 from utils.context_hints import build_finalize_time_hint, build_finalize_location_hint
+from utils.result_sanitizer import sanitize_browser_data
 
 
 # ---------------------------------------------------------------------------
@@ -86,6 +87,8 @@ def _collect_delivery_artifacts(state: OmniCoreState):
 
         for source_key in ("data", "items", "content"):
             payload = result.get(source_key)
+            if source_key == "data":
+                payload = sanitize_browser_data(payload)
             if payload in (None, "", [], {}):
                 continue
             preview = payload_preview(payload)
@@ -115,7 +118,10 @@ def _collect_delivery_artifacts(state: OmniCoreState):
 
 def _build_delivery_package(state: OmniCoreState) -> dict:
     tasks = state.get("task_queue", []) or []
-    completed = [task for task in tasks if task.get("status") == "completed"]
+    completed = [
+        task for task in tasks
+        if task.get("status") == "completed" and not task.get("skipped_by_adaptive_reroute")
+    ]
     failed = [task for task in tasks if task.get("status") == "failed"]
     waiting_approval = [task for task in tasks if task.get("status") == WAITING_FOR_APPROVAL]
     waiting_event = [task for task in tasks if task.get("status") == WAITING_FOR_EVENT]
@@ -257,6 +263,28 @@ def _build_delivery_package(state: OmniCoreState) -> dict:
 
 
 # ---------------------------------------------------------------------------
+# answer_text extraction helper (F3)
+# ---------------------------------------------------------------------------
+
+def _extract_answer_text(state: OmniCoreState) -> tuple[str, list[str]]:
+    """Return (answer_text, answer_citations) from the first browser task that has them."""
+    from config.settings import settings as _s
+    if not _s.BROWSER_ANSWER_TEXT_ENABLED or not _s.FINALIZER_ANSWER_FIRST:
+        return "", []
+    for task in state.get("task_queue", []) or []:
+        if task.get("skipped_by_adaptive_reroute"):
+            continue
+        result = task.get("result")
+        if not isinstance(result, dict):
+            continue
+        answer_text = str(result.get("answer_text") or "").strip()
+        if answer_text:
+            citations = [str(c) for c in (result.get("answer_citations") or []) if c]
+            return answer_text, citations
+    return "", []
+
+
+# ---------------------------------------------------------------------------
 # Delivery summary text
 # ---------------------------------------------------------------------------
 
@@ -270,6 +298,13 @@ def _build_delivery_summary(state: OmniCoreState) -> str:
         f"Review status: {package['review_status']}",
         f"Progress: {package['completed_task_count']}/{package['total_task_count']} task(s) completed.",
     ]
+
+    answer_text, answer_citations = _extract_answer_text(state)
+    if answer_text:
+        lines.append("")
+        lines.append(answer_text)
+        if answer_citations:
+            lines.append("Sources: " + ", ".join(answer_citations))
 
     findings_summary = extract_structured_findings(state.get("task_queue", []))
     if findings_summary:
@@ -619,6 +654,15 @@ def finalize_node(state: OmniCoreState) -> OmniCoreState:
                     )
     except Exception as exc:
         log_warning(f"Knowledge indexing failed (non-blocking): {exc}")
+
+    # C1: record episode trace for cross-session replay (Episodic Replay)
+    try:
+        from config.settings import settings as _ep_settings
+        if _ep_settings.EPISODE_REPLAY_ENABLED:
+            from memory.episode_store import get_episode_store
+            get_episode_store().record_episode(state)
+    except Exception as exc:
+        log_warning(f"Episode record failed (non-blocking): {exc}")
 
     # R7: final session memory extraction (capture end state)
     try:

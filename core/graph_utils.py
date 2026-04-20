@@ -238,9 +238,12 @@ def apply_adaptive_skip(state: OmniCoreState) -> OmniCoreState:
     for task in task_queue:
         if str(task.get("status", "")) == "pending":
             task["status"] = "completed"
-            task.setdefault("result", {})
-            if isinstance(task["result"], dict):
-                task["result"]["skipped_by_adaptive_reroute"] = True
+            existing = task.get("result")
+            if not isinstance(existing, dict):
+                task["result"] = {}
+            task["result"]["skipped_by_adaptive_reroute"] = True
+            task["result"]["success"] = True
+            task["skipped_by_adaptive_reroute"] = True  # top-level flag for downstream checks
             skipped_count += 1
     if skipped_count:
         log_agent_action(

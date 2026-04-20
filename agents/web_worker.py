@@ -43,6 +43,7 @@ from utils.web_result_normalizer import (
 )
 import utils.web_debug_recorder as web_debug_recorder
 from utils.text_relevance import extract_relevant_text_safe_async
+from utils.prompt_injection_detector import wrap_untrusted
 from config.settings import settings
 from config.domain_keywords import SEARCH_STOPWORDS_SET
 
@@ -1290,6 +1291,7 @@ class WebWorker:
             }
         sample = data[:3]
         sample_str = json.dumps(sample, ensure_ascii=False, default=str)[:1500]
+        sample_str = wrap_untrusted(sample_str, source="web_worker.sample")
         from utils.prompt_manager import get_prompt
         validation_prompt = get_prompt("web_worker_data_validation")
         response = self.llm.chat_with_system(
@@ -2662,6 +2664,7 @@ class WebWorker:
 
         url_r = await tk.get_current_url()
         links_text = "\n".join([f"- [{l['text']}]({l['href']})" for l in links])
+        links_text = wrap_untrusted(links_text, source="web_worker.links")
         response = self.llm.chat_with_system(
             system_prompt=f"""你是一个网页导航专家。用户想要获取特定数据，但当前页面是网站首页或非数据页。
 请从下面的链接列表中，找出最可能包含目标数据的链接。

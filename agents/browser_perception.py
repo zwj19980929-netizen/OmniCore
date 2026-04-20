@@ -24,6 +24,7 @@ from utils.prompt_manager import get_prompt
 from utils.perception_scripts import SCRIPT_EXTRACT_INTERACTIVE_ELEMENTS
 from utils.page_fingerprint import compute_page_hash, normalize_url_path
 from utils.vision_cache import get_vision_cache, should_bypass_for_task
+from utils.prompt_injection_detector import wrap_untrusted
 import utils.web_debug_recorder as web_debug_recorder
 
 from agents.browser_agent import (
@@ -622,7 +623,7 @@ class BrowserPerceptionLayer:
             snapshot=snapshot,
             a11y_elements=a11y_elements,
             page_content=page_content,
-            vision_description=vision_description,
+            vision_description=wrap_untrusted(vision_description, source="browser.vision") if vision_description else "",
             snapshot_version=self._snapshot_version,
             timestamp=time.time(),
             headings=headings,

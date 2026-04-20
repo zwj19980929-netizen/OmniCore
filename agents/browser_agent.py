@@ -674,6 +674,20 @@ class BrowserAgent:
         """Get main text. Delegates to perception layer."""
         return self.perception.get_snapshot_main_text(snapshot)
 
+    def _resolve_evidence_urls(
+        self, evidence_indexes: List[int], data: List[Dict[str, Any]]
+    ) -> List[str]:
+        """Map evidence_indexes back to URL fields in data items (for answer_citations)."""
+        urls: List[str] = []
+        for idx in (evidence_indexes or []):
+            if isinstance(idx, int) and 0 <= idx < len(data):
+                item = data[idx]
+                if isinstance(item, dict):
+                    url = item.get("url") or item.get("link") or item.get("source_url") or ""
+                    if url and str(url) not in urls:
+                        urls.append(str(url))
+        return urls[:settings.FINALIZER_MAX_CITATIONS]
+
     async def _format_snapshot_text_for_llm(self, snapshot: Optional[Dict[str, Any]], max_blocks: int = 0, query: str = "") -> str:
         return await self.decision._format_snapshot_text_for_llm(snapshot, max_blocks, query)
 
@@ -2525,10 +2539,17 @@ class BrowserAgent:
         if action.action_type == ActionType.DONE:
             data = await self._extract_data_for_intent(task_intent)
             _merge_new_data(data)
-            snapshot = self._last_semantic_snapshot or {}
-            main_text = self._get_snapshot_main_text(snapshot)
-            if main_text and len(main_text) >= 50:
-                _merge_new_data([{"text": main_text, "source": "page_main_text"}])
+            if not accumulated_data:
+                snapshot = self._last_semantic_snapshot or {}
+                main_text = self._get_snapshot_main_text(snapshot)
+                _max = settings.BROWSER_FALLBACK_TEXT_MAX_LEN
+                _min = settings.BROWSER_FALLBACK_TEXT_MIN_LEN
+                if main_text and len(main_text) >= _min:
+                    _merge_new_data([{
+                        "text": main_text[:_max],
+                        "source": "page_main_text_fallback",
+                        "truncated": len(main_text) > _max,
+                    }])
             if not accumulated_data:
                 vision_data = await self._extract_data_with_vision(task, task_intent, snapshot)
                 if vision_data:
@@ -2537,13 +2558,23 @@ class BrowserAgent:
             url_r = await tk.get_current_url()
             title_r = await tk.get_title()
             _final_screenshot = await self._capture_final_screenshot()
+            final_data = accumulated_data or data
+            _answer_text = ""
+            _answer_citations: List[str] = []
+            if settings.BROWSER_ANSWER_TEXT_ENABLED:
+                _answer_text = getattr(self.decision, "_last_assessment_reason", "") or ""
+                _answer_citations = self._resolve_evidence_urls(
+                    getattr(self.decision, "_last_evidence_indexes", []), final_data
+                )
             return {
                 "status": "exit",
                 "result": {
                     "success": True, "message": "task completed",
                     "url": url_r.data or "", "title": title_r.data or "",
                     "expected_url": expected_url, "steps": steps,
-                    "data": accumulated_data or data,
+                    "data": final_data,
+                    "answer_text": _answer_text,
+                    "answer_citations": _answer_citations,
                     "_page_screenshot": _final_screenshot,
                 },
             }
@@ -2552,10 +2583,17 @@ class BrowserAgent:
             # Reuse observed_data from step start instead of calling _extract_data_for_intent again
             data = observed_data
             _merge_new_data(data)
-            snapshot = self._last_semantic_snapshot or {}
-            main_text = self._get_snapshot_main_text(snapshot)
-            if main_text and len(main_text) >= 50:
-                _merge_new_data([{"text": main_text, "source": "page_main_text"}])
+            if not accumulated_data:
+                snapshot = self._last_semantic_snapshot or {}
+                main_text = self._get_snapshot_main_text(snapshot)
+                _max = settings.BROWSER_FALLBACK_TEXT_MAX_LEN
+                _min = settings.BROWSER_FALLBACK_TEXT_MIN_LEN
+                if main_text and len(main_text) >= _min:
+                    _merge_new_data([{
+                        "text": main_text[:_max],
+                        "source": "page_main_text_fallback",
+                        "truncated": len(main_text) > _max,
+                    }])
             if not accumulated_data:
                 vision_data = await self._extract_data_with_vision(task, task_intent, snapshot)
                 if vision_data:
@@ -2833,8 +2871,14 @@ class BrowserAgent:
             # main_text fallback: if structured extraction found nothing, use snapshot text
             if not accumulated_data and not step_data:
                 _snap_main = self._get_snapshot_main_text(post_snapshot)
-                if _snap_main and len(_snap_main) >= 50:
-                    _merge_new_data([{"text": _snap_main, "source": "page_main_text"}])
+                _max = settings.BROWSER_FALLBACK_TEXT_MAX_LEN
+                _min = settings.BROWSER_FALLBACK_TEXT_MIN_LEN
+                if _snap_main and len(_snap_main) >= _min:
+                    _merge_new_data([{
+                        "text": _snap_main[:_max],
+                        "source": "page_main_text_fallback",
+                        "truncated": len(_snap_main) > _max,
+                    }])
             candidate_data = accumulated_data or step_data
             requires_data = self._is_read_only_task(task, task_intent) or task_intent.intent_type == "search"
             has_sufficient_data = bool(candidate_data)
@@ -2890,10 +2934,17 @@ class BrowserAgent:
                     accumulated_data.append(item)
 
         _merge_new_data(await self._extract_data_for_intent(task_intent))
-        snapshot = self._last_semantic_snapshot or {}
-        main_text = self._get_snapshot_main_text(snapshot)
-        if main_text and len(main_text) >= 50:
-            _merge_new_data([{"text": main_text, "source": "page_main_text"}])
+        if not accumulated_data:
+            snapshot = self._last_semantic_snapshot or {}
+            main_text = self._get_snapshot_main_text(snapshot)
+            _max = settings.BROWSER_FALLBACK_TEXT_MAX_LEN
+            _min = settings.BROWSER_FALLBACK_TEXT_MIN_LEN
+            if main_text and len(main_text) >= _min:
+                _merge_new_data([{
+                    "text": main_text[:_max],
+                    "source": "page_main_text_fallback",
+                    "truncated": len(main_text) > _max,
+                }])
         if not accumulated_data:
             vision_data = await self._extract_data_with_vision(task, task_intent, self._last_semantic_snapshot)
             if vision_data:

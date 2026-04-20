@@ -105,6 +105,12 @@ class Validator:
         Returns:
             {"passed": bool, "failure_type": str|None, "issues": [str]}
         """
+        if task.get("skipped_by_adaptive_reroute") or (
+            isinstance(task.get("result"), dict)
+            and task["result"].get("skipped_by_adaptive_reroute")
+        ):
+            return {"passed": True, "failure_type": None, "issues": ["skipped_by_adaptive_reroute"]}
+
         issues: List[str] = []
         result = task.get("result")
         task_type = task.get("task_type", "")

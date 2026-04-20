@@ -505,12 +505,17 @@ class LLMClient:
                     tokens_in=tokens_in,
                     tokens_out=tokens_out,
                 )
-                if cost > 0:
+                if cost > 0 or tokens_in > 0 or tokens_out > 0:
                     guard = MonthlyCostGuard(
                         monthly_budget_usd=settings.MONTHLY_BUDGET_USD,
                         data_dir=settings.DATA_DIR,
                     )
-                    guard.record_cost(cost, model=model_name)
+                    guard.record_cost(
+                        cost,
+                        model=model_name,
+                        tokens_in=tokens_in,
+                        tokens_out=tokens_out,
+                    )
                     used, budget, warning = guard.check_budget()
                     if warning:
                         log_agent_action(

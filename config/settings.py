@@ -515,6 +515,17 @@ class Settings:
     # MCP Server startup 总超时（秒）
     MCP_STARTUP_TIMEOUT = _env_int("MCP_STARTUP_TIMEOUT", 60)
 
+    # === E1 Prompt Injection 防护 ===
+    # 启发式检测主开关:关闭后 wrap_untrusted 仍会包裹但跳过检测/事件
+    PROMPT_INJECTION_DETECT_ENABLED = os.getenv("PROMPT_INJECTION_DETECT_ENABLED", "true").lower() == "true"
+    # 高风险命中是否抛 PromptInjectionBlocked(默认仅标记不阻断)
+    PROMPT_INJECTION_BLOCK_ON_HIGH = os.getenv("PROMPT_INJECTION_BLOCK_ON_HIGH", "false").lower() == "true"
+    # 可选 LLM 判定(预留接口,实际未接入)
+    PROMPT_INJECTION_LLM_JUDGE = os.getenv("PROMPT_INJECTION_LLM_JUDGE", "false").lower() == "true"
+    PROMPT_INJECTION_SAMPLE_RATE = float(os.getenv("PROMPT_INJECTION_SAMPLE_RATE", "0.1"))
+    # security event 落盘路径(相对路径基于 PROJECT_ROOT)
+    PROMPT_INJECTION_EVENT_LOG = os.getenv("PROMPT_INJECTION_EVENT_LOG", "data/security_events.jsonl")
+
     # === 上下文预算制 + 压缩重注入（S2）===
     # 为 auto-compact 预留的 token 数
     CONTEXT_RESERVE_TOKENS = _env_int("CONTEXT_RESERVE_TOKENS", 20000)
@@ -601,6 +612,33 @@ class Settings:
     MEMORY_TIER_WEIGHT_EPISODIC = float(os.getenv("MEMORY_TIER_WEIGHT_EPISODIC", "1.0"))
     MEMORY_TIER_WEIGHT_SEMANTIC = float(os.getenv("MEMORY_TIER_WEIGHT_SEMANTIC", "1.2"))
 
+    # === Episodic Replay 跨会话轨迹注入（C1）===
+    # 默认 off：避免冷启动期空表/噪声轨迹影响 router；积累一段时间后再开
+    EPISODE_REPLAY_ENABLED = os.getenv("EPISODE_REPLAY_ENABLED", "false").lower() == "true"
+    EPISODE_REPLAY_DB = os.getenv("EPISODE_REPLAY_DB", str(DATA_DIR / "episodes.db"))
+    EPISODE_REPLAY_TOP_K = max(_env_int("EPISODE_REPLAY_TOP_K", 2), 1)
+    EPISODE_REPLAY_MAX_AGE_DAYS = max(_env_int("EPISODE_REPLAY_MAX_AGE_DAYS", 60), 1)
+    EPISODE_REPLAY_MIN_SIMILARITY = float(os.getenv("EPISODE_REPLAY_MIN_SIMILARITY", "0.45"))
+    EPISODE_REPLAY_MAX_DAG_STEPS = max(_env_int("EPISODE_REPLAY_MAX_DAG_STEPS", 8), 2)
+
+    # === Tool Failure Auto-Tune (C2) ===
+    # 通用 per-tool 失败画像：tool_pipeline 末端打点，router/planner 注入近期健康度
+    # 默认 off：积累一段时间样本后再开，避免冷启动期空表噪声
+    TOOL_FAILURE_PROFILE_ENABLED = os.getenv("TOOL_FAILURE_PROFILE_ENABLED", "false").lower() == "true"
+    TOOL_FAILURE_PROFILE_DB = os.getenv(
+        "TOOL_FAILURE_PROFILE_DB", str(DATA_DIR / "tool_failure.db")
+    )
+    # 滑动窗口：每个 tool 只保留最近 N 次执行结果用于成功率/超时率计算
+    TOOL_FAILURE_WINDOW = max(_env_int("TOOL_FAILURE_WINDOW", 20), 3)
+    # router 注入门槛：至少有 N 次样本才输出健康提示
+    TOOL_FAILURE_MIN_SAMPLES = max(_env_int("TOOL_FAILURE_MIN_SAMPLES", 5), 1)
+    # router 注入门槛：timeout_rate 超此值 planner 应绕开/调高超时
+    TOOL_FAILURE_SKIP_THRESHOLD = float(os.getenv("TOOL_FAILURE_SKIP_THRESHOLD", "0.7"))
+    # router 注入门槛：fail_rate 超此值算"近期不可靠"
+    TOOL_FAILURE_WARN_THRESHOLD = float(os.getenv("TOOL_FAILURE_WARN_THRESHOLD", "0.5"))
+    # router 注入：最多注入 N 条工具健康提示
+    TOOL_FAILURE_HINT_TOP_K = max(_env_int("TOOL_FAILURE_HINT_TOP_K", 5), 1)
+
     # === 用户偏好自动学习（A5）===
     # 默认开启:通过 persist_job_outcome 末尾的 gated 触发器周期性推断,成本极低
     PREFERENCE_LEARNING_ENABLED = os.getenv("PREFERENCE_LEARNING_ENABLED", "true").lower() == "true"
@@ -655,6 +693,24 @@ class Settings:
     TERMINAL_AUTO_ALLOW_PATTERNS = _env_csv("TERMINAL_AUTO_ALLOW_PATTERNS")
     # 用户自定义强制确认的命令前缀（逗号分隔）
     TERMINAL_ALWAYS_CONFIRM_PATTERNS = _env_csv("TERMINAL_ALWAYS_CONFIRM_PATTERNS")
+
+    # === Memory 查询去重缓存 (F4) ===
+    MEMORY_QUERY_CACHE_ENABLED = os.getenv("MEMORY_QUERY_CACHE_ENABLED", "true").lower() == "true"
+    MEMORY_QUERY_CACHE_TTL_SEC = _env_int("MEMORY_QUERY_CACHE_TTL_SEC", 60)
+
+    # === Browser 直答透传 (F3) ===
+    # 是否从 page_assessment reason 提取 answer_text 并透传到 Finalizer
+    BROWSER_ANSWER_TEXT_ENABLED = os.getenv("BROWSER_ANSWER_TEXT_ENABLED", "true").lower() == "true"
+    # Finalizer 是否把 answer_text 前置到数据表之前
+    FINALIZER_ANSWER_FIRST = os.getenv("FINALIZER_ANSWER_FIRST", "true").lower() == "true"
+    # answer_citations 最多返回条数
+    FINALIZER_MAX_CITATIONS = _env_int("FINALIZER_MAX_CITATIONS", 3)
+
+    # === Browser 数据污染治理 (F2) ===
+    # page_main_text fallback 截断阈值（字符数）
+    BROWSER_FALLBACK_TEXT_MAX_LEN = _env_int("BROWSER_FALLBACK_TEXT_MAX_LEN", 800)
+    # 低于此长度的 main_text 不作为 fallback 写入
+    BROWSER_FALLBACK_TEXT_MIN_LEN = _env_int("BROWSER_FALLBACK_TEXT_MIN_LEN", 50)
 
     # === FileWorker 配置 ===
     # CSV 流式写入触发阈值（行数超过此值自动切换分批写入，避免 OOM）

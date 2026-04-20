@@ -382,6 +382,20 @@ class ChromaMemory:
         clean_query = sanitize_text(query or "")
         if not clean_query:
             return []
+
+        # F4: TTL cache — skip expensive embedding+Chroma for identical queries
+        if scope is None:
+            try:
+                from utils.memory_query_cache import get_cached, set_cached
+                cached = get_cached(
+                    str(self._collection_name or ""),
+                    clean_query, n_results, memory_type,
+                )
+                if cached is not None:
+                    return cached
+            except Exception:
+                pass
+
         log_agent_action(self.name, "Search memory", clean_query[:60])
 
         # A1: when decay rerank is enabled, collect a larger candidate pool
@@ -424,8 +438,15 @@ class ChromaMemory:
                 seen_ids.add(item["id"])
                 memories.append(item)
                 if not decay_enabled and len(memories) >= n_results:
-                    self._touch_memories(memories[:n_results])
-                    return memories[:n_results]
+                    result = memories[:n_results]
+                    self._touch_memories(result)
+                    if scope is None:
+                        try:
+                            from utils.memory_query_cache import set_cached
+                            set_cached(str(self._collection_name or ""), clean_query, n_results, memory_type, result)
+                        except Exception:
+                            pass
+                    return result
 
         if not memories and include_legacy_unscoped:
             legacy_items = self._query_collection(
@@ -447,8 +468,15 @@ class ChromaMemory:
             half_life = float(getattr(settings, "MEMORY_HALF_LIFE_DAYS", 30.0) or 30.0)
             memories = rerank_by_decay(memories, half_life_days=half_life)
 
-        self._touch_memories(memories[:n_results])
-        return memories[:n_results]
+        result = memories[:n_results]
+        self._touch_memories(result)
+        if scope is None:
+            try:
+                from utils.memory_query_cache import set_cached
+                set_cached(str(self._collection_name or ""), clean_query, n_results, memory_type, result)
+            except Exception:
+                pass
+        return result
 
     def _records_from_get(
         self,

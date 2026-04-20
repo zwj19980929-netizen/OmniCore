@@ -34,6 +34,7 @@ from utils.search_engine_profiles import (
 from utils.url_utils import extract_first_url
 from utils.web_prompt_budget import BudgetSection, render_budgeted_sections
 from utils.text_relevance import extract_relevant_text_safe_async
+from utils.prompt_injection_detector import wrap_untrusted
 import utils.web_debug_recorder as web_debug_recorder
 
 from agents.browser_agent import (
@@ -138,6 +139,10 @@ class BrowserDecisionLayer:
 
         # Page assessment cache
         self._page_assessment_cache: Dict[str, Optional[BrowserAction]] = {}
+
+        # Last assessment reason/evidence (F3: answer_text transparency)
+        self._last_assessment_reason: str = ""
+        self._last_evidence_indexes: List[int] = []
 
         # State synced from orchestrator (via _sync_state_to_layers)
         self.last_semantic_snapshot: Optional[Dict[str, Any]] = None
@@ -668,7 +673,8 @@ class BrowserDecisionLayer:
             selector = element.selector[:72]
             ref_part = f" ref={element.ref}" if element.ref else ""
             lines.append(f"[{element.index}] type={element.element_type}{ref_part} selector={selector} info={descriptor}")
-        return "\n".join(lines)
+        rendered = "\n".join(lines)
+        return wrap_untrusted(rendered, source="browser.elements") if rendered else rendered
 
     def _format_data_for_llm(self, data: List[Dict[str, str]], max_items: int = 8) -> str:
         lines: List[str] = []
@@ -681,7 +687,10 @@ class BrowserDecisionLayer:
             parts = [part for part in [title, text, link] if part]
             if parts:
                 lines.append(f"[{index}] " + " | ".join(parts))
-        return "\n".join(lines) or "(no visible data)"
+        rendered = "\n".join(lines)
+        if not rendered:
+            return "(no visible data)"
+        return wrap_untrusted(rendered, source="browser.data")
 
     def _format_cards_for_llm(self, cards: List[SearchResultCard], max_items: int = 10) -> str:
         lines: List[str] = []
@@ -699,7 +708,10 @@ class BrowserDecisionLayer:
                 lines.append(f"[{target}] {payload}")
         if len(cards) > max_items:
             lines.append(f"... {len(cards) - max_items} more cards omitted")
-        return "\n".join(lines) or "(no cards)"
+        rendered = "\n".join(lines)
+        if not rendered:
+            return "(no cards)"
+        return wrap_untrusted(rendered, source="browser.cards")
 
     def _format_controls_for_llm(self, snapshot: Optional[Dict[str, Any]], max_items: int = 6) -> str:
         lines: List[str] = []
@@ -2394,6 +2406,9 @@ class BrowserDecisionLayer:
                 log_warning(f"[DEBUG] 页面评估 payload: {json.dumps(payload, ensure_ascii=False)[:500]}...")
 
             action = self._action_from_llm(payload, elements)
+            if isinstance(payload, dict) and payload.get("goal_satisfied"):
+                self._last_assessment_reason = str(payload.get("reason") or "")
+                self._last_evidence_indexes = list(payload.get("evidence_indexes") or [])
             web_debug_recorder.write_json("browser_page_assessment_action", self._action_to_debug_payload(action))
             if action.action_type == ActionType.FAILED:
                 self._page_assessment_cache[cache_key] = None

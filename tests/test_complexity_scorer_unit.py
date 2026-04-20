@@ -271,3 +271,87 @@ class TestMonthlyCostGuard:
             f.write(json.dumps({"ts": ts, "cost_usd": 0.1, "model": "x"}) + "\n")
         total = guard.get_current_month_cost()
         assert total == pytest.approx(0.1)
+
+    # ─── E3-lite: token 用量监控 ───────────────────────
+    def test_record_persists_tokens(self):
+        guard, tmpdir = self._make_guard()
+        guard.record_cost(0.05, model="gpt-4o", tokens_in=1000, tokens_out=500)
+        cost_file = os.path.join(tmpdir, "monthly_cost.jsonl")
+        with open(cost_file) as f:
+            record = json.loads(f.readline())
+        assert record["tokens_in"] == 1000
+        assert record["tokens_out"] == 500
+
+    def test_record_with_only_tokens_no_cost(self):
+        """tokens>0 但 cost=0（定价表缺失）仍应落盘，方便观测。"""
+        guard, tmpdir = self._make_guard()
+        guard.record_cost(0.0, model="unknown-model", tokens_in=100, tokens_out=50)
+        cost_file = os.path.join(tmpdir, "monthly_cost.jsonl")
+        assert os.path.exists(cost_file)
+        usage = guard.get_token_usage(period="month")
+        assert usage["tokens_in"] == 100
+        assert usage["tokens_out"] == 50
+        assert usage["total"] == 150
+        assert usage["calls"] == 1
+
+    def test_get_token_usage_empty(self):
+        guard, _ = self._make_guard()
+        usage = guard.get_token_usage(period="month")
+        assert usage == {"tokens_in": 0, "tokens_out": 0, "total": 0, "calls": 0}
+
+    def test_get_token_usage_aggregates_month(self):
+        guard, _ = self._make_guard()
+        guard.record_cost(0.01, model="m1", tokens_in=100, tokens_out=50)
+        guard.record_cost(0.02, model="m2", tokens_in=200, tokens_out=80)
+        usage = guard.get_token_usage(period="month")
+        assert usage["tokens_in"] == 300
+        assert usage["tokens_out"] == 130
+        assert usage["total"] == 430
+        assert usage["calls"] == 2
+
+    def test_get_token_usage_day_filter(self):
+        """period='day' 应只统计今日 UTC 的记录。"""
+        from datetime import datetime, timezone
+        guard, tmpdir = self._make_guard()
+        cost_file = os.path.join(tmpdir, "monthly_cost.jsonl")
+        os.makedirs(tmpdir, exist_ok=True)
+        now = datetime.now(timezone.utc)
+        today_ts = now.isoformat()
+        yesterday_ts = now.replace(day=max(1, now.day - 1) if now.day > 1 else 1).isoformat()
+        with open(cost_file, "w") as f:
+            f.write(json.dumps({
+                "ts": today_ts, "cost_usd": 0.01, "model": "m",
+                "tokens_in": 100, "tokens_out": 50,
+            }) + "\n")
+            if now.day > 1:
+                f.write(json.dumps({
+                    "ts": yesterday_ts, "cost_usd": 0.01, "model": "m",
+                    "tokens_in": 999, "tokens_out": 999,
+                }) + "\n")
+        day_usage = guard.get_token_usage(period="day")
+        assert day_usage["tokens_in"] == 100
+        assert day_usage["tokens_out"] == 50
+
+    def test_get_token_usage_ignores_rows_without_tokens(self):
+        """旧格式无 tokens 字段的行不计入 calls。"""
+        from datetime import datetime, timezone
+        guard, tmpdir = self._make_guard()
+        cost_file = os.path.join(tmpdir, "monthly_cost.jsonl")
+        os.makedirs(tmpdir, exist_ok=True)
+        now = datetime.now(timezone.utc)
+        ts = now.isoformat()
+        with open(cost_file, "w") as f:
+            f.write(json.dumps({"ts": ts, "cost_usd": 0.05, "model": "legacy"}) + "\n")
+        usage = guard.get_token_usage(period="month")
+        assert usage["calls"] == 0
+        assert usage["total"] == 0
+
+    def test_top_models_includes_tokens(self):
+        guard, _ = self._make_guard()
+        guard.record_cost(0.10, model="m1", tokens_in=300, tokens_out=100)
+        guard.record_cost(0.01, model="m2", tokens_in=50, tokens_out=20)
+        top = guard.get_top_models_by_cost()
+        top_map = {t["model"]: t for t in top}
+        assert top_map["m1"]["tokens_in"] == 300
+        assert top_map["m1"]["tokens_out"] == 100
+        assert top_map["m2"]["tokens_in"] == 50

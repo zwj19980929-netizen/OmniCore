@@ -177,19 +177,99 @@ def _handle_cost_command() -> Dict:
 
     used, budget, warning = guard.check_budget()
     models = guard.get_top_models_by_cost()
+    month_tokens = guard.get_token_usage(period="month")
+    day_tokens = guard.get_token_usage(period="day")
 
     budget_str = f"/ ${budget:.2f}" if budget > 0 else "(未设置预算)"
     warn_str = "  ⚠ 接近预算上限！" if warning else ""
 
+    def _fmt_k(n: int) -> str:
+        if n >= 1_000_000:
+            return f"{n/1_000_000:.2f}M"
+        if n >= 1_000:
+            return f"{n/1_000:.1f}K"
+        return str(n)
+
     lines = [f"本月 LLM 成本: ${used:.4f} {budget_str}{warn_str}", ""]
+    lines.append(
+        f"本月 token: in={_fmt_k(month_tokens['tokens_in'])} "
+        f"out={_fmt_k(month_tokens['tokens_out'])} "
+        f"total={_fmt_k(month_tokens['total'])} "
+        f"({month_tokens['calls']} 次调用)"
+    )
+    lines.append(
+        f"今日 token: in={_fmt_k(day_tokens['tokens_in'])} "
+        f"out={_fmt_k(day_tokens['tokens_out'])} "
+        f"total={_fmt_k(day_tokens['total'])} "
+        f"({day_tokens['calls']} 次调用)"
+    )
+    lines.append("")
     if models:
-        lines.append("按模型分布：")
+        lines.append("按模型分布（成本 / token）：")
         for m in models[:8]:
-            lines.append(f"  {m['model']}: ${m['cost_usd']:.4f} ({m['calls']} 次)")
+            lines.append(
+                f"  {m['model']}: ${m['cost_usd']:.4f} "
+                f"({m['calls']} 次, in={_fmt_k(m.get('tokens_in', 0))} "
+                f"out={_fmt_k(m.get('tokens_out', 0))})"
+            )
     else:
         lines.append("暂无本月调用记录。")
     lines.append("")
     lines.append("设置月度预算：在 .env 中添加 MONTHLY_BUDGET_USD=<金额>")
+    return {"success": True, "output": "\n".join(lines), "is_special_command": True}
+
+
+def _handle_tool_health_command() -> Dict:
+    """Handle /tool-health command — show per-tool failure profile (C2)."""
+    from config.settings import settings as _settings
+    if not getattr(_settings, "TOOL_FAILURE_PROFILE_ENABLED", False):
+        return {
+            "success": True,
+            "output": "Tool failure profile 未启用 (设 TOOL_FAILURE_PROFILE_ENABLED=true 开启)。",
+            "is_special_command": True,
+        }
+    try:
+        from utils.tool_failure_profile import get_tool_failure_profile_store
+        store = get_tool_failure_profile_store()
+        if store is None:
+            return {
+                "success": True,
+                "output": "Tool failure profile 未初始化。",
+                "is_special_command": True,
+            }
+        profiles = store.get_all_profiles()
+    except Exception as e:
+        return {"success": False, "output": f"读取 tool 画像失败: {e}", "is_special_command": True}
+
+    if not profiles:
+        return {
+            "success": True,
+            "output": "尚无工具执行记录。运行一些任务后再试。",
+            "is_special_command": True,
+        }
+
+    profiles.sort(key=lambda p: (p["fail_rate"], -p["total"]), reverse=True)
+    lines = [f"工具失败画像 (window={_settings.TOOL_FAILURE_WINDOW})", ""]
+    for p in profiles:
+        top_tag = ""
+        if p["error_tags"]:
+            top_tag = max(p["error_tags"].items(), key=lambda kv: kv[1])[0]
+        bits = [
+            f"n={p['total']}",
+            f"succ={p['success_rate']:.0%}",
+            f"timeout={p['timeout_rate']:.0%}",
+            f"avg={p['avg_latency_ms']}ms",
+        ]
+        if top_tag and p["fail_count"] > 0:
+            bits.append(f"top_err={top_tag}")
+        lines.append(f"  {p['tool_name']}: " + " | ".join(bits))
+
+    hints = store.get_recommendations()
+    if hints:
+        lines.append("")
+        lines.append("Planner 提示 (将注入 router):")
+        for h in hints:
+            lines.append(f"  [{h['level']}] {h['tool_name']} — {h['message']}")
     return {"success": True, "output": "\n".join(lines), "is_special_command": True}
 
 
@@ -319,6 +399,7 @@ def _handle_builtin_command(user_input: str, session_id: str = "") -> Optional[D
       /allow <prefix> 会话内批准某类命令前缀
       /shell         显示当前 shell 和工作目录信息
       /cost          查看本月 LLM 成本统计
+      /tool-health   查看工具失败画像 (C2)
       /watch         事件驱动监控管理
     """
     stripped = user_input.strip()
@@ -418,6 +499,10 @@ def _handle_builtin_command(user_input: str, session_id: str = "") -> Optional[D
     # /cost — 本月 LLM 成本统计
     if stripped.lower() == "/cost":
         return _handle_cost_command()
+
+    # /tool-health — 工具失败画像（C2）
+    if stripped.lower() in ("/tool-health", "/toolhealth"):
+        return _handle_tool_health_command()
 
     # /shell
     if stripped.lower() == "/shell":

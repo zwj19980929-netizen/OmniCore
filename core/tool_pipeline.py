@@ -289,6 +289,9 @@ class ToolPipeline:
         # S6: 审计日志
         self._write_audit_log(ctx, spec)
 
+        # C2: per-tool failure profile (sliding-window stats for planner hints)
+        self._record_tool_failure_profile(ctx)
+
         return ctx
 
     # ---- Stage 实现 ----
@@ -507,6 +510,41 @@ class ToolPipeline:
             else:
                 masked[k] = v
         return masked
+
+    # ---- C2: per-tool failure profile ----
+
+    @staticmethod
+    def _record_tool_failure_profile(ctx: ToolExecutionContext) -> None:
+        """Push one event into the C2 failure-profile store.
+
+        No-ops when ``TOOL_FAILURE_PROFILE_ENABLED=false``. Skips bookkeeping
+        for events the profile cannot meaningfully attribute to the tool
+        itself: schema/permission rejections (fault is upstream caller) and
+        approval-pending decisions (no execution happened).
+        """
+        try:
+            if not getattr(settings, "TOOL_FAILURE_PROFILE_ENABLED", False):
+                return
+            # Skip pre-execution rejections / approval gates
+            if ctx.has_fatal_error or ctx.permission_result in ("ask", "deny"):
+                return
+            from utils.tool_failure_profile import get_tool_failure_profile_store
+
+            store = get_tool_failure_profile_store()
+            if store is None:
+                return
+            result = ctx.normalized_result
+            success = bool(result.success) if result else False
+            latency_s = ctx.stage_timings.get(ToolPipelineStage.EXECUTE.value, 0.0) or 0.0
+            store.record_outcome(
+                ctx.tool_name,
+                success=success,
+                error_type=(result.error_type if result else None),
+                error_message=(result.error if result else None),
+                latency_ms=int(latency_s * 1000),
+            )
+        except Exception as exc:  # pragma: no cover — best-effort, never block
+            log_warning(f"[C2] tool failure profile record skipped: {exc}")
 
     def _write_audit_log(self, ctx: ToolExecutionContext, spec: Any) -> None:
         """S6: 将工具执行记录写入审计日志 data/audit/{date}.jsonl。"""

@@ -139,14 +139,14 @@ def test_find_best_element_skips_hidden_or_disabled_controls():
     assert chosen.selector == "#visible"
 
 
-def test_bootstrap_search_results_falls_back_to_google_when_bing_is_blank():
+def test_bootstrap_search_results_falls_back_to_google_when_duckduckgo_is_blank():
     toolkit = _BootstrapSearchToolkit()
     agent = BrowserAgent(headless=False, toolkit=toolkit)
 
     success = asyncio.run(agent._bootstrap_search_results("US Iran war escalation 2026"))
 
     assert success is True
-    assert any("bing.com/search" in url for url in toolkit.visited)
+    assert any("duckduckgo.com" in url for url in toolkit.visited)
     assert any("google.com/search" in url for url in toolkit.visited)
 
 
@@ -746,7 +746,12 @@ def test_format_elements_for_llm_uses_compact_budget():
         )
 
     payload = agent._format_elements_for_llm("search ai news", elements)
-    lines = [line for line in payload.splitlines() if line.strip()]
+    lines = [
+        line for line in payload.splitlines()
+        if line.strip()
+        and not line.lstrip().startswith("<UNTRUSTED")
+        and not line.lstrip().startswith("</UNTRUSTED")
+    ]
 
     assert len(lines) <= 8
     assert all(len(line) < 220 for line in lines)
