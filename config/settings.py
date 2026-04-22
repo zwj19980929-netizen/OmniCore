@@ -334,6 +334,7 @@ class Settings:
     BROWSER_DOM_CHECKPOINT_ENABLED = os.getenv("BROWSER_DOM_CHECKPOINT_ENABLED", "true").lower() == "true"
     BROWSER_VISUAL_VERIFY_ENABLED = os.getenv("BROWSER_VISUAL_VERIFY_ENABLED", "true").lower() == "true"
     BROWSER_CORRECTION_ESCALATE_TO_REASONING = os.getenv("BROWSER_CORRECTION_ESCALATE_TO_REASONING", "true").lower() == "true"
+    BROWSER_MAX_WAIT_SEC = _env_int("BROWSER_MAX_WAIT_SEC", 10)
 
     # === 搜索结果与文本相关性评分权重 ===
     # 文本相关性：token 匹配 / 字符 n-gram 重叠 / 数字匹配

@@ -609,7 +609,11 @@ class BrowserExecutionLayer:
             log_agent_action(self.name, "scroll", f"px={action.value or 800}")
             return r.success
         if action.action_type == ActionType.WAIT:
-            wait_sec = max(float(action.value or 1), 0.2)
+            raw_value = float(action.value or 1)
+            # LLM 常误把 value 按毫秒给（如 5000 表示 5 秒），统一折算
+            if raw_value > settings.BROWSER_MAX_WAIT_SEC * 10:
+                raw_value = raw_value / 1000.0
+            wait_sec = min(max(raw_value, 0.2), float(settings.BROWSER_MAX_WAIT_SEC))
             log_agent_action(self.name, "wait", f"{wait_sec:.1f}s")
             await asyncio.sleep(wait_sec)
             return True

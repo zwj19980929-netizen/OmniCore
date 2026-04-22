@@ -24,6 +24,13 @@ Rules:
 - Do NOT include redundant actions (e.g. clicking a field before typing — input handles focus).
 - Do NOT repeat any action from the BLACKLISTED list.
 - If the task goal is already satisfied by the current page content, return an empty actions array with goal_description explaining why.
+- "value" semantics by action type:
+  - input: exact text to type
+  - scroll: integer pixel amount (e.g. "800")
+  - navigate: full URL
+  - wait: integer SECONDS, 1–10 ONLY (NOT milliseconds). Do not emit "5000".
+  - press_key / click / select: usually empty
+- Do NOT emit a "wait" action just to "keep session open", "let user see the page", or pad the sequence. Use dom_checkpoint to verify results. Only use wait when a real animation/redirect needs ≤10s to settle.
 
 dom_checkpoint types:
 - "value_change": after input, check the field has the expected value. Provide target_ref/target_selector and expected_value.
@@ -43,7 +50,7 @@ Return schema:
       "type": "input|click|select|press_key|scroll|wait|navigate",
       "target_ref": "el_N",
       "target_selector": "#css-selector",
-      "value": "text to input / scroll pixels / url",
+      "value": "input text / scroll pixels / url / wait seconds (1-10, NOT ms)",
       "description": "what this action does",
       "keyboard_key": "Enter (only for press_key)",
       "dom_checkpoint": {{

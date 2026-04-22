@@ -24,6 +24,8 @@ Rules:
 - Include dom_checkpoint for each action.
 - If the page has changed (e.g. error message appeared, redirected), adapt to the NEW state.
 - If the original approach was fundamentally wrong, start fresh with a completely different strategy.
+- "wait" action value is integer SECONDS, 1–10 only (NOT milliseconds — do not emit "5000").
+- Do NOT emit a "wait" action just to "keep session" or pad the sequence.
 
 Return schema:
 {{
@@ -35,7 +37,7 @@ Return schema:
       "type": "input|click|select|press_key|scroll|wait|navigate",
       "target_ref": "el_N",
       "target_selector": "#css-selector",
-      "value": "text to input / scroll pixels / url",
+      "value": "input text / scroll pixels / url / wait seconds (1-10, NOT ms)",
       "description": "what this action does",
       "keyboard_key": "Enter (only for press_key)",
       "dom_checkpoint": {{
