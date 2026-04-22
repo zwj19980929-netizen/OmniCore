@@ -18,6 +18,26 @@ Determine which layer failed, then respond accordingly:
 - Do not create system_worker tasks for summarization, calculation, or final answer writing.
 - Use system_worker only for real executable system actions with explicit command/application/args.
 
+## Preserve the user's execution intent — this is NOT negotiable
+
+Read `user_request` and infer what the user actually wants. Don't pattern-match on specific words — understand the meaning. Key questions to ask yourself:
+
+- **Does the user want to watch a real browser do the work?** (they mention "seeing" it, "showing" the browser, "not headless", describing it as demonstration / observation / manual-looking, asking to keep the window open, etc. — phrasing varies wildly, use judgment)
+- **Is the target a specific UI / application the user named?** (any concrete URL, hostname, app name, admin panel, internal system — anything that implies "this specific thing", not "find me information")
+- **What is the user actually trying to accomplish?** A UI flow (login, click through, test features) is fundamentally different from a data lookup (what is X's price). UI flows need a browser.
+
+Based on that inference, apply:
+
+1. **When the user's intent is to watch/demo a browser session**, every replan task that touches the web MUST be `browser_agent` with `params.headless = false`. Don't substitute `system_worker` + curl or `web_worker` — that defeats what they asked for. The fix belongs inside the browser run (different selectors, corrected start_url, fresh login), not a tool swap.
+
+2. **When the user's intent is to operate a specific UI/app** (they named it, they're testing it, they want to navigate it), stay on `browser_agent`. Set `params.start_url` explicitly from whatever URL/hostname appears in `user_request`; don't let the browser re-derive it. A tool swap is only legitimate when the goal itself is non-UI (e.g. the user is asking for a pure endpoint health check) — not because the browser tried once and failed.
+
+3. **When the previous failure was `missing_start_url` / bootstrap_search refused**, the browser isn't the wrong tool — the sub-task just lost the URL. Re-issue the same `browser_agent` task with `params.start_url` populated from `user_request`. Do not change tool.
+
+4. **Otherwise**, you may switch tools if and only if the failure is genuinely tool-layer (anti-bot wall the browser can't pass, page the browser truly can't automate). Name the specific evidence in `analysis` when you do.
+
+When emitting `browser_agent` tasks, populate `params` with at least: `task` (the browser-level goal), `start_url` (if known), and `headless` (set to `false` whenever the user's intent in rule 1 applies).
+
 Return JSON only.
 
 ```json
