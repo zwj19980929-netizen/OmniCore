@@ -4,7 +4,7 @@ Graph utility functions shared by graph nodes, replanner, and finalizer.
 Extracted from core/graph.py (R3 refactor).
 """
 
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
 from urllib.parse import urlparse
 
 from core.state import OmniCoreState
@@ -304,6 +304,7 @@ def repair_replan_task_params(
     tasks: List[Dict[str, Any]],
     target_url: str,
     user_request: str = "",
+    original_headless: Optional[bool] = None,
 ) -> List[Dict[str, Any]]:
     target_url = sanitize_extracted_url(target_url)
     user_request = str(user_request or "").strip()
@@ -331,6 +332,9 @@ def repair_replan_task_params(
                 description = str(task_data.get("description", "") or "").strip()
                 if not current_task_param or current_task_param == description:
                     params["task"] = user_request
+            # Preserve headed/headless mode from original task if LLM didn't set it.
+            if original_headless is not None and "headless" not in params:
+                params["headless"] = original_headless
             task_data["params"] = params
         elif (
             tool_name in {"web.fetch_and_extract", "web.smart_extract"}

@@ -74,6 +74,7 @@ def replanner_node(state: OmniCoreState) -> OmniCoreState:
     error_summaries: List[str] = []
     preserved_tasks: List[Dict[str, Any]] = []
     failed_tasks_structured: List[Dict[str, Any]] = []
+    original_headless: bool | None = None  # tracks headed/headless from failed browser tasks
 
     for task in state.get("task_queue", []) or []:
         if is_task_preservable_for_replan(task):
@@ -86,6 +87,15 @@ def replanner_node(state: OmniCoreState) -> OmniCoreState:
             continue
 
         failure_record = build_replan_failure_record(task)
+
+        # Capture headless setting from the first failed browser task so we can
+        # restore it after replanning (LLM may forget to set headless in output).
+        task_type = str(task.get("task_type", "") or "")
+        tool_name = str(task.get("tool_name", "") or "")
+        if original_headless is None and (task_type == "browser_agent" or tool_name == "browser.interact"):
+            task_params = task.get("params") or {}
+            if "headless" in task_params:
+                original_headless = bool(task_params["headless"])
 
         # Determine failure layer
         ft = failure_record["failure_type"]
@@ -170,6 +180,7 @@ def replanner_node(state: OmniCoreState) -> OmniCoreState:
             result.get("tasks", []),
             authoritative_target_url,
             user_request=str(state.get("user_input", "") or ""),
+            original_headless=original_headless,
         )
         result["tasks"], finalize_instructions = extract_finalize_instructions_from_replan_tasks(
             repaired_tasks
