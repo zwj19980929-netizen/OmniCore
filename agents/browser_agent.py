@@ -3097,7 +3097,10 @@ class BrowserAgent:
             for seq_action in sequence.remaining():
                 browser_action = self._sequence_action_to_browser_action(seq_action)
                 self._record_action(browser_action)
-
+                log_agent_action(
+                    self.name, f"batch[{correction_round}]",
+                    f"{seq_action.action_type}: {seq_action.description[:60]}",
+                )
                 success = await self._execute_action(browser_action)
                 step_record = {
                     "action_type": seq_action.action_type,
@@ -3144,7 +3147,7 @@ class BrowserAgent:
                 try:
                     page = getattr(tk, '_page', None)
                     if page and self._can_use_vision():
-                        screenshot_bytes = await page.screenshot(type="jpeg", quality=50, full_page=False)
+                        screenshot_bytes = await page.screenshot(type="jpeg", quality=50, full_page=False, timeout=8000)
                         if screenshot_bytes:
                             vision_desc = await self._describe_screenshot(screenshot_bytes, task) or ""
                 except Exception:

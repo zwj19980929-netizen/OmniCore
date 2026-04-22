@@ -398,6 +398,8 @@ class BrowserExecutionLayer:
         if await self._iframe_auto_scan_click(selector, action):
             log_agent_action(self.name, "click", "iframe_auto_scan")
             return True
+        desc = (action.description[:60] if action else selector[:60]) if (action or selector) else "?"
+        log_warning(f"try_click: all {len(strategies)} strategies failed — {desc}")
         return False
 
     # ── Input with fallbacks ─────────────────────────────────
@@ -604,16 +606,22 @@ class BrowserExecutionLayer:
             return r.success
         if action.action_type == ActionType.SCROLL:
             r = await tk.scroll_down(int(action.value or 800))
+            log_agent_action(self.name, "scroll", f"px={action.value or 800}")
             return r.success
         if action.action_type == ActionType.WAIT:
-            await asyncio.sleep(max(float(action.value or 1), 0.2))
+            wait_sec = max(float(action.value or 1), 0.2)
+            log_agent_action(self.name, "wait", f"{wait_sec:.1f}s")
+            await asyncio.sleep(wait_sec)
             return True
         if action.action_type == ActionType.NAVIGATE:
+            log_agent_action(self.name, "navigate", (action.value or "")[:80])
             await tk.exit_iframe()
             r = await tk.goto(action.value, timeout=20000)
             return r.success
         if action.action_type == ActionType.PRESS_KEY:
-            r = await tk.press_key(action.value or action.keyboard_key or "Enter")
+            key = action.value or action.keyboard_key or "Enter"
+            log_agent_action(self.name, "press_key", key)
+            r = await tk.press_key(key)
             return r.success
         if action.action_type == ActionType.CONFIRM:
             return not settings.REQUIRE_HUMAN_CONFIRM
