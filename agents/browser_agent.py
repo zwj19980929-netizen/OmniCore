@@ -1155,6 +1155,42 @@ class BrowserAgent:
     def _extract_url_from_task(self, task: str) -> Optional[str]:
         return self.decision._extract_url_from_task(task)
 
+    def _should_refuse_bootstrap_search(self, task: str) -> Optional[str]:
+        """Return a reason string if bootstrap_search should be suppressed for this task.
+
+        Bootstrap search is meant for open-web research. It is wrong when the
+        task is clearly a follow-up in a system-specific job whose URL was
+        lost between sub-tasks. We refuse in those cases so the planner can
+        retry with a proper start_url, instead of silently drifting to
+        duckduckgo and picking unrelated articles.
+        """
+        if not settings.BROWSER_BOOTSTRAP_SEARCH_STRICT:
+            return None
+        if not task:
+            return None
+        # If the task already carries a full URL, bootstrap_search won't fire
+        # at the call site anyway — don't flag it here either (safer for
+        # direct callers / tests).
+        if self._extract_url_from_task(task):
+            return None
+        t = task.lower()
+        # Partial URL hints — the user clearly named a specific host but no
+        # full URL survived. Treat them as "URL required, not web search".
+        for hint in ("localhost", "127.0.0.1", "0.0.0.0", "192.168.", "10.", "172.16.", "172.17.", "172.18.", "172.19.", "172.2", "172.30.", "172.31."):
+            if hint in t:
+                return f"task mentions intranet host '{hint}' but no full URL was provided"
+        # Follow-up / session-dependent phrasings. These strongly imply the
+        # task assumes prior browser context (e.g. "after login, ...").
+        zh_markers = ("登录后", "登录成功后", "登入后", "已登录", "登陆后", "系统内", "平台内", "后台", "管理后台", "管理平台", "上一步", "前一步", "前面的", "接着", "然后")
+        en_markers = ("after login", "after logging in", "after signing in", "logged-in", "logged in", "the system", "within the system", "from the previous", "from previous step", "after the above", "continue from")
+        for m in zh_markers:
+            if m in task:
+                return f"task references prior session context ('{m}') but no URL was provided"
+        for m in en_markers:
+            if m in t:
+                return f"task references prior session context ('{m}') but no URL was provided"
+        return None
+
     def _extract_auth_fields_from_free_text(self, task: str) -> Dict[str, str]:
         return self.decision._extract_auth_fields_from_free_text(task)
 
@@ -2322,6 +2358,29 @@ class BrowserAgent:
             )
         )
         if should_bootstrap_search:
+            refuse_reason = self._should_refuse_bootstrap_search(task)
+            if refuse_reason:
+                log_warning(f"bootstrap_search refused: {refuse_reason}")
+                web_debug_recorder.record_event(
+                    "bootstrap_search_refused",
+                    reason=refuse_reason,
+                    task=task[:200],
+                )
+                return {
+                    "ok": False,
+                    "result": {
+                        "success": False,
+                        "message": (
+                            f"browser task lacks a concrete URL and bootstrap_search is unsafe here: {refuse_reason}. "
+                            "Planner should pass start_url (or inline the full URL in the task description)."
+                        ),
+                        "url": current_url,
+                        "expected_url": expected_url,
+                        "title": page_title,
+                        "steps": steps,
+                        "error_tag": "missing_start_url",
+                    },
+                }
             query = task_intent.query or self._derive_primary_query(task)
             if query:
                 await self._bootstrap_search_results(query)
