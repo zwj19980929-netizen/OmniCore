@@ -645,6 +645,7 @@ class ToolPipeline:
             "tool_name": ctx.tool_name,
             "task_type": "",
             "task_id": state.get("current_task_id", ""),
+            "job_id": state.get("job_id", ""),
             "params": ctx.effective_params,
             "tool_args": copy.deepcopy(ctx.effective_params),
             "description": "",

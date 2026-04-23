@@ -373,6 +373,9 @@ class Settings:
     STATIC_FETCH_ENABLED = os.getenv("STATIC_FETCH_ENABLED", "true").lower() == "true"
     BROWSER_POOL_ENABLED = os.getenv("BROWSER_POOL_ENABLED", "true").lower() == "true"
     BROWSER_POOL_IDLE_TTL_SECONDS = max(_env_int("BROWSER_POOL_IDLE_TTL_SECONDS", 120), 1)
+    # 跨任务浏览器会话持久化：同一 Job 内多个 browser task 共享 cookies/storage
+    BROWSER_SESSION_PERSIST_ENABLED = os.getenv("BROWSER_SESSION_PERSIST_ENABLED", "true").lower() == "true"
+    BROWSER_SESSION_DIR = os.getenv("BROWSER_SESSION_DIR", "data/browser_sessions")
     BROWSER_POOL_MAX_BROWSERS_PER_KEY = max(
         _env_int("BROWSER_POOL_MAX_BROWSERS_PER_KEY", 1), 1
     )

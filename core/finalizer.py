@@ -685,6 +685,20 @@ def finalize_node(state: OmniCoreState) -> OmniCoreState:
     from core.plan_manager import complete_plan
     complete_plan(state.get("job_id", ""))
 
+    # Clean up job-scoped browser session directory (cookies saved between tasks).
+    try:
+        from config.settings import settings as _bs_settings
+        if _bs_settings.BROWSER_SESSION_PERSIST_ENABLED:
+            import os, re, shutil
+            _jid = str(state.get("job_id", "") or "").strip()
+            if _jid:
+                _safe = re.sub(r"[^a-zA-Z0-9_-]", "_", _jid)[:48]
+                _session_dir = os.path.join(_bs_settings.BROWSER_SESSION_DIR, _safe)
+                if os.path.isdir(_session_dir):
+                    shutil.rmtree(_session_dir, ignore_errors=True)
+    except Exception:
+        pass  # non-blocking
+
     get_structured_logger().log_event("stage_end", detail="finalize")
     save_runtime_checkpoint(state, "finalize", "Finalize completed")
     return state

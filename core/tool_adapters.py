@@ -9,6 +9,8 @@ import copy
 import json
 import importlib
 import importlib.util
+import os
+import re
 import threading
 import urllib.error
 import urllib.request
@@ -810,6 +812,15 @@ class BrowserAgentAdapter(BaseToolAdapter):
             max_steps = 8
         resolved_model = resolve_model_for_task(task)
 
+        # Derive a job-scoped browser session directory so cookies/storage
+        # survive context close between tasks of the same job (e.g. replan).
+        browser_user_data_dir: Optional[str] = None
+        if settings.BROWSER_SESSION_PERSIST_ENABLED:
+            job_id = str(task.get("job_id", "") or "").strip()
+            if job_id:
+                safe_id = re.sub(r"[^a-zA-Z0-9_-]", "_", job_id)[:48]
+                browser_user_data_dir = os.path.join(settings.BROWSER_SESSION_DIR, safe_id)
+
         result = None
         last_error = None
         pool = await WorkerPool.get_instance()
@@ -819,6 +830,7 @@ class BrowserAgentAdapter(BaseToolAdapter):
                 headless=headless,
                 fast_mode=settings.BROWSER_FAST_MODE,
                 block_heavy_resources=settings.BLOCK_HEAVY_RESOURCES,
+                user_data_dir=browser_user_data_dir,
             )
             task_llm = None
             if resolved_model:
