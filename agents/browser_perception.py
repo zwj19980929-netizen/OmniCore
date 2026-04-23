@@ -313,6 +313,8 @@ class BrowserPerceptionLayer:
             return ""
 
         try:
+            if getattr(page, "is_closed", lambda: False)():
+                return ""
             screenshot_bytes = await page.screenshot(type="jpeg", quality=50, full_page=False)
             response = self._vision_llm.chat_with_image(
                 text="Describe this webpage briefly: layout, main content area, key interactive elements, any modals/overlays. Be concise (2-3 sentences).",
@@ -325,6 +327,9 @@ class BrowserPerceptionLayer:
                 return content.strip()[:500]
             return str(content or "").strip()[:500]
         except Exception as exc:
+            exc_str = str(exc).lower()
+            if "closed" in exc_str or "target page" in exc_str or "browser has been closed" in exc_str:
+                return ""  # page in transitional state, not a real error
             log_warning(f"vision description failed: {exc}")
             return ""
 
