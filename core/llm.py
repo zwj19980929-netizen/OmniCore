@@ -108,6 +108,20 @@ class LLMClient:
         return cls(capability="vision", provider=provider)
 
     @classmethod
+    def for_vision_high(cls, provider: str = None) -> "LLMClient":
+        """High-tier vision client for critical-path calls.
+
+        Resolves ``settings.VISION_MODEL_HIGH`` when set (explicit model
+        string, e.g. ``"openai/gpt-5"``). When unset, transparently falls
+        back to :meth:`for_vision` so callers never have to branch on
+        configuration — opt-in by env var only.
+        """
+        high_model = getattr(settings, "VISION_MODEL_HIGH", "") or ""
+        if high_model.strip():
+            return cls(model=high_model.strip())
+        return cls.for_vision(provider=provider)
+
+    @classmethod
     def for_image_gen(cls, provider: str = None) -> "LLMClient":
         """快捷方法：创建图片生成客户端"""
         return cls(capability="image_gen", provider=provider)

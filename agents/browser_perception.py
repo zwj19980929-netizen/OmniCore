@@ -63,10 +63,21 @@ class BrowserPerceptionLayer:
         self.page_perceiver = page_perceiver
         self.name = agent_name
 
-        # Vision LLM (lazy init)
+        # Vision LLM (lazy init). Two parallel slots:
+        #   * ``_vision_llm``      — default tier, used by observe-time
+        #     page-description (high frequency, cached).
+        #   * ``_vision_llm_high`` — HIGH tier, used by critical-path
+        #     calls (batch verify, data extraction, relevance check).
+        # When ``VISION_MODEL_HIGH`` is unset the HIGH factory transparently
+        # delegates to the default, so both slots may end up holding the
+        # same underlying model — which is fine; they're cached separately
+        # only so unavailability of one tier doesn't poison the other.
         self._vision_llm: Optional[LLMClient] = None
         self._vision_llm_attempted = False
         self._vision_llm_unavailable_logged = False
+        self._vision_llm_high: Optional[LLMClient] = None
+        self._vision_llm_high_attempted = False
+        self._vision_llm_high_unavailable_logged = False
 
         # Snapshot caching
         self._snapshot_version: int = 0
@@ -147,6 +158,27 @@ class BrowserPerceptionLayer:
                 log_warning(f"vision llm unavailable: {exc}")
                 self._vision_llm_unavailable_logged = True
             return None
+
+    def get_vision_llm_high(self) -> Optional[LLMClient]:
+        """HIGH-tier vision client for critical-path calls.
+
+        Falls back to :meth:`get_vision_llm` when ``VISION_MODEL_HIGH`` is
+        unset or when the HIGH model fails to initialise, so callers can
+        rely on this method without extra branching.
+        """
+        if self._vision_llm_high is not None:
+            return self._vision_llm_high
+        if not self._vision_llm_high_attempted:
+            self._vision_llm_high_attempted = True
+            try:
+                self._vision_llm_high = LLMClient.for_vision_high()
+                return self._vision_llm_high
+            except Exception as exc:
+                if not self._vision_llm_high_unavailable_logged:
+                    log_warning(f"vision llm (high) unavailable: {exc}")
+                    self._vision_llm_high_unavailable_logged = True
+        # Fall back to default tier.
+        return self.get_vision_llm()
 
     # ── Semantic snapshot ────────────────────────────────────
 
@@ -302,7 +334,7 @@ class BrowserPerceptionLayer:
     # ── Vision description ───────────────────────────────────
 
     async def get_vision_description(self, page) -> Tuple[str, List[Dict[str, str]]]:
-        """Take screenshot and describe via vision model.
+        """Describe the page via the default-tier vision model.
 
         Returns a ``(summary, interactive_controls)`` tuple. The summary is a
         short natural-language description; ``interactive_controls`` is a
@@ -313,19 +345,28 @@ class BrowserPerceptionLayer:
 
         Returns ``("", [])`` on any failure — callers must tolerate that.
         """
-        if not self._vision_llm and not self._vision_llm_attempted:
-            self._vision_llm_attempted = True
-            try:
-                self._vision_llm = LLMClient.for_vision()
-            except Exception:
-                if not self._vision_llm_unavailable_logged:
-                    log_warning("vision LLM unavailable for perception")
-                    self._vision_llm_unavailable_logged = True
-                return "", []
+        return await self._describe_with_vision(page, self.get_vision_llm(), "default")
 
-        if not self._vision_llm:
+    async def get_vision_description_high(self, page) -> Tuple[str, List[Dict[str, str]]]:
+        """Describe the page via the HIGH-tier vision model.
+
+        Intended for critical-path calls (batch-verify before correction,
+        data extraction on DOM-fallback, relevance check) where a stronger
+        vision model pays for itself through one fewer retry. When
+        ``VISION_MODEL_HIGH`` is unset this transparently uses the default
+        tier — opt-in by env only.
+        """
+        return await self._describe_with_vision(page, self.get_vision_llm_high(), "high")
+
+    async def _describe_with_vision(
+        self,
+        page: Any,
+        vision_llm: Optional[LLMClient],
+        tier: str,
+    ) -> Tuple[str, List[Dict[str, str]]]:
+        """Shared implementation for tier-variant vision description."""
+        if vision_llm is None:
             return "", []
-
         try:
             if getattr(page, "is_closed", lambda: False)():
                 return "", []
@@ -336,7 +377,7 @@ class BrowserPerceptionLayer:
                 # or unreadable. Keeps the call site resilient during deploys.
                 'Return JSON: {"summary": "...", "interactive_controls": [{"role": "...", "label": "..."}]}',
             )
-            response = self._vision_llm.chat_with_image(
+            response = vision_llm.chat_with_image(
                 text=prompt,
                 image=screenshot_bytes,
                 temperature=0.2,
@@ -347,7 +388,7 @@ class BrowserPerceptionLayer:
             exc_str = str(exc).lower()
             if "closed" in exc_str or "target page" in exc_str or "browser has been closed" in exc_str:
                 return "", []  # page in transitional state, not a real error
-            log_warning(f"vision description failed: {exc}")
+            log_warning(f"vision description failed ({tier}): {exc}")
             return "", []
 
     @staticmethod
@@ -428,8 +469,13 @@ class BrowserPerceptionLayer:
         snapshot: Optional[Dict[str, Any]] = None,
         derive_primary_query_fn=None,
     ) -> List[Dict[str, str]]:
-        """Screenshot -> vision model -> extract structured data (fallback when DOM extraction fails)."""
-        vision_llm = self.get_vision_llm()
+        """Screenshot -> vision model -> extract structured data (fallback when DOM extraction fails).
+
+        Uses the HIGH tier: this path is only invoked when standard DOM
+        extraction already failed, so the cost of a stronger vision call is
+        justified by the prospect of actually recovering the task's data.
+        """
+        vision_llm = self.get_vision_llm_high()
         if vision_llm is None:
             return []
 
@@ -486,8 +532,13 @@ class BrowserPerceptionLayer:
         query: str,
         snapshot: Optional[Dict[str, Any]] = None,
     ) -> Tuple[bool, str]:
-        """Screenshot -> vision model -> determine if page contains task-relevant info."""
-        vision_llm = self.get_vision_llm()
+        """Screenshot -> vision model -> determine if page contains task-relevant info.
+
+        Uses the HIGH tier: relevance judgements gate whether we commit to
+        an expensive extraction flow, so a stronger vision model here
+        prevents wasted downstream work.
+        """
+        vision_llm = self.get_vision_llm_high()
         if vision_llm is None:
             return (False, "")
 
@@ -664,6 +715,21 @@ class BrowserPerceptionLayer:
         except Exception as exc:
             log_warning(f"iframe element extraction failed: {exc}")
 
+        # Deep interactive scan (always on): picks up W3C-standard controls
+        # the primary extractor skips — chiefly ``<label for=…>`` paired with
+        # a hidden ``input[type=checkbox|radio]``, plus auxiliary ARIA roles
+        # (switch, tab, menuitem, option, combobox, slider, etc.). One extra
+        # JS evaluate per observe; no LLM cost. Runs before vision so the
+        # perception-gap check below compares against the complete element
+        # set.
+        if page:
+            try:
+                added = await self._run_deep_interactive_scan(page, snapshot)
+                if added:
+                    log_agent_action(self.name, "observe", f"deep_scan_added={added}")
+            except Exception as exc:
+                log_warning(f"deep interactive scan failed: {exc}")
+
         # B4: attach frames/tabs metadata so the decision prompt can surface
         # SWITCH_IFRAME / SWITCH_TAB actions. Both enumerations are best-effort
         # and gate behind config flags.
@@ -754,35 +820,25 @@ class BrowserPerceptionLayer:
                     except Exception as exc:
                         log_warning(f"vision perception failed: {exc}")
 
-        # Perception-gap consistency check: reconcile vision-reported controls
-        # against DOM-extracted elements. If the vision model claims to see
-        # controls that aren't in the elements list, attempt one broader deep
-        # scan to pick them up (W3C-standard label/hidden-input pattern,
-        # aux ARIA roles) and then re-check.
+        # Perception-gap anomaly check: reconcile vision-reported controls
+        # against DOM-extracted elements (which already include deep-scan
+        # augmentation performed before the vision call). Any remaining gap
+        # is a genuine perception anomaly — either the vision model
+        # hallucinated a control, or the DOM extraction has a coverage
+        # hole neither the primary extractor nor the deep scan filled.
+        # Downstream layers can use this signal; it no longer triggers a
+        # retry here.
         perception_gaps: List[Dict[str, str]] = []
         if vision_controls:
             perception_gaps = find_perception_gaps(
                 vision_controls, snapshot.get("elements") or []
             )
-            if perception_gaps and page:
+            if perception_gaps:
                 log_agent_action(
                     self.name,
                     "observe",
                     f"perception_gaps={len(perception_gaps)} {format_gaps_for_log(perception_gaps)}",
                 )
-                added = await self._run_deep_interactive_scan(page, snapshot)
-                if added:
-                    log_agent_action(
-                        self.name, "observe", f"deep_scan_added={added}",
-                    )
-                    perception_gaps = find_perception_gaps(
-                        vision_controls, snapshot.get("elements") or []
-                    )
-                    log_agent_action(
-                        self.name,
-                        "observe",
-                        f"perception_gaps_post={len(perception_gaps)} {format_gaps_for_log(perception_gaps)}",
-                    )
 
         # Apply versioned refs
         version = self._snapshot_version

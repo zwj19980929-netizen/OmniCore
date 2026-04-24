@@ -415,6 +415,14 @@ class BrowserAgent:
         from agents.page_assessment_cache import PageAssessmentCache
         self._assessment_cache = PageAssessmentCache(max_entries=16)
 
+        # Perception-gap cross-round tracker. Every ``observe()`` advances
+        # the tracker one round; gaps that persist across rounds get a
+        # rising streak counter that prompt formatters can surface. Reset
+        # at the start of each ``run()`` so one task's gap history doesn't
+        # bleed into the next.
+        from utils.gap_tracker import GapTracker
+        self._gap_tracker = GapTracker()
+
         # Build or accept toolkit
         if toolkit:
             self.toolkit = toolkit
@@ -835,10 +843,25 @@ class BrowserAgent:
         """
         Unified page observation: JS snapshot + a11y tree + perceiver + vision.
         Delegates to the perception layer (Layer 1).
+
+        After the perception layer returns, the cross-round gap tracker is
+        advanced by one round and the returned ``perception_gaps`` are
+        annotated with streak counts so downstream prompt formatters can
+        distinguish one-shot hallucinations from persistent signals.
         """
         self._sync_state_to_layers()
         observation = await self.perception.observe(self._get_semantic_snapshot)
         self._sync_perception_state()
+
+        # Advance the gap tracker and write annotated gaps back.
+        try:
+            current_url = str(observation.snapshot.get("url", "") or "")
+            self._gap_tracker.update(observation.perception_gaps or [], current_url)
+            observation.perception_gaps = self._gap_tracker.annotate(
+                observation.perception_gaps or []
+            )
+        except Exception as exc:
+            log_warning(f"gap tracker update failed: {exc}")
         return observation
 
     def _compute_snapshot_hash(self, snapshot: Dict[str, Any]) -> str:
@@ -873,6 +896,51 @@ class BrowserAgent:
         summary, _controls = await self.perception.get_vision_description(page)
         self._sync_perception_state()
         return summary
+
+    async def _refresh_vision_with_high_tier(self, page) -> bool:
+        """Overwrite the current observation with a fresh HIGH-tier vision read.
+
+        Purpose: batch-mode sequence generation commits a plan that runs
+        without intermediate LLM checks, so the vision input feeding the
+        planner needs to be the best we can afford. ``observe()`` uses the
+        default-tier vision (cheap, cached, high-frequency); this helper
+        replaces that read with a live HIGH-tier call, recomputes
+        ``perception_gaps`` against the current DOM, and mutates
+        ``self._last_observation`` in place so downstream code sees the
+        refreshed view without extra plumbing.
+
+        Returns ``True`` if the observation was updated, ``False`` if the
+        HIGH call returned nothing or raised (graceful degradation — callers
+        can keep using whatever ``observe()`` produced). The call is a
+        no-op when ``VISION_MODEL_HIGH`` is unset because the perception
+        layer transparently falls back to the default tier, which is fine
+        — slightly redundant but harmless.
+        """
+        obs = self._last_observation
+        if obs is None or page is None:
+            return False
+        try:
+            summary, controls = await self.perception.get_vision_description_high(page)
+        except Exception as exc:
+            log_warning(f"batch vision refresh failed: {exc}")
+            return False
+        if not summary and not controls:
+            return False
+        from utils.perception_gap import find_perception_gaps
+        from utils.prompt_injection_detector import wrap_untrusted
+        if summary:
+            obs.vision_description = wrap_untrusted(summary, source="browser.vision.high")
+        if controls:
+            obs.vision_controls = controls
+        recomputed = find_perception_gaps(
+            obs.vision_controls, obs.snapshot.get("elements") or []
+        )
+        # Reuse the tracker's existing counters (populated in _observe_page)
+        # so streak signals survive a HIGH refresh. We intentionally do NOT
+        # run update() here because the round has already been counted;
+        # annotate() is a read-only lookup.
+        obs.perception_gaps = self._gap_tracker.annotate(recomputed)
+        return True
 
     async def _extract_data_with_vision(
         self,
@@ -3132,6 +3200,30 @@ class BrowserAgent:
 
         log_agent_action(self.name, "batch mode", "generating action sequence")
         seq_llm = await self._get_sequence_llm()
+
+        # Pre-sequence HIGH vision refresh: batch-mode commits a plan that
+        # runs several actions without intermediate LLM checks, so we pay
+        # for one high-tier vision read here to maximise the planner's
+        # input quality. Falls back silently to the observe()-time view
+        # when VISION_MODEL_HIGH is unset or the call fails.
+        page_for_refresh = getattr(tk, "_page", None)
+        if page_for_refresh is not None:
+            refreshed = await self._refresh_vision_with_high_tier(page_for_refresh)
+            if refreshed:
+                obs_after = self._last_observation
+                log_agent_action(
+                    self.name,
+                    "batch mode",
+                    "vision refresh "
+                    f"controls={len(getattr(obs_after, 'vision_controls', []) or [])} "
+                    f"gaps={len(getattr(obs_after, 'perception_gaps', []) or [])}",
+                )
+
+        from utils.perception_gap import format_gaps_for_prompt
+        obs_for_seq = self._last_observation
+        vision_only_controls = format_gaps_for_prompt(
+            getattr(obs_for_seq, "perception_gaps", []) if obs_for_seq else []
+        )
         sequence = await generate_action_sequence(
             task=task,
             page_context=page_context,
@@ -3139,6 +3231,7 @@ class BrowserAgent:
             llm=seq_llm,
             repeated_actions=repeated_actions,
             plan_context=plan_context,
+            vision_only_controls=vision_only_controls,
         )
         if sequence is None:
             log_warning("batch mode: action sequence generation failed, falling back to step mode")
@@ -3213,13 +3306,20 @@ class BrowserAgent:
                 url_r = await tk.get_current_url()
                 title_r = await tk.get_title()
                 page_context_now = await self._build_page_context_for_sequence()
+                # Critical-path vision refresh before batch verify: pull a
+                # fresh description from the HIGH-tier vision model. Falls
+                # back to the default tier when VISION_MODEL_HIGH is unset.
+                # The previous implementation called ``_describe_screenshot``
+                # and ``_can_use_vision``, neither of which exist — meaning
+                # batch verify ran with ``vision_desc=""`` and had to judge
+                # deviations on text context alone. Routing through the
+                # perception layer fixes that silent hole.
                 vision_desc = ""
                 try:
                     page = getattr(tk, '_page', None)
-                    if page and self._can_use_vision():
-                        screenshot_bytes = await page.screenshot(type="jpeg", quality=50, full_page=False, timeout=8000)
-                        if screenshot_bytes:
-                            vision_desc = await self._describe_screenshot(screenshot_bytes, task) or ""
+                    if page is not None:
+                        summary, _controls = await self.perception.get_vision_description_high(page)
+                        vision_desc = summary or ""
                 except Exception:
                     pass
 
@@ -3481,6 +3581,8 @@ class BrowserAgent:
         )
         # Reset per-run assessment cache (B6).
         self._assessment_cache.clear()
+        # Reset cross-round perception-gap tracker — one task, one streak window.
+        self._gap_tracker.reset()
         tk = self.toolkit
         # Surface the task description to the perception layer so the
         # vision-cache (B3) can decide whether to bypass for sensitive flows.

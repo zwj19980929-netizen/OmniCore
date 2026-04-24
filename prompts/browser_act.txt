@@ -45,6 +45,7 @@ Controls:
 
 Elements:
 {elements}
+{vision_only_controls}
 
 Available iframes (non-main frames on this page — select one with SWITCH_IFRAME if the target is inside):
 {available_frames}

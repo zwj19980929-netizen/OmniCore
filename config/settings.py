@@ -119,6 +119,10 @@ class Settings:
     # === 大模型配置 ===
     DEFAULT_MODEL = os.getenv("DEFAULT_MODEL", "deepseek/deepseek-chat")
     VISION_MODEL = os.getenv("VISION_MODEL", "gpt-4o")  # 多模态模型
+    # High-tier vision model for critical-path calls (batch verify, data
+    # extraction, relevance check). Empty = fall back to VISION_MODEL so
+    # users pay nothing extra until they opt in.
+    VISION_MODEL_HIGH = os.getenv("VISION_MODEL_HIGH", "")
     OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
     OPENAI_API_BASE = os.getenv("OPENAI_API_BASE", "")  # OpenAI 代理地址
     ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY", "")

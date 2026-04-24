@@ -7,6 +7,7 @@ Page context (URL, title, page type, key content):
 
 Interactive elements on page:
 {elements}
+{vision_only_controls}
 
 Repeated actions (BLACKLISTED — do NOT use any of them):
 {repeated_actions}

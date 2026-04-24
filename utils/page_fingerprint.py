@@ -93,10 +93,24 @@ def normalize_url_path(url: str) -> str:
 
 
 def _structural_signature(dom_summary: Dict[str, Any]) -> str:
-    """Reduce a snapshot dict to a stable structural signature string.
+    """Reduce a snapshot dict to a structural signature string.
 
-    We intentionally avoid hashing element text — two pages that share
-    layout but differ in content should collide.
+    Two kinds of inputs go into the signature:
+
+    1. **Structural counts** — elements, cards, collections, headings. These
+       are passed through :func:`_bucket`, which uses adaptive resolution:
+       exact counts for small pages (so a login form changes fingerprint
+       when a control appears/disappears), coarser buckets for larger pages
+       (so a search result page with 50 vs 52 items still collides).
+
+    2. **Generic form-state signals** — how many inputs are filled, how
+       many controls are checked, whether any field is marked invalid,
+       whether a modal is open. These signals come from standard HTML /
+       ARIA attributes (``value``, ``aria-checked``, ``aria-invalid``,
+       ``role=dialog``), so the signature reacts to the *state* of a page
+       even when its structure is unchanged. This is what lets the vision
+       cache notice that a login form is mid-fill vs freshly loaded
+       without any page-type-specific rules.
     """
     if not isinstance(dom_summary, dict):
         return "empty"
@@ -109,8 +123,6 @@ def _structural_signature(dom_summary: Dict[str, Any]) -> str:
     collections = dom_summary.get("collections") or []
     headings = dom_summary.get("headings") or []
 
-    # Bucket element counts so small fluctuations (1-2 elements) don't
-    # invalidate the fingerprint.
     elem_bucket = _bucket(len(elements))
     card_bucket = _bucket(len(cards))
     coll_bucket = _bucket(len(collections))
@@ -119,26 +131,70 @@ def _structural_signature(dom_summary: Dict[str, Any]) -> str:
     role_counts = _count_landmark_roles(elements)
     role_sig = ",".join(f"{role}={role_counts.get(role, 0)}" for role in _LANDMARK_ROLES)
 
+    state = _count_state_signals(elements)
+    has_modal = bool(
+        dom_summary.get("has_modal")
+        or page_stage == "modal"
+        or any(str(e.get("role", "") or "").lower() == "dialog" for e in elements if isinstance(e, dict))
+    )
+
     return (
         f"pt={page_type}|ps={page_stage}|"
         f"e={elem_bucket}|c={card_bucket}|co={coll_bucket}|h={head_bucket}|"
+        f"filled={state['filled']}|checked={state['checked']}|inv={state['invalid']}|"
+        f"m={int(has_modal)}|"
         f"{role_sig}"
     )
 
 
 def _bucket(value: int) -> str:
-    """Coarse bucket — keeps fingerprint stable under small DOM jitter."""
+    """Adaptive-resolution bucket.
+
+    Rationale: the previous scheme lumped 1-5 elements into a single bucket,
+    which meant a login page with 5 controls and the same page with 6
+    controls (after a validation hint appears) shared one fingerprint and
+    the vision cache never refreshed. Now small pages are counted exactly;
+    bucketing only kicks in once there are enough elements that one-or-two
+    fluctuations are real noise rather than real state change.
+    """
     if value <= 0:
         return "0"
-    if value <= 5:
-        return "1-5"
-    if value <= 15:
-        return "6-15"
-    if value <= 40:
-        return "16-40"
+    if value <= 10:
+        return str(value)  # exact — small pages should be fingerprint-distinct
+    if value <= 30:
+        return f"{(value // 5) * 5}-{(value // 5) * 5 + 4}"  # 5-wide buckets
     if value <= 100:
-        return "41-100"
+        return f"{(value // 20) * 20}-{(value // 20) * 20 + 19}"  # 20-wide buckets
     return "100+"
+
+
+def _count_state_signals(elements: Iterable[Any]) -> Dict[str, int]:
+    """Aggregate generic DOM/ARIA state signals across elements.
+
+    Only uses attributes defined by the HTML / ARIA specs — no framework
+    or page-type specialisation. Callers use the counts as additional
+    fingerprint dimensions so pages that share structure but differ in
+    state (mid-form-fill, post-validation error, modal open) get distinct
+    hashes.
+    """
+    filled = 0
+    checked = 0
+    invalid = 0
+    for el in elements or ():
+        if not isinstance(el, dict):
+            continue
+        # Filled input: any element exposing a non-empty ``value`` field.
+        value = el.get("value")
+        if isinstance(value, str) and value.strip():
+            filled += 1
+        aria_state = el.get("aria_state") or {}
+        if isinstance(aria_state, dict):
+            if aria_state.get("checked") is True:
+                checked += 1
+        form_state = el.get("form_state") or {}
+        if isinstance(form_state, dict) and form_state.get("invalid"):
+            invalid += 1
+    return {"filled": filled, "checked": checked, "invalid": invalid}
 
 
 def _count_landmark_roles(elements: Iterable[Any]) -> Dict[str, int]:

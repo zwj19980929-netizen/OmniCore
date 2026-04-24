@@ -151,6 +151,7 @@ async def generate_action_sequence(
     llm,
     repeated_actions: str = "",
     plan_context: str = "",
+    vision_only_controls: str = "",
 ) -> Optional[ActionSequence]:
     if not SEQUENCE_PROMPT:
         return None
@@ -160,6 +161,7 @@ async def generate_action_sequence(
             task=task or "",
             page_context=page_context or "",
             elements=elements_text or "",
+            vision_only_controls=vision_only_controls or "",
             max_actions=max_actions,
             repeated_actions=repeated_actions or "(none)",
             plan_context=plan_context or "(no plan)",

@@ -102,19 +102,96 @@ class TestComputePageHash:
         h2 = compute_page_hash("https://x.com/p/1", snap_b)
         assert h1 != h2
 
-    def test_small_element_jitter_collides(self):
-        # 18 vs 22 elements both bucket to "16-40"
-        snap_a = _snapshot(n_elements=18)
-        snap_b = _snapshot(n_elements=22)
+    def test_medium_page_jitter_collides_within_bucket(self):
+        # 22 vs 23 elements both fall in the 20-24 bucket under the
+        # adaptive scheme, so a one-element jitter on a moderately sized
+        # page should not invalidate the fingerprint.
+        snap_a = _snapshot(n_elements=22)
+        snap_b = _snapshot(n_elements=23)
         h1 = compute_page_hash("https://x.com/p/1", snap_a)
         h2 = compute_page_hash("https://x.com/p/1", snap_b)
         assert h1 == h2
 
+    def test_large_page_jitter_collides(self):
+        # Search-result-like page: 55 vs 58 elements both in the 40-59 bucket.
+        snap_a = _snapshot(n_elements=55)
+        snap_b = _snapshot(n_elements=58)
+        h1 = compute_page_hash("https://x.com/search", snap_a)
+        h2 = compute_page_hash("https://x.com/search", snap_b)
+        assert h1 == h2
+
+    def test_small_page_one_element_change_diverges(self):
+        # 5 vs 6 elements under adaptive bucketing — small pages are
+        # counted exactly so a login form gaining a validation hint
+        # invalidates the vision cache.
+        snap_a = _snapshot(n_elements=5, landmarks=("main",), n_cards=0, n_collections=0)
+        snap_b = _snapshot(n_elements=6, landmarks=("main",), n_cards=0, n_collections=0)
+        h1 = compute_page_hash("https://x.com/login", snap_a)
+        h2 = compute_page_hash("https://x.com/login", snap_b)
+        assert h1 != h2
+
     def test_large_element_jump_diverges(self):
-        snap_small = _snapshot(n_elements=8)   # bucket 6-15
-        snap_huge = _snapshot(n_elements=80)   # bucket 41-100
+        snap_small = _snapshot(n_elements=8)   # exact bucket
+        snap_huge = _snapshot(n_elements=80)   # 80-99 bucket
         h1 = compute_page_hash("https://x.com/p/1", snap_small)
         h2 = compute_page_hash("https://x.com/p/1", snap_huge)
+        assert h1 != h2
+
+    def test_filling_input_changes_hash(self):
+        # Same structural elements, but one input goes from blank to filled.
+        base = _snapshot(n_elements=5, landmarks=("main",), n_cards=0, n_collections=0)
+        base["elements"][-1] = {"role": "textbox", "tag": "input", "value": ""}
+        filled = _snapshot(n_elements=5, landmarks=("main",), n_cards=0, n_collections=0)
+        filled["elements"][-1] = {"role": "textbox", "tag": "input", "value": "user@example.com"}
+        h1 = compute_page_hash("https://x.com/login", base)
+        h2 = compute_page_hash("https://x.com/login", filled)
+        assert h1 != h2
+
+    def test_checking_checkbox_changes_hash(self):
+        base = _snapshot(n_elements=4, landmarks=("main",), n_cards=0, n_collections=0)
+        base["elements"][-1] = {
+            "role": "checkbox", "tag": "input",
+            "aria_state": {"checked": False},
+        }
+        checked = _snapshot(n_elements=4, landmarks=("main",), n_cards=0, n_collections=0)
+        checked["elements"][-1] = {
+            "role": "checkbox", "tag": "input",
+            "aria_state": {"checked": True},
+        }
+        h1 = compute_page_hash("https://x.com/login", base)
+        h2 = compute_page_hash("https://x.com/login", checked)
+        assert h1 != h2
+
+    def test_invalid_field_changes_hash(self):
+        # Validation error pushes a field into invalid state — fingerprint
+        # should diverge so vision re-describes the error.
+        base = _snapshot(n_elements=5, landmarks=("main",), n_cards=0, n_collections=0)
+        base["elements"][-1] = {"role": "textbox", "tag": "input"}
+        invalid = _snapshot(n_elements=5, landmarks=("main",), n_cards=0, n_collections=0)
+        invalid["elements"][-1] = {
+            "role": "textbox", "tag": "input",
+            "form_state": {"invalid": True},
+        }
+        h1 = compute_page_hash("https://x.com/form", base)
+        h2 = compute_page_hash("https://x.com/form", invalid)
+        assert h1 != h2
+
+    def test_modal_presence_changes_hash(self):
+        snap_no_modal = _snapshot()
+        snap_with_modal = _snapshot()
+        snap_with_modal["has_modal"] = True
+        h1 = compute_page_hash("https://x.com/p/1", snap_no_modal)
+        h2 = compute_page_hash("https://x.com/p/1", snap_with_modal)
+        assert h1 != h2
+
+    def test_modal_inferred_from_dialog_role(self):
+        # Even without the ``has_modal`` key, a dialog role in elements
+        # should surface as a modal.
+        snap_base = _snapshot(n_elements=5, landmarks=("main",), n_cards=0, n_collections=0)
+        snap_dialog = _snapshot(n_elements=5, landmarks=("main",), n_cards=0, n_collections=0)
+        snap_dialog["elements"][-1] = {"role": "dialog", "tag": "div"}
+        h1 = compute_page_hash("https://x.com/p/1", snap_base)
+        h2 = compute_page_hash("https://x.com/p/1", snap_dialog)
         assert h1 != h2
 
     def test_query_string_does_not_affect_hash(self):

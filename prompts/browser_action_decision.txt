@@ -33,6 +33,7 @@ Controls:
 {controls}
 Elements:
 {elements}
+{vision_only_controls}
 Headings:
 {headings}
 Page regions:

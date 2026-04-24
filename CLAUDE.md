@@ -88,6 +88,7 @@ LLM prompt templates are `.txt` files under `prompts/`. Prompt section registry 
 - `OMNICORE_HTTP_PROXY` — project-scoped proxy (system proxy is disabled by default)
 - `CHROMA_PERSIST_DIR` — vector memory path
 - `VISION_MODEL`, `VISION_PERCEPTION_MODEL` — vision model selection
+- `VISION_MODEL_HIGH` — 视觉模型分级：批量 verify / 数据抽取 / 相关性判断等关键路径用（空 = 回退到 `VISION_MODEL`，零成本默认）
 - `LLM_MAX_TOKENS`, `LLM_ROUTER_MAX_TOKENS` — token limits
 - `BROWSER_STEP_MEMORY_SIZE` / `BROWSER_DEDUP_THRESHOLD` / `BROWSER_RECENT_STEPS_IN_PROMPT` — Browser 自我规划优化 P0 指纹去重
 - `BROWSER_PLAN_ENABLED` / `BROWSER_MAX_PLAN_STEPS` / `BROWSER_MAX_REPLANS` / `BROWSER_STEP_STUCK_THRESHOLD` — P1 任务级 Plan

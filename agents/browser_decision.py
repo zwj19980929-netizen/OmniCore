@@ -25,6 +25,7 @@ from urllib.parse import parse_qs, urlparse
 from config.settings import settings
 from core.llm import LLMClient
 from utils.logger import log_agent_action, log_warning
+from utils.perception_gap import format_gaps_for_prompt
 from utils.prompt_manager import get_prompt
 from utils.search_engine_profiles import (
     decode_search_redirect_url,
@@ -2519,6 +2520,9 @@ class BrowserDecisionLayer:
                     available_frames=self._format_available_frames_for_llm(active_snapshot),
                     available_tabs=self._format_available_tabs_for_llm(active_snapshot),
                     vision_description=getattr(obs, 'vision_description', '') if obs else '',
+                    vision_only_controls=format_gaps_for_prompt(
+                        getattr(obs, 'perception_gaps', []) if obs else []
+                    ),
                     task_specific_rules=_get_task_specific_rules(active_intent.intent_type),
                     stage_hint=_get_stage_hint(page_state.stage),
                     reflection=self._pending_reflection,
@@ -2787,6 +2791,9 @@ class BrowserDecisionLayer:
                 main_text=main_text[:settings.MAIN_TEXT_LIMIT_DETAIL] if main_text else "(none)",
                 visible_text_blocks=text_blocks_str,
                 vision_description=getattr(obs, "vision_description", "") or "(not available)",
+                vision_only_controls=format_gaps_for_prompt(
+                    getattr(obs, "perception_gaps", []) if obs else []
+                ),
                 cards=prompt_context.get("cards", "(no cards)"),
                 collections=prompt_context.get("collections", "(no collections)"),
                 controls=prompt_context.get("controls", "(no controls)"),

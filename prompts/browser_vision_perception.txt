@@ -1,0 +1,22 @@
+You are given a screenshot of a webpage. Return a strict JSON object describing what you see.
+
+Required schema:
+{
+  "summary": "2-3 sentence description of layout, main content area, key sections, any modals or overlays",
+  "interactive_controls": [
+    {
+      "role": "button | link | input | checkbox | radio | select | tab | switch | other",
+      "label": "visible text, placeholder, or aria-label — what a user would read to identify this control"
+    }
+  ]
+}
+
+Rules for interactive_controls:
+- List every control a user could reasonably click or type into to make progress on the page: buttons, text inputs, checkboxes, radios, tabs, dropdowns, toggles, etc.
+- Use the "role" value that best matches the control's visual affordance. If none fit, use "other".
+- "label" must be the exact visible text (or placeholder / nearby label text) a user would read — not a paraphrase.
+- Include controls even if they appear disabled, pre-checked, or partially obscured.
+- Do NOT invent controls that are not visually present.
+- Keep the list ordered top-to-bottom, left-to-right as they appear on screen.
+
+Return JSON only — no surrounding prose, no code fences.
