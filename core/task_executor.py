@@ -304,6 +304,7 @@ async def _execute_registered_tool_async(
             state=pipeline_state,
             registered_tool=registered_tool,
             shared_memory_snapshot=shared_memory_snapshot,
+            description=str(local_task.get("description", "") or ""),
         )
         # Pipeline 返回的 raw_result 就是 adapter 的 outcome dict，直接复用
         if ctx.raw_result is not None:

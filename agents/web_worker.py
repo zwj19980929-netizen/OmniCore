@@ -4055,18 +4055,16 @@ class WebWorker:
         query = params.get("query", "")
         limit = params.get("limit", 10)
         headless = params.get("headless")
-        task_description = task["description"]
+        task_description = task.get("description", "") or ""
 
-        # 🔥 修复：如果 description 是 task_id 或太短，尝试从 params 中获取实际的 task 描述
-        if task_description and (task_description.startswith("task_") or len(task_description) < 10):
-            # description 可能被错误地设置为 task_id，尝试从 params["task"] 获取
-            actual_task = params.get("task", "")
+        # 🔥 纵深防御：description 为空 / 是 task_id / 过短时，都尝试从 params['task'] 兜底
+        if (not task_description) or task_description.startswith("task_") or len(task_description) < 10:
+            actual_task = str(params.get("task", "") or "").strip()
             if actual_task and len(actual_task) > len(task_description):
-                log_warning(f"检测到 description 可能是 task_id ('{task_description}')，使用 params['task'] 代替: {actual_task[:80]}")
+                log_warning(f"description 可疑（'{task_description}'），使用 params['task'] 代替: {actual_task[:80]}")
                 task_description = actual_task
-            else:
-                # 如果 params["task"] 也没有，记录警告但继续使用原 description
-                log_warning(f"检测到可疑的 task description: '{task_description}'，但 params 中没有更好的替代")
+            elif not task_description:
+                log_warning("task description 为空且 params 中也没有可用替代，下游 LLM 推理可能失准")
 
         # 额外的调试日志
         log_agent_action(self.name, "开始智能爬取", task_description[:50])

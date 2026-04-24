@@ -118,6 +118,7 @@ class StageError:
 class ToolExecutionContext:
     tool_name: str
     raw_params: Dict[str, Any]
+    description: str = ""
     validated_params: Optional[Dict[str, Any]] = None
     injected_params: Optional[Dict[str, Any]] = None
     permission_result: Optional[str] = None  # "allow" | "deny" | "ask"
@@ -244,11 +245,13 @@ class ToolPipeline:
         registered_tool: Any,
         *,
         shared_memory_snapshot: Optional[Dict[str, Any]] = None,
+        description: str = "",
     ) -> ToolExecutionContext:
         """按顺序执行六阶段，返回 ToolExecutionContext。"""
         ctx = ToolExecutionContext(
             tool_name=tool_name,
             raw_params=copy.deepcopy(params),
+            description=str(description or ""),
         )
 
         spec = registered_tool.spec if registered_tool else None
@@ -406,7 +409,7 @@ class ToolPipeline:
         task_dict = {
             "tool_name": ctx.tool_name,
             "params": ctx.effective_params,
-            "description": "",
+            "description": ctx.description,
         }
         decision = evaluate_task_policy(task_dict)
 
@@ -648,7 +651,7 @@ class ToolPipeline:
             "job_id": state.get("job_id", ""),
             "params": ctx.effective_params,
             "tool_args": copy.deepcopy(ctx.effective_params),
-            "description": "",
+            "description": ctx.description,
             "risk_level": "medium",
             "execution_trace": [],
         }
