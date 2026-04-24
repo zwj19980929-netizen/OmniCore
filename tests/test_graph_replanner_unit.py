@@ -101,7 +101,6 @@ def _make_state(user_input: str, failed_params: dict, failed_result: dict):
         "delivery_package": {},
         "execution_status": "reviewing",
         "replan_count": 0,
-        "validator_passed": True,
     }
 
 

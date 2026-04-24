@@ -1,4 +1,4 @@
-from core.graph import after_validator, get_first_executor, replanner_node, should_retry_or_finish
+from core.graph import get_first_executor, replanner_node, should_retry_or_finish
 from core.task_executor import collect_ready_task_indexes
 import core.replanner as replanner_module
 
@@ -74,7 +74,6 @@ def _make_failed_state():
         "delivery_package": {},
         "execution_status": "reviewing",
         "replan_count": 0,
-        "validator_passed": True,
     }
 
 
@@ -98,10 +97,8 @@ def test_waiting_tasks_finalize_instead_of_replanning():
             {"task_id": "task_web", "status": "completed"},
             {"task_id": "task_system", "status": "waiting_for_approval"},
         ],
-        "validator_passed": True,
         "critic_approved": False,
         "replan_count": 1,
     }
 
-    assert after_validator(state) == "finalize"
     assert should_retry_or_finish(state) == "finalize"

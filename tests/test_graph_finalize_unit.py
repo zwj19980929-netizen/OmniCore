@@ -67,7 +67,6 @@ def test_finalize_node_builds_delivery_summary_with_artifacts(monkeypatch):
         "delivery_package": {},
         "execution_status": "reviewing",
         "replan_count": 0,
-        "validator_passed": True,
     }
 
     result = finalize_node(state)
@@ -137,7 +136,6 @@ def test_finalize_node_includes_parsed_findings_from_structured_data(monkeypatch
         "delivery_package": {},
         "execution_status": "reviewing",
         "replan_count": 0,
-        "validator_passed": True,
     }
 
     result = finalize_node(state)
@@ -203,7 +201,6 @@ def test_finalize_node_prefers_user_facing_answer_for_completed_tasks(monkeypatc
         "delivery_package": {},
         "execution_status": "reviewing",
         "replan_count": 0,
-        "validator_passed": True,
     }
 
     result = finalize_node(state)
@@ -258,7 +255,6 @@ def test_finalize_node_uses_deterministic_table_for_explicit_list_requests(monke
         "delivery_package": {},
         "execution_status": "reviewing",
         "replan_count": 0,
-        "validator_passed": True,
     }
 
     result = finalize_node(state)
@@ -326,7 +322,6 @@ def test_finalize_node_marks_waiting_for_approval_state(monkeypatch):
         "delivery_package": {},
         "execution_status": "reviewing",
         "replan_count": 0,
-        "validator_passed": True,
     }
 
     result = finalize_node(state)
@@ -363,7 +358,6 @@ def test_finalize_node_refuses_fact_answer_without_direct_answer_or_evidence(mon
         "delivery_package": {},
         "execution_status": "reviewing",
         "replan_count": 0,
-        "validator_passed": True,
     }
 
     result = finalize_node(state)
@@ -404,7 +398,6 @@ def test_finalize_node_prefers_router_direct_answer_without_llm(monkeypatch):
         "delivery_package": {},
         "execution_status": "reviewing",
         "replan_count": 0,
-        "validator_passed": True,
     }
 
     result = finalize_node(state)
@@ -471,7 +464,6 @@ def test_finalize_node_passes_replan_answer_guidance_to_synthesizer(monkeypatch)
         "delivery_package": {},
         "execution_status": "reviewing",
         "replan_count": 0,
-        "validator_passed": True,
     }
 
     result = finalize_node(state)

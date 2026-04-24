@@ -35,37 +35,37 @@ def should_continue_after_route(state: OmniCoreState) -> Literal["coordinator", 
 # Human confirm → first executor
 # ---------------------------------------------------------------------------
 
-def get_first_executor(state: OmniCoreState) -> Literal["parallel_executor", "validator", "end"]:
+def get_first_executor(state: OmniCoreState) -> Literal["parallel_executor", "critic", "end"]:
     if str(state.get("execution_status", "") or "") == "cancelled":
         return "end"
     if collect_ready_task_indexes(state):
         return "parallel_executor"
     if has_waiting_tasks(state):
-        return "validator"
+        return "critic"
     if not state["human_approved"]:
         return "end"
-    return "validator"
+    return "critic"
 
 
 # ---------------------------------------------------------------------------
 # Parallel executor
 # ---------------------------------------------------------------------------
 
-def after_parallel_executor(state: OmniCoreState) -> Literal["parallel_executor", "dynamic_replan", "validator"]:
+def after_parallel_executor(state: OmniCoreState) -> Literal["parallel_executor", "dynamic_replan", "critic"]:
     if state.get("dynamic_task_additions"):
         return "dynamic_replan"
     if collect_ready_task_indexes(state):
         return "parallel_executor"
-    return "validator"
+    return "critic"
 
 
 def after_parallel_executor_adaptive(
     state: OmniCoreState,
-) -> Literal["parallel_executor", "dynamic_replan", "validator"]:
+) -> Literal["parallel_executor", "dynamic_replan", "critic"]:
     """Post-executor routing with adaptive re-routing check (Direction 7)."""
     if should_skip_remaining_tasks(state):
         apply_adaptive_skip(state)
-        return "validator"
+        return "critic"
     return after_parallel_executor(state)
 
 
@@ -73,35 +73,10 @@ def after_parallel_executor_adaptive(
 # Dynamic replan
 # ---------------------------------------------------------------------------
 
-def after_dynamic_replan(state: OmniCoreState) -> Literal["parallel_executor", "validator"]:
+def after_dynamic_replan(state: OmniCoreState) -> Literal["parallel_executor", "critic"]:
     if collect_ready_task_indexes(state):
         return "parallel_executor"
-    return "validator"
-
-
-# ---------------------------------------------------------------------------
-# Validator
-# ---------------------------------------------------------------------------
-
-def after_validator(state: OmniCoreState) -> Literal["critic", "replanner", "finalize"]:
-    """Validator -> critic | replanner | finalize.
-
-    Consults the StageRegistry execution plan to respect skip_conditions.
-    """
-    if has_waiting_tasks(state):
-        return "finalize"
-
-    from core.stage_registry import StageRegistry
-    registry = StageRegistry.get_instance()
-    plan = registry.build_execution_plan(state)
-
-    if state.get("validator_passed", True):
-        return "critic" if "critic" in plan else "finalize"
-    if any(str(task.get("status", "") or "") == "completed" for task in state.get("task_queue", [])):
-        return "critic" if "critic" in plan else "finalize"
-    if state.get("replan_count", 0) < MAX_REPLAN:
-        return "replanner" if "replanner" in plan else "finalize"
-    return "finalize"
+    return "critic"
 
 
 # ---------------------------------------------------------------------------

@@ -2,7 +2,7 @@
 OmniCore LangGraph DAG — pure graph definition.
 
 All node implementations live in dedicated modules:
-  - core.graph_nodes     — route, plan_validator, executor, critic, validator, human_confirm
+  - core.graph_nodes     — route, plan_validator, executor, critic, human_confirm
   - core.replanner       — replanner_node
   - core.finalizer       — finalize_node
   - core.graph_conditions — conditional routing functions
@@ -23,7 +23,6 @@ from core.graph_nodes import (                          # noqa: F401
     parallel_executor_node,
     dynamic_replan_node,
     critic_node,
-    validator_node,
     human_confirm_node,
     human_confirm_node_v2,
     coordinator_node,
@@ -38,7 +37,6 @@ from core.graph_conditions import (
     after_parallel_executor,
     after_parallel_executor_adaptive,
     after_dynamic_replan,
-    after_validator,
     should_retry_or_finish,
     MAX_REPLAN,
 )
@@ -81,13 +79,12 @@ def build_graph() -> StateGraph:
 
     graph = StateGraph(OmniCoreState)
 
-    # Nodes (9)
+    # Nodes
     graph.add_node("router", route_node)
     graph.add_node("coordinator", coordinator_node)  # S5
     graph.add_node("plan_validator", plan_validator_node)
     graph.add_node("human_confirm", human_confirm_node_v2)
     graph.add_node("parallel_executor", parallel_executor_node)
-    graph.add_node("validator", validator_node)
     graph.add_node("replanner", replanner_node)
     graph.add_node("critic", critic_node)
     graph.add_node("finalize", finalize_node)
@@ -108,37 +105,30 @@ def build_graph() -> StateGraph:
     # plan_validator → human_confirm
     graph.add_edge("plan_validator", "human_confirm")
 
-    # human_confirm → executor | validator | END
+    # human_confirm → executor | critic | END
     graph.add_conditional_edges("human_confirm", get_first_executor, {
         "parallel_executor": "parallel_executor",
-        "validator": "validator",
+        "critic": "critic",
         "end": END,
     })
 
-    # executor → self-loop | dynamic_replan | validator
+    # executor → self-loop | dynamic_replan | critic
     graph.add_conditional_edges("parallel_executor", after_parallel_executor, {
         "parallel_executor": "parallel_executor",
         "dynamic_replan": "dynamic_replan",
-        "validator": "validator",
+        "critic": "critic",
     })
 
-    # dynamic_replan → executor | validator
+    # dynamic_replan → executor | critic
     graph.add_conditional_edges("dynamic_replan", after_dynamic_replan, {
         "parallel_executor": "parallel_executor",
-        "validator": "validator",
-    })
-
-    # validator → critic | replanner | finalize
-    graph.add_conditional_edges("validator", after_validator, {
         "critic": "critic",
-        "replanner": "replanner",
-        "finalize": "finalize",
     })
 
-    # replanner → executor | validator | END
+    # replanner → executor | critic | END
     graph.add_conditional_edges("replanner", get_first_executor, {
         "parallel_executor": "parallel_executor",
-        "validator": "validator",
+        "critic": "critic",
         "end": END,
     })
 
@@ -200,54 +190,42 @@ def build_graph_from_registry(registry: StageRegistry = None):
     if "plan_validator" in stage_names and "human_confirm" in stage_names:
         graph.add_edge("plan_validator", "human_confirm")
 
-    # human_confirm → executor | validator | END
+    # human_confirm → executor | critic | END
     if "human_confirm" in stage_names:
         targets = {}
         if "parallel_executor" in stage_names:
             targets["parallel_executor"] = "parallel_executor"
-        if "validator" in stage_names:
-            targets["validator"] = "validator"
+        if "critic" in stage_names:
+            targets["critic"] = "critic"
         targets["end"] = END
         graph.add_conditional_edges("human_confirm", get_first_executor, targets)
 
-    # executor → self-loop | dynamic_replan | validator (with adaptive skip)
+    # executor → self-loop | dynamic_replan | critic (with adaptive skip)
     if "parallel_executor" in stage_names:
         targets = {"parallel_executor": "parallel_executor"}
         if "dynamic_replan" in stage_names:
             targets["dynamic_replan"] = "dynamic_replan"
-        if "validator" in stage_names:
-            targets["validator"] = "validator"
+        if "critic" in stage_names:
+            targets["critic"] = "critic"
         graph.add_conditional_edges("parallel_executor", after_parallel_executor_adaptive, targets)
 
-    # dynamic_replan → executor | validator
+    # dynamic_replan → executor | critic
     if "dynamic_replan" in stage_names:
         targets = {}
         if "parallel_executor" in stage_names:
             targets["parallel_executor"] = "parallel_executor"
-        if "validator" in stage_names:
-            targets["validator"] = "validator"
+        if "critic" in stage_names:
+            targets["critic"] = "critic"
         if targets:
             graph.add_conditional_edges("dynamic_replan", after_dynamic_replan, targets)
 
-    # validator → critic | replanner | finalize
-    if "validator" in stage_names:
-        targets = {}
-        if "critic" in stage_names:
-            targets["critic"] = "critic"
-        if "replanner" in stage_names:
-            targets["replanner"] = "replanner"
-        if "finalize" in stage_names:
-            targets["finalize"] = "finalize"
-        if targets:
-            graph.add_conditional_edges("validator", after_validator, targets)
-
-    # replanner → executor | validator | END
+    # replanner → executor | critic | END
     if "replanner" in stage_names:
         targets = {}
         if "parallel_executor" in stage_names:
             targets["parallel_executor"] = "parallel_executor"
-        if "validator" in stage_names:
-            targets["validator"] = "validator"
+        if "critic" in stage_names:
+            targets["critic"] = "critic"
         targets["end"] = END
         graph.add_conditional_edges("replanner", get_first_executor, targets)
 

@@ -327,7 +327,6 @@ def coordinator_node(state: OmniCoreState) -> OmniCoreState:
 
     state["final_output"] = final_output
     state["execution_status"] = "completed"
-    state["validator_passed"] = True
     state["critic_approved"] = True
 
     save_bus(state, bus)

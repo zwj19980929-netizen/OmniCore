@@ -12,7 +12,6 @@ from core.state import OmniCoreState
 from core.router import RouterAgent
 from core.task_planner import build_policy_decision_from_task
 from agents.critic import CriticAgent
-from agents.validator import Validator
 from core.task_executor import collect_ready_task_indexes, run_ready_batch
 from core.stage_registry import register_stage
 from core.plan_validator import validate_plan
@@ -33,7 +32,6 @@ from utils.human_confirm import HumanConfirm
 # Singleton agents
 router_agent = RouterAgent()
 critic_agent = CriticAgent()
-validator_agent = Validator()
 
 # S2: singleton AutoCompactor (shared across nodes for circuit breaker state)
 _auto_compactor = None
@@ -310,11 +308,10 @@ def dynamic_replan_node(state: OmniCoreState) -> OmniCoreState:
 
 @register_stage(
     name="critic", order=50, required=False,
-    depends_on=("validator",),
-    skip_condition="state.get('validator_passed') == False",
+    depends_on=("parallel_executor",),
 )
 def critic_node(state: OmniCoreState) -> OmniCoreState:
-    """Critic review node: evaluate task output quality."""
+    """Critic review node: evaluate task output quality via LLM."""
     if should_skip_for_resume(state, "critic"):
         return state
     sl = get_structured_logger()
@@ -324,25 +321,6 @@ def critic_node(state: OmniCoreState) -> OmniCoreState:
         state = critic_agent.review(state)
         sl.log_event("stage_end", detail=f"approved={state.get('critic_approved', False)}")
     save_runtime_checkpoint(state, "critic", "Critic review completed")
-    return state
-
-
-# ---------------------------------------------------------------------------
-# validator_node
-# ---------------------------------------------------------------------------
-
-@register_stage(name="validator", order=40, required=False, depends_on=("parallel_executor",))
-def validator_node(state: OmniCoreState) -> OmniCoreState:
-    """Hard-rule validation node."""
-    if should_skip_for_resume(state, "validator"):
-        return state
-    sl = get_structured_logger()
-    job_id = state.get("job_id", "")
-    with LogContext(job_id=job_id, stage="validator"):
-        sl.log_event("stage_start")
-        state = validator_agent.validate(state)
-        sl.log_event("stage_end", detail=f"passed={state.get('validator_passed', False)}")
-    save_runtime_checkpoint(state, "validator", "Validator completed")
     return state
 
 
