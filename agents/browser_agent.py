@@ -142,6 +142,13 @@ class PageObservation:
     snapshot_version: int = 0
     timestamp: float = 0.0
     headings: List[Dict[str, str]] = field(default_factory=list)
+    # Controls the vision model claims to see on the page; each entry is
+    # ``{"role": str, "label": str}``. Populated by the perception layer.
+    vision_controls: List[Dict[str, str]] = field(default_factory=list)
+    # Controls present in ``vision_controls`` that could not be matched to
+    # any element in ``snapshot["elements"]`` — signals a perception gap
+    # that downstream layers can flag or route around.
+    perception_gaps: List[Dict[str, str]] = field(default_factory=list)
 
 
 _QUERY_STOP_TOKENS = frozenset(
@@ -857,11 +864,15 @@ class BrowserAgent:
         return self.perception.compute_complexity_score(snapshot, a11y_elements)
 
     async def _get_vision_description(self, page) -> str:
-        """Delegates to perception layer."""
+        """Delegates to perception layer.
+
+        Returns only the natural-language summary for backward compatibility —
+        the structured controls list is consumed inside ``perception.observe``.
+        """
         self._sync_state_to_layers()
-        result = await self.perception.get_vision_description(page)
+        summary, _controls = await self.perception.get_vision_description(page)
         self._sync_perception_state()
-        return result
+        return summary
 
     async def _extract_data_with_vision(
         self,

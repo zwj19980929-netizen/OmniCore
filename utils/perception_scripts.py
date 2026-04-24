@@ -1355,3 +1355,155 @@ SCRIPT_EXTRACT_INTERACTIVE_ELEMENTS = r"""
                 });
             }
             """
+
+
+# ── Deep interactive scan (fallback when DOM distillation misses a control) ──
+#
+# Runs a broader selector set than ``SCRIPT_INTERACTIVE_ELEMENTS`` and picks
+# up controls that standard extraction skips, namely:
+#   * hidden ``input[type=checkbox|radio]`` paired with a visible ``<label for=…>``
+#     — the W3C-standard "label-as-affordance" pattern common across antd,
+#     Material, Headless UI, and custom CSS frameworks.
+#   * ARIA roles beyond the common four (``checkbox``, ``radio``, ``switch``,
+#     ``tab``, ``menuitem``, ``option``, ``combobox``, ``listbox``, ``slider``).
+#
+# Output shape matches ``SCRIPT_INTERACTIVE_ELEMENTS`` so results can be merged
+# straight into ``snapshot["elements"]``. Refs are namespaced ``deep_el_N`` to
+# avoid colliding with the primary extraction.
+
+SCRIPT_DEEP_INTERACTIVE_SCAN = r"""
+((args) => {
+  try {
+    """ + SCRIPT_COMMON_UTILS + r"""
+    const vh = window.innerHeight || document.documentElement.clientHeight || 768;
+    const maxElements = Math.max(Number(args?.max_elements || 40), 10);
+    const existingSelectors = new Set(Array.from(args?.existing_selectors || []));
+
+    const labelTextFor = (el) => {
+      if (el.labels && el.labels.length) {
+        return normalize(Array.from(el.labels).map(l => l.innerText || l.textContent || '').join(' '));
+      }
+      const id = el.getAttribute('id');
+      if (id) {
+        const lab = document.querySelector('label[for="' + CSS.escape(id) + '"]');
+        if (lab) return normalize(lab.innerText || lab.textContent || '');
+      }
+      const wrapperLabel = el.closest('label');
+      if (wrapperLabel) return normalize(wrapperLabel.innerText || wrapperLabel.textContent || '');
+      return '';
+    };
+
+    const results = [];
+    const seen = new Set();
+
+    // 1) Hidden checkbox/radio inputs — prefer the label as the clickable affordance.
+    const hiddenInputs = Array.from(document.querySelectorAll(
+      'input[type="checkbox"], input[type="radio"]'
+    ));
+    for (const input of hiddenInputs) {
+      if (seen.has(input)) continue;
+      const visibleInput = isVisible(input);
+      const label = labelTextFor(input);
+      let anchor = input;
+      if (!visibleInput) {
+        // Find a clickable label/ancestor that IS visible.
+        const id = input.getAttribute('id');
+        let candidate = null;
+        if (id) {
+          candidate = document.querySelector('label[for="' + CSS.escape(id) + '"]');
+        }
+        if (!candidate || !isVisible(candidate)) {
+          candidate = input.closest('label');
+        }
+        if (candidate && isVisible(candidate)) {
+          anchor = candidate;
+        } else {
+          continue; // Truly hidden and no visible affordance — skip.
+        }
+      }
+      const rect = anchor.getBoundingClientRect();
+      if (rect.bottom < -50 || rect.top > vh + 400) continue;
+      const sel = selectorOf(anchor);
+      if (existingSelectors.has(sel)) continue;
+      seen.add(input);
+
+      results.push({
+        ref: `deep_el_${results.length + 1}`,
+        role: input.type === 'radio' ? 'radio' : 'checkbox',
+        tag: anchor.tagName.toLowerCase(),
+        type: input.type,
+        text: label,
+        href: '',
+        value: typeof input.value === 'string' ? String(input.value || '').slice(0, 220) : '',
+        label: label.slice(0, 220),
+        placeholder: '',
+        selector: sel,
+        visible: true,
+        enabled: !input.disabled,
+        region: regionOf(anchor),
+        parent_ref: '',
+        bbox: { x: Math.round(rect.x), y: Math.round(rect.y), width: Math.round(rect.width), height: Math.round(rect.height) },
+        aria_state: input.checked ? { checked: true } : undefined,
+        form_state: input.required ? { required: true } : undefined,
+        _source: 'deep_scan',
+      });
+      if (results.length >= maxElements) break;
+    }
+
+    if (results.length < maxElements) {
+      // 2) ARIA roles the primary extractor doesn't query for.
+      const auxRoles = [
+        '[role="checkbox"]', '[role="radio"]', '[role="switch"]', '[role="tab"]',
+        '[role="menuitem"]', '[role="option"]', '[role="combobox"]',
+        '[role="listbox"]', '[role="slider"]', '[role="spinbutton"]',
+      ];
+      const ariaNodes = Array.from(document.querySelectorAll(auxRoles.join(', ')));
+      for (const el of ariaNodes) {
+        if (seen.has(el)) continue;
+        if (!isVisible(el)) continue;
+        const rect = el.getBoundingClientRect();
+        if (rect.bottom < -50 || rect.top > vh + 400) continue;
+        const sel = selectorOf(el);
+        if (existingSelectors.has(sel)) continue;
+        seen.add(el);
+
+        const text = normalize(
+          el.innerText || el.textContent || el.getAttribute('aria-label') || el.getAttribute('title') || ''
+        ).slice(0, 220);
+        const role = (el.getAttribute('role') || '').toLowerCase();
+        const ariaState = {};
+        const checked = el.getAttribute('aria-checked');
+        if (checked !== null) ariaState.checked = checked === 'true';
+        const selected = el.getAttribute('aria-selected');
+        if (selected !== null) ariaState.selected = selected === 'true';
+
+        results.push({
+          ref: `deep_el_${results.length + 1}`,
+          role,
+          tag: el.tagName.toLowerCase(),
+          type: role,
+          text,
+          href: '',
+          value: '',
+          label: text,
+          placeholder: '',
+          selector: sel,
+          visible: true,
+          enabled: !el.getAttribute('aria-disabled') || el.getAttribute('aria-disabled') === 'false',
+          region: regionOf(el),
+          parent_ref: '',
+          bbox: { x: Math.round(rect.x), y: Math.round(rect.y), width: Math.round(rect.width), height: Math.round(rect.height) },
+          aria_state: Object.keys(ariaState).length ? ariaState : undefined,
+          form_state: undefined,
+          _source: 'deep_scan',
+        });
+        if (results.length >= maxElements) break;
+      }
+    }
+
+    return { elements: results, found: results.length };
+  } catch (e) {
+    return { elements: [], found: 0, error: String(e) };
+  }
+})
+"""

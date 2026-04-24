@@ -12,7 +12,7 @@ Responsibilities:
 import asyncio
 import hashlib
 import time
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Set, Tuple
 
 from config.settings import settings
 from core.llm import LLMClient
@@ -21,8 +21,12 @@ from utils.browser_toolkit import BrowserToolkit, ToolkitResult
 from utils.enhanced_page_perceiver import EnhancedPagePerceiver, PageContent
 from utils.logger import log_agent_action, log_warning
 from utils.prompt_manager import get_prompt
-from utils.perception_scripts import SCRIPT_EXTRACT_INTERACTIVE_ELEMENTS
+from utils.perception_scripts import (
+    SCRIPT_EXTRACT_INTERACTIVE_ELEMENTS,
+    SCRIPT_DEEP_INTERACTIVE_SCAN,
+)
 from utils.page_fingerprint import compute_page_hash, normalize_url_path
+from utils.perception_gap import find_perception_gaps, format_gaps_for_log
 from utils.vision_cache import get_vision_cache, should_bypass_for_task
 from utils.prompt_injection_detector import wrap_untrusted
 import utils.web_debug_recorder as web_debug_recorder
@@ -297,8 +301,18 @@ class BrowserPerceptionLayer:
 
     # ── Vision description ───────────────────────────────────
 
-    async def get_vision_description(self, page) -> str:
-        """Take screenshot and describe via vision model."""
+    async def get_vision_description(self, page) -> Tuple[str, List[Dict[str, str]]]:
+        """Take screenshot and describe via vision model.
+
+        Returns a ``(summary, interactive_controls)`` tuple. The summary is a
+        short natural-language description; ``interactive_controls`` is a
+        structured list of ``{"role", "label"}`` dicts enumerating the
+        controls the vision model claims to see on the page. The structured
+        list is used by :meth:`observe` for perception-gap detection against
+        the DOM-extracted element list.
+
+        Returns ``("", [])`` on any failure — callers must tolerate that.
+        """
         if not self._vision_llm and not self._vision_llm_attempted:
             self._vision_llm_attempted = True
             try:
@@ -307,31 +321,103 @@ class BrowserPerceptionLayer:
                 if not self._vision_llm_unavailable_logged:
                     log_warning("vision LLM unavailable for perception")
                     self._vision_llm_unavailable_logged = True
-                return ""
+                return "", []
 
         if not self._vision_llm:
-            return ""
+            return "", []
 
         try:
             if getattr(page, "is_closed", lambda: False)():
-                return ""
+                return "", []
             screenshot_bytes = await page.screenshot(type="jpeg", quality=50, full_page=False)
+            prompt = get_prompt(
+                "browser_vision_perception",
+                # Defensive inline fallback — only used if the prompt file is missing
+                # or unreadable. Keeps the call site resilient during deploys.
+                'Return JSON: {"summary": "...", "interactive_controls": [{"role": "...", "label": "..."}]}',
+            )
             response = self._vision_llm.chat_with_image(
-                text="Describe this webpage briefly: layout, main content area, key interactive elements, any modals/overlays. Be concise (2-3 sentences).",
+                text=prompt,
                 image=screenshot_bytes,
                 temperature=0.2,
-                max_tokens=300,
+                max_tokens=800,
             )
-            content = getattr(response, "content", None)
-            if isinstance(content, str):
-                return content.strip()[:500]
-            return str(content or "").strip()[:500]
+            return self._parse_vision_response(response)
         except Exception as exc:
             exc_str = str(exc).lower()
             if "closed" in exc_str or "target page" in exc_str or "browser has been closed" in exc_str:
-                return ""  # page in transitional state, not a real error
+                return "", []  # page in transitional state, not a real error
             log_warning(f"vision description failed: {exc}")
-            return ""
+            return "", []
+
+    @staticmethod
+    def _parse_vision_response(response: Any) -> Tuple[str, List[Dict[str, str]]]:
+        """Extract ``(summary, controls)`` from the vision LLM response.
+
+        Tolerates three shapes in order of preference:
+          1. Strict JSON matching the prompt schema.
+          2. JSON inside fenced code blocks.
+          3. Free-form text — treated as the summary with empty controls.
+        """
+        content = getattr(response, "content", None)
+        raw = content if isinstance(content, str) else str(content or "")
+        raw = raw.strip()
+        if not raw:
+            return "", []
+
+        import json
+        import re
+
+        def _coerce(obj: Any) -> Optional[Tuple[str, List[Dict[str, str]]]]:
+            if not isinstance(obj, dict):
+                return None
+            summary = str(obj.get("summary") or "").strip()[:500]
+            controls_raw = obj.get("interactive_controls") or []
+            controls: List[Dict[str, str]] = []
+            if isinstance(controls_raw, list):
+                for item in controls_raw:
+                    if not isinstance(item, dict):
+                        continue
+                    role = str(item.get("role") or "").strip().lower()
+                    label = str(item.get("label") or "").strip()
+                    if not role and not label:
+                        continue
+                    controls.append({"role": role, "label": label})
+            return summary, controls
+
+        # Try direct JSON parse
+        try:
+            parsed = json.loads(raw)
+            result = _coerce(parsed)
+            if result is not None:
+                return result
+        except (ValueError, TypeError):
+            pass
+
+        # Try JSON inside a fenced block
+        fence_match = re.search(r"```(?:json)?\s*(\{.*?\})\s*```", raw, re.DOTALL)
+        if fence_match:
+            try:
+                parsed = json.loads(fence_match.group(1))
+                result = _coerce(parsed)
+                if result is not None:
+                    return result
+            except (ValueError, TypeError):
+                pass
+
+        # Try the first balanced object via a greedy scan
+        brace_match = re.search(r"\{.*\}", raw, re.DOTALL)
+        if brace_match:
+            try:
+                parsed = json.loads(brace_match.group(0))
+                result = _coerce(parsed)
+                if result is not None:
+                    return result
+            except (ValueError, TypeError):
+                pass
+
+        # Last resort: treat entire response as prose summary
+        return raw[:500], []
 
     # ── Vision-based data extraction ─────────────────────────
 
@@ -476,6 +562,62 @@ class BrowserPerceptionLayer:
                 continue  # cross-origin / detached frames may raise
         return iframe_elements
 
+    # ── Deep interactive scan (perception-gap fallback) ──────
+
+    async def _run_deep_interactive_scan(
+        self,
+        page: Any,
+        snapshot: Dict[str, Any],
+    ) -> int:
+        """Run the broader interactive selector set and merge new elements
+        into ``snapshot["elements"]``. Returns the number of elements added.
+
+        This is the fallback path triggered by ``observe()`` when the
+        perception-gap check finds vision-reported controls missing from
+        the element list. The script deduplicates against existing
+        selectors so re-running is cheap.
+        """
+        if page is None:
+            return 0
+        existing_elements = snapshot.get("elements") or []
+        existing_selectors: Set[str] = {
+            str(e.get("selector"))
+            for e in existing_elements
+            if isinstance(e, dict) and e.get("selector")
+        }
+        try:
+            result = await page.evaluate(
+                SCRIPT_DEEP_INTERACTIVE_SCAN,
+                {"existing_selectors": list(existing_selectors), "max_elements": 40},
+            )
+        except Exception as exc:
+            log_warning(f"deep interactive scan failed: {exc}")
+            return 0
+
+        if not isinstance(result, dict):
+            return 0
+        new_elements = result.get("elements") or []
+        if not isinstance(new_elements, list) or not new_elements:
+            return 0
+
+        # Re-check selector uniqueness defensively (browser races) and append.
+        added = 0
+        merged = list(existing_elements)
+        seen = set(existing_selectors)
+        for elem in new_elements:
+            if not isinstance(elem, dict):
+                continue
+            sel = str(elem.get("selector") or "")
+            if sel and sel in seen:
+                continue
+            if sel:
+                seen.add(sel)
+            merged.append(elem)
+            added += 1
+        if added:
+            snapshot["elements"] = merged
+        return added
+
     # ── Unified observe pipeline ─────────────────────────────
 
     async def observe(self, get_snapshot_fn) -> PageObservation:
@@ -554,6 +696,7 @@ class BrowserPerceptionLayer:
 
         # Vision perception (conditional)
         vision_description = ""
+        vision_controls: List[Dict[str, str]] = []
         if settings.VISION_PERCEPTION_ENABLED and page:
             complexity = self.compute_complexity_score(snapshot, a11y_elements)
             page_type = str(snapshot.get("page_type", "") or "")
@@ -580,6 +723,7 @@ class BrowserPerceptionLayer:
                         cached = cache.get(page_hash)
                         if cached is not None and cached.description:
                             vision_description = cached.description
+                            vision_controls = list(cached.controls or [])
                             cache_hit = True
                             if current_url:
                                 self._last_vision_url = self._normalize_url_for_compare(current_url)
@@ -590,16 +734,55 @@ class BrowserPerceptionLayer:
                             )
                 if not cache_hit:
                     try:
-                        vision_description = await self.get_vision_description(page)
+                        vision_description, vision_controls = await self.get_vision_description(page)
                         if vision_description:
                             if current_url:
                                 self._last_vision_url = self._normalize_url_for_compare(current_url)
                             trigger = "new_page" if is_new_page else ("complexity" if complexity > settings.VISION_PERCEPTION_COMPLEXITY_THRESHOLD else "unknown_type")
-                            log_agent_action(self.name, "observe", f"vision_len={len(vision_description)} trigger={trigger}")
+                            log_agent_action(
+                                self.name,
+                                "observe",
+                                f"vision_len={len(vision_description)} controls={len(vision_controls)} trigger={trigger}",
+                            )
                             if cache is not None and page_hash:
-                                cache.set(page_hash, vision_description, normalize_url_path(current_url))
+                                cache.set(
+                                    page_hash,
+                                    vision_description,
+                                    normalize_url_path(current_url),
+                                    controls=vision_controls,
+                                )
                     except Exception as exc:
                         log_warning(f"vision perception failed: {exc}")
+
+        # Perception-gap consistency check: reconcile vision-reported controls
+        # against DOM-extracted elements. If the vision model claims to see
+        # controls that aren't in the elements list, attempt one broader deep
+        # scan to pick them up (W3C-standard label/hidden-input pattern,
+        # aux ARIA roles) and then re-check.
+        perception_gaps: List[Dict[str, str]] = []
+        if vision_controls:
+            perception_gaps = find_perception_gaps(
+                vision_controls, snapshot.get("elements") or []
+            )
+            if perception_gaps and page:
+                log_agent_action(
+                    self.name,
+                    "observe",
+                    f"perception_gaps={len(perception_gaps)} {format_gaps_for_log(perception_gaps)}",
+                )
+                added = await self._run_deep_interactive_scan(page, snapshot)
+                if added:
+                    log_agent_action(
+                        self.name, "observe", f"deep_scan_added={added}",
+                    )
+                    perception_gaps = find_perception_gaps(
+                        vision_controls, snapshot.get("elements") or []
+                    )
+                    log_agent_action(
+                        self.name,
+                        "observe",
+                        f"perception_gaps_post={len(perception_gaps)} {format_gaps_for_log(perception_gaps)}",
+                    )
 
         # Apply versioned refs
         version = self._snapshot_version
@@ -632,6 +815,8 @@ class BrowserPerceptionLayer:
             snapshot_version=self._snapshot_version,
             timestamp=time.time(),
             headings=headings,
+            vision_controls=vision_controls,
+            perception_gaps=perception_gaps,
         )
         self._last_observation = observation
         return observation

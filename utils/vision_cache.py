@@ -12,12 +12,13 @@ visual is always fresh — see :func:`should_bypass_for_task`.
 """
 from __future__ import annotations
 
+import json
 import sqlite3
 import threading
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from pathlib import Path
-from typing import Optional
+from typing import Any, Dict, List, Optional
 
 from config.settings import settings
 from utils.logger import log_warning
@@ -55,6 +56,47 @@ def _parse_iso(value: Optional[str]) -> Optional[datetime]:
         return None
 
 
+def _encode_controls(controls: Optional[List[Dict[str, Any]]]) -> str:
+    if not controls:
+        return ""
+    clean: List[Dict[str, str]] = []
+    for item in controls:
+        if not isinstance(item, dict):
+            continue
+        role = str(item.get("role") or "").strip().lower()
+        label = str(item.get("label") or "").strip()
+        if not role and not label:
+            continue
+        clean.append({"role": role, "label": label})
+    if not clean:
+        return ""
+    try:
+        return json.dumps(clean, ensure_ascii=False)
+    except (TypeError, ValueError):
+        return ""
+
+
+def _decode_controls(raw: Any) -> List[Dict[str, str]]:
+    if not raw:
+        return []
+    try:
+        parsed = json.loads(str(raw))
+    except (ValueError, TypeError):
+        return []
+    if not isinstance(parsed, list):
+        return []
+    out: List[Dict[str, str]] = []
+    for item in parsed:
+        if not isinstance(item, dict):
+            continue
+        role = str(item.get("role") or "").strip().lower()
+        label = str(item.get("label") or "").strip()
+        if not role and not label:
+            continue
+        out.append({"role": role, "label": label})
+    return out
+
+
 @dataclass
 class CachedVision:
     page_hash: str
@@ -63,6 +105,7 @@ class CachedVision:
     hit_count: int
     created_at: str
     last_used_at: str
+    controls: List[Dict[str, str]] = field(default_factory=list)
 
 
 def should_bypass_for_task(task: str) -> bool:
@@ -108,6 +151,13 @@ class VisionCache:
             conn.row_factory = sqlite3.Row
             for stmt in _SCHEMA:
                 conn.execute(stmt)
+            # Backward-compat: add controls_json column to legacy DBs.
+            try:
+                cols = {row["name"] for row in conn.execute("PRAGMA table_info(vision_cache)")}
+                if "controls_json" not in cols:
+                    conn.execute("ALTER TABLE vision_cache ADD COLUMN controls_json TEXT NOT NULL DEFAULT ''")
+            except sqlite3.Error as exc:
+                log_warning(f"VisionCache controls migration failed: {exc}")
             conn.commit()
             self._conn = conn
             return conn
@@ -146,7 +196,7 @@ class VisionCache:
                 row = conn.execute(
                     """
                     SELECT page_hash, url_template, description, hit_count,
-                           created_at, last_used_at
+                           created_at, last_used_at, controls_json
                     FROM vision_cache WHERE page_hash = ?
                     """,
                     (ph,),
@@ -167,6 +217,7 @@ class VisionCache:
                     (now, ph),
                 )
                 conn.commit()
+                controls = _decode_controls(row["controls_json"] if "controls_json" in row.keys() else "")
                 return CachedVision(
                     page_hash=row["page_hash"],
                     description=row["description"],
@@ -174,17 +225,25 @@ class VisionCache:
                     hit_count=int(row["hit_count"] or 0) + 1,
                     created_at=row["created_at"],
                     last_used_at=now,
+                    controls=controls,
                 )
             except sqlite3.Error as exc:
                 log_warning(f"VisionCache.get failed: {exc}")
                 return None
 
-    def set(self, page_hash: str, description: str, url_template: str = "") -> bool:
-        """Upsert a description. Empty inputs are ignored."""
+    def set(
+        self,
+        page_hash: str,
+        description: str,
+        url_template: str = "",
+        controls: Optional[List[Dict[str, Any]]] = None,
+    ) -> bool:
+        """Upsert a description + optional structured controls list."""
         ph = (page_hash or "").strip()
         desc = (description or "").strip()
         if not ph or not desc:
             return False
+        controls_json = _encode_controls(controls)
         now = _now_iso()
         with self._lock:
             conn = self._ensure_conn()
@@ -195,14 +254,15 @@ class VisionCache:
                     """
                     INSERT INTO vision_cache
                         (page_hash, url_template, description, hit_count,
-                         created_at, last_used_at)
-                    VALUES (?, ?, ?, 0, ?, ?)
+                         created_at, last_used_at, controls_json)
+                    VALUES (?, ?, ?, 0, ?, ?, ?)
                     ON CONFLICT(page_hash) DO UPDATE SET
                         url_template = excluded.url_template,
                         description = excluded.description,
-                        last_used_at = excluded.last_used_at
+                        last_used_at = excluded.last_used_at,
+                        controls_json = excluded.controls_json
                     """,
-                    (ph, url_template or "", desc, now, now),
+                    (ph, url_template or "", desc, now, now, controls_json),
                 )
                 conn.commit()
                 self._purge_expired_locked(conn)
