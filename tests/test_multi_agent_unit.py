@@ -121,12 +121,23 @@ class TestExtractTypedOutput:
 
 class TestResolveTaskParams:
     def test_basic_field_reference(self):
-        params = {"command": "unzip $task_1.file_path -d /tmp/"}
-        # Note: only the whole value is resolved if it starts with $
-        # For embedded refs, the value must be the entire string starting with $
         task_outputs = {"task_1": {"file_path": "/tmp/report.zip", "type": "file_download"}}
         resolved = _resolve_task_params({"input": "$task_1.file_path"}, task_outputs)
         assert resolved["input"] == "/tmp/report.zip"
+
+    def test_embedded_field_reference(self):
+        task_outputs = {"task_2": {"file_path": "/tmp/report.html", "type": "file_download"}}
+        resolved = _resolve_task_params({"task": "打开文件 $task_2.file_path"}, task_outputs)
+        assert resolved["task"] == "打开文件 /tmp/report.html"
+
+    def test_nested_reference_values(self):
+        task_outputs = {"task_1": {"file_path": "/tmp/report.zip", "type": "file_download"}}
+        resolved = _resolve_task_params(
+            {"payload": {"path": "$task_1.file_path"}, "items": ["$task_1.type"]},
+            task_outputs,
+        )
+        assert resolved["payload"]["path"] == "/tmp/report.zip"
+        assert resolved["items"] == ["file_download"]
 
     def test_whole_output_reference(self):
         task_outputs = {"task_1": {"type": "text_extraction", "content": "hello"}}

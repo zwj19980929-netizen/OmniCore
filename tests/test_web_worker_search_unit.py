@@ -89,10 +89,20 @@ class _CaptureLLM(_PlannerLLM):
     def __init__(self, payload):
         super().__init__(payload)
         self.last_system_prompt = ""
+        self.last_user_message = ""
 
     def chat_with_system(self, **kwargs):
         self.last_system_prompt = str(kwargs.get("system_prompt", "") or "")
+        self.last_user_message = str(kwargs.get("user_message", "") or "")
         return {"ok": True}
+
+
+class _FailingPlannerLLM:
+    def chat_with_system(self, **_kwargs):
+        raise RuntimeError("no llm")
+
+    def parse_json_response(self, _response):
+        return {}
 
 
 class _SemanticSnapshotToolkit:
@@ -266,6 +276,90 @@ def test_rerank_search_results_prefers_llm_selected_cards():
 
     assert serp_sufficient is False
     assert ranked[0]["link"] == "https://www.reuters.com/world/article-123"
+
+
+def test_openai_model_search_ranking_prefers_official_sources_without_llm():
+    worker = WebWorker(llm_client=_FailingPlannerLLM())
+    cards = [
+        {
+            "title": "GPT-5.2 summary",
+            "link": "https://example-news.test/openai-gpt-5-2",
+            "source": "Example News",
+            "snippet": "A news summary of OpenAI's latest model.",
+        },
+        {
+            "title": "Introducing GPT-5.2",
+            "link": "https://openai.com/index/introducing-gpt-5-2/",
+            "source": "OpenAI",
+            "snippet": "OpenAI official model announcement.",
+        },
+    ]
+
+    ranked, _ = worker._rerank_search_results(
+        "帮我看下 OpenAI 最新模型，并给我信息源",
+        "OpenAI latest models",
+        cards,
+        max_results=2,
+    )
+
+    assert ranked[0]["link"].startswith("https://openai.com/")
+
+
+def test_openai_latest_model_queries_include_official_domain_fallback():
+    worker = WebWorker(llm_client=_PlannerLLM({"queries": ["OpenAI latest model"]}))
+
+    queries = worker.plan_search_queries(
+        "帮我看下OpenAI最新模型，总结中文并给我信息源",
+        max_queries=3,
+    )
+
+    assert "OpenAI latest model" in queries
+    assert any(query.startswith("site:openai.com") for query in queries)
+
+
+def test_openai_latest_model_queries_include_current_year_and_time_context():
+    llm = _CaptureLLM({"queries": ["OpenAI latest model"]})
+    worker = WebWorker(llm_client=llm)
+
+    queries = worker.plan_search_queries(
+        "帮我看下OpenAI最新模型，总结中文并给我信息源",
+        max_queries=4,
+        current_time_context={"local_date": "2026-04-24", "current_year": 2026},
+    )
+
+    assert any("2026" in query or "2026-04-24" in query for query in queries)
+    assert any(query.startswith("site:openai.com") for query in queries)
+    assert "2026-04-24" in llm.last_user_message
+
+
+def test_rerank_search_results_receives_current_time_context():
+    llm = _CaptureLLM({"selected_indexes": [1], "serp_sufficient": False})
+    worker = WebWorker(llm_client=llm)
+    cards = [
+        {
+            "title": "Introducing GPT-5.2",
+            "link": "https://openai.com/index/introducing-gpt-5-2/",
+            "source": "OpenAI",
+            "snippet": "OpenAI official model announcement.",
+        },
+        {
+            "title": "Older model roundup",
+            "link": "https://example.com/openai-models",
+            "source": "Example",
+            "snippet": "A 2025 model roundup.",
+        },
+    ]
+
+    ranked, _ = worker._rerank_search_results(
+        "帮我看下OpenAI最新模型，总结中文并给我信息源",
+        "OpenAI latest model 2026",
+        cards,
+        max_results=2,
+        current_time_context={"local_date": "2026-04-24", "current_year": 2026},
+    )
+
+    assert ranked[0]["link"].startswith("https://openai.com/")
+    assert "2026-04-24" in llm.last_user_message
 
 
 def test_search_for_result_cards_honors_headless_override(monkeypatch):
@@ -533,6 +627,39 @@ def test_semantic_search_results_do_not_short_circuit_detail_tasks_even_when_ser
     assert result["handled"] is True
     assert result["navigated"] is True
     assert toolkit.clicked_ref == "el_weather"
+
+
+def test_semantic_search_results_open_real_result_for_latest_source_task():
+    worker = WebWorker(llm_client=_PlannerLLM({"selected_indexes": [1], "serp_sufficient": True}))
+    worker.validate_data_quality = lambda *_args, **_kwargs: {"valid": True}
+    toolkit = _SemanticSnapshotToolkit(
+        {
+            "page_type": "serp",
+            "cards": [
+                {
+                    "title": "Introducing GPT-5.2",
+                    "link": "https://openai.com/index/introducing-gpt-5-2/",
+                    "source": "OpenAI",
+                    "snippet": "GPT-5.2 is OpenAI's latest model.",
+                    "target_ref": "el_openai",
+                    "target_selector": "a.result",
+                }
+            ],
+            "elements": [],
+        }
+    )
+
+    result = asyncio.run(
+        worker._maybe_handle_semantic_search_results(
+            toolkit,
+            "帮我看下OpenAI最新模型，总结中文并给我信息源",
+            limit=1,
+        )
+    )
+
+    assert result["handled"] is True
+    assert result["navigated"] is True
+    assert toolkit.clicked_ref == "el_openai"
 
 
 def test_semantic_search_results_can_return_cards_for_list_tasks_when_snippets_are_sufficient():

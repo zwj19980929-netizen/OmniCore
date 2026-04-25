@@ -3,6 +3,7 @@ OmniCore Critic Agent - 独立审查官
 在最终结果返回或执行高危操作前进行逻辑校验
 """
 import re
+from datetime import datetime
 from typing import Dict, Any, Optional
 from pathlib import Path
 
@@ -12,6 +13,7 @@ from core.llm import LLMClient
 from core.prompt_registry import build_single_section_prompt
 from utils.logger import log_agent_action, logger
 from utils.prompt_manager import get_prompt
+from utils.time_context import is_time_sensitive_text, normalize_current_time_context
 from utils.url_utils import extract_all_urls
 from utils.web_result_normalizer import looks_like_detail_list_item
 
@@ -116,6 +118,7 @@ class CriticAgent:
         self,
         task_description: str,
         task_result: Any,
+        current_time_context: Optional[Dict[str, Any]] = None,
     ) -> Optional[Dict[str, Any]]:
         if not isinstance(task_result, dict):
             return None
@@ -123,6 +126,14 @@ class CriticAgent:
             return None
         if str(task_result.get("message", "") or "").lower().find("blocked page") >= 0:
             return None
+
+        report_review = self._review_generated_report_sources(
+            task_description,
+            task_result,
+            current_time_context=current_time_context,
+        )
+        if report_review is not None:
+            return report_review
 
         if (
             self._task_has_direct_url(task_description)
@@ -166,6 +177,123 @@ class CriticAgent:
                 "suggestions": [],
                 "summary": "显式 URL 列表抽取任务已返回有效的标题和链接",
             }
+
+        return None
+
+    @staticmethod
+    def _looks_like_source_sensitive_report_task(task_description: str) -> bool:
+        lowered = str(task_description or "").lower()
+        report_tokens = ("报告", "总结", "summary", "report", "summarize", "生成")
+        source_tokens = ("来源", "信息源", "source", "sources", "citation", "引用", "链接")
+        latest_tokens = ("最新", "latest", "recent", "up-to-date")
+        return any(token in lowered for token in report_tokens) and (
+            any(token in lowered for token in source_tokens)
+            or any(token in lowered for token in latest_tokens)
+            or is_time_sensitive_text(lowered)
+        )
+
+    def _review_generated_report_sources(
+        self,
+        task_description: str,
+        task_result: Dict[str, Any],
+        current_time_context: Optional[Dict[str, Any]] = None,
+    ) -> Optional[Dict[str, Any]]:
+        if not self._looks_like_source_sensitive_report_task(task_description):
+            return None
+        file_path = str(task_result.get("file_path", "") or "").strip()
+        if not file_path:
+            return None
+
+        path = Path(file_path).expanduser()
+        if not path.exists() or not path.is_file():
+            return {
+                "approved": False,
+                "score": 0.25,
+                "issues": [f"报告文件不存在，无法验证来源: {file_path}"],
+                "suggestions": ["确认 file_worker 返回的是实际写入路径"],
+                "summary": "报告文件路径不可验证",
+            }
+
+        try:
+            content = path.read_text(encoding="utf-8", errors="replace")
+        except Exception as exc:
+            return {
+                "approved": False,
+                "score": 0.25,
+                "issues": [f"无法读取报告文件进行来源验证: {exc}"],
+                "suggestions": ["检查文件编码和权限"],
+                "summary": "报告文件读取失败",
+            }
+
+        http_urls = [url for url in extract_all_urls(content) if url.startswith(("http://", "https://"))]
+        if not http_urls:
+            return {
+                "approved": False,
+                "score": 0.35,
+                "issues": ["报告要求包含信息源，但正文没有可点击的 HTTP/HTTPS 来源链接"],
+                "suggestions": ["基于上游抓取结果重新生成报告，并在文末列出每条来源 URL"],
+                "summary": "报告缺少可验证来源链接",
+            }
+
+        time_context = normalize_current_time_context(current_time_context)
+        current_year = int(time_context.get("current_year") or datetime.now().year)
+        local_date = str(time_context.get("local_date", "") or "").strip()
+        latest_task = is_time_sensitive_text(task_description)
+        dated_report = re.search(
+            r"(?:报告生成日期|生成日期|generated(?:\s+at|\s+on)?)[^\d]{0,20}(20\d{2})",
+            content,
+            flags=re.IGNORECASE,
+        )
+        if dated_report:
+            try:
+                report_year = int(dated_report.group(1))
+            except ValueError:
+                report_year = current_year
+            if report_year < current_year and latest_task:
+                return {
+                    "approved": False,
+                    "score": 0.4,
+                    "issues": [f"报告生成日期为 {report_year}，与最新资料任务的当前年份 {current_year} 不符"],
+                    "suggestions": ["重新联网检索并生成当前日期的报告"],
+                    "summary": "报告明显过期",
+                }
+        elif latest_task:
+            return {
+                "approved": False,
+                "score": 0.45,
+                "issues": ["时间敏感报告缺少明确生成日期，无法确认“最新/当前”的时间基准"],
+                "suggestions": ["重新生成报告，并写明当前运行日期和来源发布日期"],
+                "summary": "报告缺少当前日期基准",
+            }
+
+        stale_claim_patterns = (
+            r"(20\d{2})\s*年(?:初|上半年|下半年|截至|以来)?[^。.\n]{0,30}(?:最新|当前|目前)",
+            r"(?:最新|当前|目前|latest|current)[^。.\n]{0,30}(20\d{2})\s*年",
+        )
+        if latest_task:
+            for pattern in stale_claim_patterns:
+                for match in re.finditer(pattern, content, flags=re.IGNORECASE):
+                    try:
+                        claim_year = int(match.group(1))
+                    except Exception:
+                        continue
+                    if claim_year < current_year:
+                        return {
+                            "approved": False,
+                            "score": 0.4,
+                            "issues": [f"报告将 {claim_year} 年信息表述为最新/当前，但当前年份是 {current_year}"],
+                            "suggestions": ["基于当前日期重新检索，或明确说明旧年份信息为何仍是最新"],
+                            "summary": "报告存在过期的最新性表述",
+                        }
+
+            if local_date and local_date not in content and str(current_year) not in content:
+                return {
+                    "approved": False,
+                    "score": 0.5,
+                    "issues": [f"时间敏感报告未体现当前日期或年份（{local_date}）"],
+                    "suggestions": ["在报告中加入生成日期，并核对当前年份来源"],
+                    "summary": "报告缺少当前时间标记",
+                }
 
         return None
 
@@ -237,6 +365,7 @@ class CriticAgent:
         task_result: Any,
         expected_format: Optional[str] = None,
         page_screenshot: Optional[bytes] = None,
+        current_time_context: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
         """
         审查单个任务的执行结果
@@ -268,7 +397,11 @@ class CriticAgent:
                     "summary": "任务标记成功但无数据返回",
                 }
 
-        deterministic_result = self._deterministic_review_result(task_description, task_result)
+        deterministic_result = self._deterministic_review_result(
+            task_description,
+            task_result,
+            current_time_context=current_time_context,
+        )
         if deterministic_result is not None:
             log_agent_action(
                 self.name,
@@ -400,6 +533,17 @@ class CriticAgent:
         """
         log_agent_action(self.name, "开始全局审查")
 
+        current_time_context = None
+        try:
+            from core.message_bus import MessageBus, MSG_TIME_CONTEXT
+
+            bus = MessageBus.from_dict(state.get("message_bus", []))
+            time_msg = bus.get_latest(MSG_TIME_CONTEXT)
+            if time_msg:
+                current_time_context = time_msg.payload.get("value")
+        except Exception:
+            current_time_context = None
+
         all_approved = True
         all_issues = []
         all_suggestions = []
@@ -449,6 +593,7 @@ class CriticAgent:
                     task_description=task["description"],
                     task_result=task["result"],
                     page_screenshot=_screenshot,
+                    current_time_context=current_time_context,
                 )
                 task["critic_review"] = review_result
                 task["critic_approved"] = bool(review_result.get("approved"))

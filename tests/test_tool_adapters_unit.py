@@ -298,6 +298,59 @@ def test_browser_agent_adapter_sanitizes_polluted_start_url(monkeypatch):
     assert len(created_toolkits) == 1
 
 
+def test_browser_agent_adapter_derives_file_url_from_local_report_path(monkeypatch, tmp_path):
+    report_path = tmp_path / "generated.html"
+    report_path.write_text("<h1>report</h1>", encoding="utf-8")
+
+    class FakeToolkit:
+        def __init__(self, **_kwargs):
+            pass
+
+        async def close(self):
+            return SimpleNamespace(success=True, error=None)
+
+    class FakeAgent:
+        async def run(self, task_desc, start_url, max_steps=8):
+            assert task_desc == f"打开文件 {report_path}"
+            assert start_url == report_path.resolve().as_uri()
+            return {"success": True, "message": "ok", "steps": []}
+
+        async def close(self):
+            return None
+
+    class FakeWorkerPool:
+        def create_browser_agent(self, llm_client=None, headless=True, toolkit=None):
+            return FakeAgent()
+
+    async def _fake_get_instance(_cls):
+        return FakeWorkerPool()
+
+    monkeypatch.setattr(browser_toolkit_module, "BrowserToolkit", FakeToolkit)
+    monkeypatch.setattr(tool_adapters_module, "resolve_model_for_task", lambda _task: None)
+    monkeypatch.setattr(tool_adapters_module.WorkerPool, "get_instance", classmethod(_fake_get_instance))
+
+    registry = build_tool_adapter_registry()
+    adapter = registry.get("browser_agent")
+    tool = get_builtin_tool_registry().get("browser.interact")
+
+    outcome = asyncio.run(
+        adapter.execute(
+            {
+                "task_id": "task_browser",
+                "task_type": "browser_agent",
+                "tool_name": "browser.interact",
+                "description": f"打开文件 {report_path}",
+                "params": {"task": f"打开文件 {report_path}", "headless": True},
+                "execution_trace": [],
+            },
+            {},
+            tool,
+        )
+    )
+
+    assert outcome["status"] == "completed"
+
+
 def test_enhanced_web_worker_adapter_uses_description_when_task_param_missing(monkeypatch):
     import agents.enhanced_web_worker as enhanced_web_worker_module
 

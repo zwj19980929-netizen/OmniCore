@@ -26,6 +26,7 @@ from core.graph import get_graph  # noqa: F401 – also exposes build_graph_from
 from memory.manager import MemoryManager, build_memory_scope
 from utils.logger import console, log_agent_action, log_debug_metrics, log_error, log_warning
 from utils.text import sanitize_text, sanitize_value
+from utils.time_context import build_current_time_context
 from utils.structured_logger import get_structured_logger, LogContext
 
 if TYPE_CHECKING:
@@ -280,15 +281,7 @@ def _build_current_os_context() -> Dict[str, str]:
 
 
 def _build_current_time_context() -> Dict[str, str]:
-    now = datetime.now().astimezone()
-    timezone_name = now.tzname() or str(now.tzinfo or "")
-    return {
-        "iso_datetime": now.isoformat(timespec="seconds"),
-        "local_date": now.strftime("%Y-%m-%d"),
-        "local_time": now.strftime("%H:%M:%S"),
-        "weekday": now.strftime("%A"),
-        "timezone": timezone_name,
-    }
+    return build_current_time_context()
 
 
 def _build_current_location_context(

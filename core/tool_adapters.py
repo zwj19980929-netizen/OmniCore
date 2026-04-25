@@ -793,6 +793,23 @@ class TerminalWorkerAdapter(ExecutorBackedAdapter):
 
 @tool_adapter("browser_agent")
 class BrowserAgentAdapter(BaseToolAdapter):
+    @staticmethod
+    def _local_file_url_from_text(text: str) -> str:
+        value = str(text or "")
+        match = re.search(
+            r"(?:打开|查看|展示|open|show|view)?\s*(?:文件|file)?\s*"
+            r"((?:/|~\/)[^\s，。；;\"']+\.(?:html?|md|markdown|txt|pdf))",
+            value,
+            flags=re.IGNORECASE,
+        )
+        if not match:
+            return ""
+        try:
+            path = Path(match.group(1)).expanduser()
+            return path.resolve().as_uri()
+        except Exception:
+            return ""
+
     async def execute(
         self,
         task: Dict[str, Any],
@@ -806,6 +823,8 @@ class BrowserAgentAdapter(BaseToolAdapter):
         params = task.get("params", {})
         task_desc = params.get("task", task.get("description", ""))
         start_url = sanitize_extracted_url(params.get("start_url", "")) or extract_first_url(task_desc)
+        if not start_url:
+            start_url = self._local_file_url_from_text(task_desc)
         headless = params.get("headless", settings.BROWSER_FAST_MODE)
         max_steps = params.get("max_steps", 8)
         if not isinstance(max_steps, int) or max_steps <= 0:

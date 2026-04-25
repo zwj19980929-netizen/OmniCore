@@ -7,6 +7,7 @@ OmniCore task batch executor (async-optimized)
 import atexit
 import asyncio
 import copy
+import re
 import threading
 from typing import Dict, Any, List, Optional, Tuple
 
@@ -425,23 +426,46 @@ def _resolve_task_params(
     if not task_outputs:
         return params
 
-    resolved: Dict[str, Any] = {}
-    for k, v in params.items():
-        if isinstance(v, str) and v.startswith("$"):
-            ref = v[1:]  # 去掉 $
-            parts = ref.split(".", 1)
-            ref_task_id = parts[0]
-            task_out = task_outputs.get(ref_task_id)
-            if task_out is None:
-                resolved[k] = v  # 找不到时保留原值
-            elif len(parts) == 1:
-                resolved[k] = task_out  # 整个输出
-            else:
-                ref_field = parts[1]
-                resolved[k] = task_out.get(ref_field, v)
-        else:
-            resolved[k] = v
-    return resolved
+    ref_pattern = re.compile(r"\$([A-Za-z0-9_-]+)(?:\.([A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z_][A-Za-z0-9_]*)*))?")
+
+    def _lookup_ref(task_id: str, field: Optional[str], original: str) -> Any:
+        task_out = task_outputs.get(task_id)
+        if task_out is None:
+            return original
+        if not field:
+            return task_out
+        if isinstance(task_out, dict):
+            current: Any = task_out
+            for part in field.split("."):
+                if isinstance(current, dict) and part in current:
+                    current = current[part]
+                else:
+                    return original
+            return current
+        return original
+
+    def _resolve_value(value: Any) -> Any:
+        if isinstance(value, dict):
+            return {key: _resolve_value(item) for key, item in value.items()}
+        if isinstance(value, list):
+            return [_resolve_value(item) for item in value]
+        if not isinstance(value, str):
+            return value
+
+        full_match = ref_pattern.fullmatch(value.strip())
+        if full_match:
+            return _lookup_ref(full_match.group(1), full_match.group(2), value)
+
+        def _replace(match: re.Match) -> str:
+            original = match.group(0)
+            resolved_value = _lookup_ref(match.group(1), match.group(2), original)
+            if resolved_value is original:
+                return original
+            return str(resolved_value)
+
+        return ref_pattern.sub(_replace, value)
+
+    return {k: _resolve_value(v) for k, v in params.items()}
 
 
 def _evaluate_condition(when_expr: str, task_outputs: Dict[str, Any]) -> bool:

@@ -15,6 +15,12 @@ from core.llm import LLMClient
 from core.prompt_registry import PromptRegistry, PromptSection
 from core.tool_registry import build_dynamic_tool_prompt_lines, get_builtin_tool_registry
 from utils.logger import log_agent_action, logger
+from utils.time_context import (
+    append_temporal_instruction_if_needed,
+    build_time_context_prompt,
+    is_time_sensitive_text,
+    normalize_current_time_context,
+)
 from utils.url_utils import extract_first_url
 
 # R6: System Prompt 静态/动态分离
@@ -271,7 +277,7 @@ class RouterAgent:
         current_time_context: Dict[str, Any] | None = None,
     ) -> Dict[str, Any]:
         current_date = (
-            str((current_time_context or {}).get("local_date", "") or "").strip()
+            str(normalize_current_time_context(current_time_context).get("local_date", "") or "").strip()
             or date.today().isoformat()
         )
         response = self.llm.chat_with_system(
@@ -639,6 +645,61 @@ class RouterAgent:
         result["tasks"] = repaired_tasks
         return result
 
+    @classmethod
+    def _apply_temporal_context_to_tasks(
+        cls,
+        user_input: str,
+        result: Dict[str, Any],
+        current_time_context: dict | None = None,
+    ) -> Dict[str, Any]:
+        context = normalize_current_time_context(current_time_context)
+        user_is_temporal = is_time_sensitive_text(user_input)
+        patched_tasks = []
+        for raw_task in result.get("tasks", []) or []:
+            task_data = dict(raw_task)
+            params = task_data.get("params")
+            if not isinstance(params, dict):
+                params = {}
+            params = dict(params)
+            tool_args = task_data.get("tool_args")
+            if isinstance(tool_args, dict):
+                tool_args = dict(tool_args)
+            else:
+                tool_args = dict(params)
+
+            task_text = " ".join(
+                [
+                    str(task_data.get("description", "") or ""),
+                    " ".join(str(value) for value in params.values() if isinstance(value, str)),
+                ]
+            )
+            if user_is_temporal or is_time_sensitive_text(task_text):
+                task_data["description"] = append_temporal_instruction_if_needed(
+                    str(task_data.get("description", "") or ""),
+                    context,
+                    force=True,
+                )
+                params["current_time_context"] = context
+                tool_args["current_time_context"] = context
+
+                tool_name = str(task_data.get("tool_name", "") or "").strip()
+                if tool_name == "browser.interact" and params.get("task"):
+                    params["task"] = append_temporal_instruction_if_needed(str(params["task"]), context, force=True)
+                    tool_args["task"] = params["task"]
+                elif tool_name in {"web.fetch_and_extract", "web.smart_extract"} and params.get("task"):
+                    params["task"] = append_temporal_instruction_if_needed(str(params["task"]), context, force=True)
+                    tool_args["task"] = params["task"]
+                elif tool_name == "file.read_write" and params.get("topic"):
+                    params["topic"] = append_temporal_instruction_if_needed(str(params["topic"]), context, force=True)
+                    tool_args["topic"] = params["topic"]
+
+            task_data["params"] = params
+            task_data["tool_args"] = tool_args
+            patched_tasks.append(task_data)
+
+        result["tasks"] = patched_tasks
+        return result
+
     @staticmethod
     def _looks_like_search_results_url(url: str) -> bool:
         normalized = str(url or "").strip()
@@ -995,6 +1056,7 @@ class RouterAgent:
             包含意图和任务列表的字典
         """
         log_agent_action(self.name, "开始分析用户意图", user_input[:50] + "...")
+        current_time_context = normalize_current_time_context(current_time_context)
 
         # 构建包含对话历史的用户消息
         # R6: 动态上下文（Agent 能力 + 工具目录）作为 user_message 前缀注入，
@@ -1091,26 +1153,9 @@ class RouterAgent:
                 user_message += "\n\n---\n"
 
         if current_time_context:
-            time_lines = []
-            iso_datetime = str(current_time_context.get("iso_datetime", "") or "").strip()
-            local_date = str(current_time_context.get("local_date", "") or "").strip()
-            local_time = str(current_time_context.get("local_time", "") or "").strip()
-            weekday = str(current_time_context.get("weekday", "") or "").strip()
-            timezone_name = str(current_time_context.get("timezone", "") or "").strip()
-            if iso_datetime:
-                time_lines.append(f"- Current datetime: {iso_datetime}")
-            if local_date:
-                time_lines.append(f"- Current date: {local_date}")
-            if local_time:
-                time_lines.append(f"- Current local time: {local_time}")
-            if weekday:
-                time_lines.append(f"- Weekday: {weekday}")
-            if timezone_name:
-                time_lines.append(f"- Timezone: {timezone_name}")
-            if time_lines:
-                user_message += "## Current local time (treat this as the authoritative current time for planning):\n"
-                user_message += "\n".join(time_lines)
-                user_message += "\n\n---\n"
+            user_message += "## Current local time (treat this as the authoritative current time for planning):\n"
+            user_message += build_time_context_prompt(current_time_context)
+            user_message += "\n\n---\n"
 
         if current_location_context and self._should_include_location_context(user_input):
             location_lines = []
@@ -1301,6 +1346,11 @@ class RouterAgent:
             )
             result = self._repair_task_params_from_user_input(user_input, result)
             result = self._apply_fact_verification_guard(
+                user_input,
+                result,
+                current_time_context,
+            )
+            result = self._apply_temporal_context_to_tasks(
                 user_input,
                 result,
                 current_time_context,
@@ -1557,4 +1607,3 @@ class RouterAgent:
         )
 
         return state
-

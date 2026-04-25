@@ -348,6 +348,59 @@ def test_router_fact_freshness_guard_replaces_direct_answer_with_verification_ta
     assert result["tasks"][0]["params"]["query"] == "current Supreme Leader of Iran March 2026"
 
 
+def test_router_injects_current_date_into_time_sensitive_subtasks():
+    fake_llm = _QueuedLLM(
+        [
+            {
+                "intent": "web_scraping_and_summarization",
+                "confidence": 0.98,
+                "reasoning": "needs web and file",
+                "direct_answer": "",
+                "tasks": [
+                    {
+                        "task_id": "task_1",
+                        "task_type": "web_worker",
+                        "tool_name": "web.fetch_and_extract",
+                        "description": "搜索OpenAI最新模型资料，并提取来源链接",
+                        "params": {"query": "OpenAI latest models"},
+                    },
+                    {
+                        "task_id": "task_2",
+                        "task_type": "file_worker",
+                        "tool_name": "file.read_write",
+                        "description": "生成中文HTML报告，总结OpenAI最新模型，并给出信息源",
+                        "params": {
+                            "action": "generate",
+                            "format": "html",
+                            "topic": "OpenAI最新模型",
+                            "data_source": "task_1",
+                        },
+                    },
+                ],
+                "is_high_risk": False,
+            }
+        ]
+    )
+    router = RouterAgent(llm_client=fake_llm)
+
+    result = router.analyze_intent(
+        "帮我看下openai最新的模型，到网上找找并总结成中文，给我信息源",
+        current_time_context={
+            "iso_datetime": "2026-04-24T06:34:56-07:00",
+            "local_date": "2026-04-24",
+            "current_year": 2026,
+            "timezone": "America/Los_Angeles",
+        },
+    )
+
+    web_task, file_task = result["tasks"]
+    assert "2026-04-24" in web_task["description"]
+    assert "2026-04-24" in file_task["description"]
+    assert web_task["params"]["current_time_context"]["local_date"] == "2026-04-24"
+    assert file_task["params"]["current_time_context"]["local_date"] == "2026-04-24"
+    assert "2026-04-24" in file_task["params"]["topic"]
+
+
 def test_router_fact_freshness_guard_skips_local_time_question():
     class _TimeAnswerLLM(_FakeLLM):
         def parse_json_response(self, _response):

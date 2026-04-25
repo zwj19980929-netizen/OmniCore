@@ -2,7 +2,7 @@ import re
 from urllib.parse import urlparse
 
 _URL_PATTERN = re.compile(
-    r"https?://[A-Za-z0-9:/?#\[\]@!$&()*+,;=._~%'-]+",
+    r"(?:https?|file)://[A-Za-z0-9:/?#\[\]@!$&()*+,;=._~%'-]+",
     re.IGNORECASE,
 )
 _URL_TRAILING_PUNCT = ".,);]}>\"'，。！？；：、）］】｝〉》」』”’"
@@ -15,9 +15,16 @@ def sanitize_extracted_url(value: str) -> str:
 
     candidate = match.group(0).rstrip(_URL_TRAILING_PUNCT)
     parsed = urlparse(candidate)
-    if parsed.scheme.lower() not in {"http", "https"} or not parsed.netloc:
-        return ""
-    return candidate
+    scheme = parsed.scheme.lower()
+    if scheme in {"http", "https"}:
+        if not parsed.netloc:
+            return ""
+        return candidate
+    if scheme == "file":
+        if not parsed.path:
+            return ""
+        return candidate
+    return ""
 
 
 def extract_first_url(text: str) -> str:

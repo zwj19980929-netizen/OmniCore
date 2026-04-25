@@ -44,6 +44,11 @@ from utils.web_result_normalizer import (
 import utils.web_debug_recorder as web_debug_recorder
 from utils.text_relevance import extract_relevant_text_safe_async
 from utils.prompt_injection_detector import wrap_untrusted
+from utils.time_context import (
+    append_temporal_instruction_if_needed,
+    is_time_sensitive_text,
+    normalize_current_time_context,
+)
 from config.settings import settings
 from config.domain_keywords import SEARCH_STOPWORDS_SET
 
@@ -103,6 +108,7 @@ Rules:
 - Output 1 to 4 short search queries only.
 - Queries must be concise search phrases, not full task instructions.
 - Preserve important entities, dates, locations, and source/domain hints.
+- If current_time_context is provided and the task asks for latest/recent/current/today, include the current year or absolute date in at least one query.
 - Keep source/domain hints available for ranking, but do not add site:domain filters unless the user explicitly requested a domain-constrained search.
 - Prefer article/report/statement discovery queries over homepage navigation queries.
 """
@@ -119,7 +125,8 @@ Return JSON with this schema:
 Rules:
 - Select the results most likely to contain evidence needed for the task.
 - Prefer direct articles/statements/report pages over homepages, section pages, category pages, docs, forums, and ecommerce pages.
-- If the visible snippets alone are already enough to answer the task safely, set serp_sufficient to true.
+- Use current_time_context to judge freshness for latest/recent/current/today tasks.
+- If the visible snippets alone are already enough to answer the task safely and are fresh enough for current_time_context, set serp_sufficient to true.
 - Use the 1-based indexes from the provided result list.
 """
 
@@ -374,6 +381,7 @@ class WebWorker:
         query: str,
         *,
         max_results: int,
+        current_time_context: Optional[Dict[str, Any]] = None,
     ) -> Tuple[List[Dict[str, Any]], bool]:
         cards = self._snapshot_cards_to_search_cards(snapshot)
         if not cards:
@@ -391,6 +399,7 @@ class WebWorker:
             query,
             candidate_cards,
             max_results=max_results,
+            current_time_context=current_time_context,
         )
         return ranked_cards or candidate_cards[:max_results], serp_sufficient
 
@@ -585,6 +594,17 @@ class WebWorker:
             domains.append(value)
         return domains
 
+    def _inferred_preferred_domains(self, text: str) -> List[str]:
+        lowered = str(text or "").lower()
+        domains: List[str] = []
+        if "openai" in lowered and any(token in lowered for token in ("模型", "model", "gpt", "o3", "o4", "o1")):
+            domains.extend(["openai.com", "platform.openai.com", "help.openai.com"])
+        return domains
+
+    def _requires_authoritative_detail_sources(self, task_description: str) -> bool:
+        lowered = str(task_description or "").lower()
+        return any(token in lowered for token in ("最新", "latest", "recent", "来源", "信息源", "source", "citation", "官网", "official"))
+
     def _tokenize_query_terms(self, text: str) -> List[str]:
         terms: List[str] = []
         seen: Set[str] = set()
@@ -686,8 +706,12 @@ class WebWorker:
             value = re.sub(r"\s+", " ", str(query or "").strip())
             if not value:
                 continue
-            normalized = self._normalize_search_query_for_dedup(value)
-            signature = self._query_signature(value)
+            if value.lower().startswith("site:"):
+                normalized = value.lower()
+                signature = (normalized,)
+            else:
+                normalized = self._normalize_search_query_for_dedup(value)
+                signature = self._query_signature(value)
             if normalized in seen_normalized or (signature and signature in seen_signatures):
                 continue
             seen_normalized.add(normalized)
@@ -701,6 +725,8 @@ class WebWorker:
     def _search_query_budget(self, task_description: str, max_queries: int) -> int:
         if max_queries <= 1:
             return 1
+        if self._requires_authoritative_detail_sources(task_description) and self._inferred_preferred_domains(task_description):
+            return min(max_queries, 2)
         if self._prefers_static_text(task_description):
             return 1
         desc = str(task_description or "").lower()
@@ -749,19 +775,33 @@ class WebWorker:
         base_query: str = "",
         domain_hints: Optional[List[str]] = None,
         max_queries: int = 3,
+        current_time_context: Optional[Dict[str, Any]] = None,
     ) -> List[str]:
         domain_hints = [item for item in (domain_hints or []) if item]
+        time_context = normalize_current_time_context(current_time_context)
+        current_year = str(time_context.get("current_year", "") or "").strip()
+        temporal = is_time_sensitive_text(f"{task_description} {base_query}")
         queries: List[str] = []
         candidates = []
         if str(base_query or "").strip():
             candidates.append(str(base_query or "").strip())
         else:
             candidates.append(self._compact_query_text(task_description, max_terms=8))
-
-        if domain_hints and self._task_explicitly_requests_domain_constraint(task_description):
+        if domain_hints and (
+            self._task_explicitly_requests_domain_constraint(task_description)
+            or self._requires_authoritative_detail_sources(task_description)
+        ):
             if base_query:
                 candidates.append(self._build_domain_constrained_query(base_query, domain_hints[0]))
-            candidates.append(self._build_domain_constrained_query(task_description, domain_hints[0]))
+            domain_query = self._build_domain_constrained_query(task_description, domain_hints[0])
+            if temporal and current_year and current_year not in domain_query:
+                domain_query = f"{domain_query} {current_year}"
+            candidates.append(domain_query)
+
+        if temporal and current_year:
+            seed = candidates[0] if candidates else self._compact_query_text(task_description, max_terms=8)
+            if seed and current_year not in seed:
+                candidates.append(f"{seed} {current_year}")
 
         seen: Set[str] = set()
         for candidate in candidates:
@@ -1386,6 +1426,7 @@ class WebWorker:
         task_description: str,
         limit: int,
         snapshot: Optional[Dict[str, Any]] = None,
+        current_time_context: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
         active_snapshot = snapshot or {}
         if not active_snapshot:
@@ -1405,6 +1446,7 @@ class WebWorker:
             task_description,
             task_description,
             max_results=max(1, min(limit, 5)),
+            current_time_context=current_time_context,
         )
         if not ranked_cards:
             return {"handled": False}
@@ -1479,20 +1521,26 @@ class WebWorker:
         base_query: str = "",
         domain_hints: Optional[List[str]] = None,
         max_queries: int = 3,
+        current_time_context: Optional[Dict[str, Any]] = None,
     ) -> List[str]:
+        current_time_context = normalize_current_time_context(current_time_context)
         query_budget = self._search_query_budget(task_description or base_query, max_queries)
-        domain_hints = [item for item in (domain_hints or self._extract_domain_hints(task_description)) if item]
+        inference_text = f"{task_description} {base_query}"
+        explicit_hints = domain_hints or self._extract_domain_hints(task_description)
+        domain_hints = list(dict.fromkeys([item for item in [*explicit_hints, *self._inferred_preferred_domains(inference_text)] if item]))
         fallback = self._fallback_search_queries(
             task_description,
             base_query=base_query,
             domain_hints=domain_hints,
             max_queries=query_budget,
+            current_time_context=current_time_context,
         )
         payload = {
             "task": task_description,
             "base_query": base_query,
             "domain_hints": domain_hints,
             "fallback_queries": fallback,
+            "current_time_context": current_time_context,
         }
         try:
             response = self.llm.chat_with_system(
@@ -1512,6 +1560,12 @@ class WebWorker:
                 queries.append(value)
                 if len(queries) >= query_budget:
                     break
+            if queries and len(queries) < query_budget:
+                ordered_fallback = sorted(
+                    fallback,
+                    key=lambda item: 0 if str(item).lower().startswith("site:") else 1,
+                )
+                queries.extend(item for item in ordered_fallback if item not in seen)
             return self._dedupe_search_queries(queries or fallback, max_queries=query_budget)
         except Exception:
             return self._dedupe_search_queries(fallback, max_queries=query_budget)
@@ -1529,6 +1583,14 @@ class WebWorker:
         for token in self._tokenize_query_terms(f"{task_description} {query}"):
             if token in haystack:
                 score += 3
+        preferred_domains = self._inferred_preferred_domains(task_description)
+        if preferred_domains:
+            try:
+                host = urlparse(str(card.get("link", "") or "")).netloc.lower()
+            except Exception:
+                host = ""
+            if any(host == domain or host.endswith(f".{domain}") for domain in preferred_domains):
+                score += 12
         if self._is_probably_detail_url(str(card.get("link", "") or "")):
             score += 2
         snippet = str(card.get("snippet", card.get("summary", "")) or "").strip()
@@ -1542,6 +1604,7 @@ class WebWorker:
         query: str,
         cards: List[Dict[str, Any]],
         max_results: int = 5,
+        current_time_context: Optional[Dict[str, Any]] = None,
     ) -> Tuple[List[Dict[str, Any]], bool]:
         if not cards:
             return [], False
@@ -1571,6 +1634,7 @@ class WebWorker:
                     {
                         "task": task_description,
                         "query": query,
+                        "current_time_context": normalize_current_time_context(current_time_context),
                         "results": payload_cards,
                     },
                     ensure_ascii=False,
@@ -2580,7 +2644,9 @@ class WebWorker:
         max_results: int = 5,
         headless: Optional[bool] = None,
         tk: BrowserToolkit = None,
+        current_time_context: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
+        current_time_context = normalize_current_time_context(current_time_context)
         search_context = str(base_query or "").strip() or task_description
         allow_serp_answer = self._task_allows_serp_answer(search_context, max_results)
         queries = self.plan_search_queries(
@@ -2588,6 +2654,7 @@ class WebWorker:
             base_query=base_query,
             domain_hints=domain_hints,
             max_queries=min(4, max(1, max_results)),
+            current_time_context=current_time_context,
         )
         aggregate_cards: List[Dict[str, Any]] = []
         seen_links: Set[str] = set()
@@ -2605,6 +2672,7 @@ class WebWorker:
                 query,
                 cards,
                 max_results=max_results,
+                current_time_context=current_time_context,
             )
             serp_sufficient = serp_sufficient or (allow_serp_answer and ranked_serp_sufficient)
             for card in ranked_cards:
@@ -2619,6 +2687,7 @@ class WebWorker:
             " ".join(queries),
             aggregate_cards,
             max_results=max_results,
+            current_time_context=current_time_context,
         )
         if ranked_cards and allow_serp_answer and not serp_sufficient:
             try:
@@ -3178,6 +3247,13 @@ class WebWorker:
         shared_memory: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
         log_agent_action(self.name, "开始智能爬取", task_description[:50])
+        current_time_context = normalize_current_time_context(
+            (shared_memory or {}).get("current_time_context")
+        )
+        task_description = append_temporal_instruction_if_needed(
+            task_description,
+            current_time_context,
+        )
         trace = web_debug_recorder.start_trace(
             "web_worker",
             {
@@ -3290,6 +3366,7 @@ class WebWorker:
                     max_results=max(3, min(limit, 6)),
                     headless=headless if headless is not None else False,
                     tk=tk,
+                    current_time_context=current_time_context,
                 )
                 web_debug_recorder.write_json("search_bundle", search_bundle)
                 for card in search_bundle.get("cards", []):
@@ -3515,6 +3592,7 @@ class WebWorker:
                             task_description,
                             limit,
                             snapshot=retry_snapshot,
+                            current_time_context=current_time_context,
                         )
                         if semantic_serp.get("return_data"):
                             cards = list(semantic_serp.get("data", []) or [])[:limit]
@@ -3574,6 +3652,12 @@ class WebWorker:
                             )
                             retry_quality = self.validate_data_quality(retry_data, task_description, limit)
                             if retry_quality.get("valid"):
+                                if (
+                                    observed_page_type == "serp"
+                                    and not self._task_allows_serp_answer(task_description, limit)
+                                ):
+                                    log_warning("搜索结果页摘要不足以完成该任务，继续打开真实结果页")
+                                    continue
                                 web_debug_recorder.record_event(
                                     "search_candidate_retry_success",
                                     url=next_url,
@@ -3722,6 +3806,7 @@ class WebWorker:
                         task_description,
                         limit,
                         snapshot=snapshot,
+                        current_time_context=current_time_context,
                     )
                     if semantic_serp.get("return_data"):
                         cards = list(semantic_serp.get("data", []) or [])[:limit]
@@ -3834,6 +3919,19 @@ class WebWorker:
                         )
                         quality = self.validate_data_quality(data, task_description, limit)
                         if quality.get("valid"):
+                            if (
+                                observed_page_type == "serp"
+                                and not self._task_allows_serp_answer(task_description, limit)
+                            ):
+                                log_warning("搜索结果页摘要不足以完成该任务，改为继续访问真实结果页")
+                                search_candidate_entries = [
+                                    dict(item)
+                                    for item in data
+                                    if isinstance(item, dict)
+                                    and str(item.get("link", "") or item.get("url", "") or "").strip().startswith("http")
+                                ]
+                                data = []
+                                break
                             log_success(f"数据质量验证通过: {quality.get('reason', '')[:50]}")
                             break
                         log_warning(f"数据不符合要求: {quality.get('reason', '')[:80]}")
@@ -3899,7 +3997,7 @@ class WebWorker:
                 if data:
                     log_success(f"最终成功提取 {len(data)} 条数据")
                 else:
-                    if opened_from_search_page and search_candidate_entries:
+                    if search_candidate_entries:
                         remaining_search_candidates = [
                             candidate
                             for candidate in search_candidate_entries
@@ -3941,6 +4039,7 @@ class WebWorker:
                         domain_hints=domain_hints,
                         max_results=3,
                         tk=tk,
+                        current_time_context=current_time_context,
                     )
                     alt_urls = list(alt_bundle.get("urls", []))
                     original_domain = "/".join(url.split("/")[:3]) if url else ""
@@ -4051,6 +4150,9 @@ class WebWorker:
         classify_failure, make_trace_step, evaluate_success_criteria, execute_fallback, MAX_FALLBACK_ATTEMPTS = _import_paod()
 
         params = task["params"]
+        effective_shared_memory = dict(shared_memory or {})
+        if isinstance(params.get("current_time_context"), dict):
+            effective_shared_memory["current_time_context"] = params["current_time_context"]
         url = params.get("url", "")
         query = params.get("query", "")
         limit = params.get("limit", 10)
@@ -4091,7 +4193,7 @@ class WebWorker:
             limit,
             headless=headless,
             query=query,
-            shared_memory=shared_memory,
+            shared_memory=effective_shared_memory,
         )
         trace[-1]["observation"] = f"success={result.get('success')}, count={result.get('count', 0)}"
 
@@ -4131,6 +4233,7 @@ class WebWorker:
                 retry_limit,
                 headless=retry_headless,
                 query=retry_query,
+                shared_memory=effective_shared_memory,
             )
             trace[-1]["observation"] = f"success={result.get('success')}, count={result.get('count', 0)}"
 

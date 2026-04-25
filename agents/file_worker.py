@@ -6,6 +6,7 @@ import ast
 import csv
 import json
 import os
+import re
 import zipfile
 from typing import Dict, Any, Optional, List
 from datetime import datetime
@@ -17,6 +18,11 @@ import yaml
 from core.state import OmniCoreState, TaskItem
 from utils.logger import log_agent_action, logger, log_success, log_error, log_warning
 from utils.human_confirm import HumanConfirm
+from utils.time_context import (
+    build_time_context_prompt,
+    is_time_sensitive_text,
+    normalize_current_time_context,
+)
 from config.settings import settings
 
 def _import_paod():
@@ -38,19 +44,30 @@ class FileWorker:
     # 路径解析
     # ------------------------------------------------------------------
 
+    @staticmethod
+    def _looks_like_windows_drive_path(path_value: str) -> bool:
+        return bool(re.match(r"^[a-zA-Z]:[\\/]", str(path_value or "").strip()))
+
+    def _effective_desktop_path(self) -> Path:
+        configured = Path(str(settings.USER_DESKTOP_PATH)).expanduser()
+        if os.name != "nt" and self._looks_like_windows_drive_path(str(settings.USER_DESKTOP_PATH)):
+            return Path.home() / "Desktop"
+        return configured
+
     def _resolve_path(self, file_path: str) -> Path:
         """解析文件路径，支持 ~ 和相对路径"""
-        path = Path(file_path)
+        raw_path = str(file_path or "").strip()
+        path = Path(raw_path)
 
-        if str(file_path).startswith("~"):
-            path = Path(file_path).expanduser()
+        if raw_path.startswith("~"):
+            path = Path(raw_path).expanduser()
 
         if "Desktop" in str(path) or "桌面" in str(path):
             filename = path.name
-            path = settings.USER_DESKTOP_PATH / filename
+            path = self._effective_desktop_path() / filename
 
         if not path.is_absolute() and str(path.parent) == ".":
-            path = settings.USER_DESKTOP_PATH / path.name
+            path = self._effective_desktop_path() / path.name
 
         return path
 
@@ -169,7 +186,124 @@ class FileWorker:
     # P0-1: LLM 驱动的文档内容生成
     # ------------------------------------------------------------------
 
-    def _generate_content(self, topic: str, outline: List[str], style: str, fmt: str) -> str:
+    def _build_source_context(self, data_items: List[Dict[str, Any]], max_items: int = 12) -> str:
+        """将抓取结果压缩成生成报告可用的事实材料。"""
+        if not data_items:
+            return ""
+
+        compact_items = []
+        for idx, item in enumerate(data_items[:max_items], 1):
+            if not isinstance(item, dict):
+                compact_items.append({"index": idx, "content": str(item)[:1200]})
+                continue
+            compact = {"index": idx}
+            for key in (
+                "title", "name", "summary", "snippet", "description", "text",
+                "url", "link", "source", "source_url", "date", "published_at",
+            ):
+                value = item.get(key)
+                if value:
+                    compact[key] = str(value)[:1200]
+            if len(compact) == 1:
+                compact["content"] = json.dumps(item, ensure_ascii=False)[:1200]
+            compact_items.append(compact)
+
+        return json.dumps(compact_items, ensure_ascii=False, indent=2)
+
+    def _extract_source_urls(self, data_items: List[Dict[str, Any]]) -> List[str]:
+        urls: List[str] = []
+        seen = set()
+        for item in data_items:
+            if not isinstance(item, dict):
+                continue
+            for key in ("url", "link", "source_url"):
+                value = str(item.get(key, "") or "").strip()
+                if value.startswith("http") and value not in seen:
+                    seen.add(value)
+                    urls.append(value)
+        return urls
+
+    def _ensure_html_document(self, content: str, title: str = "Generated Report") -> str:
+        body = str(content or "").strip()
+        if re.search(r"<html\b", body, flags=re.IGNORECASE):
+            return body
+        return (
+            "<!DOCTYPE html><html><head><meta charset='utf-8'>"
+            f"<title>{title}</title>"
+            "<style>"
+            "body{font-family:system-ui,-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;"
+            "max-width:980px;margin:40px auto;padding:0 20px;line-height:1.65;color:#1f2933}"
+            "a{color:#0b66c3} table{border-collapse:collapse;width:100%;margin:16px 0}"
+            "th,td{border:1px solid #d9e2ec;padding:8px 10px;text-align:left;vertical-align:top}"
+            "th{background:#f0f4f8} code{background:#f4f6f8;padding:1px 4px;border-radius:4px}"
+            "</style></head><body>"
+            f"{body}</body></html>"
+        )
+
+    def _append_missing_source_links(self, content: str, data_items: List[Dict[str, Any]], fmt: str) -> str:
+        urls = self._extract_source_urls(data_items)
+        if not urls:
+            return content
+        if any(url in content for url in urls):
+            return content
+
+        if fmt == "html":
+            links = "".join(f"<li><a href=\"{url}\">{url}</a></li>" for url in urls)
+            return f"{content}\n<section><h2>信息源</h2><ol>{links}</ol></section>"
+
+        lines = ["", "## 信息源", *[f"- {url}" for url in urls]]
+        return content.rstrip() + "\n" + "\n".join(lines) + "\n"
+
+    def _ensure_generated_date(
+        self,
+        content: str,
+        fmt: str,
+        current_time_context: Dict[str, Any],
+        *,
+        force: bool = False,
+    ) -> str:
+        if not force:
+            return content
+        context = normalize_current_time_context(current_time_context)
+        local_date = str(context.get("local_date", "") or "").strip()
+        if not local_date or local_date in str(content or ""):
+            return content
+        if re.search(r"(报告生成日期|生成日期|generated(?:\s+at|\s+on)?)", str(content or ""), flags=re.IGNORECASE):
+            return content
+
+        if fmt == "html":
+            return f"<p><strong>生成日期：</strong>{local_date}</p>\n{content}"
+        if fmt in {"markdown", "md"}:
+            return f"> 生成日期: {local_date}\n\n{content}"
+        if fmt in {"txt", "text"}:
+            return f"生成日期: {local_date}\n\n{content}"
+        return content
+
+    def _normalize_generated_file_path(self, file_path: str, fmt: str, explicit_file_path: bool) -> str:
+        target = str(file_path or "").strip()
+        normalized_fmt = str(fmt or "").strip().lower()
+        if not target:
+            suffix = "html" if normalized_fmt == "html" else "md"
+            return f"~/Desktop/generated.{suffix}"
+        if normalized_fmt == "html":
+            suffix = Path(target).suffix.lower()
+            if not suffix and not explicit_file_path:
+                return f"{target}.html"
+            if not explicit_file_path and suffix not in {".html", ".htm"}:
+                return str(Path(target).with_suffix(".html"))
+            if suffix in {".md", ".markdown", ".txt"} and Path(target).name.startswith("generated"):
+                return str(Path(target).with_suffix(".html"))
+        return target
+
+    def _generate_content(
+        self,
+        topic: str,
+        outline: List[str],
+        style: str,
+        fmt: str,
+        source_context: str = "",
+        current_time_context: Optional[Dict[str, Any]] = None,
+    ) -> str:
         """调用 LLM 生成文档正文"""
         from core.llm import LLMClient
         from pathlib import Path as _Path
@@ -185,11 +319,30 @@ class FileWorker:
             .replace("{outline}", outline_str)
             .replace("{format}", fmt or "markdown")
         )
+        time_context = normalize_current_time_context(current_time_context)
+        system_prompt += (
+            "\n\n## 当前时间（权威）\n"
+            f"{build_time_context_prompt(time_context)}\n"
+            "如果主题要求“最新/最近/当前/今天”，报告必须以该日期为基准，并明确生成日期。"
+        )
+        if source_context:
+            system_prompt += (
+                "\n\n## 已抓取的事实材料\n"
+                "下面是上游 WebWorker 抓取/搜索到的材料。生成事实性报告时必须优先使用这些材料，"
+                "不要编造未在材料中出现的发布时间、模型名或能力；如果材料不足，请明确说明。"
+                "涉及来源时必须保留可点击 URL。\n"
+                f"{source_context}\n"
+            )
 
         llm = LLMClient()
+        user_content = f"请根据以上要求，生成关于「{topic}」的{style or ''}文档。"
+        if source_context:
+            user_content += "请基于已抓取材料总结，并在文末列出信息源链接。"
+        if is_time_sensitive_text(topic):
+            user_content += f"当前日期是 {time_context.get('local_date')}，不要把更早年份的信息称为最新，除非来源证明仍然有效。"
         messages = [
             {"role": "system", "content": system_prompt},
-            {"role": "user", "content": f"请根据以上要求，生成关于「{topic}」的{style or ''}文档。"},
+            {"role": "user", "content": user_content},
         ]
         response = llm.chat(messages, temperature=0.7, max_tokens=settings.FILE_GENERATE_MAX_TOKENS)
         return response.content
@@ -542,6 +695,12 @@ class FileWorker:
                         item_copy = dict(item)
                         item_copy.setdefault("source", source_id)
                         merged.append(item_copy)
+            elif isinstance(source_data, dict) and isinstance(source_data.get("data"), list):
+                for item in source_data.get("data") or []:
+                    if isinstance(item, dict):
+                        item_copy = dict(item)
+                        item_copy.setdefault("source", source_id)
+                        merged.append(item_copy)
             elif source_data is not None:
                 merged.append({"data": str(source_data), "source": source_id})
         return merged
@@ -576,6 +735,13 @@ class FileWorker:
                 return source_data
             elif isinstance(source_data, list) and source_data:
                 return [{"data": str(item)} for item in source_data]
+            elif isinstance(source_data, dict):
+                nested_data = source_data.get("data")
+                if isinstance(nested_data, list) and nested_data and isinstance(nested_data[0], dict):
+                    return nested_data
+                if isinstance(nested_data, list) and nested_data:
+                    return [{"data": str(item)} for item in nested_data]
+                return [{"data": json.dumps(source_data, ensure_ascii=False)}]
 
         if data_source:
             for key in shared_memory:
@@ -584,11 +750,21 @@ class FileWorker:
                     if isinstance(value, list) and value and isinstance(value[0], dict):
                         logger.debug(f"模糊匹配到数据源: {key}")
                         return value
+                    if isinstance(value, dict):
+                        nested_data = value.get("data")
+                        if isinstance(nested_data, list) and nested_data and isinstance(nested_data[0], dict):
+                            logger.debug(f"模糊匹配到嵌套数据源: {key}")
+                            return nested_data
 
         for key, value in shared_memory.items():
             if isinstance(value, list) and value and isinstance(value[0], dict):
                 logger.debug(f"fallback 使用数据源: {key}")
                 return value
+            if isinstance(value, dict):
+                nested_data = value.get("data")
+                if isinstance(nested_data, list) and nested_data and isinstance(nested_data[0], dict):
+                    logger.debug(f"fallback 使用嵌套数据源: {key}")
+                    return nested_data
 
         logger.warning(f"未找到任何可用数据，shared_memory 内容: {list(shared_memory.keys())}")
         return []
@@ -680,17 +856,40 @@ class FileWorker:
 
         # ---- P0-1: generate ----
         if action == "generate":
-            file_path = params.get("file_path", "~/Desktop/generated.md")
+            explicit_file_path = bool(str(params.get("file_path", "") or "").strip())
+            requested_format = str(params.get("format", "") or "").strip().lower()
+            file_path = params.get("file_path", "")
             topic = params.get("topic", task["description"])
             outline = params.get("outline", [])
             style = params.get("style", "技术文档")
-            fmt = params.get("format", Path(file_path).suffix.lower().lstrip(".") or "markdown")
+            fmt = requested_format or Path(file_path).suffix.lower().lstrip(".") or "markdown"
             if fmt == "md":
                 fmt = "markdown"
+            file_path = self._normalize_generated_file_path(file_path, fmt, explicit_file_path)
+            data_items = self._collect_data_items(params, shared_memory, task)
+            data_items = self._apply_column_filter(
+                data_items,
+                params.get("columns"),
+                params.get("exclude_columns"),
+            )
+            source_context = self._build_source_context(data_items)
+            current_time_context = normalize_current_time_context(
+                params.get("current_time_context")
+                if isinstance(params.get("current_time_context"), dict)
+                else (shared_memory or {}).get("current_time_context")
+            )
+            temporal_report = is_time_sensitive_text(f"{task.get('description', '')} {topic}")
 
             trace.append(make_trace_step(step_no, f"generate content ({fmt})", file_path, "", ""))
             try:
-                content = self._generate_content(topic, outline, style, fmt)
+                content = self._generate_content(
+                    topic,
+                    outline,
+                    style,
+                    fmt,
+                    source_context=source_context,
+                    current_time_context=current_time_context,
+                )
             except Exception as e:
                 result = {"success": False, "error": f"LLM 生成失败: {e}", "file_path": file_path}
                 trace[-1]["observation"] = f"error={e}"
@@ -703,12 +902,22 @@ class FileWorker:
             code_fmts = {"python", "json", "yaml", "toml", "js", "javascript"}
             if fmt in code_fmts:
                 content = self._validate_code_content(content, fmt)
+            elif fmt == "html":
+                content = self._ensure_generated_date(content, fmt, current_time_context, force=temporal_report)
+                content = self._append_missing_source_links(content, data_items, fmt)
+                content = self._ensure_html_document(content, title=self._generate_report_title(task["description"]))
+            else:
+                content = self._ensure_generated_date(content, fmt, current_time_context, force=temporal_report)
+                content = self._append_missing_source_links(content, data_items, fmt)
 
             step_no += 1
             trace.append(make_trace_step(step_no, f"write generated file", file_path, "", ""))
             result = self.write_file(file_path, content, require_confirm=False, policy_preconfirmed=True)
             trace[-1]["observation"] = f"success={result.get('success')}, path={result.get('file_path', '')}"
             trace[-1]["decision"] = "done" if result.get("success") else "failed"
+            if result.get("success") and data_items:
+                actual_path = Path(result.get("file_path", ""))
+                result["artifact_preview"] = self._build_artifact_preview(actual_path, data_items, fmt)
 
             # 硬验证
             step_no += 1

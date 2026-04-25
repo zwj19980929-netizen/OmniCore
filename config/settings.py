@@ -168,7 +168,7 @@ class Settings:
 
     # === 本地路径 ===
     USER_DESKTOP_PATH = Path(
-        os.getenv("USER_DESKTOP_PATH", Path.home() / "Desktop")
+        os.getenv("USER_DESKTOP_PATH") or (Path.home() / "Desktop")
     )
     CHROMA_PERSIST_DIR = Path(
         os.getenv("CHROMA_PERSIST_DIR", DATA_DIR / "chroma")
