@@ -916,6 +916,64 @@ def test_assess_page_with_llm_prefers_extract_and_caches_result():
     assert llm.calls == 1
 
 
+def test_assess_page_with_llm_clicks_serp_source_for_latest_model_research():
+    llm = SemanticAssessmentLLM(
+        {
+            "page_relevant": True,
+            "goal_satisfied": True,
+            "confidence": 0.92,
+            "action": {
+                "type": "extract",
+                "description": "search snippets mention the latest model",
+            },
+        }
+    )
+    agent = BrowserAgent(llm_client=llm, headless=True)
+    elements = [
+        PageElement(
+            index=0,
+            tag="input",
+            text="",
+            element_type="search",
+            selector="#q",
+            attributes={"placeholder": "Search", "value": "OpenAI latest model"},
+            is_visible=True,
+            is_clickable=True,
+        ),
+        PageElement(
+            index=1,
+            tag="a",
+            text="OpenAI latest model release: GPT-5.4 mini",
+            element_type="link",
+            selector="a.result",
+            attributes={"href": "https://openai.com/index/introducing-gpt-5-4-mini/"},
+            is_visible=True,
+            is_clickable=True,
+        ),
+    ]
+
+    action = asyncio.run(
+        agent._assess_page_with_llm(
+            "帮我看下OpenAI最新模型，给我官方来源、发布时间、参数和性能对比",
+            "https://www.google.com/search?q=OpenAI+latest+model",
+            "OpenAI latest model - Google Search",
+            elements,
+            TaskIntent(intent_type="search", query="OpenAI latest model", confidence=0.9),
+            [
+                {
+                    "title": "OpenAI latest model release: GPT-5.4 mini",
+                    "text": "Snippet mentions GPT-5.4 mini.",
+                    "link": "https://openai.com/index/introducing-gpt-5-4-mini/",
+                }
+            ],
+        )
+    )
+
+    assert action is not None
+    assert action.action_type == ActionType.CLICK
+    assert action.target_selector == "a.result"
+
+
 def test_assess_page_with_llm_can_click_semantic_result_candidate():
     llm = SemanticAssessmentLLM(
         {
@@ -1652,6 +1710,45 @@ def test_page_data_satisfies_goal_requires_target_count_on_list_page():
     )
 
     assert satisfied is False
+
+
+def test_target_count_parses_at_least_search_results():
+    agent = BrowserAgent(headless=True)
+
+    assert agent._extract_target_result_count("extract at least 5 search results") == 5
+
+
+def test_snapshot_navigation_does_not_extract_irrelevant_search_homepage_links():
+    agent = BrowserAgent(headless=True)
+    snapshot = {
+        "page_type": "list",
+        "main_text": "百度一下 关于百度 About Baidu 帮助中心 企业推广",
+        "affordances": {},
+    }
+    data = [
+        {"title": "hao123", "link": "https://www.hao123.com/?src=from_pc"},
+        {"title": "搭子DuMate", "link": "https://cloud.baidu.com/product/dumate.html?track=bdsy"},
+        {"title": "关于百度", "link": "https://home.baidu.com/"},
+        {"title": "About Baidu", "link": "http://ir.baidu.com/"},
+        {"title": "帮助中心", "link": "https://help.baidu.com/question?prod_id=1"},
+    ]
+
+    action = agent._choose_snapshot_navigation_action(
+        "Search Baidu for 'AI 大模型 最新动态 2026年4月 DeepSeek OpenAI' "
+        "and extract at least 5 search results (title, URL, snippet).",
+        "https://www.baidu.com/",
+        [],
+        TaskIntent(
+            intent_type="navigate",
+            query="AI 大模型 最新动态 2026年4月 DeepSeek OpenAI",
+            confidence=0.55,
+            requires_interaction=True,
+        ),
+        data,
+        snapshot=snapshot,
+    )
+
+    assert action is None or action.action_type != ActionType.EXTRACT
 
 
 def test_choose_snapshot_navigation_action_prefers_load_more_for_list_pages():

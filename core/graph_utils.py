@@ -176,7 +176,8 @@ def should_skip_remaining_tasks(state: OmniCoreState) -> bool:
     Rules (no LLM call needed):
     1. Single-answer task + answer already found -> skip remaining
     2. Accumulated data meets or exceeds the requested item count -> skip remaining
-    3. All remaining tasks depend on a failed prerequisite -> stop
+    Failed prerequisites are handled by the critic/replanner path instead of
+    being marked as skipped success.
     """
     from utils.structured_extract import extract_requested_item_count
 
@@ -210,22 +211,6 @@ def should_skip_remaining_tasks(state: OmniCoreState) -> bool:
                     if isinstance(payload, list):
                         total_items += len(payload)
         if total_items >= requested_count:
-            return True
-
-    # Rule 3: all remaining tasks depend on a failed task
-    failed_ids = {
-        str(t.get("task_id", ""))
-        for t in task_queue
-        if str(t.get("status", "")) == "failed"
-    }
-    if failed_ids and pending:
-        all_blocked = True
-        for task in pending:
-            deps = list(task.get("depends_on") or [])
-            if not deps or not any(dep in failed_ids for dep in deps):
-                all_blocked = False
-                break
-        if all_blocked:
             return True
 
     return False

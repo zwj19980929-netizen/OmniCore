@@ -15,7 +15,14 @@ from utils.logger import log_agent_action, logger
 from utils.prompt_manager import get_prompt
 from utils.time_context import is_time_sensitive_text, normalize_current_time_context
 from utils.url_utils import extract_all_urls
-from utils.web_result_normalizer import looks_like_detail_list_item
+from utils.structured_extract import extract_requested_item_count
+from utils.web_result_normalizer import (
+    best_title_from_item,
+    best_url_from_item,
+    looks_like_detail_list_item,
+    normalize_text,
+    tokenize_text,
+)
 
 
 class CriticAgent:
@@ -59,23 +66,7 @@ class CriticAgent:
 
     @staticmethod
     def _extract_target_count(task_description: str) -> int:
-        text = str(task_description or "")
-        patterns = (
-            r"前\s*(\d+)\s*(?:条|个|项|篇)?",
-            r"top\s*(\d+)",
-            r"(\d+)\s*(?:items?|results?|links?|headlines?|stories|repositories|repos)\b",
-        )
-        for pattern in patterns:
-            match = re.search(pattern, text, flags=re.IGNORECASE)
-            if not match:
-                continue
-            try:
-                value = int(match.group(1))
-            except (TypeError, ValueError):
-                continue
-            if value > 0:
-                return value
-        return 0
+        return extract_requested_item_count(task_description)
 
     @staticmethod
     def _primary_task_url(task_description: str) -> str:
@@ -113,6 +104,72 @@ class CriticAgent:
         if not isinstance(data, list):
             return False
         return len(data) >= target_count
+
+    _GENERIC_RELEVANCE_TOKENS = {
+        "a", "an", "and", "at", "browser", "current", "data", "extract",
+        "for", "from", "go", "google", "latest", "link", "links", "list",
+        "news", "of", "open", "page", "query", "recent", "result",
+        "results", "search", "source", "sources", "the", "title", "titles",
+        "to", "url", "urls", "use", "visit", "web",
+        "baidu", "bing", "duckduckgo", "google新闻", "谷歌", "百度", "必应",
+        "使用", "访问", "打开", "搜索", "结果", "标题", "链接", "新闻",
+        "最新", "最新动态", "当前", "最近", "提取", "抓取", "条", "个",
+    }
+
+    @classmethod
+    def _task_relevance_tokens(cls, task_description: str) -> list[str]:
+        text = re.sub(r"https?://\S+", " ", str(task_description or "")).lower()
+        tokens = []
+        for token in tokenize_text(text):
+            normalized = normalize_text(token).lower()
+            if not normalized or normalized in cls._GENERIC_RELEVANCE_TOKENS:
+                continue
+            if normalized.isdigit():
+                continue
+            if len(normalized) <= 1:
+                continue
+            tokens.append(normalized)
+        return list(dict.fromkeys(tokens))[:12]
+
+    @staticmethod
+    def _token_in_text(token: str, text: str) -> bool:
+        if re.fullmatch(r"[a-z0-9.+-]{1,3}", token):
+            return bool(re.search(rf"(?<![a-z0-9]){re.escape(token)}(?![a-z0-9])", text))
+        return token in text
+
+    @classmethod
+    def _result_has_task_relevant_items(cls, task_description: str, task_result: Any) -> bool:
+        if not isinstance(task_result, dict):
+            return False
+        data = task_result.get("data")
+        if not isinstance(data, list) or not data:
+            return False
+        tokens = cls._task_relevance_tokens(task_description)
+        if not tokens:
+            return True
+
+        relevant_count = 0
+        for item in data[:12]:
+            if not isinstance(item, dict):
+                continue
+            haystack = " ".join(
+                normalize_text(value).lower()
+                for value in (
+                    best_title_from_item(item),
+                    item.get("summary"),
+                    item.get("snippet"),
+                    item.get("text"),
+                    item.get("source"),
+                    best_url_from_item(item),
+                )
+                if normalize_text(value)
+            )
+            if any(cls._token_in_text(token, haystack) for token in tokens):
+                relevant_count += 1
+
+        target_count = cls._extract_target_count(task_description)
+        required_relevant = min(3, max(1, (target_count or len(data)) // 2))
+        return relevant_count >= required_relevant
 
     def _deterministic_review_result(
         self,
@@ -162,6 +219,21 @@ class CriticAgent:
                 "issues": ["返回的数据更像导航、筛选或翻页链接，而不是目标实体详情链接"],
                 "suggestions": ["改用更强的列表区域识别，或排除同页筛选/分页链接"],
                 "summary": "显式 URL 列表抽取任务提取到了错误的重复区域",
+            }
+
+        if (
+            self._task_has_direct_url(task_description)
+            and self._looks_like_list_extraction_task(task_description)
+            and self._result_meets_target_count(task_description, task_result)
+            and self._result_has_title_link_items(task_description, task_result)
+            and not self._result_has_task_relevant_items(task_description, task_result)
+        ):
+            return {
+                "approved": False,
+                "score": 0.35,
+                "issues": ["返回条目与搜索主题不匹配，更像首页导航、热榜或无关链接"],
+                "suggestions": ["先提交搜索词并等待结果页，再提取与查询主题匹配的标题、链接和摘要"],
+                "summary": "列表抽取结果与任务主题不匹配",
             }
 
         if (

@@ -36,6 +36,7 @@ from utils.url_utils import extract_first_url
 from utils.web_prompt_budget import BudgetSection, render_budgeted_sections
 from utils.text_relevance import extract_relevant_text_safe_async
 from utils.prompt_injection_detector import wrap_untrusted
+from utils.structured_extract import extract_requested_item_count
 import utils.web_debug_recorder as web_debug_recorder
 
 from agents.browser_agent import (
@@ -1204,16 +1205,7 @@ class BrowserDecisionLayer:
         return ""
 
     def _extract_target_result_count(self, task: str) -> int:
-        match = re.search(
-            r'(\d+)\s*(?:个|条|款|项|条数据|items?|results?|records?|articles?|entries|pieces?)',
-            task or "", flags=re.IGNORECASE,
-        )
-        if not match:
-            return 0
-        try:
-            return max(int(match.group(1)), 0)
-        except (TypeError, ValueError):
-            return 0
+        return max(extract_requested_item_count(task), 0)
 
     def _data_has_substantive_text(self, data: List[Dict[str, str]]) -> bool:
         for item in data[:8]:
@@ -1308,6 +1300,46 @@ class BrowserDecisionLayer:
             return True
         query = active_intent.query or self._derive_primary_query(task)
         return len(self._extract_query_tokens(query)) >= 2
+
+    @staticmethod
+    def _task_requires_authoritative_serp_source(task: str) -> bool:
+        """Return True when SERP snippets are too weak to satisfy the task."""
+        lowered = str(task or "").lower()
+        source_tokens = (
+            "source", "sources", "citation", "citations", "official", "authoritative",
+            "release", "announcement", "benchmark", "performance", "parameter",
+            "parameters", "pricing", "spec", "specs", "compare", "comparison",
+            "来源", "信息源", "引用", "链接", "官网", "官方", "权威", "公告",
+            "发布", "发布时间", "发布日期", "参数", "价格", "规格", "性能",
+            "基准", "评测", "对比",
+        )
+        freshness_tokens = (
+            "latest", "recent", "current", "today", "2026",
+            "最新", "最近", "当前", "今天", "本日", "今年",
+        )
+        model_tokens = (
+            "model", "models", "gpt", "deepseek", "openai",
+            "模型", "参数规模", "架构",
+        )
+        if any(token in lowered for token in source_tokens):
+            return True
+        return (
+            any(token in lowered for token in freshness_tokens)
+            and any(token in lowered for token in model_tokens)
+        )
+
+    def _search_intent_for_serp_source(self, task: str, intent: Optional[TaskIntent]) -> TaskIntent:
+        active_intent = intent or TaskIntent(intent_type="search", query="", confidence=0.0)
+        if active_intent.intent_type in {"search", "navigate"}:
+            return active_intent
+        return TaskIntent(
+            intent_type="search",
+            query=active_intent.query or self._derive_primary_query(task),
+            confidence=active_intent.confidence,
+            fields=active_intent.fields,
+            target_text=active_intent.target_text,
+            requires_interaction=active_intent.requires_interaction,
+        )
 
     # ── Phase 2: main decision methods ────────────────────────
 
@@ -2041,7 +2073,8 @@ class BrowserDecisionLayer:
         snapshot: Optional[Dict[str, Any]] = None,
     ) -> Optional[BrowserAction]:
         active_snapshot = snapshot or self.last_semantic_snapshot or {}
-        page_state = self._infer_page_state(task, current_url, intent, data, active_snapshot, elements=elements)
+        active_intent = intent or TaskIntent(intent_type="read", query=self._derive_primary_query(task), confidence=0.0)
+        page_state = self._infer_page_state(task, current_url, active_intent, data, active_snapshot, elements=elements)
         if page_state.goal_satisfied:
             if data:
                 return BrowserAction(action_type=ActionType.EXTRACT, description="extract current structured content", confidence=0.84)
@@ -2055,7 +2088,16 @@ class BrowserDecisionLayer:
                 return modal_action
 
         if page_state.page_type == "list":
-            if data and (page_state.target_count == 0 or len(data) >= min(page_state.target_count or len(data), page_state.item_count or len(data))):
+            data_satisfies_goal = bool(
+                data
+                and self._page_data_satisfies_goal(
+                    task, current_url, active_intent, data, snapshot=active_snapshot,
+                )
+            )
+            if data_satisfies_goal and (
+                page_state.target_count == 0
+                or len(data) >= min(page_state.target_count or len(data), page_state.item_count or len(data))
+            ):
                 return BrowserAction(action_type=ActionType.EXTRACT, description="extract visible list content", confidence=0.78)
             if page_state.target_count and len(data) < page_state.target_count:
                 load_more_action = self._build_snapshot_click_action(
@@ -2071,7 +2113,7 @@ class BrowserDecisionLayer:
                 if next_page_action is not None:
                     return next_page_action
                 return BrowserAction(action_type=ActionType.SCROLL, value="900", description="scroll for lazy-loaded list items", confidence=0.52)
-            if data:
+            if data_satisfies_goal:
                 return BrowserAction(action_type=ActionType.EXTRACT, description="extract current list page", confidence=0.7)
 
         if page_state.page_type in {"list", "unknown", "detail"} and not data:
@@ -2177,6 +2219,17 @@ class BrowserDecisionLayer:
     ) -> Optional[BrowserAction]:
         active_intent = intent or TaskIntent(intent_type="read", query="", confidence=0.0)
         query = active_intent.query or self._derive_primary_query(task)
+
+        if self._is_search_engine_url(current_url) and self._task_requires_authoritative_serp_source(task):
+            click_action = self._find_search_result_click_action(
+                task,
+                current_url,
+                elements,
+                self._search_intent_for_serp_source(task, active_intent),
+                snapshot=snapshot,
+            )
+            if click_action is not None:
+                return click_action
 
         if data and self._page_data_satisfies_goal(task, current_url, active_intent, data, snapshot=snapshot):
             return BrowserAction(action_type=ActionType.EXTRACT, description="use current page results", confidence=0.82)
@@ -2414,6 +2467,21 @@ class BrowserDecisionLayer:
             if action.action_type == ActionType.FAILED:
                 self._page_assessment_cache[cache_key] = None
                 return None
+
+            if (
+                (page_state.page_type == "serp" or self._is_search_engine_url(current_url))
+                and self._task_requires_authoritative_serp_source(task)
+                and action.action_type in {ActionType.EXTRACT, ActionType.DONE, ActionType.WAIT}
+            ):
+                click_action = self._find_search_result_click_action(
+                    task,
+                    current_url,
+                    elements,
+                    self._search_intent_for_serp_source(task, active_intent),
+                    snapshot=snapshot,
+                )
+                if click_action is not None:
+                    action = click_action
 
             if (
                 page_state.page_type == "list" and page_state.target_count

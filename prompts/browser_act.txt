@@ -80,6 +80,7 @@ Decision rules (read ALL before deciding):
 - Do NOT repeat any action in the "Repeated actions" list. Pick a different target, different action type, or DONE/EXTRACT.
 - Do NOT repeat the same failed action unless the page clearly changed.
 - Choose CLICK on a card's target_ref when a serp result clearly matches.
+- For current/latest/recent research, model-release, source/citation, official/authoritative, parameter/pricing/spec/benchmark, or comparison tasks, do not finish from search snippets. Click the strongest authoritative result.
 - For numeric targets not yet reached: CLICK pagination if visible, else SCROLL then EXTRACT.
 - For form/auth pages with editable inputs, use fields to fill or submit; do NOT return DONE/EXTRACT yet.
 - Choose WAIT only for clear loading/hydration states.

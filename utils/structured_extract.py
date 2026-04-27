@@ -102,8 +102,12 @@ def extract_structured_findings(task_queue: list, max_items: int = 5) -> str:
 def extract_requested_item_count(text: str) -> int:
     source = str(text or "")
     patterns = (
+        r"(?:至少|不少于|起码|最少)\s*(\d+)\s*(?:条|个|项|篇)?",
         r"前\s*(\d+)\s*(?:条|个|项|篇)?",
+        r"(\d+)\s*(?:条|个|项|篇)",
         r"top\s*(\d+)",
+        r"(?:at\s+least|minimum(?:\s+of)?|no\s+fewer\s+than)\s*(\d+)\s*(?:[A-Za-z-]+\s+){0,3}(?:items?|results?|links?|headlines?|stories|repositories|repos|models?|articles?|entries|records?)\b",
+        r"(\d+)\s*(?:[A-Za-z-]+\s+){0,2}(?:items?|results?|links?|headlines?|stories|repositories|repos|models?|articles?|entries|records?)\b",
         r"(\d+)\s*(?:items?|results?|links?|headlines?|stories|repositories|repos|models?)\b",
     )
     for pattern in patterns:
@@ -113,6 +117,8 @@ def extract_requested_item_count(text: str) -> int:
         try:
             value = int(match.group(1))
         except (TypeError, ValueError):
+            continue
+        if 1900 <= value <= 2100:
             continue
         if value > 0:
             return value

@@ -64,6 +64,7 @@ Decision rules:
 - Avoid repeating the same failed action unless the page clearly changed.
 - Actions listed under "Repeated actions" are BLACKLISTED. Do NOT propose any of them again; choose a different target, a different action type, or DONE/EXTRACT.
 - If page_type is `serp` and a card clearly matches, CLICK the card's `target_ref`.
+- For current/latest/recent research, model-release, source/citation, official/authoritative, parameter/pricing/spec/benchmark, or comparison tasks, search-result snippets are only source candidates; click through to a real source before extracting.
 - If the task specifies a numeric target and you haven't reached it, and pagination is visible, CLICK next page.
 - If the task specifies a numeric target and you haven't reached it, and no pagination is visible, SCROLL then EXTRACT.
 - For `form`/`auth` pages, use fields to fill inputs or submit.

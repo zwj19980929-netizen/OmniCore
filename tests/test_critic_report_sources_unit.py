@@ -134,3 +134,29 @@ def test_critic_review_uses_message_bus_time_context(tmp_path):
 
     assert reviewed["critic_approved"] is False
     assert reviewed["task_queue"][0]["critic_review"]["summary"] == "报告明显过期"
+
+
+def test_critic_rejects_search_homepage_navigation_links():
+    critic = CriticAgent(llm_client=_UnusedLLM())
+    result = critic.review_task_result(
+        "Use a browser to visit Baidu search (https://www.baidu.com), "
+        "search Baidu for 'AI 大模型 最新动态 2026年4月 DeepSeek OpenAI' "
+        "and extract at least 5 search results (title, URL, snippet).",
+        {
+            "success": True,
+            "data": [
+                {"title": "hao123", "link": "https://www.hao123.com/?src=from_pc"},
+                {"title": "搭子DuMate", "link": "https://cloud.baidu.com/product/dumate.html?track=bdsy"},
+                {"title": "关于百度", "link": "https://home.baidu.com/"},
+                {"title": "About Baidu", "link": "http://ir.baidu.com/"},
+                {"title": "帮助中心", "link": "https://help.baidu.com/question?prod_id=1"},
+            ],
+        },
+    )
+
+    assert result["approved"] is False
+    assert result["summary"] == "列表抽取结果与任务主题不匹配"
+
+
+def test_critic_parses_at_least_search_result_count():
+    assert CriticAgent._extract_target_count("extract at least 5 search results") == 5
